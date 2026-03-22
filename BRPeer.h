@@ -232,6 +232,12 @@ inline static int BRPeerEq(const void *peer, const void *otherPeer)
 // frees memory allocated for peer
 void BRPeerFree(BRPeer *peer);
 
+// SOCKS5 proxy support — set ONCE before peer connections are established.
+// Changing the proxy requires stopping and restarting sync.
+void BRPeerSetSocksProxy(const char *host, int port);
+void BRPeerClearSocksProxy(void);
+int  BRPeerHasSocksProxy(void);
+
 #ifdef __cplusplus
 }
 #endif

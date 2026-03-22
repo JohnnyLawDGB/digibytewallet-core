@@ -42,6 +42,71 @@
 #include <sys/time.h>
 #include <netinet/in.h> 
 #include <arpa/inet.h>
+#include <netdb.h>
+
+/* ---------- SOCKS5 proxy global state ---------- */
+/* Set ONCE before startSync(); requires stop/start to change. */
+static char g_socksHost[256] = {0};
+static int  g_socksPort      = 0;
+static pthread_mutex_t g_socksMutex = PTHREAD_MUTEX_INITIALIZER;
+
+void BRPeerSetSocksProxy(const char *host, int port) {
+    pthread_mutex_lock(&g_socksMutex);
+    if (host && host[0] != '\0') {
+        strncpy(g_socksHost, host, sizeof(g_socksHost) - 1);
+        g_socksHost[sizeof(g_socksHost) - 1] = '\0';
+    } else {
+        g_socksHost[0] = '\0';
+    }
+    g_socksPort = port;
+    pthread_mutex_unlock(&g_socksMutex);
+}
+
+void BRPeerClearSocksProxy(void) {
+    pthread_mutex_lock(&g_socksMutex);
+    memset(g_socksHost, 0, sizeof(g_socksHost));
+    g_socksPort = 0;
+    pthread_mutex_unlock(&g_socksMutex);
+}
+
+int BRPeerHasSocksProxy(void) {
+    int has;
+    pthread_mutex_lock(&g_socksMutex);
+    has = (g_socksHost[0] != '\0' && g_socksPort > 0);
+    pthread_mutex_unlock(&g_socksMutex);
+    return has;
+}
+
+/* Perform SOCKS5 handshake on an already-connected (to proxy) blocking socket.
+ * peer_addr_bytes: 4-byte IPv4 address in network byte order.
+ * peer_port:       port in host byte order.
+ * Returns 1 on success, 0 on failure. */
+static int _BRPeerSocks5Handshake(int sock, const uint8_t peer_addr_bytes[4], uint16_t peer_port) {
+    uint8_t buf[16];
+    ssize_t n;
+
+    /* Greeting: VER=5, NMETHODS=1, METHOD=0 (no auth) */
+    buf[0] = 0x05; buf[1] = 0x01; buf[2] = 0x00;
+    if (send(sock, buf, 3, 0) != 3) return 0;
+
+    /* Server greeting response: VER=5, METHOD=0 */
+    n = recv(sock, buf, 2, MSG_WAITALL);
+    if (n != 2 || buf[0] != 0x05 || buf[1] != 0x00) return 0;
+
+    /* Connect request: VER=5, CMD=CONNECT, RSV=0, ATYP=IPv4, ADDR(4), PORT(2) */
+    buf[0] = 0x05; buf[1] = 0x01; buf[2] = 0x00; buf[3] = 0x01;
+    buf[4] = peer_addr_bytes[0]; buf[5] = peer_addr_bytes[1];
+    buf[6] = peer_addr_bytes[2]; buf[7] = peer_addr_bytes[3];
+    buf[8] = (peer_port >> 8) & 0xFF;
+    buf[9] = peer_port & 0xFF;
+    if (send(sock, buf, 10, 0) != 10) return 0;
+
+    /* Connect response: read at least 4 bytes (VER, REP, RSV, ATYP) + bound addr */
+    n = recv(sock, buf, sizeof(buf), MSG_WAITALL);
+    if (n < 2) return 0;
+    /* buf[1] == 0x00 means success */
+    return (buf[1] == 0x00) ? 1 : 0;
+}
 
 #define HEADER_LENGTH      24
 #define MAX_MSG_LENGTH     0x02000000u
@@ -870,41 +935,112 @@ static int _BRPeerOpenSocket(BRPeer *peer, int domain, double timeout, int *erro
 
     if (r) {
         memset(&addr, 0, sizeof(addr));
-        
-        if (domain == PF_INET6) {
-            ((struct sockaddr_in6 *)&addr)->sin6_family = AF_INET6;
-            ((struct sockaddr_in6 *)&addr)->sin6_addr = *(struct in6_addr *)&peer->address;
-            ((struct sockaddr_in6 *)&addr)->sin6_port = htons(peer->port);
-            addrLen = sizeof(struct sockaddr_in6);
-        }
-        else {
-            ((struct sockaddr_in *)&addr)->sin_family = AF_INET;
-            ((struct sockaddr_in *)&addr)->sin_addr = *(struct in_addr *)&peer->address.u32[3];
-            ((struct sockaddr_in *)&addr)->sin_port = htons(peer->port);
-            addrLen = sizeof(struct sockaddr_in);
-        }
-        
-        if (connect(ctx->socket, (struct sockaddr *)&addr, addrLen) < 0) err = errno;
-        
-        if (err == EINPROGRESS) {
-            err = 0;
-            optLen = sizeof(err);
-            tv.tv_sec = timeout;
-            tv.tv_usec = (long)(timeout*1000000) % 1000000;
-            FD_ZERO(&fds);
-            FD_SET(ctx->socket, &fds);
-            count = select(ctx->socket + 1, NULL, &fds, NULL, &tv);
 
-            if (count <= 0 || getsockopt(ctx->socket, SOL_SOCKET, SO_ERROR, &err, &optLen) < 0 || err) {
-                if (count == 0) err = ETIMEDOUT;
-                if (count < 0 || ! err) err = errno;
-                r = 0;
+        /* If a SOCKS5 proxy is configured, connect to the proxy instead of the peer.
+         * The SOCKS5 handshake (performed after TCP connect) establishes the tunnel
+         * to the actual peer address. Only IPv4 peer addresses are supported via proxy. */
+        if (BRPeerHasSocksProxy()) {
+            /* Snapshot proxy settings under lock */
+            struct in_addr proxyAddr;
+            pthread_mutex_lock(&g_socksMutex);
+            int proxyPort = g_socksPort;
+            char proxyHost[256];
+            strncpy(proxyHost, g_socksHost, sizeof(proxyHost) - 1);
+            proxyHost[sizeof(proxyHost) - 1] = '\0';
+            pthread_mutex_unlock(&g_socksMutex);
+
+            if (inet_pton(AF_INET, proxyHost, &proxyAddr) != 1) {
+                /* hostname — resolve it */
+                struct addrinfo hints, *res = NULL;
+                memset(&hints, 0, sizeof(hints));
+                hints.ai_family = AF_INET;
+                hints.ai_socktype = SOCK_STREAM;
+                if (getaddrinfo(proxyHost, NULL, &hints, &res) != 0 || !res) {
+                    err = EHOSTUNREACH;
+                    r = 0;
+                } else {
+                    proxyAddr = ((struct sockaddr_in *)res->ai_addr)->sin_addr;
+                    freeaddrinfo(res);
+                }
             }
+
+            if (r) {
+                ((struct sockaddr_in *)&addr)->sin_family = AF_INET;
+                ((struct sockaddr_in *)&addr)->sin_addr   = proxyAddr;
+                ((struct sockaddr_in *)&addr)->sin_port   = htons((uint16_t)proxyPort);
+                addrLen = sizeof(struct sockaddr_in);
+
+                if (connect(ctx->socket, (struct sockaddr *)&addr, addrLen) < 0) err = errno;
+
+                if (err == EINPROGRESS) {
+                    err = 0;
+                    optLen = sizeof(err);
+                    tv.tv_sec = timeout;
+                    tv.tv_usec = (long)(timeout * 1000000) % 1000000;
+                    FD_ZERO(&fds);
+                    FD_SET(ctx->socket, &fds);
+                    count = select(ctx->socket + 1, NULL, &fds, NULL, &tv);
+
+                    if (count <= 0 || getsockopt(ctx->socket, SOL_SOCKET, SO_ERROR, &err, &optLen) < 0 || err) {
+                        if (count == 0) err = ETIMEDOUT;
+                        if (count < 0 || !err) err = errno;
+                        r = 0;
+                    }
+                } else if (err) r = 0;
+
+                if (r) {
+                    /* TCP connected to proxy — temporarily switch to blocking for SOCKS5 handshake */
+                    fcntl(ctx->socket, F_SETFL, arg); /* restore blocking */
+
+                    const uint8_t *peerIPv4 = (const uint8_t *)&peer->address.u32[3];
+                    if (!_BRPeerSocks5Handshake(ctx->socket, peerIPv4, peer->port)) {
+                        peer_log(peer, "SOCKS5 handshake failed");
+                        err = ECONNREFUSED;
+                        r = 0;
+                    } else {
+                        peer_log(peer, "SOCKS5 tunnel established via %s:%d", proxyHost, proxyPort);
+                        /* Re-apply non-blocking so the caller's restoration below is consistent */
+                        fcntl(ctx->socket, F_SETFL, arg | O_NONBLOCK);
+                    }
+                }
+            }
+        } else {
+            /* Direct connection — original code path */
+            if (domain == PF_INET6) {
+                ((struct sockaddr_in6 *)&addr)->sin6_family = AF_INET6;
+                ((struct sockaddr_in6 *)&addr)->sin6_addr = *(struct in6_addr *)&peer->address;
+                ((struct sockaddr_in6 *)&addr)->sin6_port = htons(peer->port);
+                addrLen = sizeof(struct sockaddr_in6);
+            }
+            else {
+                ((struct sockaddr_in *)&addr)->sin_family = AF_INET;
+                ((struct sockaddr_in *)&addr)->sin_addr = *(struct in_addr *)&peer->address.u32[3];
+                ((struct sockaddr_in *)&addr)->sin_port = htons(peer->port);
+                addrLen = sizeof(struct sockaddr_in);
+            }
+
+            if (connect(ctx->socket, (struct sockaddr *)&addr, addrLen) < 0) err = errno;
+
+            if (err == EINPROGRESS) {
+                err = 0;
+                optLen = sizeof(err);
+                tv.tv_sec = timeout;
+                tv.tv_usec = (long)(timeout*1000000) % 1000000;
+                FD_ZERO(&fds);
+                FD_SET(ctx->socket, &fds);
+                count = select(ctx->socket + 1, NULL, &fds, NULL, &tv);
+
+                if (count <= 0 || getsockopt(ctx->socket, SOL_SOCKET, SO_ERROR, &err, &optLen) < 0 || err) {
+                    if (count == 0) err = ETIMEDOUT;
+                    if (count < 0 || ! err) err = errno;
+                    r = 0;
+                }
+            }
+            else if (err && domain == PF_INET6 && _BRPeerIsIPv4(peer)) {
+                return _BRPeerOpenSocket(peer, PF_INET, timeout, error); // fallback to IPv4
+            }
+            else if (err) r = 0;
         }
-        else if (err && domain == PF_INET6 && _BRPeerIsIPv4(peer)) {
-            return _BRPeerOpenSocket(peer, PF_INET, timeout, error); // fallback to IPv4
-        }
-        else if (err) r = 0;
 
         if (r) peer_log(peer, "socket connected");
         fcntl(ctx->socket, F_SETFL, arg); // restore socket non-blocking status

@@ -46,16 +46,14 @@ typedef struct {
 } BRChainParams;
 
 static const char *BRMainNetDNSSeeds[] = {
-        "seed.digibyte.io", // Jared Tate
-        "seed.digibyte.org", // Website collective
-        "dnsseed.lifehash.com", // LifeHash
-        "seed.digihash.co", // Jared Tate
-        "seed.digiassets.net", // DigiByte Foundation
-        "digibyte.host", // SashaD
-        "seed.digiexplorer.info", // DigiByte Foundation
-        "seed2.digibyte.io", // Jared Tate
-        "seed3.digibyte.io", // Jared Tate
-        "dgb.quakeguy.com",  NULL // Quakeitup 
+        "seed.digibyte.io",           // Jared Tate @JaredTate
+        "seed.diginode.tools",        // Olly Stedall @saltedlolly
+        "seed.digibyteblockchain.org",// John Song @j50ng
+        "eu.digibyteseed.com",        // Jan De Jong @jongjan88
+        "seed.digibyte.link",         // Bastian Driessen @bastiandriessen
+        "seed.quakeguy.com",          // Paul Morgan @SnKQuaKe
+        "seed.aroundtheblock.app",    // Mark McNiel @JohnnyLawDGB
+        "seed.digibyte.services", NULL// Craig Donnachie @cdonnachie
 };
 
 static const char *BRTestNetDNSSeeds[] = {
@@ -102,7 +100,27 @@ static const BRCheckPoint BRMainNetCheckpoints[] = {
         { 11000000, uint256("0f4ad10ae49b504246c0175f6cbab9b0f91b6568a88931e6341a83a731701054"), 1591976167, 0x1b008be8 },
         { 12000000, uint256("0000000000000000e231d6676909d4d54296d640d996453b6778cc8081239c1f"), 1606947788, 0x19029b4f },
         { 13000000, uint256("a4c1069938986237270340fa9118e839e9a4b614fddf57b3d51e988ab357c13f"), 1621883565, 0x1a09f428 },
-        { 13510000, uint256("e41f3bbb0668b4db50682506e131d4f6c31fbf66be58d03d35a5dc30fed5432a"), 1629510979, 0x1a24afff }
+        { 13510000, uint256("e41f3bbb0668b4db50682506e131d4f6c31fbf66be58d03d35a5dc30fed5432a"), 1629510979, 0x1a24afff },
+        // Checkpoints added for DigiByte Core 8.26 compatibility — extracted from local mainnet node v8.26.2
+        { 14000000, uint256("a33861c857eed46191cf6cdaf81693e0dfcd00b3a11133821b0c73fe1d7769d9"), 1636828206, 0x1b00ad8c },
+        { 14500000, uint256("7de279fee9a88b3cedac3b0fead7af3ba89411545076a42c836ec1d6ba0d1d46"), 1644302520, 0x1a19ae92 },
+        { 15000000, uint256("57debd1dd4427be41f9b0d59beb26ca482255c18b2a01979a64bb70b173a537c"), 1651770202, 0x1a017ed3 },
+        { 15500000, uint256("000000000000000439d5c66b2fb3ec50f50a68b65f5790d338150b63488de645"), 1659244610, 0x19049b92 },
+        { 16000000, uint256("5c0c7d7baecc5e13c69f06eb90534ab2db8ff0cc98a1ac8d8797f11dc16ea0ad"), 1666719839, 0x1b00dfbe },
+        { 16500000, uint256("0f08ad160c196da58d855e505aca4237d8527788c917b8e85593ca33444e549d"), 1674196649, 0x1b009f8e },
+        { 17000000, uint256("f167688cc0102743b135499ed9f9eff9c5bad096203150e438be0a6e783d5587"), 1681676982, 0x1a10412f },
+        { 17500000, uint256("31838212ab7cb0eb24f0b7100b2a688f92c8d0109878ce8360586b26cdc1da68"), 1689155057, 0x1a0a5772 },
+        { 18000000, uint256("c71cc4929af6adb6b501f59a5b60b2638e0fd1cbe631b6ce40aacb21b46ca7b0"), 1696633305, 0x1a047f1d },
+        { 18500000, uint256("745dc7b89208de482071a3a8d13eb5596d55bedc4f5ba2fa74cbea9ecf91169e"), 1704110816, 0x1a5daab1 },
+        { 19000000, uint256("67066a10cdb8f3d86a4b405209e06ccc77b908d464af04193ad47682c0b4da73"), 1711586649, 0x1a012a4d },
+        { 19500000, uint256("c008cae8399ff9a4d9a5572f3f2ddc53e2db9754df1dda6f1f09424da8dab29f"), 1719078271, 0x1a219c86 },
+        { 20000000, uint256("f530a66ba6fe93e647f7d88a9b3f22bfe8c2c2ab1ec1b0286286f86b82d6a10f"), 1726553537, 0x1a08cd13 },
+        { 20500000, uint256("d39c147eb2faef374f1e5e0a9095558c5393d3a2ccee981de65dc4203845107e"), 1734032704, 0x1a00f3ee },
+        { 21000000, uint256("0000000000000001cb40d3be76bf601d98555a069669d963060d633ea3a140e8"), 1741505272, 0x19027f4c },
+        { 21500000, uint256("00000000000000007cbe22612937832c2e6341ec867e881979e2246df44fa727"), 1748982571, 0x1903b647 },
+        { 22000000, uint256("f8ee51070753b526000469277c2e73981d96f15852ae7c9b0ae5de0bdb8b9ee8"), 1756460375, 0x1a34dafd },
+        { 22500000, uint256("e9e740eef2cd62cbf4321e11b26703acc1f0506c726cb2a61f7c886974d1bc7d"), 1763941298, 0x1a2aca28 },
+        { 23000000, uint256("a805aa0c3c4e01abee1ce0edbc7ea7a4dd2fbf920681ced7333e20b35f95a97e"), 1771424588, 0x1a0b9a5c }
 
 };
 

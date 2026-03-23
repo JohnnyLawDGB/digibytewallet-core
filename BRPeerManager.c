@@ -321,17 +321,32 @@ static void _BRPeerManagerLoadBloomFilter(BRPeerManager *manager, BRPeer *peer)
     addrsCount = BRWalletAllAddrs(manager->wallet, addrs, addrsCount);
     utxosCount = BRWalletUTXOs(manager->wallet, utxos, utxosCount);
     txCount = BRWalletTxUnconfirmedBefore(manager->wallet, transactions, txCount, blockHeight);
+
+    peer_log(peer, "bloom filter: %zu addrs, %zu utxos, %zu txs, fpRate=%.6f",
+             addrsCount, utxosCount, txCount, manager->fpRate);
+
     filter = BRBloomFilterNew(manager->fpRate, addrsCount + utxosCount + txCount + 100, (uint32_t) BRPeerHash(peer),
                               BLOOM_UPDATE_ALL); // BUG: XXX txCount not the same as number of spent wallet outputs
-    
+
+    size_t insertedCount = 0;
+    size_t failedCount = 0;
     for (size_t i = 0; i < addrsCount; i++) { // add addresses to watch for tx receiving money to the wallet
         UInt160 hash = UINT160_ZERO;
-        
+
         BRAddressHash160(&hash, addrs[i].s);
-        
+
         if (! UInt160IsZero(hash) && ! BRBloomFilterContainsData(filter, hash.u8, sizeof(hash))) {
             BRBloomFilterInsertData(filter, hash.u8, sizeof(hash));
+            insertedCount++;
+        } else if (UInt160IsZero(hash)) {
+            peer_log(peer, "bloom filter: FAILED to hash addr[%zu] = '%.10s...'", i, addrs[i].s);
+            failedCount++;
         }
+    }
+
+    peer_log(peer, "bloom filter: inserted %zu address hashes, %zu failed", insertedCount, failedCount);
+    if (addrsCount > 0) {
+        peer_log(peer, "bloom filter: first addr = '%s'", addrs[0].s);
     }
 
     free(addrs);

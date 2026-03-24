@@ -46,6 +46,7 @@ typedef struct {
 } BRChainParams;
 
 static const char *BRMainNetDNSSeeds[] = {
+        "digiscope.me",               // DigiScope SPV-enabled node (bloom filters on)
         "seed.digibyte.io",           // Jared Tate @JaredTate
         "seed.diginode.tools",        // Olly Stedall @saltedlolly
         "seed.digibyteblockchain.org",// John Song @j50ng

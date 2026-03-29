@@ -338,6 +338,18 @@ static void _BRPeerManagerLoadBloomFilter(BRPeerManager *manager, BRPeer *peer)
         if (! UInt160IsZero(hash) && ! BRBloomFilterContainsData(filter, hash.u8, sizeof(hash))) {
             BRBloomFilterInsertData(filter, hash.u8, sizeof(hash));
             insertedCount++;
+
+            /* Also insert the full P2WPKH witness program (OP_0 + push20 + hash160)
+             * so peers that match against the serialized scriptPubKey (not just data
+             * elements) will find segwit transactions. Without this, BIP37 bloom
+             * filter matching fails for segwit outputs on some node implementations. */
+            uint8_t witnessProgram[22];
+            witnessProgram[0] = 0x00;  /* OP_0 (witness version 0) */
+            witnessProgram[1] = 0x14;  /* push 20 bytes */
+            memcpy(&witnessProgram[2], hash.u8, 20);
+            if (! BRBloomFilterContainsData(filter, witnessProgram, sizeof(witnessProgram))) {
+                BRBloomFilterInsertData(filter, witnessProgram, sizeof(witnessProgram));
+            }
         } else if (UInt160IsZero(hash)) {
             peer_log(peer, "bloom filter: FAILED to hash addr[%zu] = '%.10s...'", i, addrs[i].s);
             failedCount++;

@@ -46,15 +46,20 @@ typedef struct {
 } BRChainParams;
 
 static const char *BRMainNetDNSSeeds[] = {
-        "digiscope.me",               // DigiScope SPV-enabled node (bloom filters on)
-        "seed.digibyte.io",           // Jared Tate @JaredTate
-        "seed.diginode.tools",        // Olly Stedall @saltedlolly
-        "seed.digibyteblockchain.org",// John Song @j50ng
-        "eu.digibyteseed.com",        // Jan De Jong @jongjan88
-        "seed.digibyte.link",         // Bastian Driessen @bastiandriessen
-        "seed.quakeguy.com",          // Paul Morgan @SnKQuaKe
-        "seed.aroundtheblock.app",    // Mark McNiel @JohnnyLawDGB
-        "seed.digibyte.services", NULL// Craig Donnachie @cdonnachie
+        /* Bloom-filter-enabled nodes (priority — tried first by C core) */
+        "digiscope.me",               // DigiScope SPV node (peerbloomfilters=1)
+        /* Active DNS seeders (verified resolving, ordered by address count) */
+        "seed.diginode.tools",        // Olly Stedall @saltedlolly (25 addrs)
+        "seed.digibyte.link",         // Bastian Driessen @bastiandriessen (25 addrs)
+        "seed.quakeguy.com",          // Paul Morgan @SnKQuaKe (25 addrs)
+        "seed.aroundtheblock.app",    // Mark McNiel @JohnnyLawDGB (24 addrs)
+        "seed.digibyte.io",           // Jared Tate @JaredTate (1 addr)
+        /* Dead/unresponsive seeders removed 2026-03-30:
+         *   seed.digibyteblockchain.org (0 addrs)
+         *   eu.digibyteseed.com (0 addrs)
+         *   seed.digibyte.services (0 addrs)
+         */
+        NULL
 };
 
 static const char *BRTestNetDNSSeeds[] = {

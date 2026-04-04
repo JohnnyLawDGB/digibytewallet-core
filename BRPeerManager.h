@@ -37,7 +37,7 @@
 extern "C" {
 #endif
 
-#define PEER_MAX_CONNECTIONS 3
+#define PEER_MAX_CONNECTIONS 5
 
 /* defines, how many blocks to be held in sqlite DB */
 #define SAVE_BLOCK_COUNT 300

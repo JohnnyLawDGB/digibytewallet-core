@@ -28,6 +28,9 @@
 #include "BRSet.h"
 #include "BRArray.h"
 #include "BRCrypto.h"
+#ifdef __ANDROID__
+#include <android/log.h>
+#endif
 #include "BRInt.h"
 #include <stdlib.h>
 #include <float.h>
@@ -79,33 +82,62 @@ int BRPeerHasSocksProxy(void) {
 
 /* Perform SOCKS5 handshake on an already-connected (to proxy) blocking socket.
  * peer_addr_bytes: 4-byte IPv4 address in network byte order.
- * peer_port:       port in host byte order.
+ * peer_addr:  full 16-byte UInt128 (IPv4-mapped IPv6 or native IPv6).
+ * peer_port:  port in host byte order.
  * Returns 1 on success, 0 on failure. */
-static int _BRPeerSocks5Handshake(int sock, const uint8_t peer_addr_bytes[4], uint16_t peer_port) {
-    uint8_t buf[16];
+static int _BRPeerSocks5Handshake(int sock, const UInt128 *peer_addr, uint16_t peer_port) {
+    uint8_t buf[32];
     ssize_t n;
+
+    /* Increase timeout — Tor circuit setup can take several seconds */
+    struct timeval tv = { .tv_sec = 30, .tv_usec = 0 };
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
 
     /* Greeting: VER=5, NMETHODS=1, METHOD=0 (no auth) */
     buf[0] = 0x05; buf[1] = 0x01; buf[2] = 0x00;
     if (send(sock, buf, 3, 0) != 3) return 0;
 
-    /* Server greeting response: VER=5, METHOD=0 */
     n = recv(sock, buf, 2, MSG_WAITALL);
     if (n != 2 || buf[0] != 0x05 || buf[1] != 0x00) return 0;
 
-    /* Connect request: VER=5, CMD=CONNECT, RSV=0, ATYP=IPv4, ADDR(4), PORT(2) */
-    buf[0] = 0x05; buf[1] = 0x01; buf[2] = 0x00; buf[3] = 0x01;
-    buf[4] = peer_addr_bytes[0]; buf[5] = peer_addr_bytes[1];
-    buf[6] = peer_addr_bytes[2]; buf[7] = peer_addr_bytes[3];
-    buf[8] = (peer_port >> 8) & 0xFF;
-    buf[9] = peer_port & 0xFF;
-    if (send(sock, buf, 10, 0) != 10) return 0;
+    /* Detect IPv4-mapped IPv6 (::ffff:x.x.x.x) vs native IPv6 */
+    int isIPv4 = (peer_addr->u64[0] == 0 &&
+                  peer_addr->u16[4] == 0 &&
+                  peer_addr->u16[5] == 0xffff);
 
-    /* Connect response: read at least 4 bytes (VER, REP, RSV, ATYP) + bound addr */
-    n = recv(sock, buf, sizeof(buf), MSG_WAITALL);
-    if (n < 2) return 0;
-    /* buf[1] == 0x00 means success */
-    return (buf[1] == 0x00) ? 1 : 0;
+    buf[0] = 0x05; buf[1] = 0x01; buf[2] = 0x00; /* VER, CMD=CONNECT, RSV */
+    int sendLen;
+    if (isIPv4) {
+        const uint8_t *ip4 = (const uint8_t *)&peer_addr->u32[3];
+        buf[3] = 0x01; /* ATYP=IPv4 */
+        memcpy(buf + 4, ip4, 4);
+        buf[8] = (peer_port >> 8) & 0xFF;
+        buf[9] = peer_port & 0xFF;
+        sendLen = 10;
+    } else {
+        buf[3] = 0x04; /* ATYP=IPv6 */
+        memcpy(buf + 4, peer_addr->u8, 16);
+        buf[20] = (peer_port >> 8) & 0xFF;
+        buf[21] = peer_port & 0xFF;
+        sendLen = 22;
+    }
+    if (send(sock, buf, sendLen, 0) != sendLen) return 0;
+
+    /* Response header: VER, REP, RSV, ATYP */
+    n = recv(sock, buf, 4, MSG_WAITALL);
+    if (n != 4 || buf[1] != 0x00) return 0;
+
+    /* Consume bound address so socket is clean for peer data */
+    int rem = (buf[3] == 0x01) ? 6 : (buf[3] == 0x04) ? 18 : 0;
+    if (buf[3] == 0x03) { uint8_t dl; recv(sock, &dl, 1, MSG_WAITALL); rem = dl + 2; }
+    if (rem > 0 && rem <= (int)sizeof(buf)) recv(sock, buf, rem, MSG_WAITALL);
+
+    /* Restore 1s timeout for normal peer communication */
+    tv.tv_sec = 1;
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+    return 1;
 }
 
 #define HEADER_LENGTH      24
@@ -913,8 +945,12 @@ static int _BRPeerOpenSocket(BRPeer *peer, int domain, double timeout, int *erro
     socklen_t addrLen, optLen;
     int count, arg = 0, err = 0, on = 1, r = 1;
 
-    ctx->socket = socket(domain, SOCK_STREAM, 0);
-    
+    /* When routing through SOCKS5, the TCP connection goes to the proxy at
+     * 127.0.0.1 (IPv4). Force PF_INET so IPv6 peers don't create an IPv6
+     * socket that can't connect to the IPv4 proxy (EINVAL). */
+    int sockDomain = BRPeerHasSocksProxy() ? PF_INET : domain;
+    ctx->socket = socket(sockDomain, SOCK_STREAM, 0);
+
     if (ctx->socket < 0) {
         err = errno;
         r = 0;
@@ -992,8 +1028,7 @@ static int _BRPeerOpenSocket(BRPeer *peer, int domain, double timeout, int *erro
                     /* TCP connected to proxy — temporarily switch to blocking for SOCKS5 handshake */
                     fcntl(ctx->socket, F_SETFL, arg); /* restore blocking */
 
-                    const uint8_t *peerIPv4 = (const uint8_t *)&peer->address.u32[3];
-                    if (!_BRPeerSocks5Handshake(ctx->socket, peerIPv4, peer->port)) {
+                    if (!_BRPeerSocks5Handshake(ctx->socket, &peer->address, peer->port)) {
                         peer_log(peer, "SOCKS5 handshake failed");
                         err = ECONNREFUSED;
                         r = 0;

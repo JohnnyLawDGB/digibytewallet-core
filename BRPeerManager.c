@@ -972,7 +972,13 @@ static void _peerRelayedPeers(void *info, const BRPeer peers[], size_t peersCoun
     pthread_mutex_lock(&manager->lock);
     peer_log(peer, "relayed %zu peer(s)", peersCount);
 
-    array_add_array(manager->peers, peers, peersCount);
+    // Only add peers that advertise NODE_BLOOM — non-bloom peers are useless
+    // for SPV mode and flood the pool, drowning out bloom seeder peers.
+    for (size_t i = 0; i < peersCount; i++) {
+        if ((peers[i].services & SERVICES_NODE_BLOOM) == SERVICES_NODE_BLOOM) {
+            _BRPeerManagerAddPeer(manager, (BRPeer *)&peers[i]);
+        }
+    }
     qsort(manager->peers, array_count(manager->peers), sizeof(*manager->peers), _peerTimestampCompare);
 
     // limit total to 2500 peers

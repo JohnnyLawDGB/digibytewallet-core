@@ -97,6 +97,16 @@ typedef struct BRWalletStruct BRWallet;
 // allocates and populates a BRWallet struct that must be freed by calling BRWalletFree()
 BRWallet *BRWalletNew(BRTransaction *transactions[], size_t txCount, BRMasterPubKey mpk);
 
+// allocates a wallet with dual master key support: mpkBIP84 is the primary BIP84 key (m/84'/20'/0'),
+// mpkLegacy is the legacy key (m/0H, "DigiByte seed") used only for recovery scanning of old addresses.
+// Both address sets are included in the bloom filter and UTXO tracking.
+// must be freed by calling BRWalletFree()
+BRWallet *BRWalletNewDual(BRTransaction *transactions[], size_t txCount,
+                          BRMasterPubKey mpkBIP84, BRMasterPubKey mpkLegacy);
+
+// returns non-zero if any UTXO in the wallet belongs to the legacy key chains (old m/0H addresses)
+int BRWalletHasLegacyFunds(BRWallet *wallet);
+
 // not thread-safe, set callbacks once after BRWalletNew(), before calling other BRWallet functions
 // info is a void pointer that will be passed along with each callback call
 // void balanceChanged(void *, uint64_t) - called when the wallet balance changes

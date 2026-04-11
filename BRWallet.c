@@ -44,6 +44,13 @@ struct BRWalletStruct {
     BRMasterPubKey masterPubKey;
     BRAddress *internalChain, *externalChain;
     BRAddress *internalChainSegwit, *externalChainSegwit;
+    // Legacy key support: populated by BRWalletNewDual for recovery scanning of old m/0H addresses
+    BRMasterPubKey legacyPubKey;
+    int hasLegacyKey;
+    BRAddress *legacyExternalChain;
+    BRAddress *legacyInternalChain;
+    BRAddress *legacyExternalChainSegwit;
+    BRAddress *legacyInternalChainSegwit;
     BRSet *allTx, *invalidTx, *pendingTx, *spentOutputs, *usedAddrs, *allAddrs;
     void *callbackInfo;
     void (*balanceChanged)(void *info, uint64_t balance);
@@ -292,6 +299,11 @@ BRWallet *BRWalletNew(BRTransaction *transactions[], size_t txCount, BRMasterPub
     array_new(wallet->externalChain, 50);
     array_new(wallet->internalChainSegwit, 50);
     array_new(wallet->externalChainSegwit, 50);
+    wallet->hasLegacyKey = 0;
+    array_new(wallet->legacyExternalChain, 50);
+    array_new(wallet->legacyInternalChain, 50);
+    array_new(wallet->legacyExternalChainSegwit, 50);
+    array_new(wallet->legacyInternalChainSegwit, 50);
     array_new(wallet->balanceHist, txCount + 100);
     wallet->allTx = BRSetNew(BRTransactionHash, BRTransactionEq, txCount + 100);
     wallet->invalidTx = BRSetNew(BRTransactionHash, BRTransactionEq, 10);
@@ -324,6 +336,102 @@ BRWallet *BRWalletNew(BRTransaction *transactions[], size_t txCount, BRMasterPub
     }
     
     return wallet;
+}
+
+// internal helper: generate up to 'count' addresses from mpk on chain/nativeSegwit,
+// add them to addrChain and wallet->allAddrs
+static void _BRWalletPregenLegacyChain(BRWallet *wallet, BRAddress **addrChainPtr,
+                                        BRMasterPubKey mpk, uint32_t chain,
+                                        int nativeSegwit, uint32_t count)
+{
+    BRAddress *addrChain = *addrChainPtr;
+    uint32_t startCount = (uint32_t)array_count(addrChain);
+    for (uint32_t idx = startCount; idx < count; idx++) {
+        BRKey key;
+        BRAddress address = BR_ADDRESS_NONE;
+        uint8_t pubKey[BRBIP32PubKey(NULL, 0, mpk, chain, idx)];
+        size_t len = BRBIP32PubKey(pubKey, sizeof(pubKey), mpk, chain, idx);
+        if (! BRKeySetPubKey(&key, pubKey, len)) break;
+        if (nativeSegwit) {
+            if (! BRKeySegwitAddress(&key, address.s, sizeof(address), OP_0) ||
+                BRAddressEq(&address, &BR_ADDRESS_NONE)) break;
+        } else {
+            if (! BRKeyAddress(&key, address.s, sizeof(address)) ||
+                BRAddressEq(&address, &BR_ADDRESS_NONE)) break;
+        }
+        array_add(addrChain, address);
+        BRSetAdd(wallet->allAddrs, &addrChain[array_count(addrChain) - 1]);
+    }
+    *addrChainPtr = addrChain;
+}
+
+// allocates a wallet with dual master key support for BIP84 migration
+// mpkBIP84  — BIP84 master pub key (m/84'/20'/0', "Bitcoin seed") — primary key for new addresses
+// mpkLegacy — legacy master pub key (m/0H, "DigiByte seed") — used only for recovery scanning
+BRWallet *BRWalletNewDual(BRTransaction *transactions[], size_t txCount,
+                          BRMasterPubKey mpkBIP84, BRMasterPubKey mpkLegacy)
+{
+    // Create wallet using the BIP84 key as the primary master key
+    BRWallet *wallet = BRWalletNew(transactions, txCount, mpkBIP84);
+    if (! wallet) return NULL;
+
+    // Install legacy key
+    wallet->legacyPubKey = mpkLegacy;
+    wallet->hasLegacyKey = 1;
+
+    // Pre-generate legacy addresses: 30 external + 10 internal, both P2PKH and P2WPKH
+    pthread_mutex_lock(&wallet->lock);
+
+    _BRWalletPregenLegacyChain(wallet, &wallet->legacyExternalChain,
+                               mpkLegacy, SEQUENCE_EXTERNAL_CHAIN, 0,
+                               SEQUENCE_GAP_LIMIT_EXTERNAL_LEGACY);
+    _BRWalletPregenLegacyChain(wallet, &wallet->legacyInternalChain,
+                               mpkLegacy, SEQUENCE_INTERNAL_CHAIN, 0,
+                               SEQUENCE_GAP_LIMIT_INTERNAL_LEGACY);
+    _BRWalletPregenLegacyChain(wallet, &wallet->legacyExternalChainSegwit,
+                               mpkLegacy, SEQUENCE_EXTERNAL_CHAIN, 1,
+                               SEQUENCE_GAP_LIMIT_EXTERNAL_LEGACY);
+    _BRWalletPregenLegacyChain(wallet, &wallet->legacyInternalChainSegwit,
+                               mpkLegacy, SEQUENCE_INTERNAL_CHAIN, 1,
+                               SEQUENCE_GAP_LIMIT_INTERNAL_LEGACY);
+
+    // Re-scan transactions now that legacy addresses are in allAddrs
+    _BRWalletUpdateBalance(wallet);
+
+    pthread_mutex_unlock(&wallet->lock);
+    return wallet;
+}
+
+// returns non-zero if any UTXO in the wallet belongs to the legacy key chains (old m/0H addresses)
+int BRWalletHasLegacyFunds(BRWallet *wallet)
+{
+    assert(wallet != NULL);
+    if (! wallet->hasLegacyKey) return 0;
+
+    int r = 0;
+    pthread_mutex_lock(&wallet->lock);
+
+    for (size_t i = 0; ! r && i < array_count(wallet->utxos); i++) {
+        BRTransaction *tx = BRSetGet(wallet->allTx, &wallet->utxos[i].hash);
+        if (! tx || wallet->utxos[i].n >= tx->outCount) continue;
+        const char *addr = tx->outputs[wallet->utxos[i].n].address;
+
+        for (size_t j = 0; ! r && j < array_count(wallet->legacyExternalChain); j++) {
+            if (strcmp(addr, wallet->legacyExternalChain[j].s) == 0) r = 1;
+        }
+        for (size_t j = 0; ! r && j < array_count(wallet->legacyInternalChain); j++) {
+            if (strcmp(addr, wallet->legacyInternalChain[j].s) == 0) r = 1;
+        }
+        for (size_t j = 0; ! r && j < array_count(wallet->legacyExternalChainSegwit); j++) {
+            if (strcmp(addr, wallet->legacyExternalChainSegwit[j].s) == 0) r = 1;
+        }
+        for (size_t j = 0; ! r && j < array_count(wallet->legacyInternalChainSegwit); j++) {
+            if (strcmp(addr, wallet->legacyInternalChainSegwit[j].s) == 0) r = 1;
+        }
+    }
+
+    pthread_mutex_unlock(&wallet->lock);
+    return r;
 }
 
 // not thread-safe, set callbacks once after BRWalletNew(), before calling other BRWallet functions
@@ -586,15 +694,17 @@ size_t BRWalletAllAddrs(BRWallet *wallet, BRAddress addrs[], size_t addrsCount)
 {
     size_t i, internalCount = 0, externalCount = 0;
     size_t internalCountSegwit, externalCountSegwit = 0;
+    // Legacy chain counts
+    size_t legIntCount = 0, legExtCount = 0, legIntSegCount = 0, legExtSegCount = 0;
     size_t rest = (addrsCount == 0 ? 100000 : addrsCount);
-    
+
     assert(wallet != NULL);
     pthread_mutex_lock(&wallet->lock);
-    
+
     internalCountSegwit = (! addrs || array_count(wallet->internalChainSegwit) < rest) ?
         array_count(wallet->internalChainSegwit) : (addrsCount / 4);
     rest -= internalCountSegwit;
-    
+
     internalCount = (! addrs || array_count(wallet->internalChain) < rest) ?
         array_count(wallet->internalChain) : (addrsCount / 4);
     rest -= internalCount;
@@ -602,16 +712,15 @@ size_t BRWalletAllAddrs(BRWallet *wallet, BRAddress addrs[], size_t addrsCount)
     // Add the segwit addresses first
     for (i = 0; addrs && i < internalCountSegwit; i++)
         addrs[i] = wallet->internalChainSegwit[i];
-    
+
     // Add the legacy addresses second
-    // Check: How many addresses will be put in here?
     for (i = 0; addrs && i < internalCount; i++)
         addrs[i + internalCountSegwit] = wallet->internalChain[i];
 
     externalCountSegwit = (! addrs || array_count(wallet->externalChainSegwit) < rest) ?
         array_count(wallet->externalChainSegwit) : (addrsCount / 4);
     rest -= externalCountSegwit;
-    
+
     externalCount = (! addrs || array_count(wallet->externalChain) < rest) ?
                     array_count(wallet->externalChain) : rest;
     rest -= externalCount;
@@ -619,14 +728,42 @@ size_t BRWalletAllAddrs(BRWallet *wallet, BRAddress addrs[], size_t addrsCount)
     // Add the external segwit addresses first
     for (i = 0; addrs && i < externalCountSegwit; i++)
         addrs[i + internalCount + internalCountSegwit] = wallet->externalChainSegwit[i];
-    
+
     // Add the external legacy addresses second
-    // Check: How many addresses will be put in here?
     for (i = 0; addrs && i < externalCount; i++)
         addrs[i + internalCount + internalCountSegwit + externalCountSegwit] = wallet->externalChain[i];
-    
+
+    // Add legacy key chains (populated only when hasLegacyKey == 1)
+    size_t primaryTotal = internalCount + externalCount + internalCountSegwit + externalCountSegwit;
+    if (wallet->hasLegacyKey) {
+        legIntSegCount = (! addrs || array_count(wallet->legacyInternalChainSegwit) < rest) ?
+            array_count(wallet->legacyInternalChainSegwit) : rest;
+        rest -= legIntSegCount;
+        legIntCount = (! addrs || array_count(wallet->legacyInternalChain) < rest) ?
+            array_count(wallet->legacyInternalChain) : rest;
+        rest -= legIntCount;
+        legExtSegCount = (! addrs || array_count(wallet->legacyExternalChainSegwit) < rest) ?
+            array_count(wallet->legacyExternalChainSegwit) : rest;
+        rest -= legExtSegCount;
+        legExtCount = (! addrs || array_count(wallet->legacyExternalChain) < rest) ?
+            array_count(wallet->legacyExternalChain) : rest;
+
+        size_t off = primaryTotal;
+        for (i = 0; addrs && i < legIntSegCount; i++)
+            addrs[off + i] = wallet->legacyInternalChainSegwit[i];
+        off += legIntSegCount;
+        for (i = 0; addrs && i < legIntCount; i++)
+            addrs[off + i] = wallet->legacyInternalChain[i];
+        off += legIntCount;
+        for (i = 0; addrs && i < legExtSegCount; i++)
+            addrs[off + i] = wallet->legacyExternalChainSegwit[i];
+        off += legExtSegCount;
+        for (i = 0; addrs && i < legExtCount; i++)
+            addrs[off + i] = wallet->legacyExternalChain[i];
+    }
+
     pthread_mutex_unlock(&wallet->lock);
-    return internalCount + externalCount + internalCountSegwit + externalCountSegwit;
+    return primaryTotal + legIntCount + legExtCount + legIntSegCount + legExtSegCount;
 }
 
 // true if the address was previously generated by BRWalletUnusedAddrs() (even if it's now used)
@@ -824,46 +961,91 @@ int BRWalletGetAddressPrivateKey(BRWallet* wallet, BRKey* key, const char* addre
 // returns true if all inputs were signed, or false if there was an error or not all inputs were able to be signed
 int BRWalletSignTransaction(BRWallet *wallet, BRTransaction *tx, int forkId, const void *seed, size_t seedLen)
 {
-    uint32_t j, internalIdx[tx->inCount], externalIdx[tx->inCount];
-    size_t i, internalCount = 0, externalCount = 0;
+    // BIP84 (primary) chain indices — use BRBIP32PrivKeyListBIP84 for these
+    uint32_t j, bip84InternalIdx[tx->inCount], bip84ExternalIdx[tx->inCount];
+    size_t i, bip84InternalCount = 0, bip84ExternalCount = 0;
+    // Legacy chain indices — use BRBIP32PrivKeyList (DigiByte seed, m/0H) for these
+    uint32_t legacyInternalIdx[tx->inCount], legacyExternalIdx[tx->inCount];
+    size_t legacyInternalCount = 0, legacyExternalCount = 0;
     int r = 0;
-    
+
     assert(wallet != NULL);
     assert(tx != NULL);
     pthread_mutex_lock(&wallet->lock);
-    
+
     for (i = 0; tx && i < tx->inCount; i++) {
+        // BIP84 primary chains (masterPubKey — m/84'/20'/0')
         for (j = (uint32_t)array_count(wallet->internalChainSegwit); j > 0; j--) {
-            if (BRAddressEq(tx->inputs[i].address, &wallet->internalChainSegwit[j - 1])) internalIdx[internalCount++] = j - 1;
+            if (BRAddressEq(tx->inputs[i].address, &wallet->internalChainSegwit[j - 1]))
+                bip84InternalIdx[bip84InternalCount++] = j - 1;
         }
-        
+
         for (j = (uint32_t)array_count(wallet->internalChain); j > 0; j--) {
-            if (BRAddressEq(tx->inputs[i].address, &wallet->internalChain[j - 1])) internalIdx[internalCount++] = j - 1;
+            if (BRAddressEq(tx->inputs[i].address, &wallet->internalChain[j - 1]))
+                bip84InternalIdx[bip84InternalCount++] = j - 1;
         }
-        
+
         for (j = (uint32_t)array_count(wallet->externalChainSegwit); j > 0; j--) {
-            if (BRAddressEq(tx->inputs[i].address, &wallet->externalChainSegwit[j - 1])) externalIdx[externalCount++] = j - 1;
+            if (BRAddressEq(tx->inputs[i].address, &wallet->externalChainSegwit[j - 1]))
+                bip84ExternalIdx[bip84ExternalCount++] = j - 1;
         }
 
         for (j = (uint32_t)array_count(wallet->externalChain); j > 0; j--) {
-            if (BRAddressEq(tx->inputs[i].address, &wallet->externalChain[j - 1])) externalIdx[externalCount++] = j - 1;
+            if (BRAddressEq(tx->inputs[i].address, &wallet->externalChain[j - 1]))
+                bip84ExternalIdx[bip84ExternalCount++] = j - 1;
+        }
+
+        // Legacy chains (legacyPubKey — m/0H, DigiByte seed)
+        if (wallet->hasLegacyKey) {
+            for (j = (uint32_t)array_count(wallet->legacyInternalChainSegwit); j > 0; j--) {
+                if (BRAddressEq(tx->inputs[i].address, &wallet->legacyInternalChainSegwit[j - 1]))
+                    legacyInternalIdx[legacyInternalCount++] = j - 1;
+            }
+
+            for (j = (uint32_t)array_count(wallet->legacyInternalChain); j > 0; j--) {
+                if (BRAddressEq(tx->inputs[i].address, &wallet->legacyInternalChain[j - 1]))
+                    legacyInternalIdx[legacyInternalCount++] = j - 1;
+            }
+
+            for (j = (uint32_t)array_count(wallet->legacyExternalChainSegwit); j > 0; j--) {
+                if (BRAddressEq(tx->inputs[i].address, &wallet->legacyExternalChainSegwit[j - 1]))
+                    legacyExternalIdx[legacyExternalCount++] = j - 1;
+            }
+
+            for (j = (uint32_t)array_count(wallet->legacyExternalChain); j > 0; j--) {
+                if (BRAddressEq(tx->inputs[i].address, &wallet->legacyExternalChain[j - 1]))
+                    legacyExternalIdx[legacyExternalCount++] = j - 1;
+            }
         }
     }
 
     pthread_mutex_unlock(&wallet->lock);
 
-    BRKey keys[internalCount + externalCount];
+    size_t totalKeys = bip84InternalCount + bip84ExternalCount + legacyInternalCount + legacyExternalCount;
+    BRKey keys[totalKeys];
 
     if (seed) {
-        BRBIP32PrivKeyList(keys, internalCount, seed, seedLen, SEQUENCE_INTERNAL_CHAIN, internalIdx);
-        BRBIP32PrivKeyList(&keys[internalCount], externalCount, seed, seedLen, SEQUENCE_EXTERNAL_CHAIN, externalIdx);
+        size_t keyOff = 0;
+        // BIP84 keys: use "Bitcoin seed" + m/84'/20'/0'
+        BRBIP32PrivKeyListBIP84(keys + keyOff, bip84InternalCount, seed, seedLen,
+                                SEQUENCE_INTERNAL_CHAIN, bip84InternalIdx);
+        keyOff += bip84InternalCount;
+        BRBIP32PrivKeyListBIP84(keys + keyOff, bip84ExternalCount, seed, seedLen,
+                                SEQUENCE_EXTERNAL_CHAIN, bip84ExternalIdx);
+        keyOff += bip84ExternalCount;
+        // Legacy keys: use "DigiByte seed" + m/0H
+        BRBIP32PrivKeyList(keys + keyOff, legacyInternalCount, seed, seedLen,
+                           SEQUENCE_INTERNAL_CHAIN, legacyInternalIdx);
+        keyOff += legacyInternalCount;
+        BRBIP32PrivKeyList(keys + keyOff, legacyExternalCount, seed, seedLen,
+                           SEQUENCE_EXTERNAL_CHAIN, legacyExternalIdx);
         // TODO: XXX wipe seed callback
         seed = NULL;
-        if (tx) r = BRTransactionSign(tx, forkId, keys, internalCount + externalCount);
-        for (i = 0; i < internalCount + externalCount; i++) BRKeyClean(&keys[i]);
+        if (tx) r = BRTransactionSign(tx, forkId, keys, totalKeys);
+        for (i = 0; i < totalKeys; i++) BRKeyClean(&keys[i]);
     }
     else r = -1; // user canceled authentication
-    
+
     return r;
 }
 
@@ -1378,6 +1560,10 @@ void BRWalletFree(BRWallet *wallet)
     array_free(wallet->externalChain);
     array_free(wallet->externalChainSegwit);
     array_free(wallet->internalChainSegwit);
+    array_free(wallet->legacyExternalChain);
+    array_free(wallet->legacyInternalChain);
+    array_free(wallet->legacyExternalChainSegwit);
+    array_free(wallet->legacyInternalChainSegwit);
     array_free(wallet->balanceHist);
 
     for (size_t i = array_count(wallet->transactions); i > 0; i--) {

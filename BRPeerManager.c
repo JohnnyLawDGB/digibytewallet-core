@@ -1826,14 +1826,47 @@ void BRPeerManagerConnect(BRPeerManager *manager)
         }
         
         array_new(peers, 100);
-        array_add_array(peers, manager->peers,
-                        (array_count(manager->peers) < 100) ? array_count(manager->peers) : 100);
+
+        // Prioritize bloom-capable peers: add them to the candidate list first,
+        // then fill remaining slots with other peers. This ensures all 5
+        // connection slots go to bloom peers when enough are available.
+        {
+            size_t totalAvail = array_count(manager->peers);
+            size_t added = 0;
+
+            // First pass: bloom-capable peers only
+            for (size_t k = 0; k < totalAvail && added < 100; k++) {
+                if ((manager->peers[k].services & SERVICES_NODE_BLOOM) == SERVICES_NODE_BLOOM) {
+                    array_add(peers, manager->peers[k]);
+                    added++;
+                }
+            }
+            // Second pass: fill remaining slots with any peer
+            for (size_t k = 0; k < totalAvail && added < 100; k++) {
+                if ((manager->peers[k].services & SERVICES_NODE_BLOOM) != SERVICES_NODE_BLOOM) {
+                    array_add(peers, manager->peers[k]);
+                    added++;
+                }
+            }
+        }
 
         while ((array_count(peers) > 0) && (array_count(manager->connectedPeers) < manager->maxConnectCount)) {
-            size_t i = BRRand((uint32_t)array_count(peers)); // index of random peer
+            size_t bloomCount = 0;
+            for (size_t bc = 0; bc < array_count(peers); bc++) {
+                if ((peers[bc].services & SERVICES_NODE_BLOOM) == SERVICES_NODE_BLOOM) bloomCount++;
+            }
+
+            size_t i;
             BRPeerCallbackInfo *info;
-            
-            i = i*i/array_count(peers); // bias random peer selection toward peers with more recent timestamp
+
+            if (bloomCount > 0) {
+                // Pick randomly from bloom peers only (they're at the front)
+                i = BRRand((uint32_t)bloomCount);
+            } else {
+                // No bloom peers left, fall back to random from full list
+                i = BRRand((uint32_t)array_count(peers));
+                i = i*i/array_count(peers); // bias toward recent timestamp
+            }
         
             for (size_t j = array_count(manager->connectedPeers); i != SIZE_MAX && j > 0; j--) {
                 if (! BRPeerEq(&peers[i], manager->connectedPeers[j - 1])) continue;

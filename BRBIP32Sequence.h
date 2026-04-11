@@ -40,6 +40,15 @@ extern "C" {
 
 #define BIP32_HARD                  0x80000000
 
+#define BIP84_PURPOSE               84
+#define DGB_COIN_TYPE               20
+#define BIP84_ACCOUNT               0
+
+#define SEQUENCE_GAP_LIMIT_EXTERNAL_BIP84  20
+#define SEQUENCE_GAP_LIMIT_INTERNAL_BIP84  10
+#define SEQUENCE_GAP_LIMIT_EXTERNAL_LEGACY 30
+#define SEQUENCE_GAP_LIMIT_INTERNAL_LEGACY 10
+
 #define SEQUENCE_GAP_LIMIT_EXTERNAL 10
 #define SEQUENCE_GAP_LIMIT_INTERNAL 5
 #define SEQUENCE_EXTERNAL_CHAIN     0
@@ -56,6 +65,22 @@ typedef struct {
 
 // returns the master public key for the default BIP32 wallet layout - derivation path N(m/0H)
 BRMasterPubKey BRBIP32MasterPubKey(const void *seed, size_t seedLen);
+
+// returns the master public key for BIP84 — derivation path N(m/84'/20'/0')
+// uses standard "Bitcoin seed" HMAC key per BIP32 spec
+BRMasterPubKey BRBIP32MasterPubKeyBIP84(const void *seed, size_t seedLen);
+
+// returns the master public key for legacy breadwallet layout — derivation path N(m/0H)
+// uses "DigiByte seed" HMAC key (non-standard, for backward compatibility)
+BRMasterPubKey BRBIP32MasterPubKeyLegacy(const void *seed, size_t seedLen);
+
+// sets the private key for BIP84 path m/84'/20'/0'/chain/index
+// uses "Bitcoin seed" HMAC key
+void BRBIP32PrivKeyBIP84(BRKey *key, const void *seed, size_t seedLen, uint32_t chain, uint32_t index);
+
+// batch version — sets private key for each element in keys
+void BRBIP32PrivKeyListBIP84(BRKey keys[], size_t keysCount, const void *seed, size_t seedLen,
+                             uint32_t chain, const uint32_t indexes[]);
 
 // writes the public key for path N(m/0H/chain/index) to pubKey
 // returns number of bytes written, or pubKeyLen needed if pubKey is NULL

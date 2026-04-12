@@ -399,14 +399,25 @@ BRWallet *BRWalletNewDual(BRTransaction *transactions[], size_t txCount,
 
     pthread_mutex_unlock(&wallet->lock);
 
-    // NOW register saved transactions — both BIP84 and legacy addresses are
-    // in allAddrs, so transactions from either key tree will be recognized.
+    // NOW bulk-add saved transactions — use the same trusted approach as
+    // BRWalletNew: add ALL transactions to allTx and usedAddrs first,
+    // THEN update balance. This avoids _BRWalletContainsTx rejecting
+    // child transactions whose parent txs haven't been registered yet
+    // (which caused send transactions to be silently dropped).
     if (transactions && txCount > 0) {
+        pthread_mutex_lock(&wallet->lock);
         for (size_t i = 0; i < txCount; i++) {
-            if (transactions[i]) {
-                BRWalletRegisterTransaction(wallet, transactions[i]);
+            BRTransaction *tx = transactions[i];
+            if (! tx || ! BRTransactionIsSigned(tx) || BRSetContains(wallet->allTx, tx)) continue;
+            BRSetAdd(wallet->allTx, tx);
+            _BRWalletInsertTx(wallet, tx);
+
+            for (size_t j = 0; j < tx->outCount; j++) {
+                if (tx->outputs[j].address[0] != '\0') BRSetAdd(wallet->usedAddrs, tx->outputs[j].address);
             }
         }
+        _BRWalletUpdateBalance(wallet);
+        pthread_mutex_unlock(&wallet->lock);
     }
 
     return wallet;

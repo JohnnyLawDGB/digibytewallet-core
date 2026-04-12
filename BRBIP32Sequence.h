@@ -46,8 +46,11 @@ extern "C" {
 
 #define SEQUENCE_GAP_LIMIT_EXTERNAL_BIP84  20
 #define SEQUENCE_GAP_LIMIT_INTERNAL_BIP84  10
-#define SEQUENCE_GAP_LIMIT_EXTERNAL_LEGACY 30
-#define SEQUENCE_GAP_LIMIT_INTERNAL_LEGACY 10
+// Legacy scan must cover all addresses the old wallet could have generated.
+// Old gap limit was 10, but each received tx extends the pool. A user with
+// 90 received txs would have addresses up to index ~100. Use 150/50 to be safe.
+#define SEQUENCE_GAP_LIMIT_EXTERNAL_LEGACY 150
+#define SEQUENCE_GAP_LIMIT_INTERNAL_LEGACY 50
 
 #define SEQUENCE_GAP_LIMIT_EXTERNAL 10
 #define SEQUENCE_GAP_LIMIT_INTERNAL 5

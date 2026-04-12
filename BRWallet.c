@@ -1340,7 +1340,12 @@ void BRWalletUpdateTransactions(BRWallet *wallet, const UInt256 txHashes[], size
             hashes[j++] = txHashes[i];
             if (BRSetContains(wallet->pendingTx, tx) || BRSetContains(wallet->invalidTx, tx)) needsUpdate = 1;
         }
-        else if (blockHeight != TX_UNCONFIRMED) { // remove and free confirmed non-wallet tx
+        else if (blockHeight != TX_UNCONFIRMED && ! wallet->hasLegacyKey) {
+            // Remove confirmed non-wallet tx — but NOT in dual-key wallets.
+            // Dual-key wallets have saved transactions from the old key tree
+            // whose parent/child relationships are needed for correct send
+            // amount calculation. Removing a parent tx causes
+            // BRWalletAmountSentByTx to return 0, making sends disappear.
             BRSetRemove(wallet->allTx, tx);
             BRTransactionFree(tx);
         }

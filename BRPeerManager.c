@@ -565,7 +565,15 @@ static void _requestUnrelayedTxGetdataDone(void *info, int success)
             
             if (! isPublishing && _BRTxPeerListCount(manager->txRelays, tx[i]->txHash) == 0 &&
                 _BRTxPeerListCount(manager->txRequests, tx[i]->txHash) == 0) {
-                BRWalletRemoveTransaction(manager->wallet, tx[i]->txHash);
+                // Don't remove unconfirmed transactions while still syncing.
+                // Saved transactions are loaded with blockHeight=TX_UNCONFIRMED
+                // (BRTransactionSerialize doesn't persist block heights). The
+                // sync will re-confirm them, but this cleanup fires first and
+                // deletes them because no peer relays old confirmed txs.
+                // Only clean up after we've reached the chain tip.
+                if (manager->lastBlock->height >= manager->estimatedHeight) {
+                    BRWalletRemoveTransaction(manager->wallet, tx[i]->txHash);
+                }
             }
             else if (! isPublishing && _BRTxPeerListCount(manager->txRelays, tx[i]->txHash) < manager->maxConnectCount){
                 // set timestamp 0 to mark as unverified

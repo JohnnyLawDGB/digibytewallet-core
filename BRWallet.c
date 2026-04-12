@@ -371,15 +371,17 @@ static void _BRWalletPregenLegacyChain(BRWallet *wallet, BRAddress **addrChainPt
 BRWallet *BRWalletNewDual(BRTransaction *transactions[], size_t txCount,
                           BRMasterPubKey mpkBIP84, BRMasterPubKey mpkLegacy)
 {
-    // Create wallet using the BIP84 key as the primary master key
-    BRWallet *wallet = BRWalletNew(transactions, txCount, mpkBIP84);
+    // CRITICAL: Create wallet EMPTY first, then register legacy addresses,
+    // THEN add transactions. If transactions are passed to BRWalletNew before
+    // legacy addresses exist, old transactions (which reference m/0H addresses)
+    // are rejected because the wallet only knows BIP84 addresses at that point.
+    BRWallet *wallet = BRWalletNew(NULL, 0, mpkBIP84);
     if (! wallet) return NULL;
 
-    // Install legacy key
+    // Install legacy key and pre-generate legacy addresses BEFORE adding transactions
     wallet->legacyPubKey = mpkLegacy;
     wallet->hasLegacyKey = 1;
 
-    // Pre-generate legacy addresses: 30 external + 10 internal, both P2PKH and P2WPKH
     pthread_mutex_lock(&wallet->lock);
 
     _BRWalletPregenLegacyChain(wallet, &wallet->legacyExternalChain,
@@ -395,10 +397,18 @@ BRWallet *BRWalletNewDual(BRTransaction *transactions[], size_t txCount,
                                mpkLegacy, SEQUENCE_INTERNAL_CHAIN, 1,
                                SEQUENCE_GAP_LIMIT_INTERNAL_LEGACY);
 
-    // Re-scan transactions now that legacy addresses are in allAddrs
-    _BRWalletUpdateBalance(wallet);
-
     pthread_mutex_unlock(&wallet->lock);
+
+    // NOW register saved transactions — both BIP84 and legacy addresses are
+    // in allAddrs, so transactions from either key tree will be recognized.
+    if (transactions && txCount > 0) {
+        for (size_t i = 0; i < txCount; i++) {
+            if (transactions[i]) {
+                BRWalletRegisterTransaction(wallet, transactions[i]);
+            }
+        }
+    }
+
     return wallet;
 }
 

@@ -572,7 +572,19 @@ static void _requestUnrelayedTxGetdataDone(void *info, int success)
                 // deletes them because no peer relays old confirmed txs.
                 // Only clean up after we've reached the chain tip.
                 if (manager->lastBlock->height >= manager->estimatedHeight) {
-                    BRWalletRemoveTransaction(manager->wallet, tx[i]->txHash);
+                    // Even at chain tip, don't remove transactions the wallet
+                    // has a stake in. Historical sends loaded from saved_txs
+                    // sit here with blockHeight=TX_UNCONFIRMED and no peer
+                    // still relaying them (they're old confirmed txs, long
+                    // since out of every mempool), but they're part of the
+                    // wallet's ledger — we spent our own UTXOs producing them
+                    // or received coins in them. Removing them here is what
+                    // caused users to see their sends flash into history on
+                    // app launch and then vanish the moment the sync hit tip.
+                    if (BRWalletAmountSentByTx(manager->wallet, tx[i]) == 0 &&
+                        BRWalletAmountReceivedFromTx(manager->wallet, tx[i]) == 0) {
+                        BRWalletRemoveTransaction(manager->wallet, tx[i]->txHash);
+                    }
                 }
             }
             else if (! isPublishing && _BRTxPeerListCount(manager->txRelays, tx[i]->txHash) < manager->maxConnectCount){

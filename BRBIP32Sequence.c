@@ -335,24 +335,98 @@ void BRBIP32vPrivKeyPath(BRKey *key, const void *seed, size_t seedLen, int depth
 {
     UInt512 I;
     UInt256 secret, chainCode;
-    
+
     assert(key != NULL);
     assert(seed != NULL || seedLen == 0);
     assert(depth >= 0);
-    
+
     if (key && (seed || seedLen == 0)) {
         BRHMAC(&I, BRSHA512, sizeof(UInt512), BIP32_SEED_KEY, strlen(BIP32_SEED_KEY), seed, seedLen);
         secret = *(UInt256 *)&I;
         chainCode = *(UInt256 *)&I.u8[sizeof(UInt256)];
         var_clean(&I);
-     
+
         for (int i = 0; i < depth; i++) {
             _CKDpriv(&secret, &chainCode, va_arg(vlist, uint32_t));
         }
-        
+
         BRKeySetSecret(key, &secret, 1);
         var_clean(&secret, &chainCode);
     }
+}
+
+// ── Universal Restore primitives ──────────────────────────────────────────────
+
+// derive the master public key at an arbitrary path prefix using a
+// caller-supplied HMAC seed-key string (e.g. "Bitcoin seed" or "DigiByte seed").
+// Returns BR_MASTER_PUBKEY_NONE on bad input. After this, callers can use the
+// standard BRBIP32PubKey(mpk, chain, index) to generate child addresses under
+// the prefix — the last two non-hardened levels (chain/index) are handled
+// there.
+BRMasterPubKey BRBIP32MasterPubKeyPath(const void *seed, size_t seedLen,
+                                       const char *hmacKey,
+                                       const uint32_t *path, size_t depth)
+{
+    BRMasterPubKey mpk = BR_MASTER_PUBKEY_NONE;
+    UInt512 I;
+    UInt256 secret, chain;
+    BRKey key;
+
+    if (!hmacKey) return mpk;
+    if (!seed && seedLen > 0) return mpk;
+    if (!path && depth > 0) return mpk;
+
+    BRHMAC(&I, BRSHA512, sizeof(UInt512), hmacKey, strlen(hmacKey), seed, seedLen);
+    secret = *(UInt256 *)&I;
+    chain = *(UInt256 *)&I.u8[sizeof(UInt256)];
+    var_clean(&I);
+
+    // Walk the first depth-1 levels, recording the fingerprint from the
+    // parent of the final level (matches BIP32 mpk fingerprint convention).
+    for (size_t i = 0; i < depth; i++) {
+        if (i + 1 == depth) {
+            // Capture fingerprint of parent (current secret before final CKD).
+            BRKeySetSecret(&key, &secret, 1);
+            mpk.fingerPrint = BRKeyHash160(&key).u32[0];
+            BRKeyClean(&key);
+        }
+        _CKDpriv(&secret, &chain, path[i]);
+    }
+
+    mpk.chainCode = chain;
+    BRKeySetSecret(&key, &secret, 1);
+    var_clean(&secret, &chain);
+    BRKeyPubKey(&key, &mpk.pubKey, sizeof(mpk.pubKey));
+    BRKeyClean(&key);
+
+    return mpk;
+}
+
+// derive the private key at an arbitrary full path using a caller-supplied
+// HMAC seed-key string. Complement of BRBIP32MasterPubKeyPath — used when the
+// legacy-path sweeper needs to sign for a specific UTXO address.
+void BRBIP32PrivKeyArrayPath(BRKey *key, const void *seed, size_t seedLen,
+                             const char *hmacKey,
+                             const uint32_t *path, size_t depth)
+{
+    UInt512 I;
+    UInt256 secret, chainCode;
+
+    if (!key || !hmacKey) return;
+    if (!seed && seedLen > 0) return;
+    if (!path && depth > 0) return;
+
+    BRHMAC(&I, BRSHA512, sizeof(UInt512), hmacKey, strlen(hmacKey), seed, seedLen);
+    secret = *(UInt256 *)&I;
+    chainCode = *(UInt256 *)&I.u8[sizeof(UInt256)];
+    var_clean(&I);
+
+    for (size_t i = 0; i < depth; i++) {
+        _CKDpriv(&secret, &chainCode, path[i]);
+    }
+
+    BRKeySetSecret(key, &secret, 1);
+    var_clean(&secret, &chainCode);
 }
 
 // writes the base58check encoded serialized master private key (xprv) to str

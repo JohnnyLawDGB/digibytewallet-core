@@ -98,6 +98,31 @@ void BRBIP32PrivKeyList(BRKey keys[], size_t keysCount, const void *seed, size_t
     
 // sets the private key for the specified path to key
 // depth is the number of arguments used to specify the path
+// ── Universal Restore primitives ──────────────────────────────────────────────
+//
+// Derive keys at arbitrary paths with a caller-supplied HMAC seed-key string
+// ("Bitcoin seed" vs "DigiByte seed"). Used by the Kotlin RecoveryScanService
+// to probe for funds on non-native derivation paths (BIP44 DGB, BIP44 BTC
+// wrong-coin, BIP49, legacy-with-wrong-hmac, etc.) during seed restore.
+//
+// `hmacKey` is typically one of "Bitcoin seed" or "DigiByte seed".
+// `path` is an array of child indices; apply BIP32_HARD to any segment that
+// must be hardened (e.g. 44 | BIP32_HARD for BIP44's purpose level).
+
+// returns the master public key derived at the given path prefix. Callers
+// pass only the hardened prefix (e.g. m/44'/20'/0') then use BRBIP32PubKey
+// with chain/index for each child address — faster than re-walking the
+// prefix for every address.
+BRMasterPubKey BRBIP32MasterPubKeyPath(const void *seed, size_t seedLen,
+                                       const char *hmacKey,
+                                       const uint32_t *path, size_t depth);
+
+// sets the private key at an arbitrary full path. Used by the legacy-path
+// sweeper to sign inputs from UTXOs the main wallet doesn't hold directly.
+void BRBIP32PrivKeyArrayPath(BRKey *key, const void *seed, size_t seedLen,
+                             const char *hmacKey,
+                             const uint32_t *path, size_t depth);
+
 void BRBIP32PrivKeyPath(BRKey *key, const void *seed, size_t seedLen, int depth, ...);
 
 // sets the private key for the path specified by vlist to key

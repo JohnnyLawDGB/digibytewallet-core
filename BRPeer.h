@@ -71,9 +71,10 @@
 extern "C" {
 #endif
 
-#define SERVICES_NODE_NETWORK 0x01 // services value indicating a node carries full blocks, not just headers
-#define SERVICES_NODE_BLOOM   0x04 // BIP111: https://github.com/bitcoin/bips/blob/master/bip-0111.mediawiki
-#define SERVICES_NODE_WITNESS 0x08 // BIP144: required to request SegWit witness data from 8.26+ peers
+#define SERVICES_NODE_NETWORK         0x01 // services value indicating a node carries full blocks, not just headers
+#define SERVICES_NODE_BLOOM           0x04 // BIP111: https://github.com/bitcoin/bips/blob/master/bip-0111.mediawiki
+#define SERVICES_NODE_WITNESS         0x08 // BIP144: required to request SegWit witness data from 8.26+ peers
+#define SERVICES_NODE_COMPACT_FILTERS 0x40 // BIP157: peer serves cfheaders/cfilter/cfcheckpt for basic filters
 
 #define BR_VERSION "1.0.0"
 #define USER_AGENT "/digiwallet:" BR_VERSION "/"
@@ -102,6 +103,24 @@ extern "C" {
 #define MSG_ALERT        "alert"
 #define MSG_REJECT       "reject"   // described in BIP61: https://github.com/bitcoin/bips/blob/master/bip-0061.mediawiki
 #define MSG_FEEFILTER    "feefilter"// described in BIP133 https://github.com/bitcoin/bips/blob/master/bip-0133.mediawiki
+
+// BIP 157 compact-filter messages. https://github.com/bitcoin/bips/blob/master/bip-0157.mediawiki
+#define MSG_GETCFILTERS    "getcfilters"
+#define MSG_CFILTER        "cfilter"
+#define MSG_GETCFHEADERS   "getcfheaders"
+#define MSG_CFHEADERS      "cfheaders"
+#define MSG_GETCFCHECKPT   "getcfcheckpt"
+#define MSG_CFCHECKPT      "cfcheckpt"
+
+// BIP 158 basic filter type. The only filter type defined by the spec to date.
+#define FILTER_TYPE_BASIC 0x00
+
+// BIP 157 wire limits.
+#define MAX_CFHEADERS_RESULTS 2000u  // max filter_hashes in one cfheaders message
+#define MAX_CFILTERS_RESULTS  1000u  // max blocks one getcfilters may request
+// Hard cap on filter_headers in a cfcheckpt message. cfcheckpt sends one
+// header per 1000 blocks of the chain; 30k entries covers a 30M-block chain.
+#define MAX_CFCHECKPT_RESULTS 30000u
 
 #define REJECT_INVALID     0x10 // transaction is invalid for some reason (invalid signature, output value > input, etc)
 #define REJECT_SPENT       0x12 // an input is already spent
@@ -208,6 +227,37 @@ void BRPeerSendGetdata(BRPeer *peer, const UInt256 txHashes[], size_t txCount, c
                        size_t blockCount);
 void BRPeerSendGetaddr(BRPeer *peer);
 void BRPeerSendPing(BRPeer *peer, void *info, void (*pongCallback)(void *info, int success));
+
+// BIP 157 send helpers. May be called only after a successful handshake.
+// startHeight is inclusive; stopHash bounds the range. For getcfheaders the
+// range is up to MAX_CFHEADERS_RESULTS headers; for getcfilters up to
+// MAX_CFILTERS_RESULTS filters. getcfcheckpt has no start height — peer
+// replies with every 1000th filter header up to stopHash.
+void BRPeerSendGetCFHeaders(BRPeer *peer, uint8_t filterType, uint32_t startHeight, UInt256 stopHash);
+void BRPeerSendGetCFilters(BRPeer *peer, uint8_t filterType, uint32_t startHeight, UInt256 stopHash);
+void BRPeerSendGetCFCheckpt(BRPeer *peer, uint8_t filterType, UInt256 stopHash);
+
+// Subscribe to BIP 157 reply messages. Callbacks are optional (pass NULL to
+// ignore a message type) and receive borrowed pointers that must not be
+// retained past the call. Set once before BRPeerConnect; not thread-safe.
+//
+// relayedCFHeaders is invoked with the decoded cfheaders payload. filterHashes
+// borrows from a thread-local buffer; copy if you need to retain.
+//
+// relayedCFilter is invoked with the encoded filter bytes still owned by the
+// caller; pass them straight to BRGCSFilterBasicParse or copy. Length is
+// already validated to be <= BR_GCS_MAX_ENCODED_SIZE.
+//
+// relayedCFCheckpt is invoked with the decoded cfcheckpt payload. filterHeaders
+// borrows from a thread-local buffer; copy if you need to retain.
+void BRPeerSetCompactFilterCallbacks(BRPeer *peer,
+                                     void (*relayedCFHeaders)(void *info, uint8_t filterType, UInt256 stopHash,
+                                                              UInt256 prevFilterHeader,
+                                                              const UInt256 *filterHashes, size_t count),
+                                     void (*relayedCFilter)(void *info, uint8_t filterType, UInt256 blockHash,
+                                                            const uint8_t *encoded, size_t encodedLen),
+                                     void (*relayedCFCheckpt)(void *info, uint8_t filterType, UInt256 stopHash,
+                                                              const UInt256 *filterHeaders, size_t count));
 
 // useful to get additional tx after a bloom filter update
 void BRPeerRerequestBlocks(BRPeer *peer, UInt256 fromBlock);

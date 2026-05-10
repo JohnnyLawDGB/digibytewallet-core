@@ -28,6 +28,7 @@
 #include "BRSet.h"
 #include "BRArray.h"
 #include "BRCrypto.h"
+#include "BRGCSFilter.h"
 #ifdef __ANDROID__
 #include <android/log.h>
 #endif
@@ -217,6 +218,12 @@ typedef struct {
     BRTransaction *(*requestedTx)(void *info, UInt256 txHash);
     int (*networkIsReachable)(void *info);
     void (*threadCleanup)(void *info);
+    void (*relayedCFHeaders)(void *info, uint8_t filterType, UInt256 stopHash, UInt256 prevFilterHeader,
+                             const UInt256 *filterHashes, size_t count);
+    void (*relayedCFilter)(void *info, uint8_t filterType, UInt256 blockHash,
+                           const uint8_t *encoded, size_t encodedLen);
+    void (*relayedCFCheckpt)(void *info, uint8_t filterType, UInt256 stopHash,
+                             const UInt256 *filterHeaders, size_t count);
     void **volatile pongInfo;
     void (**volatile pongCallback)(void *info, int success);
     void *volatile mempoolInfo;
@@ -890,7 +897,7 @@ static int _BRPeerAcceptFeeFilterMessage(BRPeer *peer, const uint8_t *msg, size_
 {
     BRPeerContext *ctx = (BRPeerContext *)peer;
     int r = 1;
-    
+
     if (sizeof(uint64_t) > msgLen) {
         peer_log(peer, "malformed feefilter message, length is %zu, should be >= %zu", msgLen, sizeof(uint64_t));
         r = 0;
@@ -900,7 +907,161 @@ static int _BRPeerAcceptFeeFilterMessage(BRPeer *peer, const uint8_t *msg, size_
         peer_log(peer, "got feefilter with rate %llu", ctx->feePerKb);
         if (ctx->setFeePerKb) ctx->setFeePerKb(ctx->info, ctx->feePerKb);
     }
-    
+
+    return r;
+}
+
+// BIP 157: https://github.com/bitcoin/bips/blob/master/bip-0157.mediawiki
+//   cfheaders payload:
+//     filter_type             (1 byte)
+//     stop_hash               (32 bytes)
+//     previous_filter_header  (32 bytes)
+//     filter_hashes_count     (CompactSize)
+//     filter_hashes           (32 bytes * count)
+static int _BRPeerAcceptCFHeadersMessage(BRPeer *peer, const uint8_t *msg, size_t msgLen)
+{
+    BRPeerContext *ctx = (BRPeerContext *)peer;
+    size_t off = 0, varLen = 0;
+    int r = 1;
+
+    if (msgLen < 1 + 32 + 32 + 1) {
+        peer_log(peer, "malformed cfheaders message, length is %zu, should be >= %zu", msgLen, (size_t)(1 + 32 + 32 + 1));
+        return 0;
+    }
+
+    uint8_t filterType = msg[off];
+    off += 1;
+    UInt256 stopHash = UInt256Get(&msg[off]);
+    off += sizeof(UInt256);
+    UInt256 prevFilterHeader = UInt256Get(&msg[off]);
+    off += sizeof(UInt256);
+    size_t count = (size_t)BRVarInt(&msg[off], (off <= msgLen ? msgLen - off : 0), &varLen);
+    off += varLen;
+
+    if (varLen == 0 || count > MAX_CFHEADERS_RESULTS || off + count*sizeof(UInt256) != msgLen) {
+        peer_log(peer, "malformed cfheaders message, type %u count %zu, length is %zu",
+                 (unsigned)filterType, count, msgLen);
+        r = 0;
+    }
+    else {
+        peer_log(peer, "got cfheaders type %u with %zu filter hash(es), stop %s",
+                 (unsigned)filterType, count, log_u256_hex_encode(stopHash));
+
+        if (ctx->relayedCFHeaders) {
+            // Spill into a thread-local buffer so the callback receives an aligned UInt256 array
+            // rather than the unaligned wire bytes.
+            UInt256 stackHashes[64];
+            UInt256 *hashes = (count <= sizeof(stackHashes)/sizeof(stackHashes[0]))
+                              ? stackHashes
+                              : (UInt256 *)malloc(count*sizeof(UInt256));
+            if (count > 0 && hashes == NULL) {
+                peer_log(peer, "cfheaders alloc failed for %zu hashes", count);
+                r = 0;
+            }
+            else {
+                for (size_t i = 0; i < count; i++) {
+                    hashes[i] = UInt256Get(&msg[1 + 32 + 32 + varLen + i*sizeof(UInt256)]);
+                }
+                ctx->relayedCFHeaders(ctx->info, filterType, stopHash, prevFilterHeader, hashes, count);
+                if (hashes != stackHashes) free(hashes);
+            }
+        }
+    }
+
+    return r;
+}
+
+//   cfilter payload:
+//     filter_type        (1 byte)
+//     block_hash         (32 bytes)
+//     num_filter_bytes   (CompactSize)
+//     filter_bytes       (variable)
+static int _BRPeerAcceptCFilterMessage(BRPeer *peer, const uint8_t *msg, size_t msgLen)
+{
+    BRPeerContext *ctx = (BRPeerContext *)peer;
+    size_t off = 0, varLen = 0;
+    int r = 1;
+
+    if (msgLen < 1 + 32 + 1) {
+        peer_log(peer, "malformed cfilter message, length is %zu, should be >= %zu", msgLen, (size_t)(1 + 32 + 1));
+        return 0;
+    }
+
+    uint8_t filterType = msg[off];
+    off += 1;
+    UInt256 blockHash = UInt256Get(&msg[off]);
+    off += sizeof(UInt256);
+    size_t encodedLen = (size_t)BRVarInt(&msg[off], (off <= msgLen ? msgLen - off : 0), &varLen);
+    off += varLen;
+
+    if (varLen == 0 || encodedLen > BR_GCS_MAX_ENCODED_SIZE || off + encodedLen != msgLen) {
+        peer_log(peer, "malformed cfilter message, type %u, declared filter size %zu, msg length %zu",
+                 (unsigned)filterType, encodedLen, msgLen);
+        r = 0;
+    }
+    else {
+        peer_log(peer, "got cfilter type %u, %zu byte(s), block %s",
+                 (unsigned)filterType, encodedLen, log_u256_hex_encode(blockHash));
+
+        if (ctx->relayedCFilter) {
+            ctx->relayedCFilter(ctx->info, filterType, blockHash, &msg[off], encodedLen);
+        }
+    }
+
+    return r;
+}
+
+//   cfcheckpt payload:
+//     filter_type            (1 byte)
+//     stop_hash              (32 bytes)
+//     filter_headers_length  (CompactSize)
+//     filter_headers         (32 bytes * length, one per 1000 blocks)
+static int _BRPeerAcceptCFCheckptMessage(BRPeer *peer, const uint8_t *msg, size_t msgLen)
+{
+    BRPeerContext *ctx = (BRPeerContext *)peer;
+    size_t off = 0, varLen = 0;
+    int r = 1;
+
+    if (msgLen < 1 + 32 + 1) {
+        peer_log(peer, "malformed cfcheckpt message, length is %zu, should be >= %zu", msgLen, (size_t)(1 + 32 + 1));
+        return 0;
+    }
+
+    uint8_t filterType = msg[off];
+    off += 1;
+    UInt256 stopHash = UInt256Get(&msg[off]);
+    off += sizeof(UInt256);
+    size_t count = (size_t)BRVarInt(&msg[off], (off <= msgLen ? msgLen - off : 0), &varLen);
+    off += varLen;
+
+    if (varLen == 0 || count > MAX_CFCHECKPT_RESULTS || off + count*sizeof(UInt256) != msgLen) {
+        peer_log(peer, "malformed cfcheckpt message, type %u count %zu, length is %zu",
+                 (unsigned)filterType, count, msgLen);
+        r = 0;
+    }
+    else {
+        peer_log(peer, "got cfcheckpt type %u with %zu filter header(s), stop %s",
+                 (unsigned)filterType, count, log_u256_hex_encode(stopHash));
+
+        if (ctx->relayedCFCheckpt) {
+            UInt256 stackHeaders[64];
+            UInt256 *headers = (count <= sizeof(stackHeaders)/sizeof(stackHeaders[0]))
+                               ? stackHeaders
+                               : (UInt256 *)malloc(count*sizeof(UInt256));
+            if (count > 0 && headers == NULL) {
+                peer_log(peer, "cfcheckpt alloc failed for %zu headers", count);
+                r = 0;
+            }
+            else {
+                for (size_t i = 0; i < count; i++) {
+                    headers[i] = UInt256Get(&msg[1 + 32 + varLen + i*sizeof(UInt256)]);
+                }
+                ctx->relayedCFCheckpt(ctx->info, filterType, stopHash, headers, count);
+                if (headers != stackHeaders) free(headers);
+            }
+        }
+    }
+
     return r;
 }
 
@@ -931,6 +1092,9 @@ static int _BRPeerAcceptMessage(BRPeer *peer, const uint8_t *msg, size_t msgLen,
     else if (strncmp(MSG_MERKLEBLOCK, type, 12) == 0) r = _BRPeerAcceptMerkleblockMessage(peer, msg, msgLen);
     else if (strncmp(MSG_REJECT, type, 12) == 0) r = _BRPeerAcceptRejectMessage(peer, msg, msgLen);
     else if (strncmp(MSG_FEEFILTER, type, 12) == 0) r = _BRPeerAcceptFeeFilterMessage(peer, msg, msgLen);
+    else if (strncmp(MSG_CFHEADERS, type, 12) == 0) r = _BRPeerAcceptCFHeadersMessage(peer, msg, msgLen);
+    else if (strncmp(MSG_CFILTER, type, 12) == 0) r = _BRPeerAcceptCFilterMessage(peer, msg, msgLen);
+    else if (strncmp(MSG_CFCHECKPT, type, 12) == 0) r = _BRPeerAcceptCFCheckptMessage(peer, msg, msgLen);
     else peer_log(peer, "dropping %s, length %zu, not implemented", type, msgLen);
 
     return r;
@@ -1668,13 +1832,75 @@ void BRPeerSendPing(BRPeer *peer, void *info, void (*pongCallback)(void *info, i
     BRPeerContext *ctx = (BRPeerContext *)peer;
     uint8_t msg[sizeof(uint64_t)];
     struct timeval tv;
-    
+
     gettimeofday(&tv, NULL);
     ctx->startTime = tv.tv_sec + (double)tv.tv_usec/1000000;
     array_add(ctx->pongInfo, info);
     array_add(ctx->pongCallback, pongCallback);
     UInt64SetLE(msg, ctx->nonce);
     BRPeerSendMessage(peer, msg, sizeof(msg), MSG_PING);
+}
+
+// BIP 157 getcfheaders / getcfilters share an identical wire layout:
+//   filter_type   (1 byte)
+//   start_height  (4 bytes, little-endian)
+//   stop_hash     (32 bytes)
+static void _BRPeerSendCFRangeRequest(BRPeer *peer, const char *type,
+                                      uint8_t filterType, uint32_t startHeight, UInt256 stopHash)
+{
+    uint8_t msg[1 + sizeof(uint32_t) + sizeof(UInt256)];
+    size_t off = 0;
+
+    msg[off] = filterType;
+    off += 1;
+    UInt32SetLE(&msg[off], startHeight);
+    off += sizeof(uint32_t);
+    UInt256Set(&msg[off], stopHash);
+    off += sizeof(UInt256);
+
+    peer_log(peer, "calling %s type %u from height %u to %s",
+             type, (unsigned)filterType, startHeight, log_u256_hex_encode(stopHash));
+    BRPeerSendMessage(peer, msg, off, type);
+}
+
+void BRPeerSendGetCFHeaders(BRPeer *peer, uint8_t filterType, uint32_t startHeight, UInt256 stopHash)
+{
+    _BRPeerSendCFRangeRequest(peer, MSG_GETCFHEADERS, filterType, startHeight, stopHash);
+}
+
+void BRPeerSendGetCFilters(BRPeer *peer, uint8_t filterType, uint32_t startHeight, UInt256 stopHash)
+{
+    _BRPeerSendCFRangeRequest(peer, MSG_GETCFILTERS, filterType, startHeight, stopHash);
+}
+
+void BRPeerSendGetCFCheckpt(BRPeer *peer, uint8_t filterType, UInt256 stopHash)
+{
+    uint8_t msg[1 + sizeof(UInt256)];
+    size_t off = 0;
+
+    msg[off] = filterType;
+    off += 1;
+    UInt256Set(&msg[off], stopHash);
+    off += sizeof(UInt256);
+
+    peer_log(peer, "calling getcfcheckpt type %u stop %s",
+             (unsigned)filterType, log_u256_hex_encode(stopHash));
+    BRPeerSendMessage(peer, msg, off, MSG_GETCFCHECKPT);
+}
+
+void BRPeerSetCompactFilterCallbacks(BRPeer *peer,
+                                     void (*relayedCFHeaders)(void *info, uint8_t filterType, UInt256 stopHash,
+                                                              UInt256 prevFilterHeader,
+                                                              const UInt256 *filterHashes, size_t count),
+                                     void (*relayedCFilter)(void *info, uint8_t filterType, UInt256 blockHash,
+                                                            const uint8_t *encoded, size_t encodedLen),
+                                     void (*relayedCFCheckpt)(void *info, uint8_t filterType, UInt256 stopHash,
+                                                              const UInt256 *filterHeaders, size_t count))
+{
+    BRPeerContext *ctx = (BRPeerContext *)peer;
+    ctx->relayedCFHeaders = relayedCFHeaders;
+    ctx->relayedCFilter = relayedCFilter;
+    ctx->relayedCFCheckpt = relayedCFCheckpt;
 }
 
 // useful to get additional tx after a bloom filter update

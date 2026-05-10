@@ -27,6 +27,7 @@
 #include "BRSet.h"
 #include "BRArray.h"
 #include "BRInt.h"
+#include "BRCompactFilterChain.h"
 #include <stdlib.h>
 #include <stdio.h>
 #include <inttypes.h>
@@ -200,6 +201,11 @@ struct BRPeerManagerStruct {
     void (*savePeers)(void *info, int replace, const BRPeer peers[], size_t peersCount);
     int (*networkIsReachable)(void *info);
     void (*threadCleanup)(void *info);
+    // BIP 158 compact-filter sync (inert unless syncMode != BLOOM_ONLY)
+    BRSyncMode syncMode;
+    BRCompactFilterChain *compactFilterChain;
+    void *saveFilterHeadersInfo;
+    void (*saveFilterHeaders)(void *info, const BRCompactFilterChain *chain);
     pthread_mutex_t lock;
 };
 
@@ -814,6 +820,11 @@ static void _BRPeerManagerFindPeers(BRPeerManager *manager)
     }
 }
 
+// Forward declaration — BIP 158 hook used by _peerConnected; definition lives
+// near BRPeerManagerSetCallbacks alongside the rest of the compact-filter
+// helpers.
+static void _BRPeerManagerOnFilterCapablePeerConnected(BRPeerManager *manager, void *peerCbInfo, BRPeer *peer);
+
 static void _peerConnected(void *info)
 {
     BRPeer *peer = ((BRPeerCallbackInfo *)info)->peer;
@@ -891,6 +902,14 @@ static void _peerConnected(void *info)
             manager->connectFailureCount = 0; // reset connect failure count
             _BRPeerManagerLoadMempools(manager);
         }
+    }
+
+    // If we didn't bounce the peer above and BIP 158 sync is enabled, register
+    // the compact-filter callbacks and kick off the cfheaders fetch loop. The
+    // peer's info pointer was already set by BRPeerSetCallbacks at connect, so
+    // BRPeerSetCompactFilterCallbacks shares that same info struct.
+    if (BRPeerConnectStatus(peer) == BRPeerStatusConnected) {
+        _BRPeerManagerOnFilterCapablePeerConnected(manager, info, peer);
     }
 
     pthread_mutex_unlock(&manager->lock);
@@ -1759,6 +1778,164 @@ BRPeerManager *BRPeerManagerNewEx(const BRChainParams *params, BRWallet *wallet,
     return manager;
 }
 
+// --- BIP 158 helpers ------------------------------------------------------
+//
+// All helpers below assume the caller holds manager->lock.
+
+// Walk manager->lastBlock backwards via prevBlock until we reach `height`,
+// returning the block hash at that height. Returns UINT256_ZERO if the
+// height is outside the in-memory window. Bounded by the local chain
+// length so it is at most O(chainLength).
+static UInt256 _BRPeerManagerBlockHashAtHeight(BRPeerManager *manager, uint32_t height)
+{
+    BRMerkleBlock *b = manager->lastBlock;
+    while (b && b->height > height) {
+        b = BRSetGet(manager->blocks, &b->prevBlock);
+    }
+    if (b && b->height == height) return b->blockHash;
+    return UINT256_ZERO;
+}
+
+// Returns 1 if the peer is eligible to serve BIP 158 messages given the
+// manager's current sync mode, 0 otherwise.
+static int _BRPeerManagerPeerSupportsCompactFilters(BRPeerManager *manager, BRPeer *peer)
+{
+    if (manager->syncMode == BR_SYNC_MODE_BLOOM_ONLY) return 0;
+    if (!peer) return 0;
+    return (peer->services & SERVICES_NODE_COMPACT_FILTERS) == SERVICES_NODE_COMPACT_FILTERS ? 1 : 0;
+}
+
+// Drive the cfheaders fetch loop. Asks `peer` for the next batch
+// starting at chain->NextHeight, capped at MAX_CFHEADERS_RESULTS and at
+// the manager's known tip. No-op if the chain is already caught up or
+// the peer is not filter-capable.
+static void _BRPeerManagerRequestNextCFHeaders(BRPeerManager *manager, BRPeer *peer)
+{
+    if (!_BRPeerManagerPeerSupportsCompactFilters(manager, peer)) return;
+    if (!manager->compactFilterChain) return;
+    if (!manager->lastBlock) return;
+
+    uint32_t next = BRCompactFilterChainNextHeight(manager->compactFilterChain);
+    uint32_t tip = manager->lastBlock->height;
+    if (next > tip) return; // already caught up
+
+    uint32_t batchEnd = next + (MAX_CFHEADERS_RESULTS - 1);
+    if (batchEnd > tip) batchEnd = tip;
+
+    UInt256 stopHash = _BRPeerManagerBlockHashAtHeight(manager, batchEnd);
+    if (UInt256IsZero(stopHash)) {
+        peer_log(peer, "cfheaders: no block hash for height %u, deferring", batchEnd);
+        return;
+    }
+
+    peer_log(peer, "cfheaders: requesting [%u..%u] (%u headers)",
+             next, batchEnd, batchEnd - next + 1);
+    BRPeerSendGetCFHeaders(peer,
+                           BRCompactFilterChainType(manager->compactFilterChain),
+                           next, stopHash);
+}
+
+// --- BIP 158 peer callbacks -----------------------------------------------
+
+static void _peerRelayedCFHeaders(void *info, uint8_t filterType, UInt256 stopHash,
+                                  UInt256 prevFilterHeader,
+                                  const UInt256 *filterHashes, size_t count)
+{
+    BRPeer *peer = ((BRPeerCallbackInfo *)info)->peer;
+    BRPeerManager *manager = ((BRPeerCallbackInfo *)info)->manager;
+
+    pthread_mutex_lock(&manager->lock);
+
+    // Lazily allocate the chain on the first batch if persistence hadn't
+    // restored one yet. Genesis anchor: startHeight=0, prevHeader=ZERO.
+    if (!manager->compactFilterChain) {
+        manager->compactFilterChain = BRCompactFilterChainNew(filterType, 0, UINT256_ZERO);
+    }
+
+    if (filterType != BRCompactFilterChainType(manager->compactFilterChain)) {
+        peer_log(peer, "cfheaders: ignoring filter type %u (chain type %u)",
+                 (unsigned)filterType, (unsigned)BRCompactFilterChainType(manager->compactFilterChain));
+        pthread_mutex_unlock(&manager->lock);
+        return;
+    }
+
+    int ok = BRCompactFilterChainAppend(manager->compactFilterChain, prevFilterHeader, filterHashes, count);
+    if (!ok) {
+        peer_log(peer, "cfheaders: continuity check failed, treating peer as misbehavin'");
+        _BRPeerManagerPeerMisbehavin(manager, peer);
+        pthread_mutex_unlock(&manager->lock);
+        return;
+    }
+
+    peer_log(peer, "cfheaders: chain extended to height %u (added %zu, stop %s)",
+             BRCompactFilterChainNextHeight(manager->compactFilterChain) - 1,
+             count, log_u256_hex_encode(stopHash));
+
+    if (manager->saveFilterHeaders) {
+        manager->saveFilterHeaders(manager->saveFilterHeadersInfo, manager->compactFilterChain);
+    }
+
+    // Request the next batch if still behind the local block tip.
+    _BRPeerManagerRequestNextCFHeaders(manager, peer);
+    pthread_mutex_unlock(&manager->lock);
+}
+
+// B2 stub: the cfilter response handler. C1 will add wallet-address
+// matching here. For now we just verify the filter against the chain so
+// peers serving garbage are caught early.
+static void _peerRelayedCFilter(void *info, uint8_t filterType, UInt256 blockHash,
+                                const uint8_t *encoded, size_t encodedLen)
+{
+    BRPeer *peer = ((BRPeerCallbackInfo *)info)->peer;
+    BRPeerManager *manager = ((BRPeerCallbackInfo *)info)->manager;
+
+    pthread_mutex_lock(&manager->lock);
+    if (!manager->compactFilterChain ||
+        filterType != BRCompactFilterChainType(manager->compactFilterChain)) {
+        pthread_mutex_unlock(&manager->lock);
+        return;
+    }
+
+    // We need the height for this block to verify. Look it up in the block
+    // set; the value comes for free once we walk the chain.
+    BRMerkleBlock *b = BRSetGet(manager->blocks, &blockHash);
+    if (!b) {
+        peer_log(peer, "cfilter: unknown block %s, dropping", log_u256_hex_encode(blockHash));
+        pthread_mutex_unlock(&manager->lock);
+        return;
+    }
+
+    if (!BRCompactFilterChainVerifyFilter(manager->compactFilterChain, b->height, encoded, encodedLen)) {
+        peer_log(peer, "cfilter: filter for block %s does not match chain — misbehavin'",
+                 log_u256_hex_encode(blockHash));
+        _BRPeerManagerPeerMisbehavin(manager, peer);
+    }
+    // C1: wallet-address matching + block fetch on hit.
+    pthread_mutex_unlock(&manager->lock);
+}
+
+// B2 stub: cfcheckpt is informational at the moment. C1+ may use checkpoints
+// to bootstrap a chain anchor from a height other than 0.
+static void _peerRelayedCFCheckpt(void *info, uint8_t filterType, UInt256 stopHash,
+                                  const UInt256 *filterHeaders, size_t count)
+{
+    BRPeer *peer = ((BRPeerCallbackInfo *)info)->peer;
+    peer_log(peer, "cfcheckpt: received %zu header(s) for filter type %u, stop %s",
+             count, (unsigned)filterType, log_u256_hex_encode(stopHash));
+}
+
+// Public-facing hook called from _peerConnected when a filter-capable peer
+// finishes handshake.
+static void _BRPeerManagerOnFilterCapablePeerConnected(BRPeerManager *manager, void *peerCbInfo,
+                                                       BRPeer *peer)
+{
+    if (manager->syncMode == BR_SYNC_MODE_BLOOM_ONLY) return;
+    if (!_BRPeerManagerPeerSupportsCompactFilters(manager, peer)) return;
+
+    BRPeerSetCompactFilterCallbacks(peer, _peerRelayedCFHeaders, _peerRelayedCFilter, _peerRelayedCFCheckpt);
+    _BRPeerManagerRequestNextCFHeaders(manager, peer);
+}
+
 // not thread-safe, set callbacks once before calling BRPeerManagerConnect()
 // info is a void pointer that will be passed along with each callback call
 // void syncStarted(void *) - called when blockchain syncing starts
@@ -2220,9 +2397,63 @@ void BRPeerManagerFree(BRPeerManager *manager)
     array_free(manager->txRequests);
     array_free(manager->publishedTx);
     array_free(manager->publishedTxHashes);
+    if (manager->compactFilterChain) {
+        BRCompactFilterChainFree(manager->compactFilterChain);
+        manager->compactFilterChain = NULL;
+    }
     pthread_mutex_unlock(&manager->lock);
     pthread_mutex_destroy(&manager->lock);
     free(manager);
+}
+
+// --- BIP 158 public API ---------------------------------------------------
+
+void BRPeerManagerSetSyncMode(BRPeerManager *manager, BRSyncMode mode)
+{
+    assert(manager != NULL);
+    pthread_mutex_lock(&manager->lock);
+    manager->syncMode = mode;
+    pthread_mutex_unlock(&manager->lock);
+}
+
+BRSyncMode BRPeerManagerGetSyncMode(BRPeerManager *manager)
+{
+    if (!manager) return BR_SYNC_MODE_BLOOM_ONLY;
+    pthread_mutex_lock(&manager->lock);
+    BRSyncMode m = manager->syncMode;
+    pthread_mutex_unlock(&manager->lock);
+    return m;
+}
+
+void BRPeerManagerSetCompactFilterChain(BRPeerManager *manager, BRCompactFilterChain *chain)
+{
+    assert(manager != NULL);
+    pthread_mutex_lock(&manager->lock);
+    if (manager->compactFilterChain && manager->compactFilterChain != chain) {
+        BRCompactFilterChainFree(manager->compactFilterChain);
+    }
+    manager->compactFilterChain = chain;
+    pthread_mutex_unlock(&manager->lock);
+}
+
+const BRCompactFilterChain *BRPeerManagerGetCompactFilterChain(BRPeerManager *manager)
+{
+    // Borrowed pointer — caller must not call this concurrently with
+    // SetCompactFilterChain/Free. PeerManager's normal usage pattern is
+    // single-owner inside JNI, so this matches existing accessors like
+    // BRPeerManagerLastBlockHeight.
+    return manager ? manager->compactFilterChain : NULL;
+}
+
+void BRPeerManagerSetSaveFilterHeaders(BRPeerManager *manager, void *info,
+                                       void (*saveFilterHeaders)(void *info,
+                                                                  const BRCompactFilterChain *chain))
+{
+    assert(manager != NULL);
+    pthread_mutex_lock(&manager->lock);
+    manager->saveFilterHeadersInfo = info;
+    manager->saveFilterHeaders = saveFilterHeaders;
+    pthread_mutex_unlock(&manager->lock);
 }
 
 /*

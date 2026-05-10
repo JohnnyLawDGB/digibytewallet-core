@@ -30,6 +30,7 @@
 #include "BRTransaction.h"
 #include "BRWallet.h"
 #include "BRChainParams.h"
+#include "BRCompactFilterChain.h"
 #include <stddef.h>
 #include <inttypes.h>
 
@@ -67,6 +68,15 @@ Remarks:
 /* Readability constants */
 #define ADD_TO_SAVED_BLOCKS 0
 #define REPLACE_SAVED_BLOCKS 1
+
+// BIP 158 sync mode. Controls which peer protocols the manager uses to find
+// wallet-relevant transactions. Set via BRPeerManagerSetSyncMode before
+// BRPeerManagerConnect; changes after connect take effect on the next sync.
+typedef enum {
+    BR_SYNC_MODE_BLOOM_ONLY = 0,            // legacy BIP 37 SPV (default)
+    BR_SYNC_MODE_COMPACT_FILTERS_ONLY = 1,  // BIP 157/158 only
+    BR_SYNC_MODE_BOTH = 2,                  // both paths in parallel
+} BRSyncMode;
 
 typedef struct BRPeerManagerStruct BRPeerManager;
 
@@ -143,6 +153,51 @@ void BRPeerManagerPublishTx(BRPeerManager *manager, BRTransaction *tx, void *inf
 
 // number of connected peers that have relayed the given unconfirmed transaction
 size_t BRPeerManagerRelayCount(BRPeerManager *manager, UInt256 txHash);
+
+// ----------- BIP 158 compact-filter sync (opt-in) -----------
+//
+// The functions below are inert until BRPeerManagerSetSyncMode is called with
+// a mode other than BR_SYNC_MODE_BLOOM_ONLY. With BLOOM_ONLY (the default)
+// the manager behaves exactly as before.
+//
+// Lifecycle for a filter-sync-enabled wallet:
+//   1) BRPeerManagerSetSyncMode(manager, BR_SYNC_MODE_COMPACT_FILTERS_ONLY)
+//   2) Either pass a previously persisted chain via SetCompactFilterChain
+//      (deserialize from SharedPreferences) or skip — the manager will lazily
+//      create one anchored at startHeight=0 / UINT256_ZERO on the first
+//      cfheaders batch.
+//   3) Register saveFilterHeaders so the manager can persist progress every
+//      time it successfully extends the chain.
+//   4) BRPeerManagerConnect — peers advertising NODE_COMPACT_FILTERS will be
+//      driven to send cfheaders/cfheaders/cfcheckpt; the chain accumulator
+//      validates continuity and the manager misbehavin's any peer whose
+//      batch breaks the chain.
+
+// Set the sync mode. Must be called before BRPeerManagerConnect, or before
+// the next BRPeerManagerRescan. No-op if the same mode is already set.
+void BRPeerManagerSetSyncMode(BRPeerManager *manager, BRSyncMode mode);
+
+BRSyncMode BRPeerManagerGetSyncMode(BRPeerManager *manager);
+
+// Provide a previously persisted filter-header chain. The manager takes
+// ownership of the chain pointer; do not free it. Passing NULL clears any
+// existing chain. Must be called before BRPeerManagerConnect.
+void BRPeerManagerSetCompactFilterChain(BRPeerManager *manager,
+                                         BRCompactFilterChain *chain);
+
+// Borrowed pointer into the manager's chain (do NOT free). NULL when sync
+// mode is BLOOM_ONLY or no batches have been received yet.
+const BRCompactFilterChain *BRPeerManagerGetCompactFilterChain(BRPeerManager *manager);
+
+// Persistence hook. Called from inside the manager lock after every
+// successful BRCompactFilterChainAppend, with the chain pointer that was
+// updated. The callback may serialize it via BRCompactFilterChainSerialize.
+// Pass NULL to clear.
+void BRPeerManagerSetSaveFilterHeaders(BRPeerManager *manager, void *info,
+                                       void (*saveFilterHeaders)(void *info,
+                                                                  const BRCompactFilterChain *chain));
+
+// ----------- end BIP 158 opt-in -----------
 
 // frees memory allocated for manager (call BRPeerManagerDisconnect() first if connected)
 void BRPeerManagerFree(BRPeerManager *manager);

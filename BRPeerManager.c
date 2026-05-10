@@ -208,6 +208,10 @@ struct BRPeerManagerStruct {
     BRCompactFilterChain *compactFilterChain;
     void *saveFilterHeadersInfo;
     void (*saveFilterHeaders)(void *info, const BRCompactFilterChain *chain);
+    int autoFetchCFiltersEnabled;
+    uint32_t autoFetchCFiltersStart;     // wallet birth height (inclusive)
+    uint32_t autoFetchCFiltersThrough;   // highest height already requested (or
+                                         // start-1 if no request has fired yet)
     pthread_mutex_t lock;
 };
 
@@ -822,10 +826,12 @@ static void _BRPeerManagerFindPeers(BRPeerManager *manager)
     }
 }
 
-// Forward declaration — BIP 158 hook used by _peerConnected; definition lives
-// near BRPeerManagerSetCallbacks alongside the rest of the compact-filter
-// helpers.
+// Forward declarations — BIP 158 hooks used by _peerConnected and
+// _peerRelayedCFHeaders. Definitions live near BRPeerManagerSetCallbacks
+// alongside the rest of the compact-filter helpers.
 static void _BRPeerManagerOnFilterCapablePeerConnected(BRPeerManager *manager, void *peerCbInfo, BRPeer *peer);
+static size_t _BRPeerManagerRequestCFiltersLocked(BRPeerManager *manager,
+                                                  uint32_t startHeight, uint32_t stopHeight);
 
 static void _peerConnected(void *info)
 {
@@ -1869,12 +1875,33 @@ static void _peerRelayedCFHeaders(void *info, uint8_t filterType, UInt256 stopHa
         return;
     }
 
+    uint32_t chainTip = BRCompactFilterChainNextHeight(manager->compactFilterChain) - 1;
     peer_log(peer, "cfheaders: chain extended to height %u (added %zu, stop %s)",
-             BRCompactFilterChainNextHeight(manager->compactFilterChain) - 1,
-             count, log_u256_hex_encode(stopHash));
+             chainTip, count, log_u256_hex_encode(stopHash));
 
     if (manager->saveFilterHeaders) {
         manager->saveFilterHeaders(manager->saveFilterHeadersInfo, manager->compactFilterChain);
+    }
+
+    // Auto-fetch cfilters for the newly validated range, capped at the spec
+    // MAX_CFILTERS_RESULTS. The driver requests one batch per cfheaders
+    // arrival; consecutive cfheaders responses advance the cursor through
+    // the chain until it catches up to the block tip.
+    if (manager->autoFetchCFiltersEnabled) {
+        uint32_t reqStart = manager->autoFetchCFiltersThrough + 1;
+        if (reqStart < manager->autoFetchCFiltersStart) reqStart = manager->autoFetchCFiltersStart;
+        if (reqStart <= chainTip) {
+            uint32_t reqStop = chainTip;
+            if (reqStop > reqStart + (MAX_CFILTERS_RESULTS - 1)) {
+                reqStop = reqStart + (MAX_CFILTERS_RESULTS - 1);
+            }
+            size_t n = _BRPeerManagerRequestCFiltersLocked(manager, reqStart, reqStop);
+            if (n > 0) {
+                manager->autoFetchCFiltersThrough = reqStop;
+                peer_log(peer, "cfilters: auto-requested [%u..%u] (%zu blocks)",
+                         reqStart, reqStop, n);
+            }
+        }
     }
 
     // Request the next batch if still behind the local block tip.
@@ -2487,26 +2514,19 @@ void BRPeerManagerSetSaveFilterHeaders(BRPeerManager *manager, void *info,
     pthread_mutex_unlock(&manager->lock);
 }
 
-size_t BRPeerManagerRequestCompactFilters(BRPeerManager *manager,
-                                          uint32_t startHeight, uint32_t stopHeight)
+// Lock-held internal helper. Caller must hold manager->lock. Returns the
+// number of blocks actually requested or 0 if no eligible peer was found.
+static size_t _BRPeerManagerRequestCFiltersLocked(BRPeerManager *manager,
+                                                  uint32_t startHeight, uint32_t stopHeight)
 {
-    if (!manager) return 0;
     if (stopHeight < startHeight) return 0;
-
-    pthread_mutex_lock(&manager->lock);
-    if (manager->syncMode == BR_SYNC_MODE_BLOOM_ONLY) {
-        pthread_mutex_unlock(&manager->lock);
-        return 0;
-    }
+    if (manager->syncMode == BR_SYNC_MODE_BLOOM_ONLY) return 0;
 
     uint32_t cap = startHeight + (MAX_CFILTERS_RESULTS - 1);
     if (stopHeight > cap) stopHeight = cap;
 
     UInt256 stopHash = _BRPeerManagerBlockHashAtHeight(manager, stopHeight);
-    if (UInt256IsZero(stopHash)) {
-        pthread_mutex_unlock(&manager->lock);
-        return 0;
-    }
+    if (UInt256IsZero(stopHash)) return 0;
 
     uint8_t filterType = manager->compactFilterChain
                          ? BRCompactFilterChainType(manager->compactFilterChain)
@@ -2520,17 +2540,42 @@ size_t BRPeerManagerRequestCompactFilters(BRPeerManager *manager,
         target = p;
         break;
     }
-
-    if (!target) {
-        pthread_mutex_unlock(&manager->lock);
-        return 0;
-    }
-
-    size_t requested = stopHeight - startHeight + 1;
-    pthread_mutex_unlock(&manager->lock); // release before blocking send
+    if (!target) return 0;
 
     BRPeerSendGetCFilters(target, filterType, startHeight, stopHash);
-    return requested;
+    return stopHeight - startHeight + 1;
+}
+
+size_t BRPeerManagerRequestCompactFilters(BRPeerManager *manager,
+                                          uint32_t startHeight, uint32_t stopHeight)
+{
+    if (!manager) return 0;
+    pthread_mutex_lock(&manager->lock);
+    size_t n = _BRPeerManagerRequestCFiltersLocked(manager, startHeight, stopHeight);
+    pthread_mutex_unlock(&manager->lock);
+    return n;
+}
+
+void BRPeerManagerEnableAutoCompactFilterFetch(BRPeerManager *manager, uint32_t startHeight)
+{
+    assert(manager != NULL);
+    pthread_mutex_lock(&manager->lock);
+    manager->autoFetchCFiltersEnabled = 1;
+    manager->autoFetchCFiltersStart = startHeight;
+    // Reset cursor to (start - 1) so the first cfheaders batch covering the
+    // range immediately triggers a cfilter fetch at startHeight.
+    manager->autoFetchCFiltersThrough = (startHeight > 0) ? startHeight - 1 : 0;
+    pthread_mutex_unlock(&manager->lock);
+}
+
+void BRPeerManagerDisableAutoCompactFilterFetch(BRPeerManager *manager)
+{
+    assert(manager != NULL);
+    pthread_mutex_lock(&manager->lock);
+    manager->autoFetchCFiltersEnabled = 0;
+    manager->autoFetchCFiltersStart = 0;
+    manager->autoFetchCFiltersThrough = 0;
+    pthread_mutex_unlock(&manager->lock);
 }
 
 /*

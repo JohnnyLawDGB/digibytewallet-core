@@ -205,11 +205,19 @@ void BRPeerManagerSetSaveFilterHeaders(BRPeerManager *manager, void *info,
 //
 // Returns the number of blocks actually requested (0 if no eligible peer
 // is connected, or both endpoints fall outside the in-memory block window).
-// Caller drives this — the manager does not auto-request cfilters because
-// "which blocks to ask about" depends on wallet birth height and prior
-// match state owned by the wallet layer.
 size_t BRPeerManagerRequestCompactFilters(BRPeerManager *manager,
                                           uint32_t startHeight, uint32_t stopHeight);
+
+// Enable automatic cfilter requesting. Once enabled, every successful
+// cfheaders batch triggers a cfilter request for the new range capped at
+// MAX_CFILTERS_RESULTS, starting from max(startHeight, lastRequested+1).
+// "startHeight" should be the wallet's birth height (height of earliest
+// block that could contain a wallet-relevant tx). Pass 0 to scan from
+// genesis.
+//
+// Disable resets the auto-fetch cursor so the next Enable starts fresh.
+void BRPeerManagerEnableAutoCompactFilterFetch(BRPeerManager *manager, uint32_t startHeight);
+void BRPeerManagerDisableAutoCompactFilterFetch(BRPeerManager *manager);
 
 // ----------- end BIP 158 opt-in -----------
 

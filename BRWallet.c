@@ -416,6 +416,20 @@ BRWallet *BRWalletNewDual(BRTransaction *transactions[], size_t txCount,
                 if (tx->outputs[j].address[0] != '\0') BRSetAdd(wallet->usedAddrs, tx->outputs[j].address);
             }
         }
+        pthread_mutex_unlock(&wallet->lock);
+
+        // Extend BIP84 chains past every used address before computing balance.
+        // Without this, _BRWalletUpdateBalance skips outputs whose addresses
+        // are beyond the gap-limit window pre-genned by BRWalletNew(NULL,0,…)
+        // above — the wallet shows full tx history but balance == 0 until a
+        // later SPV register fires this same extension as a side effect.
+        // Mirrors BRWalletNew's post-tx-load order (lines 327-330).
+        BRWalletUnusedAddrs(wallet, NULL, SEQUENCE_GAP_LIMIT_EXTERNAL, 0, 1);
+        BRWalletUnusedAddrs(wallet, NULL, SEQUENCE_GAP_LIMIT_INTERNAL, 1, 1);
+        BRWalletUnusedAddrs(wallet, NULL, SEQUENCE_GAP_LIMIT_EXTERNAL, 0, 0);
+        BRWalletUnusedAddrs(wallet, NULL, SEQUENCE_GAP_LIMIT_INTERNAL, 1, 0);
+
+        pthread_mutex_lock(&wallet->lock);
         _BRWalletUpdateBalance(wallet);
         pthread_mutex_unlock(&wallet->lock);
     }

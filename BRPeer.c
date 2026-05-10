@@ -911,6 +911,69 @@ static int _BRPeerAcceptFeeFilterMessage(BRPeer *peer, const uint8_t *msg, size_
     return r;
 }
 
+// Full-block message handler. The 80-byte block header is followed by a
+// CompactSize tx count, then serialized txs. Each tx is dispatched via the
+// existing relayedTx callback so the wallet's tx-registration path handles
+// it the same way it would a standalone "tx" message.
+//
+// BIP 158 path: we ask for a full block (inv_block) after a cfilter match,
+// then this handler walks the txs to find the ones touching our wallet.
+// Chain extension is handled by the regular "headers"/"merkleblock" path
+// independent of this handler, so we deliberately do not call relayedBlock
+// from here.
+static int _BRPeerAcceptBlockMessage(BRPeer *peer, const uint8_t *msg, size_t msgLen)
+{
+    BRPeerContext *ctx = (BRPeerContext *)peer;
+
+    if (msgLen < 80 + 1) {
+        peer_log(peer, "malformed block message, length is %zu, should be >= 81", msgLen);
+        return 0;
+    }
+
+    size_t off = 80; // skip the block header
+    size_t varLen = 0;
+    size_t txCount = (size_t)BRVarInt(&msg[off], (off <= msgLen ? msgLen - off : 0), &varLen);
+    off += varLen;
+
+    if (varLen == 0) {
+        peer_log(peer, "malformed block message, bad tx count CompactSize");
+        return 0;
+    }
+
+    peer_log(peer, "got block with %zu tx(s), %zu bytes", txCount, msgLen);
+
+    size_t delivered = 0;
+    for (size_t i = 0; i < txCount; i++) {
+        if (off >= msgLen) {
+            peer_log(peer, "malformed block: ran off end at tx %zu of %zu", i, txCount);
+            return 0;
+        }
+        BRTransaction *tx = BRTransactionParse(&msg[off], msgLen - off);
+        if (!tx) {
+            peer_log(peer, "malformed block: tx %zu failed to parse", i);
+            return 0;
+        }
+        size_t consumed = BRTransactionSerialize(tx, NULL, 0);
+        if (consumed == 0 || off + consumed > msgLen) {
+            peer_log(peer, "malformed block: tx %zu consumed %zu would overrun", i, consumed);
+            BRTransactionFree(tx);
+            return 0;
+        }
+        off += consumed;
+
+        if (ctx->relayedTx) {
+            ctx->relayedTx(ctx->info, tx); // callback takes ownership
+            delivered++;
+        }
+        else {
+            BRTransactionFree(tx);
+        }
+    }
+
+    peer_log(peer, "block: delivered %zu/%zu tx(s) via relayedTx", delivered, txCount);
+    return 1;
+}
+
 // BIP 157: https://github.com/bitcoin/bips/blob/master/bip-0157.mediawiki
 //   cfheaders payload:
 //     filter_type             (1 byte)
@@ -1095,6 +1158,7 @@ static int _BRPeerAcceptMessage(BRPeer *peer, const uint8_t *msg, size_t msgLen,
     else if (strncmp(MSG_CFHEADERS, type, 12) == 0) r = _BRPeerAcceptCFHeadersMessage(peer, msg, msgLen);
     else if (strncmp(MSG_CFILTER, type, 12) == 0) r = _BRPeerAcceptCFilterMessage(peer, msg, msgLen);
     else if (strncmp(MSG_CFCHECKPT, type, 12) == 0) r = _BRPeerAcceptCFCheckptMessage(peer, msg, msgLen);
+    else if (strncmp(MSG_BLOCK, type, 12) == 0) r = _BRPeerAcceptBlockMessage(peer, msg, msgLen);
     else peer_log(peer, "dropping %s, length %zu, not implemented", type, msgLen);
 
     return r;
@@ -1792,7 +1856,7 @@ void BRPeerSendGetdata(BRPeer *peer, const UInt256 txHashes[], size_t txCount, c
                        size_t blockCount)
 {
     size_t i, off = 0, count = txCount + blockCount;
-    
+
     if (count > MAX_GETDATA_HASHES) { // limit total hash count to MAX_GETDATA_HASHES
         peer_log(peer, "couldn't send getdata, %zu is too many items, max is %d", count, MAX_GETDATA_HASHES);
     }
@@ -1801,24 +1865,49 @@ void BRPeerSendGetdata(BRPeer *peer, const UInt256 txHashes[], size_t txCount, c
         uint8_t msg[msgLen];
 
         off += BRVarIntSet(&msg[off], (off <= msgLen ? msgLen - off : 0), count);
-        
+
         for (i = 0; i < txCount; i++) {
             UInt32SetLE(&msg[off], inv_tx);
             off += sizeof(uint32_t);
             UInt256Set(&msg[off], txHashes[i]);
             off += sizeof(UInt256);
         }
-        
+
         for (i = 0; i < blockCount; i++) {
             UInt32SetLE(&msg[off], inv_filtered_block);
             off += sizeof(uint32_t);
             UInt256Set(&msg[off], blockHashes[i]);
             off += sizeof(UInt256);
         }
-        
+
         ((BRPeerContext *)peer)->sentGetdata = 1;
         BRPeerSendMessage(peer, msg, off, MSG_GETDATA);
     }
+}
+
+void BRPeerSendGetdataBlocks(BRPeer *peer, const UInt256 blockHashes[], size_t blockCount)
+{
+    if (blockCount == 0) return;
+    if (blockCount > MAX_GETDATA_HASHES) {
+        peer_log(peer, "couldn't send getdata(blocks), %zu is too many items, max is %d",
+                 blockCount, MAX_GETDATA_HASHES);
+        return;
+    }
+
+    size_t off = 0;
+    size_t msgLen = BRVarIntSize(blockCount) + (sizeof(uint32_t) + sizeof(UInt256))*blockCount;
+    uint8_t msg[msgLen];
+
+    off += BRVarIntSet(&msg[off], (off <= msgLen ? msgLen - off : 0), blockCount);
+    for (size_t i = 0; i < blockCount; i++) {
+        UInt32SetLE(&msg[off], inv_block);
+        off += sizeof(uint32_t);
+        UInt256Set(&msg[off], blockHashes[i]);
+        off += sizeof(UInt256);
+    }
+
+    ((BRPeerContext *)peer)->sentGetdata = 1;
+    BRPeerSendMessage(peer, msg, off, MSG_GETDATA);
 }
 
 void BRPeerSendGetaddr(BRPeer *peer)

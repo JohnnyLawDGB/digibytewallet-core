@@ -197,6 +197,20 @@ void BRPeerManagerSetSaveFilterHeaders(BRPeerManager *manager, void *info,
                                        void (*saveFilterHeaders)(void *info,
                                                                   const BRCompactFilterChain *chain));
 
+// Request cfilters for the inclusive range [startHeight, stopHeight] from
+// any filter-capable peer that is currently connected. Caps the range at
+// MAX_CFILTERS_RESULTS; if the requested range is larger, only the first
+// MAX_CFILTERS_RESULTS blocks are requested and the caller must call again
+// with the remainder.
+//
+// Returns the number of blocks actually requested (0 if no eligible peer
+// is connected, or both endpoints fall outside the in-memory block window).
+// Caller drives this — the manager does not auto-request cfilters because
+// "which blocks to ask about" depends on wallet birth height and prior
+// match state owned by the wallet layer.
+size_t BRPeerManagerRequestCompactFilters(BRPeerManager *manager,
+                                          uint32_t startHeight, uint32_t stopHeight);
+
 // ----------- end BIP 158 opt-in -----------
 
 // frees memory allocated for manager (call BRPeerManagerDisconnect() first if connected)

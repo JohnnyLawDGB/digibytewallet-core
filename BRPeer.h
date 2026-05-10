@@ -237,6 +237,11 @@ void BRPeerSendGetCFHeaders(BRPeer *peer, uint8_t filterType, uint32_t startHeig
 void BRPeerSendGetCFilters(BRPeer *peer, uint8_t filterType, uint32_t startHeight, UInt256 stopHash);
 void BRPeerSendGetCFCheckpt(BRPeer *peer, uint8_t filterType, UInt256 stopHash);
 
+// BIP 158 full-block fetch. getdata with inv_block (vs the inv_filtered_block
+// used by BRPeerSendGetdata, which only makes sense once a bloom filter is
+// loaded). Triggered when a cfilter matches one of the wallet's elements.
+void BRPeerSendGetdataBlocks(BRPeer *peer, const UInt256 blockHashes[], size_t blockCount);
+
 // Subscribe to BIP 157 reply messages. Callbacks are optional (pass NULL to
 // ignore a message type) and receive borrowed pointers that must not be
 // retained past the call. Set once before BRPeerConnect; not thread-safe.

@@ -28,6 +28,8 @@
 #include "BRArray.h"
 #include "BRInt.h"
 #include "BRCompactFilterChain.h"
+#include "BRGCSFilter.h"
+#include "BRWalletFilterElements.h"
 #include <stdlib.h>
 #include <stdio.h>
 #include <inttypes.h>
@@ -1880,9 +1882,13 @@ static void _peerRelayedCFHeaders(void *info, uint8_t filterType, UInt256 stopHa
     pthread_mutex_unlock(&manager->lock);
 }
 
-// B2 stub: the cfilter response handler. C1 will add wallet-address
-// matching here. For now we just verify the filter against the chain so
-// peers serving garbage are caught early.
+// cfilter response handler. Three jobs:
+//   1. Verify the filter against the chain (catches lying peers).
+//   2. Match the wallet's address set against the decoded filter.
+//   3. On match, ask the same peer for the full block via inv_block getdata.
+//      The block message handler in BRPeer.c walks the txs and dispatches
+//      each via the existing relayedTx callback, which is wired to
+//      BRWalletRegisterTransaction. Idempotent on duplicate registers.
 static void _peerRelayedCFilter(void *info, uint8_t filterType, UInt256 blockHash,
                                 const uint8_t *encoded, size_t encodedLen)
 {
@@ -1896,8 +1902,6 @@ static void _peerRelayedCFilter(void *info, uint8_t filterType, UInt256 blockHas
         return;
     }
 
-    // We need the height for this block to verify. Look it up in the block
-    // set; the value comes for free once we walk the chain.
     BRMerkleBlock *b = BRSetGet(manager->blocks, &blockHash);
     if (!b) {
         peer_log(peer, "cfilter: unknown block %s, dropping", log_u256_hex_encode(blockHash));
@@ -1909,8 +1913,35 @@ static void _peerRelayedCFilter(void *info, uint8_t filterType, UInt256 blockHas
         peer_log(peer, "cfilter: filter for block %s does not match chain — misbehavin'",
                  log_u256_hex_encode(blockHash));
         _BRPeerManagerPeerMisbehavin(manager, peer);
+        pthread_mutex_unlock(&manager->lock);
+        return;
     }
-    // C1: wallet-address matching + block fetch on hit.
+
+    BRGCSFilter *gcs = BRGCSFilterBasicParse(encoded, encodedLen, blockHash);
+    if (!gcs) {
+        peer_log(peer, "cfilter: failed to parse filter for block %s",
+                 log_u256_hex_encode(blockHash));
+        pthread_mutex_unlock(&manager->lock);
+        return;
+    }
+
+    BRWalletFilterElements *fe = BRWalletGetFilterElements(manager->wallet);
+    int hit = 0;
+    if (fe && fe->count > 0) {
+        hit = BRGCSFilterMatchAny(gcs, fe->elements, fe->elementLens, fe->count);
+    }
+    BRWalletFilterElementsFree(fe);
+    BRGCSFilterFree(gcs);
+
+    if (hit) {
+        peer_log(peer, "cfilter: MATCH on block %s @ height %u, requesting full block",
+                 log_u256_hex_encode(blockHash), b->height);
+        // Send while holding the lock — matches the pattern used elsewhere
+        // in this file (e.g. _BRPeerManagerRequestNextCFHeaders also sends
+        // under the lock). The lock guards manager state, not the socket.
+        BRPeerSendGetdataBlocks(peer, &blockHash, 1);
+    }
+
     pthread_mutex_unlock(&manager->lock);
 }
 
@@ -2454,6 +2485,52 @@ void BRPeerManagerSetSaveFilterHeaders(BRPeerManager *manager, void *info,
     manager->saveFilterHeadersInfo = info;
     manager->saveFilterHeaders = saveFilterHeaders;
     pthread_mutex_unlock(&manager->lock);
+}
+
+size_t BRPeerManagerRequestCompactFilters(BRPeerManager *manager,
+                                          uint32_t startHeight, uint32_t stopHeight)
+{
+    if (!manager) return 0;
+    if (stopHeight < startHeight) return 0;
+
+    pthread_mutex_lock(&manager->lock);
+    if (manager->syncMode == BR_SYNC_MODE_BLOOM_ONLY) {
+        pthread_mutex_unlock(&manager->lock);
+        return 0;
+    }
+
+    uint32_t cap = startHeight + (MAX_CFILTERS_RESULTS - 1);
+    if (stopHeight > cap) stopHeight = cap;
+
+    UInt256 stopHash = _BRPeerManagerBlockHashAtHeight(manager, stopHeight);
+    if (UInt256IsZero(stopHash)) {
+        pthread_mutex_unlock(&manager->lock);
+        return 0;
+    }
+
+    uint8_t filterType = manager->compactFilterChain
+                         ? BRCompactFilterChainType(manager->compactFilterChain)
+                         : FILTER_TYPE_BASIC;
+
+    BRPeer *target = NULL;
+    for (size_t i = array_count(manager->connectedPeers); i > 0; i--) {
+        BRPeer *p = manager->connectedPeers[i - 1];
+        if (BRPeerConnectStatus(p) != BRPeerStatusConnected) continue;
+        if ((p->services & SERVICES_NODE_COMPACT_FILTERS) != SERVICES_NODE_COMPACT_FILTERS) continue;
+        target = p;
+        break;
+    }
+
+    if (!target) {
+        pthread_mutex_unlock(&manager->lock);
+        return 0;
+    }
+
+    size_t requested = stopHeight - startHeight + 1;
+    pthread_mutex_unlock(&manager->lock); // release before blocking send
+
+    BRPeerSendGetCFilters(target, filterType, startHeight, stopHash);
+    return requested;
 }
 
 /*

@@ -278,14 +278,13 @@ BRGCSFilter *BRGCSFilterParse(const uint8_t *bytes, size_t len,
     }
 
     // The stream must be exhausted after N values, possibly with a few
-    // padding zero bits to the next byte boundary. Any remaining bytes
-    // beyond the current byte indicate excess data — reject (matches
-    // Bitcoin Core's "encoded_filter contains excess data" check).
-    //
-    // We accept remaining bits in the current byte because Golomb-Rice
-    // is bit-aligned, not byte-aligned. Bitcoin Core's BitStreamReader
-    // handles this implicitly; we make it explicit here.
-    if (br.bytePos < len) { BRGCSFilterFree(f); return NULL; }
+    // padding zero bits to the next byte boundary. BIP 158 zero-pads to
+    // byte boundary at the end, so after the last value bytePos lands
+    // either ON the final byte (bitPos > 0, padding ahead) or one past
+    // it (bitPos == 0, exact alignment). We only reject if a WHOLE byte
+    // remains unread — matches Bitcoin Core's "encoded_filter contains
+    // excess data" check while accepting valid bit-aligned termination.
+    if (br.bytePos + 1 < len) { BRGCSFilterFree(f); return NULL; }
     // Intentionally no check on br.bitPos: the encoder zero-pads to the
     // next byte boundary per BIP 158, so any trailing bits should be
     // zero but we don't verify that — not all implementations are

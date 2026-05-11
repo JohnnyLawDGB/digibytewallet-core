@@ -179,6 +179,17 @@ void BRPeerManagerSetSyncMode(BRPeerManager *manager, BRSyncMode mode);
 
 BRSyncMode BRPeerManagerGetSyncMode(BRPeerManager *manager);
 
+// Mid-run fallback: flips to BLOOM_ONLY and immediately pushes a bloom
+// filterload to every connected peer. Use when the BIP158 watchdog
+// determines filter peers are unreachable. After this returns, the
+// wallet receives txs via merkleblocks/bloom; cfheaders/cfilters paths
+// stay inert until the next mode change.
+void BRPeerManagerFallbackToBloom(BRPeerManager *manager);
+
+// Current compact-filter chain tip height (0 if no chain yet). Used by
+// the watchdog to detect "filter peers connected but not making progress."
+uint32_t BRPeerManagerCFChainTipHeight(BRPeerManager *manager);
+
 // Provide a previously persisted filter-header chain. The manager takes
 // ownership of the chain pointer; do not free it. Passing NULL clears any
 // existing chain. Must be called before BRPeerManagerConnect.

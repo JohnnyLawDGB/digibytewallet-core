@@ -304,6 +304,14 @@ static size_t _BRPeerManagerAddPeer(BRPeerManager *manager, BRPeer *peer) {
 
 static void _BRPeerManagerLoadBloomFilter(BRPeerManager *manager, BRPeer *peer)
 {
+    // Privacy-first: skip bloom filterload entirely when the wallet is
+    // running compact-filters-only. The wallet still receives merkleblock
+    // headers without a filterload (peer assumes empty filter == match-all),
+    // but the address set never leaves the device. The Kotlin watchdog
+    // flips syncMode to BLOOM_ONLY if filter peers don't progress within
+    // 120s, after which this function runs normally on the next call.
+    if (manager->syncMode == BR_SYNC_MODE_COMPACT_FILTERS_ONLY) return;
+
     // every time a new wallet address is added, the bloom filter has to be rebuilt, and each address is only used
     // for one transaction, so here we generate some spare addresses to avoid rebuilding the filter each time a
     // wallet transaction is encountered during the chain sync
@@ -832,6 +840,8 @@ static void _BRPeerManagerFindPeers(BRPeerManager *manager)
 static void _BRPeerManagerOnFilterCapablePeerConnected(BRPeerManager *manager, void *peerCbInfo, BRPeer *peer);
 static size_t _BRPeerManagerRequestCFiltersLocked(BRPeerManager *manager,
                                                   uint32_t startHeight, uint32_t stopHeight);
+static BRPeer *_BRPeerManagerAnyFilterCapablePeer(BRPeerManager *manager);
+static void _BRPeerManagerRequestNextCFHeaders(BRPeerManager *manager, BRPeer *peer);
 
 static void _peerConnected(void *info)
 {
@@ -1413,7 +1423,17 @@ static void _peerRelayedBlock(void *info, BRMerkleBlock *block)
         
         BRSetAdd(manager->blocks, block);
         manager->lastBlock = block;
-        
+
+        // Kick cfheaders driver — on fresh-boot the autoFetchCFiltersStart
+        // height may sit above the checkpoint, so OnFilterCapablePeerConnected
+        // saw tip<start and bailed. Each block that advances lastBlock gives
+        // the driver another chance; it self-no-ops once caught up.
+        if (manager->autoFetchCFiltersEnabled &&
+            manager->syncMode != BR_SYNC_MODE_BLOOM_ONLY) {
+            BRPeer *fp = _BRPeerManagerAnyFilterCapablePeer(manager);
+            if (fp) _BRPeerManagerRequestNextCFHeaders(manager, fp);
+        }
+
         // clear some memory
         _BRPeerManagerClearMemory(manager);
         
@@ -1813,17 +1833,44 @@ static int _BRPeerManagerPeerSupportsCompactFilters(BRPeerManager *manager, BRPe
     return (peer->services & SERVICES_NODE_COMPACT_FILTERS) == SERVICES_NODE_COMPACT_FILTERS ? 1 : 0;
 }
 
+// Pick any connected filter-capable peer (returns NULL if none). Used
+// to kick the cfheaders driver from non-peer-scoped contexts (e.g. when
+// header sync catches up to the auto-fetch start height after a fresh
+// boot). Caller must hold manager->lock.
+static BRPeer *_BRPeerManagerAnyFilterCapablePeer(BRPeerManager *manager)
+{
+    for (size_t i = array_count(manager->connectedPeers); i > 0; i--) {
+        BRPeer *p = manager->connectedPeers[i - 1];
+        if (BRPeerConnectStatus(p) != BRPeerStatusConnected) continue;
+        if (_BRPeerManagerPeerSupportsCompactFilters(manager, p)) return p;
+    }
+    return NULL;
+}
+
 // Drive the cfheaders fetch loop. Asks `peer` for the next batch
 // starting at chain->NextHeight, capped at MAX_CFHEADERS_RESULTS and at
 // the manager's known tip. No-op if the chain is already caught up or
-// the peer is not filter-capable.
+// the peer is not filter-capable. If no chain exists yet, the first batch
+// request runs anyway with startHeight=0 — the chain is created lazily in
+// _peerRelayedCFHeaders when the response lands.
 static void _BRPeerManagerRequestNextCFHeaders(BRPeerManager *manager, BRPeer *peer)
 {
     if (!_BRPeerManagerPeerSupportsCompactFilters(manager, peer)) return;
-    if (!manager->compactFilterChain) return;
     if (!manager->lastBlock) return;
 
-    uint32_t next = BRCompactFilterChainNextHeight(manager->compactFilterChain);
+    // No chain yet → start from the configured wallet birth height (TOFU).
+    // Genesis (next=0) would force a full-chain backfill we don't want.
+    uint32_t next;
+    if (manager->compactFilterChain) {
+        next = BRCompactFilterChainNextHeight(manager->compactFilterChain);
+    } else {
+        next = manager->autoFetchCFiltersEnabled
+               ? manager->autoFetchCFiltersStart
+               : 0;
+    }
+    uint8_t filterType = manager->compactFilterChain
+                         ? BRCompactFilterChainType(manager->compactFilterChain)
+                         : FILTER_TYPE_BASIC;
     uint32_t tip = manager->lastBlock->height;
     if (next > tip) return; // already caught up
 
@@ -1838,9 +1885,7 @@ static void _BRPeerManagerRequestNextCFHeaders(BRPeerManager *manager, BRPeer *p
 
     peer_log(peer, "cfheaders: requesting [%u..%u] (%u headers)",
              next, batchEnd, batchEnd - next + 1);
-    BRPeerSendGetCFHeaders(peer,
-                           BRCompactFilterChainType(manager->compactFilterChain),
-                           next, stopHash);
+    BRPeerSendGetCFHeaders(peer, filterType, next, stopHash);
 }
 
 // --- BIP 158 peer callbacks -----------------------------------------------
@@ -1855,9 +1900,14 @@ static void _peerRelayedCFHeaders(void *info, uint8_t filterType, UInt256 stopHa
     pthread_mutex_lock(&manager->lock);
 
     // Lazily allocate the chain on the first batch if persistence hadn't
-    // restored one yet. Genesis anchor: startHeight=0, prevHeader=ZERO.
+    // restored one yet. Anchor TOFU-style at the wallet birth height with
+    // the peer's claimed prevFilterHeader; Append() then succeeds because
+    // the anchor it checks against equals the value we just stored.
     if (!manager->compactFilterChain) {
-        manager->compactFilterChain = BRCompactFilterChainNew(filterType, 0, UINT256_ZERO);
+        uint32_t startHeight = manager->autoFetchCFiltersEnabled
+                               ? manager->autoFetchCFiltersStart
+                               : 0;
+        manager->compactFilterChain = BRCompactFilterChainNew(filterType, startHeight, prevFilterHeader);
     }
 
     if (filterType != BRCompactFilterChainType(manager->compactFilterChain)) {
@@ -2481,6 +2531,44 @@ BRSyncMode BRPeerManagerGetSyncMode(BRPeerManager *manager)
     BRSyncMode m = manager->syncMode;
     pthread_mutex_unlock(&manager->lock);
     return m;
+}
+
+// Mid-run fallback: flip syncMode to BLOOM_ONLY AND push a freshly-built
+// bloom filterload to every currently-connected peer. Required because
+// _peerConnected only fires on new connections — peers that handshook
+// while syncMode==COMPACT_FILTERS_ONLY never received our filter, so they
+// won't relay matching txs after the mode change without an explicit
+// reload. Called from JNI when the Kotlin watchdog times out.
+void BRPeerManagerFallbackToBloom(BRPeerManager *manager)
+{
+    assert(manager != NULL);
+    pthread_mutex_lock(&manager->lock);
+    manager->syncMode = BR_SYNC_MODE_BLOOM_ONLY;
+    for (size_t i = array_count(manager->connectedPeers); i > 0; i--) {
+        BRPeer *p = manager->connectedPeers[i - 1];
+        if (BRPeerConnectStatus(p) == BRPeerStatusConnected) {
+            _BRPeerManagerLoadBloomFilter(manager, p);
+        }
+    }
+    pthread_mutex_unlock(&manager->lock);
+}
+
+// Current cfheaders tip height (height of the last header we've stored).
+// 0 if no chain yet. Used by the watchdog to detect "no progress."
+uint32_t BRPeerManagerCFChainTipHeight(BRPeerManager *manager)
+{
+    if (!manager) return 0;
+    pthread_mutex_lock(&manager->lock);
+    uint32_t h = 0;
+    if (manager->compactFilterChain) {
+        // NextHeight is start + count; tip is one below, but if count==0
+        // there's no tip yet — return start-1 as "anchor seen, no headers"
+        // marker, or 0 if no chain at all.
+        uint32_t next = BRCompactFilterChainNextHeight(manager->compactFilterChain);
+        h = next > 0 ? next - 1 : 0;
+    }
+    pthread_mutex_unlock(&manager->lock);
+    return h;
 }
 
 void BRPeerManagerSetCompactFilterChain(BRPeerManager *manager, BRCompactFilterChain *chain)

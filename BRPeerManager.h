@@ -226,9 +226,17 @@ size_t BRPeerManagerRequestCompactFilters(BRPeerManager *manager,
 // block that could contain a wallet-relevant tx). Pass 0 to scan from
 // genesis.
 //
+// SPV wallets only persist a window of block headers near the current
+// tip, so passing a startHeight below that window would defer the first
+// cfheaders batch forever (the driver can't produce a stopHash for an
+// unknown block). The implementation snaps startHeight up to a height it
+// can resolve, biased toward lastBlock. Use BRPeerManagerGetAutoFetchCFiltersStart
+// to read back the value the manager actually committed to.
+//
 // Disable resets the auto-fetch cursor so the next Enable starts fresh.
 void BRPeerManagerEnableAutoCompactFilterFetch(BRPeerManager *manager, uint32_t startHeight);
 void BRPeerManagerDisableAutoCompactFilterFetch(BRPeerManager *manager);
+uint32_t BRPeerManagerGetAutoFetchCFiltersStart(BRPeerManager *manager);
 
 // ----------- end BIP 158 opt-in -----------
 

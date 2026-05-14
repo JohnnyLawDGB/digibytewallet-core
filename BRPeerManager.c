@@ -2648,6 +2648,34 @@ void BRPeerManagerEnableAutoCompactFilterFetch(BRPeerManager *manager, uint32_t 
 {
     assert(manager != NULL);
     pthread_mutex_lock(&manager->lock);
+
+    // Clamp startHeight up to a value the in-memory block window can
+    // resolve. _BRPeerManagerBlockHashAtHeight walks lastBlock backwards
+    // via prevBlock pointers; if startHeight is below that window the
+    // cfheaders driver defers forever (stopHash for batchEnd never
+    // exists). Callers commonly request startHeight=0 either because a
+    // fresh wallet has not loaded saved blocks yet or because the caller
+    // can't resolve the wallet's birth height pre-startSync; either way
+    // we still want filters to work, so anchor near lastBlock.
+    if (manager->lastBlock && startHeight < manager->lastBlock->height) {
+        UInt256 startHash = _BRPeerManagerBlockHashAtHeight(manager, startHeight);
+        if (UInt256IsZero(startHash)) {
+            uint32_t tipHeight = manager->lastBlock->height;
+            // Back off by one cfheaders batch from tip so the first batch
+            // is filled and subsequent batches advance forward. Subsequent
+            // batches resolve their own stopHash via the filter chain so
+            // don't need a margin.
+            uint32_t margin = (MAX_CFHEADERS_RESULTS > 1) ? (MAX_CFHEADERS_RESULTS - 1) : 0;
+            startHeight = (tipHeight > margin) ? tipHeight - margin : 0;
+            // Belt-and-suspenders: if the clamped value is still
+            // unreachable (e.g. fresh wallet with only a sparse checkpoint
+            // in manager->blocks), fall back to lastBlock->height itself
+            // which is always resolvable.
+            UInt256 clampedHash = _BRPeerManagerBlockHashAtHeight(manager, startHeight);
+            if (UInt256IsZero(clampedHash)) startHeight = tipHeight;
+        }
+    }
+
     manager->autoFetchCFiltersEnabled = 1;
     manager->autoFetchCFiltersStart = startHeight;
     // Reset cursor to (start - 1) so the first cfheaders batch covering the
@@ -2664,6 +2692,15 @@ void BRPeerManagerDisableAutoCompactFilterFetch(BRPeerManager *manager)
     manager->autoFetchCFiltersStart = 0;
     manager->autoFetchCFiltersThrough = 0;
     pthread_mutex_unlock(&manager->lock);
+}
+
+uint32_t BRPeerManagerGetAutoFetchCFiltersStart(BRPeerManager *manager)
+{
+    if (!manager) return 0;
+    pthread_mutex_lock(&manager->lock);
+    uint32_t height = manager->autoFetchCFiltersStart;
+    pthread_mutex_unlock(&manager->lock);
+    return height;
 }
 
 /*

@@ -302,6 +302,23 @@ static size_t _BRPeerManagerAddPeer(BRPeerManager *manager, BRPeer *peer) {
 	return add;
 }
 
+// Public wrapper around _BRPeerManagerAddPeer for runtime peer injection from
+// e.g. a seeder API. The init-time savedPeers blob is consumed once at peer-
+// manager creation and never reread, so injecting into that path after the
+// fact is a silent no-op — callers seeing "0 peers" while their seeder is
+// returning fresh peers want THIS function instead. Holds the manager lock
+// because manager->peers may be mutated concurrently by the message handler.
+int BRPeerManagerAddPeer(BRPeerManager *manager, UInt128 address, uint16_t port,
+                          uint64_t services)
+{
+    assert(manager != NULL);
+    BRPeer peer = (BRPeer){ address, port, services, (uint64_t)time(NULL), 0 };
+    pthread_mutex_lock(&manager->lock);
+    size_t added = _BRPeerManagerAddPeer(manager, &peer);
+    pthread_mutex_unlock(&manager->lock);
+    return (int)added;
+}
+
 static void _BRPeerManagerLoadBloomFilter(BRPeerManager *manager, BRPeer *peer)
 {
     // Privacy-first: skip bloom filterload entirely when the wallet is

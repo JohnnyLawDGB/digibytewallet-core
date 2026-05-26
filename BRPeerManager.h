@@ -112,6 +112,15 @@ void BRPeerManagerSetCallbacks(BRPeerManager *manager, void *info,
 // set address to UINT128_ZERO to revert to default behavior
 void BRPeerManagerSetFixedPeer(BRPeerManager *manager, UInt128 address, uint16_t port);
 
+// add a peer to the live candidate pool the manager picks from on the next
+// BRPeerManagerConnect cycle. Idempotent — if the address+port pair is already
+// present, this is a no-op. Returns 1 if the peer was newly added, 0 if it was
+// already known. Use this to feed runtime-discovered peers (e.g. from a seeder
+// API) into a manager that's already been built — passing them through the
+// init-time savedPeers blob only works once and is lost on next connect cycle.
+int BRPeerManagerAddPeer(BRPeerManager *manager, UInt128 address, uint16_t port,
+                          uint64_t services);
+
 // sets a custom start block
 void BRPeerManagerSetStartBlock(BRPeerManager* manager, BRMerkleBlock* start);
     

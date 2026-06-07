@@ -2123,6 +2123,33 @@ BRPeerStatus BRPeerManagerConnectStatus(BRPeerManager *manager)
     return status;
 }
 
+// Begin an async connect to a copy of `tmpl`, wiring all manager callbacks and
+// adding it to connectedPeers. Caller must hold manager->lock. Mirrors the inline
+// connect block in BRPeerManagerConnect so the BIP158 filter-first pre-pass and the
+// regular bloom selection share identical setup.
+static void _BRPeerManagerBeginConnect(BRPeerManager *manager, const BRPeer *tmpl)
+{
+    BRPeerCallbackInfo *info = calloc(1, sizeof(*info));
+    assert(info != NULL);
+    info->manager = manager;
+    info->peer = BRPeerNew(manager->params->magicNumber);
+    *info->peer = *tmpl;
+    manager->peerThreadCount++;
+    array_add(manager->connectedPeers, info->peer);
+    BRPeerSetCallbacks(info->peer, info, _peerConnected, _peerDisconnected, _peerRelayedPeers,
+                       _peerRelayedTx, _peerHasTx, _peerRejectedTx, _peerRelayedBlock, _peerDataNotfound,
+                       _peerSetFeePerKb, _peerRequestedTx, _peerNetworkIsReachable, _peerThreadCleanup);
+    BRPeerSetEarliestKeyTime(info->peer, manager->earliestKeyTime);
+    BRPeerConnect(info->peer);
+
+    if (BRPeerConnectStatus(info->peer) == BRPeerStatusDisconnected) {
+        pthread_mutex_unlock(&manager->lock);
+        _peerDisconnected(info, ENOTCONN);
+        pthread_mutex_lock(&manager->lock);
+        manager->peerThreadCount--;
+    }
+}
+
 // connect to bitcoin peer-to-peer network (also call this whenever networkIsReachable() status changes)
 void BRPeerManagerConnect(BRPeerManager *manager)
 {
@@ -2152,7 +2179,32 @@ void BRPeerManagerConnect(BRPeerManager *manager)
 			((manager->peers[manager->maxConnectCount - 1].timestamp + 3*24*60*60) < now)) {
             _BRPeerManagerFindPeers(manager);
         }
-        
+
+        // BIP 158: filter-first. The cfheaders driver only runs once a
+        // NODE_COMPACT_FILTERS peer is connected, but those are a tiny minority
+        // of the candidate pool (a few seeder nodes among hundreds of random
+        // bloom peers). The random bloom selection below almost never picks one
+        // inside the watchdog's fallback window, so connect the filter-capable
+        // peers up front. Skips any already connected; the bloom pass fills any
+        // slots left over (filter peers are full nodes, so block download still
+        // works either way). Inert in BLOOM_ONLY mode (failsafe fallback).
+        if (manager->syncMode != BR_SYNC_MODE_BLOOM_ONLY) {
+            for (size_t k = 0; k < array_count(manager->peers) &&
+                               array_count(manager->connectedPeers) < manager->maxConnectCount; k++) {
+                if ((manager->peers[k].services & SERVICES_NODE_COMPACT_FILTERS) != SERVICES_NODE_COMPACT_FILTERS)
+                    continue;
+
+                int alreadyConnected = 0;
+                for (size_t j = array_count(manager->connectedPeers); j > 0; j--) {
+                    if (BRPeerEq(&manager->peers[k], manager->connectedPeers[j - 1])) { alreadyConnected = 1; break; }
+                }
+                if (alreadyConnected) continue;
+
+                peer_log(&manager->peers[k], "BIP158: connecting filter-capable peer first");
+                _BRPeerManagerBeginConnect(manager, &manager->peers[k]);
+            }
+        }
+
         array_new(peers, 100);
 
         // Prioritize bloom-capable peers: add them to the candidate list first,

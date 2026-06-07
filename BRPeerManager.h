@@ -207,6 +207,10 @@ void BRPeerManagerFallbackToBloom(BRPeerManager *manager);
 // the watchdog to detect "filter peers connected but not making progress."
 uint32_t BRPeerManagerCFChainTipHeight(BRPeerManager *manager);
 
+// Re-anchor the compact-filter chain at the block floor when cfTip is stuck
+// below the downloaded chain (legacy deficit). Returns 1 if re-anchored.
+int BRPeerManagerReanchorCompactFilterChainAtFloor(BRPeerManager *manager);
+
 // Provide a previously persisted filter-header chain. The manager takes
 // ownership of the chain pointer; do not free it. Passing NULL clears any
 // existing chain. Must be called before BRPeerManagerConnect.

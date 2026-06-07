@@ -2692,6 +2692,75 @@ uint32_t BRPeerManagerCFChainTipHeight(BRPeerManager *manager)
     return h;
 }
 
+// Lowest contiguous block height reachable by walking prevBlock links from
+// lastBlock through the block set — i.e. the deepest height the cfheaders
+// stop-hash lookup can still resolve. Returns 0 if there is no lastBlock.
+// Caller must hold manager->lock.
+static uint32_t _BRPeerManagerBlockFloor(BRPeerManager *manager)
+{
+    BRMerkleBlock *b = manager->lastBlock;
+    if (!b) return 0;
+    for (;;) {
+        BRMerkleBlock *prev = BRSetGet(manager->blocks, &b->prevBlock);
+        if (!prev) break;
+        b = prev;
+    }
+    return b->height;
+}
+
+// Re-anchor the compact-filter chain at the current block floor when cfTip has
+// fallen below the lowest contiguous downloaded block — a legacy deficit the
+// header-retention fix cannot bridge, because the gap blocks were never
+// re-downloaded this session. Discards the stuck chain so the next cfheaders
+// response TOFU-creates a fresh one at the floor (the existing lazy-create path
+// in _peerRelayedCFHeaders). Returns 1 if it re-anchored, 0 otherwise.
+//
+// The historical gap [old cfTip, floor] is intentionally skipped: those blocks
+// were already scanned by bloom in prior sessions. The caller (SyncService
+// watchdog) gates this on has_synced, which is that guarantee.
+int BRPeerManagerReanchorCompactFilterChainAtFloor(BRPeerManager *manager)
+{
+    assert(manager != NULL);
+    pthread_mutex_lock(&manager->lock);
+
+    if (manager->syncMode == BR_SYNC_MODE_BLOOM_ONLY || !manager->compactFilterChain) {
+        pthread_mutex_unlock(&manager->lock);
+        return 0;
+    }
+
+    uint32_t next  = BRCompactFilterChainNextHeight(manager->compactFilterChain);
+    uint32_t floor = _BRPeerManagerBlockFloor(manager);
+
+    // Only re-anchor when the next cfheaders batch starts BELOW the floor — that
+    // is the genuinely unbridgeable case. If next >= floor the driver can still
+    // walk back to its stop hash; nothing to do.
+    if (floor == 0 || next >= floor) {
+        pthread_mutex_unlock(&manager->lock);
+        return 0;
+    }
+
+    peer_log(&BR_PEER_NONE, "cfheaders: re-anchoring filter chain from stuck tip %u to block floor %u",
+             next > 0 ? next - 1 : 0, floor);
+
+    BRCompactFilterChainFree(manager->compactFilterChain);
+    manager->compactFilterChain = NULL;
+    // Establishing a fresh auto-fetch anchor at the floor — arm auto-fetch so the
+    // chain-less driver path resolves `next` to the floor (not genesis) and the
+    // lazy-create in _peerRelayedCFHeaders uses it.
+    manager->autoFetchCFiltersEnabled  = 1;
+    manager->autoFetchCFiltersStart    = floor;
+    manager->autoFetchCFiltersThrough  = floor > 0 ? floor - 1 : 0;
+    manager->cfHeadersRequestedThrough = 0;   // clear the serialization in-flight guard
+
+    // Kick recovery immediately if a filter peer is connected; otherwise the
+    // next block-extend kick handles it once filter-first connects one.
+    BRPeer *fp = _BRPeerManagerAnyFilterCapablePeer(manager);
+    if (fp) _BRPeerManagerRequestNextCFHeaders(manager, fp);
+
+    pthread_mutex_unlock(&manager->lock);
+    return 1;
+}
+
 void BRPeerManagerSetCompactFilterChain(BRPeerManager *manager, BRCompactFilterChain *chain)
 {
     assert(manager != NULL);

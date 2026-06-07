@@ -204,6 +204,41 @@ static int test_deserialize_rejects_garbage(void)
     return 0;
 }
 
+// Re-anchor pattern: an old chain anchored low is discarded, and a new chain is
+// created at a higher floor with a fresh peer-provided anchor. The new chain must
+// append from its own anchor, independent of the discarded one. This is exactly
+// what BRPeerManagerReanchorCompactFilterChainAtFloor relies on (it frees the
+// chain; _peerRelayedCFHeaders lazily recreates it at the floor).
+static int test_reanchor_restart_at_higher_start(void)
+{
+    UInt256 oldAnchor = u256_fill(0xa1);
+    BRCompactFilterChain *old = BRCompactFilterChainNew(0, 50, oldAnchor);
+    UInt256 oh = u256_fill(0x11);
+    BRCompactFilterChainAppend(old, oldAnchor, &oh, 1);
+    BRCompactFilterChainFree(old);   // discard (simulates the re-anchor)
+
+    UInt256 floorAnchor = u256_fill(0xb2);
+    BRCompactFilterChain *fresh = BRCompactFilterChainNew(0, 1000, floorAnchor);
+    EXPECT(BRCompactFilterChainNextHeight(fresh) == 1000, "fresh chain NextHeight == floor start");
+    EXPECT(BRCompactFilterChainCount(fresh) == 0, "fresh chain empty");
+
+    UInt256 f0 = u256_fill(0x30);
+    UInt256 f1 = u256_fill(0x40);
+    UInt256 batch[] = { f0, f1 };
+    int ok = BRCompactFilterChainAppend(fresh, floorAnchor, batch, 2);
+    EXPECT(ok == 1, "append against fresh floor anchor should succeed");
+    EXPECT(BRCompactFilterChainNextHeight(fresh) == 1002, "NextHeight after floor append");
+
+    UInt256 hdr1000 = BRGCSFilterHeader(f0, floorAnchor);
+    EXPECT(UInt256Eq(BRCompactFilterChainHeader(fresh, 1000), hdr1000), "floor header[1000] wrong");
+
+    UInt256 hdr1001 = BRGCSFilterHeader(f1, hdr1000);
+    EXPECT(UInt256Eq(BRCompactFilterChainHeader(fresh, 1001), hdr1001), "floor header[1001] wrong");
+
+    BRCompactFilterChainFree(fresh);
+    return 0;
+}
+
 // ---- Entry point ---------------------------------------------------------
 
 int BRCompactFilterChainTests(void)
@@ -216,6 +251,7 @@ int BRCompactFilterChainTests(void)
     r |= test_verify_filter();
     r |= test_serialize_round_trip();
     r |= test_deserialize_rejects_garbage();
+    r |= test_reanchor_restart_at_higher_start();
     if (r == 0) {
         printf("BRCompactFilterChainTests: all passing\n");
     } else {

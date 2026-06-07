@@ -212,6 +212,13 @@ struct BRPeerManagerStruct {
     uint32_t autoFetchCFiltersStart;     // wallet birth height (inclusive)
     uint32_t autoFetchCFiltersThrough;   // highest height already requested (or
                                          // start-1 if no request has fired yet)
+    // BIP 158 cfheaders are a linear chain — only one getcfheaders batch may be
+    // in flight at a time, else the rapid per-block driver kicks send duplicate
+    // requests whose late responses fail the continuity check and get filter
+    // peers disconnected. These serialize the driver: the next batch isn't
+    // requested until the in-flight one lands, fails, or times out.
+    uint32_t cfHeadersRequestedThrough;  // batchEnd of the in-flight request (0 = none)
+    time_t   cfHeadersRequestTime;       // when it was sent, for the timeout
     pthread_mutex_t lock;
 };
 
@@ -1266,25 +1273,46 @@ static void _BRPeerManagerClearMemory(BRPeerManager* manager) {
     UInt256 prevHash;
     size_t count = BRSetCount(manager->blocks);
     size_t i = 0;
-    
+
+    // BIP 158: never prune block headers at/above the compact-filter sync
+    // frontier. The cfheaders driver computes a batch's stop hash by walking
+    // prevBlock links from lastBlock down to that height; if those headers were
+    // freed the chain can never catch up a cfTip deficit (the permanent
+    // "no block hash for height H, deferring" stall). cfFloor tracks cfTip, so
+    // once filters keep pace the retained span collapses back to the normal
+    // tail. Zero in BLOOM_ONLY / no-chain so pruning behaves exactly as before.
+    uint32_t cfFloor = 0;
+    if (manager->syncMode != BR_SYNC_MODE_BLOOM_ONLY && manager->compactFilterChain) {
+        uint32_t cfNext = BRCompactFilterChainNextHeight(manager->compactFilterChain);
+        if (cfNext > CLEAR_MEM_CF_RETENTION_MARGIN) cfFloor = cfNext - CLEAR_MEM_CF_RETENTION_MARGIN;
+        else if (cfNext > 0) cfFloor = 1;
+    }
+
     if (count >= CLEAR_MEM_BLOCKS_COUNT_TRIGGER) {
         // find the tail
         while (blockPtr && i++ <= (CLEAR_MEM_BLOCKS_COUNT_TRIGGER - CLEAR_MEM_BLOCKS_COUNT_TAIL_LEN))
             blockPtr = BRSetGet(manager->blocks, &blockPtr->prevBlock);
-        
+
         if (blockPtr) {
             prevHash = blockPtr->prevBlock;
-            
+
             // clear the tail
             while (blockPtr && !UInt256IsZero(prevHash)) {
-                
+
                 // get the block
                 blockPtr = BRSetGet(manager->blocks, &prevHash);
                 if (!blockPtr) break;
-                
+
                 // get previous hash
                 prevHash = blockPtr->prevBlock;
-                
+
+                // BIP 158: keep everything at/above the compact-filter frontier
+                // so cfheaders can walk back to it. Heights descend as we walk,
+                // so once we drop below cfFloor every remaining block is too —
+                // but `continue` (not break) keeps the loop robust to any
+                // non-monotonic ordering in the set.
+                if (cfFloor > 0 && blockPtr->height >= cfFloor) continue;
+
                 // remove the current block
                 if (BRSetRemove(manager->blocks, blockPtr)) {
                     // free the actual memory
@@ -1294,7 +1322,7 @@ static void _BRPeerManagerClearMemory(BRPeerManager* manager) {
                     break;
                 }
             }
-            
+
             debug_log("[MEMORY]: Blocks reduced from %ld to %ld blocks\n", count, BRSetCount(manager->blocks));
         }
     }
@@ -1870,6 +1898,11 @@ static BRPeer *_BRPeerManagerAnyFilterCapablePeer(BRPeerManager *manager)
 // the peer is not filter-capable. If no chain exists yet, the first batch
 // request runs anyway with startHeight=0 — the chain is created lazily in
 // _peerRelayedCFHeaders when the response lands.
+// If an in-flight cfheaders request gets no response within this many seconds
+// (peer dropped, slow link), the serialization guard releases so another peer
+// can retry the same batch.
+#define CF_HEADERS_REQUEST_TIMEOUT_SECS 5
+
 static void _BRPeerManagerRequestNextCFHeaders(BRPeerManager *manager, BRPeer *peer)
 {
     if (!_BRPeerManagerPeerSupportsCompactFilters(manager, peer)) return;
@@ -1891,6 +1924,17 @@ static void _BRPeerManagerRequestNextCFHeaders(BRPeerManager *manager, BRPeer *p
     uint32_t tip = manager->lastBlock->height;
     if (next > tip) return; // already caught up
 
+    // Serialize: if a batch covering `next` is already in flight and hasn't
+    // timed out, don't send a duplicate. The driver is kicked on every
+    // block-extend during the initial sync; without this it fires the same
+    // [next..batchEnd] request at several filter peers, and the late
+    // responses fail the continuity check (chain already moved) and get those
+    // peers marked misbehavin' and disconnected — stalling cfheaders entirely.
+    if (manager->cfHeadersRequestedThrough >= next &&
+        (time(NULL) - manager->cfHeadersRequestTime) < CF_HEADERS_REQUEST_TIMEOUT_SECS) {
+        return;
+    }
+
     uint32_t batchEnd = next + (MAX_CFHEADERS_RESULTS - 1);
     if (batchEnd > tip) batchEnd = tip;
 
@@ -1903,6 +1947,8 @@ static void _BRPeerManagerRequestNextCFHeaders(BRPeerManager *manager, BRPeer *p
     peer_log(peer, "cfheaders: requesting [%u..%u] (%u headers)",
              next, batchEnd, batchEnd - next + 1);
     BRPeerSendGetCFHeaders(peer, filterType, next, stopHash);
+    manager->cfHeadersRequestedThrough = batchEnd;
+    manager->cfHeadersRequestTime = time(NULL);
 }
 
 // --- BIP 158 peer callbacks -----------------------------------------------
@@ -1937,12 +1983,18 @@ static void _peerRelayedCFHeaders(void *info, uint8_t filterType, UInt256 stopHa
     int ok = BRCompactFilterChainAppend(manager->compactFilterChain, prevFilterHeader, filterHashes, count);
     if (!ok) {
         peer_log(peer, "cfheaders: continuity check failed, treating peer as misbehavin'");
+        // Release the in-flight guard so another peer can retry this batch.
+        manager->cfHeadersRequestedThrough = 0;
         _BRPeerManagerPeerMisbehavin(manager, peer);
         pthread_mutex_unlock(&manager->lock);
         return;
     }
 
     uint32_t chainTip = BRCompactFilterChainNextHeight(manager->compactFilterChain) - 1;
+    // Mark the in-flight request satisfied through the actual new tip (a peer
+    // may return fewer than MAX_CFHEADERS_RESULTS); the continuation below then
+    // requests the next batch instead of being blocked by a stale guard value.
+    manager->cfHeadersRequestedThrough = chainTip;
     peer_log(peer, "cfheaders: chain extended to height %u (added %zu, stop %s)",
              chainTip, count, log_u256_hex_encode(stopHash));
 

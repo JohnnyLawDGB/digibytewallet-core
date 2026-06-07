@@ -64,6 +64,14 @@ Remarks:
 #define CLEAR_MEM_BLOCKS_COUNT_TRIGGER 5000
 #define CLEAR_MEM_BLOCKS_RESERVE_COUNT 500
 #define CLEAR_MEM_BLOCKS_COUNT_TAIL_LEN (CLEAR_MEM_BLOCKS_COUNT_TRIGGER - SAVE_BLOCK_COUNT - CLEAR_MEM_BLOCKS_RESERVE_COUNT)
+
+/* BIP 158: block headers at/above (cfTip - this margin) are never pruned, so
+   the cfheaders driver can always walk prevBlock links back to its next batch's
+   stop height. Without this, pruning frees the deficit region and cfheaders
+   stalls forever with "no block hash for height H". In steady state cfTip
+   tracks blockTip so the retained span collapses to the normal tail; it only
+   expands transiently while a large cfTip deficit is being recovered. */
+#define CLEAR_MEM_CF_RETENTION_MARGIN 144
     
 /* Readability constants */
 #define ADD_TO_SAVED_BLOCKS 0

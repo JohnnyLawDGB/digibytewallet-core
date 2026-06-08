@@ -872,6 +872,9 @@ static size_t _BRPeerManagerRequestCFiltersLocked(BRPeerManager *manager,
 static BRPeer *_BRPeerManagerAnyFilterCapablePeer(BRPeerManager *manager);
 static void _BRPeerManagerRequestNextCFHeaders(BRPeerManager *manager, BRPeer *peer);
 static int _BRPeerManagerReanchorAtFloorLocked(BRPeerManager *manager, int force);
+static void _BRPeerManagerProbeOtherFilterPeersForCFHeaders(BRPeerManager *manager, BRPeer *current,
+                                                            uint8_t filterType, uint32_t startHeight,
+                                                            UInt256 stopHash);
 
 static void _peerConnected(void *info)
 {
@@ -1957,6 +1960,39 @@ static void _BRPeerManagerRequestNextCFHeaders(BRPeerManager *manager, BRPeer *p
     manager->cfHeadersRequestTime = time(NULL);
 }
 
+// On the FIRST continuity mismatch (one disagreer recorded, still below the
+// re-anchor threshold), actively ask every OTHER connected filter peer about the
+// SAME contested batch. Their responses are continuity-checked against our
+// (divergent) tip too, so distinct disagreers accumulate to K within ~one round
+// trip — instead of waiting for the driver to rotate peers, which it won't once a
+// post-restore block rescan resets the block tip below cfTip and the driver goes
+// dormant (next > tip). Each probe replays the exact getcfheaders the current
+// peer just answered, so the replies align with our expected start height (the
+// alignment guard in _peerRelayedCFHeaders rejects any that arrive after a
+// re-anchor has already moved the chain). Peers already in the disagreed set are
+// skipped, so this can't storm. Assumes manager->lock is held.
+static void _BRPeerManagerProbeOtherFilterPeersForCFHeaders(BRPeerManager *manager, BRPeer *current,
+                                                            uint8_t filterType, uint32_t startHeight,
+                                                            UInt256 stopHash)
+{
+    for (size_t i = array_count(manager->connectedPeers); i > 0; i--) {
+        BRPeer *p = manager->connectedPeers[i - 1];
+        if (BRPeerEq(p, current)) continue;
+        if (BRPeerConnectStatus(p) != BRPeerStatusConnected) continue;
+        if (! _BRPeerManagerPeerSupportsCompactFilters(manager, p)) continue;
+
+        int known = 0;
+        for (uint8_t k = 0; k < manager->cfDisagreedCount; k++) {
+            if (UInt128Eq(manager->cfDisagreedPeers[k], p->address)) { known = 1; break; }
+        }
+        if (known) continue;
+
+        peer_log(p, "cfheaders: probing contested batch [%u..stop %s] to confirm divergence",
+                 startHeight, log_u256_hex_encode(stopHash));
+        BRPeerSendGetCFHeaders(p, filterType, startHeight, stopHash);
+    }
+}
+
 // --- BIP 158 peer callbacks -----------------------------------------------
 
 static void _peerRelayedCFHeaders(void *info, uint8_t filterType, UInt256 stopHash,
@@ -1967,6 +2003,32 @@ static void _peerRelayedCFHeaders(void *info, uint8_t filterType, UInt256 stopHa
     BRPeerManager *manager = ((BRPeerCallbackInfo *)info)->manager;
 
     pthread_mutex_lock(&manager->lock);
+
+    // Height-alignment guard. Compute the block height this batch claims to cover
+    // (stop height − count + 1) and compare it to where our chain expects the next
+    // batch to begin. This rejects responses that don't line up — in particular a
+    // stale active-probe reply for the OLD contested range that lands AFTER a
+    // re-anchor has already moved the chain start down to the block floor; without
+    // this it would lazily anchor a fresh chain at the floor but fill it with the
+    // contested range's filter hashes, mislabeling their heights. We only enforce
+    // the guard when the stop block is known and the batch is non-empty; otherwise
+    // we fall through to the existing continuity logic unchanged.
+    {
+        BRMerkleBlock *stopBlock = BRSetGet(manager->blocks, &stopHash);
+        if (stopBlock && count > 0 && (uint32_t)stopBlock->height + 1 >= (uint32_t)count) {
+            uint32_t batchStart = (uint32_t)stopBlock->height - (uint32_t)count + 1;
+            uint32_t expectedStart = manager->compactFilterChain
+                                     ? BRCompactFilterChainNextHeight(manager->compactFilterChain)
+                                     : (manager->autoFetchCFiltersEnabled
+                                        ? manager->autoFetchCFiltersStart : 0);
+            if (batchStart != expectedStart) {
+                peer_log(peer, "cfheaders: batch start %u != expected %u — stale/misaligned, ignoring",
+                         batchStart, expectedStart);
+                pthread_mutex_unlock(&manager->lock);
+                return;
+            }
+        }
+    }
 
     // Lazily allocate the chain on the first batch if persistence hadn't
     // restored one yet. Anchor TOFU-style at the wallet birth height with
@@ -1999,6 +2061,18 @@ static void _peerRelayedCFHeaders(void *info, uint8_t filterType, UInt256 stopHa
             manager->cfDisagreedPeers[manager->cfDisagreedCount++] = peer->address;
         }
         manager->cfHeadersRequestedThrough = 0;  // let another peer be tried
+
+        // Newly-recorded disagreer that hasn't yet reached the threshold: actively
+        // probe the other filter peers about this same contested batch so distinct
+        // disagreers accumulate to K immediately. Passive driver rotation doesn't
+        // happen once a rescan resets the block tip below cfTip (the driver goes
+        // dormant on next > tip), so without this the count stalls at 1 forever.
+        // Gated on a fresh add below K and deduped inside the probe, so no storm.
+        if (!_known && manager->cfDisagreedCount < CF_CONTINUITY_REANCHOR_K) {
+            _BRPeerManagerProbeOtherFilterPeersForCFHeaders(manager, peer, filterType,
+                                                            BRCompactFilterChainNextHeight(manager->compactFilterChain),
+                                                            stopHash);
+        }
 
         if (manager->cfDisagreedCount >= CF_CONTINUITY_REANCHOR_K &&
             manager->cfReanchorCount < CF_CONTINUITY_REANCHOR_MAX) {

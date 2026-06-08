@@ -219,6 +219,11 @@ struct BRPeerManagerStruct {
     // requested until the in-flight one lands, fails, or times out.
     uint32_t cfHeadersRequestedThrough;  // batchEnd of the in-flight request (0 = none)
     time_t   cfHeadersRequestTime;       // when it was sent, for the timeout
+    // Distinct peers that failed the cfheaders continuity check since the last
+    // successful append. K of them disagreeing means WE are the outlier.
+    UInt128  cfDisagreedPeers[CF_CONTINUITY_REANCHOR_K];
+    uint8_t  cfDisagreedCount;
+    uint8_t  cfReanchorCount;            // continuity-triggered re-anchors this session
     pthread_mutex_t lock;
 };
 
@@ -866,6 +871,7 @@ static size_t _BRPeerManagerRequestCFiltersLocked(BRPeerManager *manager,
                                                   uint32_t startHeight, uint32_t stopHeight);
 static BRPeer *_BRPeerManagerAnyFilterCapablePeer(BRPeerManager *manager);
 static void _BRPeerManagerRequestNextCFHeaders(BRPeerManager *manager, BRPeer *peer);
+static int _BRPeerManagerReanchorAtFloorLocked(BRPeerManager *manager, int force);
 
 static void _peerConnected(void *info)
 {
@@ -1982,10 +1988,35 @@ static void _peerRelayedCFHeaders(void *info, uint8_t filterType, UInt256 stopHa
 
     int ok = BRCompactFilterChainAppend(manager->compactFilterChain, prevFilterHeader, filterHashes, count);
     if (!ok) {
-        peer_log(peer, "cfheaders: continuity check failed, treating peer as misbehavin'");
-        // Release the in-flight guard so another peer can retry this batch.
-        manager->cfHeadersRequestedThrough = 0;
-        _BRPeerManagerPeerMisbehavin(manager, peer);
+        // Record this peer as one that disagrees with our tip (dedup by address).
+        // Do NOT mark it misbehavin'/disconnect — if the majority disagrees, the
+        // honest peers are right and OUR chain is the divergent outlier.
+        int _known = 0;
+        for (uint8_t i = 0; i < manager->cfDisagreedCount; i++) {
+            if (UInt128Eq(manager->cfDisagreedPeers[i], peer->address)) { _known = 1; break; }
+        }
+        if (!_known && manager->cfDisagreedCount < CF_CONTINUITY_REANCHOR_K) {
+            manager->cfDisagreedPeers[manager->cfDisagreedCount++] = peer->address;
+        }
+        manager->cfHeadersRequestedThrough = 0;  // let another peer be tried
+
+        if (manager->cfDisagreedCount >= CF_CONTINUITY_REANCHOR_K &&
+            manager->cfReanchorCount < CF_CONTINUITY_REANCHOR_MAX) {
+            manager->cfReanchorCount++;
+            peer_log(peer, "cfheaders: %u peers disagree with our tip — chain is the outlier, "
+                     "re-anchoring (attempt %u/%u)",
+                     manager->cfDisagreedCount, manager->cfReanchorCount, CF_CONTINUITY_REANCHOR_MAX);
+            _BRPeerManagerReanchorAtFloorLocked(manager, 1);
+            pthread_mutex_unlock(&manager->lock);
+            return;
+        }
+
+        // Below the K threshold, or re-anchor budget exhausted: don't append and
+        // don't punish. If the budget is exhausted the chain stops advancing and
+        // the SyncService watchdog falls back to bloom as today — pool never burned.
+        peer_log(peer, "cfheaders: continuity mismatch (%u/%u disagree, reanchors %u/%u) — not appending",
+                 manager->cfDisagreedCount, CF_CONTINUITY_REANCHOR_K,
+                 manager->cfReanchorCount, CF_CONTINUITY_REANCHOR_MAX);
         pthread_mutex_unlock(&manager->lock);
         return;
     }
@@ -1995,6 +2026,7 @@ static void _peerRelayedCFHeaders(void *info, uint8_t filterType, UInt256 stopHa
     // may return fewer than MAX_CFHEADERS_RESULTS); the continuation below then
     // requests the next batch instead of being blocked by a stale guard value.
     manager->cfHeadersRequestedThrough = chainTip;
+    manager->cfDisagreedCount = 0;   // appended cleanly — clear the disagreement window
     peer_log(peer, "cfheaders: chain extended to height %u (added %zu, stop %s)",
              chainTip, count, log_u256_hex_encode(stopHash));
 
@@ -2718,47 +2750,47 @@ static uint32_t _BRPeerManagerBlockFloor(BRPeerManager *manager)
 // The historical gap [old cfTip, floor] is intentionally skipped: those blocks
 // were already scanned by bloom in prior sessions. The caller (SyncService
 // watchdog) gates this on has_synced, which is that guarantee.
-int BRPeerManagerReanchorCompactFilterChainAtFloor(BRPeerManager *manager)
+// Discard the compact-filter chain and re-anchor at the block floor. Caller MUST
+// hold manager->lock. With force=0 (watchdog path) only re-anchors when cfTip is
+// below the floor (the unbridgeable-gap case). With force=1 (continuity-failure
+// recovery) re-anchors regardless — the chain is divergent wherever cfTip sits.
+// Returns 1 if it re-anchored, 0 otherwise.
+static int _BRPeerManagerReanchorAtFloorLocked(BRPeerManager *manager, int force)
 {
-    assert(manager != NULL);
-    pthread_mutex_lock(&manager->lock);
-
-    if (manager->syncMode == BR_SYNC_MODE_BLOOM_ONLY || !manager->compactFilterChain) {
-        pthread_mutex_unlock(&manager->lock);
-        return 0;
-    }
+    if (manager->syncMode == BR_SYNC_MODE_BLOOM_ONLY || !manager->compactFilterChain) return 0;
 
     uint32_t next  = BRCompactFilterChainNextHeight(manager->compactFilterChain);
     uint32_t floor = _BRPeerManagerBlockFloor(manager);
+    if (floor == 0) return 0;
+    if (!force && next >= floor) return 0;   // watchdog path keeps the cfTip<floor guard
 
-    // Only re-anchor when the next cfheaders batch starts BELOW the floor — that
-    // is the genuinely unbridgeable case. If next >= floor the driver can still
-    // walk back to its stop hash; nothing to do.
-    if (floor == 0 || next >= floor) {
-        pthread_mutex_unlock(&manager->lock);
-        return 0;
-    }
-
-    peer_log(&BR_PEER_NONE, "cfheaders: re-anchoring filter chain from stuck tip %u to block floor %u",
-             next > 0 ? next - 1 : 0, floor);
+    peer_log(&BR_PEER_NONE, "cfheaders: re-anchoring filter chain (force=%d) from tip %u to block floor %u",
+             force, next > 0 ? next - 1 : 0, floor);
 
     BRCompactFilterChainFree(manager->compactFilterChain);
     manager->compactFilterChain = NULL;
-    // Establishing a fresh auto-fetch anchor at the floor — arm auto-fetch so the
-    // chain-less driver path resolves `next` to the floor (not genesis) and the
-    // lazy-create in _peerRelayedCFHeaders uses it.
+    // Arm auto-fetch so the chain-less driver resolves `next` to the floor (not
+    // genesis) and the lazy-create in _peerRelayedCFHeaders uses it.
     manager->autoFetchCFiltersEnabled  = 1;
     manager->autoFetchCFiltersStart    = floor;
     manager->autoFetchCFiltersThrough  = floor > 0 ? floor - 1 : 0;
-    manager->cfHeadersRequestedThrough = 0;   // clear the serialization in-flight guard
+    manager->cfHeadersRequestedThrough = 0;
+    manager->cfDisagreedCount          = 0;   // fresh disagreement window
 
     // Kick recovery immediately if a filter peer is connected; otherwise the
     // next block-extend kick handles it once filter-first connects one.
     BRPeer *fp = _BRPeerManagerAnyFilterCapablePeer(manager);
     if (fp) _BRPeerManagerRequestNextCFHeaders(manager, fp);
-
-    pthread_mutex_unlock(&manager->lock);
     return 1;
+}
+
+int BRPeerManagerReanchorCompactFilterChainAtFloor(BRPeerManager *manager)
+{
+    assert(manager != NULL);
+    pthread_mutex_lock(&manager->lock);
+    int r = _BRPeerManagerReanchorAtFloorLocked(manager, 0);
+    pthread_mutex_unlock(&manager->lock);
+    return r;
 }
 
 void BRPeerManagerSetCompactFilterChain(BRPeerManager *manager, BRCompactFilterChain *chain)

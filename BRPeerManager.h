@@ -72,6 +72,14 @@ Remarks:
    tracks blockTip so the retained span collapses to the normal tail; it only
    expands transiently while a large cfTip deficit is being recovered. */
 #define CLEAR_MEM_CF_RETENTION_MARGIN 144
+
+/* BIP 158 continuity-failure recovery. If this many DISTINCT peers fail the
+   cfheaders continuity check against our current tip since the last successful
+   append, our chain is the outlier (it diverged via unverified TOFU) — re-anchor
+   instead of marking the (honest) peers misbehavin'. Bounded per session so a
+   persistently-divergent peer can't loop forever. */
+#define CF_CONTINUITY_REANCHOR_K   2
+#define CF_CONTINUITY_REANCHOR_MAX 3
     
 /* Readability constants */
 #define ADD_TO_SAVED_BLOCKS 0

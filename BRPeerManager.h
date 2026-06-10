@@ -179,6 +179,27 @@ void BRPeerManagerPublishTx(BRPeerManager *manager, BRTransaction *tx, void *inf
 // number of connected peers that have relayed the given unconfirmed transaction
 size_t BRPeerManagerRelayCount(BRPeerManager *manager, UInt256 txHash);
 
+// Enable/disable Dandelion stem submission (default on). Thread-safe.
+void BRPeerManagerSetDandelionEnabled(BRPeerManager *manager, int enabled);
+
+// Register a peer address as Dandelion-capable (sourced from the seeder + the
+// priority peer; there is no service bit to read). Idempotent, thread-safe.
+void BRPeerManagerAddDandelionPeer(BRPeerManager *manager, UInt128 address);
+
+// 1 if Dandelion is enabled AND a connected peer is Dandelion-capable.
+int BRPeerManagerHasDandelionPeer(BRPeerManager *manager);
+
+// Stem-submit a signed tx to ONE Dandelion-capable peer (sets is_dandelion=1 and
+// invs only that peer; the peer's getdata then pulls the dandeliontx). Returns 1
+// if stemmed, 0 if no capable peer was available (caller should then fall back to
+// BRPeerManagerPublishTx for a normal flood). Do not BRTransactionFree(tx) after.
+int BRPeerManagerStemPublishTx(BRPeerManager *manager, BRTransaction *tx, void *info,
+                               void (*callback)(void *info, int error));
+
+// Re-broadcast (flood) a previously stem-submitted tx to all connected peers,
+// clearing the dandelion flag. Idempotent; no-op if the tx isn't in the publish list.
+void BRPeerManagerFluffTx(BRPeerManager *manager, UInt256 txHash);
+
 // ----------- BIP 158 compact-filter sync (opt-in) -----------
 //
 // The functions below are inert until BRPeerManagerSetSyncMode is called with

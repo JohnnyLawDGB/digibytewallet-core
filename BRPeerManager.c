@@ -203,6 +203,9 @@ struct BRPeerManagerStruct {
     void (*savePeers)(void *info, int replace, const BRPeer peers[], size_t peersCount);
     int (*networkIsReachable)(void *info);
     void (*threadCleanup)(void *info);
+    // Dandelion++ stem submission (broadcast-origin privacy)
+    int dandelionEnabled;            // wallet setting: stem-submit on broadcast (default on)
+    UInt128 *dandelionPeers;         // addresses known Dandelion-capable (no service bit exists)
     // BIP 158 compact-filter sync (inert unless syncMode != BLOOM_ONLY)
     BRSyncMode syncMode;
     BRCompactFilterChain *compactFilterChain;
@@ -1855,6 +1858,8 @@ BRPeerManager *BRPeerManagerNewEx(const BRChainParams *params, BRWallet *wallet,
     array_new(manager->txRequests, 10);
     array_new(manager->publishedTx, 10);
     array_new(manager->publishedTxHashes, 10);
+    array_new(manager->dandelionPeers, 4);
+    manager->dandelionEnabled = 1;   // default on; Kotlin overrides from the saved setting
     pthread_mutex_init(&manager->lock, NULL);
     manager->threadCleanup = _dummyThreadCleanup;
     return manager;
@@ -2635,6 +2640,111 @@ static void _publishTxInvDone(void *info, int success)
 }
 
 // publishes tx to bitcoin network (do not call BRTransactionFree() on tx afterward)
+void BRPeerManagerSetDandelionEnabled(BRPeerManager *manager, int enabled)
+{
+    assert(manager != NULL);
+    pthread_mutex_lock(&manager->lock);
+    manager->dandelionEnabled = (enabled != 0);
+    pthread_mutex_unlock(&manager->lock);
+}
+
+void BRPeerManagerAddDandelionPeer(BRPeerManager *manager, UInt128 address)
+{
+    assert(manager != NULL);
+    pthread_mutex_lock(&manager->lock);
+    int known = 0;
+    for (size_t i = array_count(manager->dandelionPeers); i > 0; i--) {
+        if (UInt128Eq(manager->dandelionPeers[i - 1], address)) { known = 1; break; }
+    }
+    if (! known) array_add(manager->dandelionPeers, address);
+    pthread_mutex_unlock(&manager->lock);
+}
+
+// caller must hold manager->lock
+static int _BRPeerManagerPeerIsDandelionCapable(BRPeerManager *manager, BRPeer *peer)
+{
+    for (size_t i = array_count(manager->dandelionPeers); i > 0; i--) {
+        if (UInt128Eq(manager->dandelionPeers[i - 1], peer->address)) return 1;
+    }
+    return 0;
+}
+
+// caller must hold manager->lock; returns first connected Dandelion-capable peer or NULL
+static BRPeer *_BRPeerManagerAnyDandelionPeer(BRPeerManager *manager)
+{
+    for (size_t i = array_count(manager->connectedPeers); i > 0; i--) {
+        BRPeer *p = manager->connectedPeers[i - 1];
+        if (BRPeerConnectStatus(p) != BRPeerStatusConnected) continue;
+        if (_BRPeerManagerPeerIsDandelionCapable(manager, p)) return p;
+    }
+    return NULL;
+}
+
+int BRPeerManagerHasDandelionPeer(BRPeerManager *manager)
+{
+    assert(manager != NULL);
+    pthread_mutex_lock(&manager->lock);
+    int r = manager->dandelionEnabled && _BRPeerManagerAnyDandelionPeer(manager) != NULL;
+    pthread_mutex_unlock(&manager->lock);
+    return r;
+}
+
+int BRPeerManagerStemPublishTx(BRPeerManager *manager, BRTransaction *tx, void *info,
+                               void (*callback)(void *info, int error))
+{
+    assert(manager != NULL && tx != NULL);
+    if (! BRTransactionIsSigned(tx)) return 0;   // let the flood path report EINVAL
+    pthread_mutex_lock(&manager->lock);
+
+    if (! manager->isConnected) { pthread_mutex_unlock(&manager->lock); return 0; }
+
+    BRPeer *stem = manager->dandelionEnabled ? _BRPeerManagerAnyDandelionPeer(manager) : NULL;
+    if (! stem) { pthread_mutex_unlock(&manager->lock); return 0; }   // caller floods instead
+
+    tx->is_dandelion = 1;
+    tx->timestamp = (uint32_t)time(NULL);
+    _BRPeerManagerAddTxToPublishList(manager, tx, info, callback);
+
+    BRPeerCallbackInfo *peerInfo = calloc(1, sizeof(*peerInfo));
+    assert(peerInfo != NULL);
+    peerInfo->peer = stem;
+    peerInfo->manager = manager;
+    _BRPeerManagerPublishPendingTx(manager, stem);      // inv(inv_tx) to the stem peer only
+    BRPeerSendPing(stem, peerInfo, _publishTxInvDone);  // ping→pong confirms the inv was sent
+
+    peer_log(stem, "dandelion: stem-submitted tx %s to single peer", u256hex(tx->txHash));
+    pthread_mutex_unlock(&manager->lock);
+    return 1;
+}
+
+void BRPeerManagerFluffTx(BRPeerManager *manager, UInt256 txHash)
+{
+    assert(manager != NULL);
+    pthread_mutex_lock(&manager->lock);
+
+    BRTransaction *tx = NULL;
+    for (size_t i = array_count(manager->publishedTx); i > 0; i--) {
+        if (UInt256Eq(manager->publishedTx[i - 1].tx->txHash, txHash)) {
+            tx = manager->publishedTx[i - 1].tx; break;
+        }
+    }
+    if (! tx) { pthread_mutex_unlock(&manager->lock); return; }
+    tx->is_dandelion = 0;   // fluff: a normal tx from here on
+
+    for (size_t i = array_count(manager->connectedPeers); i > 0; i--) {
+        BRPeer *peer = manager->connectedPeers[i - 1];
+        if (BRPeerConnectStatus(peer) != BRPeerStatusConnected) continue;
+        _BRPeerManagerPublishPendingTx(manager, peer);
+        BRPeerCallbackInfo *peerInfo = calloc(1, sizeof(*peerInfo));
+        assert(peerInfo != NULL);
+        peerInfo->peer = peer;
+        peerInfo->manager = manager;
+        BRPeerSendPing(peer, peerInfo, _publishTxInvDone);
+    }
+    peer_log(&BR_PEER_NONE, "dandelion: embargo fluff — flooded tx %s to all peers", u256hex(txHash));
+    pthread_mutex_unlock(&manager->lock);
+}
+
 void BRPeerManagerPublishTx(BRPeerManager *manager, BRTransaction *tx, void *info,
                             void (*callback)(void *info, int error))
 {
@@ -2732,6 +2842,7 @@ void BRPeerManagerFree(BRPeerManager *manager)
     array_free(manager->txRequests);
     array_free(manager->publishedTx);
     array_free(manager->publishedTxHashes);
+    array_free(manager->dandelionPeers);
     if (manager->compactFilterChain) {
         BRCompactFilterChainFree(manager->compactFilterChain);
         manager->compactFilterChain = NULL;

@@ -144,6 +144,13 @@ static int _BRPeerSocks5Handshake(int sock, const UInt128 *peer_addr, uint16_t p
 #define HEADER_LENGTH      24
 #define MAX_MSG_LENGTH     0x02000000u
 #define MAX_GETDATA_HASHES 50000
+// Outgoing-message payloads up to this size are built on the stack; larger ones
+// are heap-allocated. Prevents a stack-VLA overflow (SIGSEGV) when a message
+// approaches MAX_MSG_LENGTH — e.g. a getdata re-request of up to
+// MAX_GETDATA_HASHES*36 ≈ 1.8 MB, which a peer can drive via an oversized inv.
+// 64 KB covers every routine message (filterload, normal getdata batches, etc.)
+// so the heap path is reached only for genuinely large messages.
+#define PEER_MSG_STACK_BUF 0x10000u  // 64 KB
 #define ENABLED_SERVICES   0ULL  // we don't provide full blocks to remote nodes
 #define PROTOCOL_VERSION   70019
 #define MIN_PROTO_VERSION  70017 // peers earlier than this protocol version not supported (need v0.9 txFee relay rules)
@@ -1653,12 +1660,25 @@ void BRPeerSendMessage(BRPeer *peer, const uint8_t *msg, size_t msgLen, const ch
     }
     else {
         BRPeerContext *ctx = (BRPeerContext *)peer;
-        uint8_t buf[HEADER_LENGTH + msgLen], hash[32];
+        size_t bufLen = HEADER_LENGTH + msgLen;
+        // A stack VLA here (`buf[HEADER_LENGTH + msgLen]`) overflows the peer
+        // thread stack for large messages — a block re-request getdata can reach
+        // MAX_GETDATA_HASHES*36 ≈ 1.8 MB, and a malicious peer can drive it there
+        // with an oversized inv. That overflow is a remotely-triggerable SIGSEGV.
+        // Keep small messages on the stack (the common case); heap-allocate larger
+        // ones. PEER_MSG_STACK_BUF must cover every routine message.
+        uint8_t stackbuf[HEADER_LENGTH + PEER_MSG_STACK_BUF], hash[32];
+        uint8_t *buf = (bufLen <= sizeof(stackbuf)) ? stackbuf : malloc(bufLen);
         size_t off = 0;
         ssize_t n = 0;
         struct timeval tv;
         int socket, error = 0;
-        
+
+        if (! buf) {
+            peer_log(peer, "failed to send %s, out of memory for %zu bytes", type, bufLen);
+            return;
+        }
+
         UInt32SetLE(&buf[off], ctx->magicNumber);
         off += sizeof(uint32_t);
         strncpy((char *)&buf[off], type, 12);
@@ -1673,16 +1693,18 @@ void BRPeerSendMessage(BRPeer *peer, const uint8_t *msg, size_t msgLen, const ch
         msgLen = 0;
         socket = ctx->socket;
         if (socket < 0) error = ENOTCONN;
-        
-        while (socket >= 0 && ! error && msgLen < sizeof(buf)) {
-            n = send(socket, &buf[msgLen], sizeof(buf) - msgLen, MSG_NOSIGNAL);
+
+        while (socket >= 0 && ! error && msgLen < bufLen) {
+            n = send(socket, &buf[msgLen], bufLen - msgLen, MSG_NOSIGNAL);
             if (n >= 0) msgLen += n;
             if (n < 0 && errno != EWOULDBLOCK) error = errno;
             gettimeofday(&tv, NULL);
             if (! error && tv.tv_sec + (double)tv.tv_usec/1000000 >= ctx->disconnectTime) error = ETIMEDOUT;
             socket = ctx->socket;
         }
-        
+
+        if (buf != stackbuf) free(buf);
+
         if (error) {
             peer_log(peer, "%s", strerror(error));
             BRPeerDisconnect(peer);
@@ -1862,7 +1884,15 @@ void BRPeerSendGetdata(BRPeer *peer, const UInt256 txHashes[], size_t txCount, c
     }
     else if (count > 0) {
         size_t msgLen = BRVarIntSize(count) + (sizeof(uint32_t) + sizeof(UInt256))*(count);
-        uint8_t msg[msgLen];
+        // Heap-allocate large payloads — `count` can be up to MAX_GETDATA_HASHES
+        // (50000 → ~1.8 MB), which overflows the stack as a VLA. See PEER_MSG_STACK_BUF.
+        uint8_t stackbuf[PEER_MSG_STACK_BUF];
+        uint8_t *msg = (msgLen <= sizeof(stackbuf)) ? stackbuf : malloc(msgLen);
+
+        if (! msg) {
+            peer_log(peer, "couldn't send getdata, out of memory for %zu bytes", msgLen);
+            return;
+        }
 
         off += BRVarIntSet(&msg[off], (off <= msgLen ? msgLen - off : 0), count);
 
@@ -1882,6 +1912,7 @@ void BRPeerSendGetdata(BRPeer *peer, const UInt256 txHashes[], size_t txCount, c
 
         ((BRPeerContext *)peer)->sentGetdata = 1;
         BRPeerSendMessage(peer, msg, off, MSG_GETDATA);
+        if (msg != stackbuf) free(msg);
     }
 }
 
@@ -1896,7 +1927,15 @@ void BRPeerSendGetdataBlocks(BRPeer *peer, const UInt256 blockHashes[], size_t b
 
     size_t off = 0;
     size_t msgLen = BRVarIntSize(blockCount) + (sizeof(uint32_t) + sizeof(UInt256))*blockCount;
-    uint8_t msg[msgLen];
+    // Heap-allocate large payloads — blockCount up to MAX_GETDATA_HASHES overflows
+    // the stack as a VLA. See PEER_MSG_STACK_BUF.
+    uint8_t stackbuf[PEER_MSG_STACK_BUF];
+    uint8_t *msg = (msgLen <= sizeof(stackbuf)) ? stackbuf : malloc(msgLen);
+
+    if (! msg) {
+        peer_log(peer, "couldn't send getdata(blocks), out of memory for %zu bytes", msgLen);
+        return;
+    }
 
     off += BRVarIntSet(&msg[off], (off <= msgLen ? msgLen - off : 0), blockCount);
     for (size_t i = 0; i < blockCount; i++) {
@@ -1908,6 +1947,7 @@ void BRPeerSendGetdataBlocks(BRPeer *peer, const UInt256 blockHashes[], size_t b
 
     ((BRPeerContext *)peer)->sentGetdata = 1;
     BRPeerSendMessage(peer, msg, off, MSG_GETDATA);
+    if (msg != stackbuf) free(msg);
 }
 
 void BRPeerSendGetaddr(BRPeer *peer)

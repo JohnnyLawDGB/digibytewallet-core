@@ -107,6 +107,14 @@ BRWallet *BRWalletNewDual(BRTransaction *transactions[], size_t txCount,
 // returns non-zero if any UTXO in the wallet belongs to the legacy key chains (old m/0H addresses)
 int BRWalletHasLegacyFunds(BRWallet *wallet);
 
+// installs the BIP86 (Taproot / P2TR) master pub key (m/86'/20'/0') and pre-generates the
+// gap+100 external (receive) and internal (change) P2TR address windows, so
+// BRWalletReceiveAddress()/BRWalletUnusedAddrs() with scriptType 2 return dgb1p… addresses.
+// Call once, right after wallet creation, before syncing.
+// FUND-SAFETY: taprootMpk MUST be the m/86' twin derived from the SAME seed as the wallet's
+// BIP84 masterPubKey — deriving P2TR over the m/84' key would produce unrecoverable addresses.
+void BRWalletSetTaprootKey(BRWallet *wallet, BRMasterPubKey taprootMpk);
+
 // not thread-safe, set callbacks once after BRWalletNew(), before calling other BRWallet functions
 // info is a void pointer that will be passed along with each callback call
 // void balanceChanged(void *, uint64_t) - called when the wallet balance changes

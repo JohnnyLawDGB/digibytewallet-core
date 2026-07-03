@@ -458,6 +458,25 @@ BRWallet *BRWalletNewDual(BRTransaction *transactions[], size_t txCount,
     return wallet;
 }
 
+// installs the BIP86 Taproot master pub key and pre-generates the P2TR external + internal
+// gap windows. See BRWallet.h for the fund-safety contract (taprootMpk must be the m/86'
+// twin of the wallet's own seed). Call once, right after wallet creation, before syncing.
+void BRWalletSetTaprootKey(BRWallet *wallet, BRMasterPubKey taprootMpk)
+{
+    assert(wallet != NULL);
+
+    wallet->taprootPubKey = taprootMpk;
+    wallet->hasTaprootKey = 1;
+
+    // Pre-generate gap+100 P2TR receive (external) + change (internal) addresses over the
+    // m/86' key (scriptType 2). The +100 look-ahead mirrors BRWalletNew's BIP84/legacy
+    // pre-gen so a taproot address that a relayed-back tx pays is already in allAddrs
+    // post-restart. Uses the PLAIN gap constants (matches BRWallet.c:345-348). Do NOT hold
+    // wallet->lock here — BRWalletUnusedAddrs takes it internally (non-recursive).
+    BRWalletUnusedAddrs(wallet, NULL, SEQUENCE_GAP_LIMIT_EXTERNAL + 100, 0, 2);
+    BRWalletUnusedAddrs(wallet, NULL, SEQUENCE_GAP_LIMIT_INTERNAL + 100, 1, 2);
+}
+
 // returns non-zero if any UTXO in the wallet belongs to the legacy key chains (old m/0H addresses)
 int BRWalletHasLegacyFunds(BRWallet *wallet)
 {

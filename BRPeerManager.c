@@ -227,6 +227,12 @@ struct BRPeerManagerStruct {
     UInt128  cfDisagreedPeers[CF_CONTINUITY_REANCHOR_K];
     uint8_t  cfDisagreedCount;
     uint8_t  cfReanchorCount;            // continuity-triggered re-anchors this session
+    // When only ONE filter peer is connected the K-distinct-disagreers threshold
+    // can never be met (the active probe reaches no other filter peer), so
+    // cfDisagreedCount wedges at 1/K forever and cfheaders never advance. Count
+    // CONSECUTIVE diverged rounds instead; at CF_SINGLE_PEER_REANCHOR_ROUNDS force
+    // a (still CF_CONTINUITY_REANCHOR_MAX-bounded) re-anchor.
+    uint8_t  cfSingleDisagreeRounds;
     pthread_mutex_t lock;
 };
 
@@ -1998,6 +2004,28 @@ static void _BRPeerManagerProbeOtherFilterPeersForCFHeaders(BRPeerManager *manag
     }
 }
 
+// Consecutive diverged cfheaders rounds tolerated while only one filter peer is
+// connected before forcing a re-anchor. With a single peer the K-distinct-
+// disagreers path (CF_CONTINUITY_REANCHOR_K) can never fire — the probe loop
+// reaches no other filter peer — so this is the escape hatch. Overall still
+// bounded by CF_CONTINUITY_REANCHOR_MAX total re-anchors per session.
+#define CF_SINGLE_PEER_REANCHOR_ROUNDS 3
+
+// Count connected peers eligible to serve BIP 158 messages in the current sync
+// mode. Mirrors the per-peer guards in the active-probe loop above
+// (_BRPeerManagerProbeOtherFilterPeersForCFHeaders). Caller must hold manager->lock.
+static int _BRPeerManagerConnectedFilterPeerCount(BRPeerManager *manager)
+{
+    int n = 0;
+    for (size_t i = array_count(manager->connectedPeers); i > 0; i--) {
+        BRPeer *p = manager->connectedPeers[i - 1];
+        if (BRPeerConnectStatus(p) != BRPeerStatusConnected) continue;
+        if (! _BRPeerManagerPeerSupportsCompactFilters(manager, p)) continue;
+        n++;
+    }
+    return n;
+}
+
 // --- BIP 158 peer callbacks -----------------------------------------------
 
 static void _peerRelayedCFHeaders(void *info, uint8_t filterType, UInt256 stopHash,
@@ -2096,6 +2124,33 @@ static void _peerRelayedCFHeaders(void *info, uint8_t filterType, UInt256 stopHa
             return;
         }
 
+        // Single-filter-peer escape hatch. Runs only if the K-distinct-disagreers
+        // path above did NOT fire. With a single connected filter peer that path can
+        // never fire (the probe reaches no other filter peer, so cfDisagreedCount is
+        // stuck at 1/K), and cfheaders would never advance — the wedge. Count
+        // CONSECUTIVE diverged rounds instead; after N of them force a re-anchor,
+        // still bounded by the same CF_CONTINUITY_REANCHOR_MAX total budget. A 1-peer
+        // re-anchor may TOFU-accept a lying peer's chain, but bloom runs in parallel
+        // (catches any missed tx), it's capped at MAX, and the watchdog falls back to
+        // bloom after — acceptable for liveness. The moment a 2nd filter peer arrives
+        // we prefer the safe K=2 path, so the round counter resets.
+        if (_BRPeerManagerConnectedFilterPeerCount(manager) <= 1) {
+            manager->cfSingleDisagreeRounds++;
+            if (manager->cfSingleDisagreeRounds >= CF_SINGLE_PEER_REANCHOR_ROUNDS &&
+                manager->cfReanchorCount < CF_CONTINUITY_REANCHOR_MAX) {
+                manager->cfReanchorCount++;
+                peer_log(peer, "cfheaders: single filter peer, %u rounds diverged — "
+                         "forcing re-anchor (attempt %u/%u)",
+                         manager->cfSingleDisagreeRounds,
+                         manager->cfReanchorCount, CF_CONTINUITY_REANCHOR_MAX);
+                _BRPeerManagerReanchorAtFloorLocked(manager, 1);
+                pthread_mutex_unlock(&manager->lock);
+                return;
+            }
+        } else {
+            manager->cfSingleDisagreeRounds = 0;  // 2nd filter peer present → prefer K=2 path
+        }
+
         // Below the K threshold, or re-anchor budget exhausted: don't append and
         // don't punish. If the budget is exhausted the chain stops advancing and
         // the SyncService watchdog falls back to bloom as today — pool never burned.
@@ -2112,6 +2167,7 @@ static void _peerRelayedCFHeaders(void *info, uint8_t filterType, UInt256 stopHa
     // requests the next batch instead of being blocked by a stale guard value.
     manager->cfHeadersRequestedThrough = chainTip;
     manager->cfDisagreedCount = 0;   // appended cleanly — clear the disagreement window
+    manager->cfSingleDisagreeRounds = 0;   // ...and the single-peer diverged-round counter
     peer_log(peer, "cfheaders: chain extended to height %u (added %zu, stop %s)",
              chainTip, count, log_u256_hex_encode(stopHash));
 
@@ -2967,6 +3023,7 @@ static int _BRPeerManagerReanchorAtFloorLocked(BRPeerManager *manager, int force
     manager->autoFetchCFiltersThrough  = floor > 0 ? floor - 1 : 0;
     manager->cfHeadersRequestedThrough = 0;
     manager->cfDisagreedCount          = 0;   // fresh disagreement window
+    manager->cfSingleDisagreeRounds    = 0;   // fresh single-peer diverged-round window
 
     // Kick recovery immediately if a filter peer is connected; otherwise the
     // next block-extend kick handles it once filter-first connects one.

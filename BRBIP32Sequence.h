@@ -41,6 +41,7 @@ extern "C" {
 #define BIP32_HARD                  0x80000000
 
 #define BIP84_PURPOSE               84
+#define BIP86_PURPOSE               86
 #define DGB_COIN_TYPE               20
 #define BIP84_ACCOUNT               0
 
@@ -72,6 +73,10 @@ BRMasterPubKey BRBIP32MasterPubKey(const void *seed, size_t seedLen);
 // returns the master public key for BIP84 — derivation path N(m/84'/20'/0')
 // uses standard "Bitcoin seed" HMAC key per BIP32 spec
 BRMasterPubKey BRBIP32MasterPubKeyBIP84(const void *seed, size_t seedLen);
+
+// returns the master public key for BIP86 (Taproot) — derivation path N(m/86'/20'/0')
+// uses standard "Bitcoin seed" HMAC key per BIP32 spec
+BRMasterPubKey BRBIP32MasterPubKeyBIP86(const void *seed, size_t seedLen);
 
 // returns the master public key for legacy breadwallet layout — derivation path N(m/0H)
 // uses "DigiByte seed" HMAC key (non-standard, for backward compatibility)

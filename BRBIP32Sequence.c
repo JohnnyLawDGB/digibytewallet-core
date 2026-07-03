@@ -170,6 +170,42 @@ BRMasterPubKey BRBIP32MasterPubKeyBIP84(const void *seed, size_t seedLen)
     return mpk;
 }
 
+// BIP86 master pub key: m/86'/20'/0' with standard "Bitcoin seed" HMAC
+// Verbatim clone of BRBIP32MasterPubKeyBIP84 -- only the hardened purpose
+// level differs (84 -> 86); same HMAC key, same DGB_COIN_TYPE, same account 0.
+BRMasterPubKey BRBIP32MasterPubKeyBIP86(const void *seed, size_t seedLen)
+{
+    BRMasterPubKey mpk = BR_MASTER_PUBKEY_NONE;
+    UInt512 I;
+    UInt256 secret, chain;
+    BRKey key;
+
+    assert(seed != NULL || seedLen == 0);
+
+    if (seed || seedLen == 0) {
+        BRHMAC(&I, BRSHA512, sizeof(UInt512), BIP32_SEED_KEY_STANDARD,
+               strlen(BIP32_SEED_KEY_STANDARD), seed, seedLen);
+        secret = *(UInt256 *)&I;
+        chain = *(UInt256 *)&I.u8[sizeof(UInt256)];
+        var_clean(&I);
+
+        BRKeySetSecret(&key, &secret, 1);
+        mpk.fingerPrint = BRKeyHash160(&key).u32[0];
+
+        _CKDpriv(&secret, &chain, BIP86_PURPOSE | BIP32_HARD); // m/86'
+        _CKDpriv(&secret, &chain, DGB_COIN_TYPE | BIP32_HARD);  // m/86'/20'
+        _CKDpriv(&secret, &chain, BIP84_ACCOUNT | BIP32_HARD);  // m/86'/20'/0'
+
+        mpk.chainCode = chain;
+        BRKeySetSecret(&key, &secret, 1);
+        var_clean(&secret, &chain);
+        BRKeyPubKey(&key, &mpk.pubKey, sizeof(mpk.pubKey));
+        BRKeyClean(&key);
+    }
+
+    return mpk;
+}
+
 // Legacy master pub key — explicit name for the old m/0H path with "DigiByte seed"
 BRMasterPubKey BRBIP32MasterPubKeyLegacy(const void *seed, size_t seedLen)
 {

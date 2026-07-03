@@ -2067,13 +2067,19 @@ static void _peerRelayedCFHeaders(void *info, uint8_t filterType, UInt256 stopHa
         }
         manager->cfHeadersRequestedThrough = 0;  // let another peer be tried
 
-        // Newly-recorded disagreer that hasn't yet reached the threshold: actively
-        // probe the other filter peers about this same contested batch so distinct
-        // disagreers accumulate to K immediately. Passive driver rotation doesn't
-        // happen once a rescan resets the block tip below cfTip (the driver goes
-        // dormant on next > tip), so without this the count stalls at 1 forever.
-        // Gated on a fresh add below K and deduped inside the probe, so no storm.
-        if (!_known && manager->cfDisagreedCount < CF_CONTINUITY_REANCHOR_K) {
+        // Below the re-anchor threshold: actively probe the OTHER filter peers about
+        // this same contested batch so distinct disagreers accumulate to K.
+        //
+        // Re-fire on EVERY mismatch while below K — not only on the first (fresh add).
+        // The disagreeing peer is usually the priority peer (digiscope.me), which
+        // connects first; the seeder's other filter peers finish their handshake a
+        // few seconds LATER. A one-shot probe (gated on the fresh add) therefore loops
+        // over a peer list that holds no other filter peer yet, reaches nobody, and the
+        // count wedges at 1/K until an unrelated rescan resets it ~tens of minutes on.
+        // Re-probing each round catches those peers the moment they connect. The probe
+        // skips peers already in the disagreed set and we only reach here once per
+        // cfheaders round-trip (the request is serialized), so it can't storm.
+        if (manager->cfDisagreedCount < CF_CONTINUITY_REANCHOR_K) {
             _BRPeerManagerProbeOtherFilterPeersForCFHeaders(manager, peer, filterType,
                                                             BRCompactFilterChainNextHeight(manager->compactFilterChain),
                                                             stopHash);

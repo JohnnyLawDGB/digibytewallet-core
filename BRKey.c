@@ -513,3 +513,72 @@ size_t BRKeySchnorrSign(BRKey *key, uint8_t *sig64, UInt256 md)
 
     return r;
 }
+
+// BIP-86 key-path-only Taproot output key. P = x-only(pubkey(key));
+// t = TaggedHash("TapTweak", P) -- BIP-86 always uses an EMPTY script tree,
+// so NO merkle root is appended to the tagged hash (that omission is the
+// entire point of key-path-only spending: the general BIP-341 tweak is
+// TaggedHash("TapTweak", P || merkle_root), and an empty script tree means
+// merkle_root is the empty byte string, i.e. nothing appended at all).
+// Q = P + t*G; writes the 32-byte x-only serialization X(Q) to out32.
+// Returns 1 on success, 0 on failure.
+int BRKeyTaprootOutputKey(BRKey *key, uint8_t out32[32])
+{
+    secp256k1_pubkey pk, pkQ;
+    secp256k1_xonly_pubkey xo;
+    uint8_t pubKey[65], p32[32];
+    size_t len;
+    UInt256 t;
+    int r = 0;
+
+    assert(key != NULL);
+    assert(out32 != NULL);
+
+    pthread_once(&_ctx_once, _ctx_init);
+
+    len = BRKeyPubKey(key, pubKey, sizeof(pubKey));
+
+    if (len > 0 && secp256k1_ec_pubkey_parse(_ctx, &pk, pubKey, len) &&
+        secp256k1_xonly_pubkey_from_pubkey(_ctx, &xo, NULL, &pk) &&
+        secp256k1_xonly_pubkey_serialize(_ctx, p32, &xo)) {
+
+        BRKeyTaggedHash("TapTweak", p32, sizeof(p32), &t);
+
+        if (secp256k1_xonly_pubkey_tweak_add(_ctx, &pkQ, &xo, t.u8) &&
+            secp256k1_xonly_pubkey_from_pubkey(_ctx, &xo, NULL, &pkQ) &&
+            secp256k1_xonly_pubkey_serialize(_ctx, out32, &xo)) {
+            r = 1;
+        }
+    }
+
+    var_clean(&t);
+    return r;
+}
+
+// writes the BIP-86 key-path-only P2TR (Taproot) address for key to addr:
+// {OP_1, 0x20, X(Q)} bech32m-encoded (BIP-350) with the DigiByte witness hrp.
+// returns the number of bytes written, or 0 on failure
+size_t BRKeyTaprootAddress(BRKey *key, char *addr, size_t addrLen)
+{
+    uint8_t data[91] = { '\0' };
+    char result[91] = { '\0' };
+    size_t count;
+
+    assert(key != NULL);
+
+    data[0] = OP_1;
+    data[1] = 32; // x-only output key length
+
+    if (! BRKeyTaprootOutputKey(key, &data[2])) return 0;
+
+    count = BRBech32Encode(&result[0], DIGIBYTE_PUBKEY_BECH32, &data[0]);
+    assert(count < addrLen);
+
+    if (addr && count < addrLen)
+        // copy the result
+        memcpy(addr, &result[0], count);
+    else
+        return 0;
+
+    return count;
+}

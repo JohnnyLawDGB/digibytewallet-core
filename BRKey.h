@@ -126,6 +126,18 @@ void BRKeyTaggedHash(const char *tag, const uint8_t *msg, size_t msgLen, UInt256
 // signature must tweak key->secret before calling this.
 size_t BRKeySchnorrSign(BRKey *key, uint8_t *sig64, UInt256 md);
 
+// BIP-86 key-path-only Taproot output key: P = x-only(pubkey(key));
+// t = TaggedHash("TapTweak", P) (NO merkle root appended -- BIP-86 always
+// uses an empty script tree, which is the entire point of key-path-only
+// spending); Q = P + t*G. Writes the 32-byte x-only serialization X(Q) to
+// out32. Returns 1 on success, 0 on failure.
+int BRKeyTaprootOutputKey(BRKey *key, uint8_t out32[32]);
+
+// writes the BIP-86 key-path-only P2TR (Taproot) address for key to addr:
+// {OP_1, 0x20, X(Q)} bech32m-encoded (BIP-350) with the DigiByte witness hrp.
+// returns the number of bytes written, or 0 on failure
+size_t BRKeyTaprootAddress(BRKey *key, char *addr, size_t addrLen);
+
 #ifdef __cplusplus
 }
 #endif

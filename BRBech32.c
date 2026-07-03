@@ -84,7 +84,8 @@ size_t BRBech32Decode(char *hrp84, uint8_t *data42, const char *addr)
     }
     
     bufLen = (addrLen - (sep + 2 + 6))*5/8;
-    if (hrp84 == NULL || data42 == NULL || chk != 1 || ver > 16 || bufLen < 2 || bufLen > 40) return 0;
+    if (hrp84 == NULL || data42 == NULL || chk != (ver == 0 ? 1u : 0x2bc830a3u) || ver > 16 ||
+        bufLen < 2 || bufLen > 40) return 0;
     assert(sep < 84);
     for (i = 0; i < sep; i++) hrp84[i] = tolower(addr[i]);
     hrp84[sep] = '\0';
@@ -134,7 +135,7 @@ size_t BRBech32Encode(char *addr91, const char *hrp, const uint8_t data[])
     }
     
     for (j = 0; j < 6; j++) chk = polymod(chk);
-    chk ^= 1;
+    chk ^= (ver == 0 ? 1u : 0x2bc830a3u);
     for (j = 0; j < 6; ++j) addr[i++] = chars[(chk >> ((5 - j)*5)) & 0x1f];
     addr[i++] = '\0';
     assert(i <= 91);

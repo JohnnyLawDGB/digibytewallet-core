@@ -51,6 +51,11 @@ struct BRWalletStruct {
     BRAddress *legacyInternalChain;
     BRAddress *legacyExternalChainSegwit;
     BRAddress *legacyInternalChainSegwit;
+    // Taproot (BIP86 / P2TR) support: derived from taprootPubKey (m/86'), dormant until installed
+    BRMasterPubKey taprootPubKey;
+    int hasTaprootKey;
+    BRAddress *taprootExternalChain;
+    BRAddress *taprootInternalChain;
     BRSet *allTx, *invalidTx, *pendingTx, *spentOutputs, *usedAddrs, *allAddrs;
     void *callbackInfo;
     void (*balanceChanged)(void *info, uint64_t balance);
@@ -304,6 +309,9 @@ BRWallet *BRWalletNew(BRTransaction *transactions[], size_t txCount, BRMasterPub
     array_new(wallet->legacyInternalChain, 50);
     array_new(wallet->legacyExternalChainSegwit, 50);
     array_new(wallet->legacyInternalChainSegwit, 50);
+    array_new(wallet->taprootExternalChain, 50);
+    array_new(wallet->taprootInternalChain, 50);
+    wallet->hasTaprootKey = 0;
     array_new(wallet->balanceHist, txCount + 100);
     wallet->allTx = BRSetNew(BRTransactionHash, BRTransactionEq, txCount + 100);
     wallet->invalidTx = BRSetNew(BRTransactionHash, BRTransactionEq, 10);
@@ -511,17 +519,21 @@ void BRWalletSetCallbacks(BRWallet *wallet, void *info,
 // the internal chain is used for change addresses and the external chain for receive addresses
 // addrs may be NULL to only generate addresses for BRWalletContainsAddress()
 // returns the number addresses written to addrs
-size_t BRWalletUnusedAddrs(BRWallet *wallet, BRAddress addrs[], uint32_t gapLimit, int internal, int nativeSegwit)
+size_t BRWalletUnusedAddrs(BRWallet *wallet, BRAddress addrs[], uint32_t gapLimit, int internal, int scriptType)
 {
+    // scriptType: 0 = P2PKH (legacy), 1 = P2WPKH (native segwit / BIP84), 2 = P2TR (taproot / BIP86)
     BRAddress *addrChain;
     size_t i, j = 0, count, startCount;
     uint32_t chain = (internal) ? SEQUENCE_INTERNAL_CHAIN : SEQUENCE_EXTERNAL_CHAIN;
 
     assert(wallet != NULL);
     assert(gapLimit > 0);
+    assert(scriptType == 0 || scriptType == 1 || scriptType == 2);
     pthread_mutex_lock(&wallet->lock);
-    
-    if (nativeSegwit) {
+
+    if (scriptType == 2) {
+        addrChain = (internal) ? wallet->taprootInternalChain : wallet->taprootExternalChain;
+    } else if (scriptType == 1) {
         addrChain = (internal) ? wallet->internalChainSegwit : wallet->externalChainSegwit;
     } else {
         addrChain = (internal) ? wallet->internalChain : wallet->externalChain;
@@ -539,14 +551,22 @@ size_t BRWalletUnusedAddrs(BRWallet *wallet, BRAddress addrs[], uint32_t gapLimi
         BRKey key;
         BRAddress address = BR_ADDRESS_NONE;
         
+        // Taproot MUST derive over the m/86' taprootPubKey — deriving P2TR over the
+        // m/84' masterPubKey would yield unrecoverable (fund-loss) addresses.
+        BRMasterPubKey mpk = (scriptType == 2) ? wallet->taprootPubKey : wallet->masterPubKey;
+
         // Generate the pubkey from seed and write it into pubKey
-        uint8_t pubKey[BRBIP32PubKey(NULL, 0, wallet->masterPubKey, chain, count)];
-        size_t len = BRBIP32PubKey(pubKey, sizeof(pubKey), wallet->masterPubKey, chain, (uint32_t)count);
-        
+        uint8_t pubKey[BRBIP32PubKey(NULL, 0, mpk, chain, count)];
+        size_t len = BRBIP32PubKey(pubKey, sizeof(pubKey), mpk, chain, (uint32_t)count);
+
         // Convert pubKey to internal format
         if (! BRKeySetPubKey(&key, pubKey, len)) break;
-        
-        if (nativeSegwit) {
+
+        if (scriptType == 2) {
+            // Generate the P2TR (taproot, dgb1p...)
+            if (!BRKeyTaprootAddress(&key, address.s, sizeof(address)) ||
+                BRAddressEq(&address, &BR_ADDRESS_NONE)) break;
+        } else if (scriptType == 1) {
             // Generate the P2WPKH
             if (!BRKeySegwitAddress(&key, address.s, sizeof(address), OP_0) ||
                 BRAddressEq(&address, &BR_ADDRESS_NONE)) break;
@@ -571,14 +591,18 @@ size_t BRWalletUnusedAddrs(BRWallet *wallet, BRAddress addrs[], uint32_t gapLimi
     
     // was addrChain moved to a new memory location?
     if (addrChain == (internal ? wallet->internalChain : wallet->externalChain) ||
-        addrChain == (internal ? wallet->internalChainSegwit : wallet->externalChainSegwit)) {
+        addrChain == (internal ? wallet->internalChainSegwit : wallet->externalChainSegwit) ||
+        addrChain == (internal ? wallet->taprootInternalChain : wallet->taprootExternalChain)) {
         for (i = startCount; i < count; i++) {
             BRSetAdd(wallet->allAddrs, &addrChain[i]);
         }
     }
     else {
         // Reassign the addressChain, if it got reallocated
-        if (nativeSegwit) {
+        if (scriptType == 2) {
+            if (internal) wallet->taprootInternalChain = addrChain;
+            if (! internal) wallet->taprootExternalChain = addrChain;
+        } else if (scriptType == 1) {
             if (internal) wallet->internalChainSegwit = addrChain;
             if (! internal) wallet->externalChainSegwit = addrChain;
         } else {
@@ -600,9 +624,36 @@ size_t BRWalletUnusedAddrs(BRWallet *wallet, BRAddress addrs[], uint32_t gapLimi
         for (i = array_count(wallet->internalChainSegwit); i > 0; i--) {
             BRSetAdd(wallet->allAddrs, &wallet->internalChainSegwit[i - 1]);
         }
-        
+
         for (i = array_count(wallet->externalChainSegwit); i > 0; i--) {
             BRSetAdd(wallet->allAddrs, &wallet->externalChainSegwit[i - 1]);
+        }
+
+        // Legacy chains (previously OMITTED — any array-growth realloc silently evicted
+        // recovery addresses from allAddrs, hiding incoming funds on old m/0H paths).
+        for (i = array_count(wallet->legacyInternalChain); i > 0; i--) {
+            BRSetAdd(wallet->allAddrs, &wallet->legacyInternalChain[i - 1]);
+        }
+
+        for (i = array_count(wallet->legacyExternalChain); i > 0; i--) {
+            BRSetAdd(wallet->allAddrs, &wallet->legacyExternalChain[i - 1]);
+        }
+
+        for (i = array_count(wallet->legacyInternalChainSegwit); i > 0; i--) {
+            BRSetAdd(wallet->allAddrs, &wallet->legacyInternalChainSegwit[i - 1]);
+        }
+
+        for (i = array_count(wallet->legacyExternalChainSegwit); i > 0; i--) {
+            BRSetAdd(wallet->allAddrs, &wallet->legacyExternalChainSegwit[i - 1]);
+        }
+
+        // Taproot chains (empty/dormant until the BIP86 key is installed).
+        for (i = array_count(wallet->taprootInternalChain); i > 0; i--) {
+            BRSetAdd(wallet->allAddrs, &wallet->taprootInternalChain[i - 1]);
+        }
+
+        for (i = array_count(wallet->taprootExternalChain); i > 0; i--) {
+            BRSetAdd(wallet->allAddrs, &wallet->taprootExternalChain[i - 1]);
         }
     }
 
@@ -1617,6 +1668,8 @@ void BRWalletFree(BRWallet *wallet)
     array_free(wallet->legacyInternalChain);
     array_free(wallet->legacyExternalChainSegwit);
     array_free(wallet->legacyInternalChainSegwit);
+    array_free(wallet->taprootExternalChain);
+    array_free(wallet->taprootInternalChain);
     array_free(wallet->balanceHist);
 
     for (size_t i = array_count(wallet->transactions); i > 0; i--) {

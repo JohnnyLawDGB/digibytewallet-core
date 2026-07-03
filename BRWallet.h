@@ -126,9 +126,9 @@ void BRWalletSetCallbacks(BRWallet *wallet, void *info,
 // this function writes to addrs an array of <gapLimit> unused addresses following the last used address in the chain
 // the internal chain is used for change addresses and the external chain for receive addresses
 // addrs may be NULL to only generate addresses for BRWalletContainsAddress()
-// nativeSegwit to generate a native segwit address
+// scriptType selects the address encoding: 0 = P2PKH, 1 = P2WPKH (native segwit), 2 = P2TR (taproot)
 // returns the number addresses written to addrs
-size_t BRWalletUnusedAddrs(BRWallet *wallet, BRAddress addrs[], uint32_t gapLimit, int internal, int nativeSegwit);
+size_t BRWalletUnusedAddrs(BRWallet *wallet, BRAddress addrs[], uint32_t gapLimit, int internal, int scriptType);
 
 // returns the first unused external address
 BRAddress BRWalletReceiveAddress(BRWallet *wallet, int useSegwit);

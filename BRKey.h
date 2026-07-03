@@ -113,6 +113,19 @@ size_t BRKeyCompactSign(const BRKey *key, void *compactSig, size_t sigLen, UInt2
 // assigns pubKey recovered from compactSig to key and returns true on success
 int BRKeyRecoverPubKey(BRKey *key, UInt256 md, const void *compactSig, size_t sigLen);
 
+// BIP-340 tagged hash: SHA256(SHA256(tag) || SHA256(tag) || msg). `tag` is a
+// NUL-terminated ASCII string (e.g. "BIP0340/challenge", "TapTweak"); `msg`/
+// `msgLen` is the payload to hash after the doubled tag-hash prefix. Writes
+// the 32-byte result to *out.
+void BRKeyTaggedHash(const char *tag, const uint8_t *msg, size_t msgLen, UInt256 *out);
+
+// BIP-340 Schnorr-signs the 32-byte message/digest md with key's UNTWEAKED
+// secret key, writing a 64-byte signature to sig64. Returns 64 on success,
+// 0 on failure. This is the raw BIP-340 primitive: it does not apply any
+// BIP-341 taptweak to the key -- callers that need a taproot output-key
+// signature must tweak key->secret before calling this.
+size_t BRKeySchnorrSign(BRKey *key, uint8_t *sig64, UInt256 md);
+
 #ifdef __cplusplus
 }
 #endif

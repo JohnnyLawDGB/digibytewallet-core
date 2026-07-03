@@ -32,6 +32,7 @@
 #include "BRBech32.h"
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <assert.h>
 #include <pthread.h>
@@ -449,6 +450,66 @@ int BRKeyRecoverPubKey(BRKey *key, UInt256 md, const void *compactSig, size_t si
             r = BRKeySetPubKey(key, pubKey, len);
         }
     }
+
+    return r;
+}
+
+// BIP-340 tagged hash: SHA256(SHA256(tag) || SHA256(tag) || msg). `tag` is a
+// NUL-terminated ASCII string; writes the 32-byte result to *out.
+//
+// The doubled tag-hash prefix is concatenated with msg into a heap buffer
+// (rather than a stack buffer/VLA sized by the caller-controlled msgLen) —
+// this codebase already fixed one stack-overflow bug from a length-driven
+// stack VLA (BRPeerSendMessage, oversized-inv DoS), so a runtime-sized
+// buffer here is allocated on the heap on purpose.
+void BRKeyTaggedHash(const char *tag, const uint8_t *msg, size_t msgLen, UInt256 *out)
+{
+    UInt256 tagHash;
+    size_t bufLen = sizeof(tagHash) * 2 + msgLen;
+
+    assert(tag != NULL);
+    assert(msg != NULL || msgLen == 0);
+    assert(out != NULL);
+
+    BRSHA256(tagHash.u8, tag, strlen(tag));
+
+    uint8_t *buf = malloc(bufLen);
+    assert(buf != NULL);
+    memcpy(buf, tagHash.u8, sizeof(tagHash));
+    memcpy(buf + sizeof(tagHash), tagHash.u8, sizeof(tagHash));
+    if (msgLen > 0) memcpy(buf + sizeof(tagHash)*2, msg, msgLen);
+
+    BRSHA256(out->u8, buf, bufLen);
+
+    mem_clean(buf, bufLen);
+    free(buf);
+}
+
+// BIP-340 Schnorr-signs the 32-byte message/digest md with key's UNTWEAKED
+// secret key, writing a 64-byte signature to sig64. Returns 64 on success,
+// 0 on failure.
+//
+// aux_rand is passed as NULL (secp256k1_schnorrsig_sign32 treats NULL the
+// same as an all-zero 32-byte buffer per its own doc comment), making this
+// primitive a deterministic function of (key, md) — useful for reproducible
+// signing and testing. This is the raw BIP-340 primitive: no BIP-341
+// taptweak is applied here; a caller that needs a taproot output-key
+// signature must tweak key->secret before calling this.
+size_t BRKeySchnorrSign(BRKey *key, uint8_t *sig64, UInt256 md)
+{
+    secp256k1_keypair kp;
+    size_t r = 0;
+
+    assert(key != NULL);
+    assert(sig64 != NULL);
+
+    pthread_once(&_ctx_once, _ctx_init);
+
+    if (secp256k1_keypair_create(_ctx, &kp, key->secret.u8) &&
+        secp256k1_schnorrsig_sign32(_ctx, sig64, md.u8, &kp, NULL)) {
+        r = 64;
+    }
+    var_clean(&kp);
 
     return r;
 }

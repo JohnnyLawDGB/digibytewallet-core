@@ -45,8 +45,14 @@
 #define WORDS_BIGENDIAN        1
 #endif
 #define DETERMINISTIC          1
-#define USE_BASIC_CONFIG       1
-#define ENABLE_MODULE_RECOVERY 1
+// secp256k1 v0.4.1 amalgamation: enable the modules this build needs.
+// recovery = Digi-ID recoverable ECDSA; ecdh; extrakeys + schnorrsig = BIP340
+// (Taproot prerequisite). USE_BASIC_CONFIG is gone — modern secp256k1
+// auto-detects field/scalar/widemul and ships no src/basic-config.h.
+#define ENABLE_MODULE_ECDH       1
+#define ENABLE_MODULE_RECOVERY   1
+#define ENABLE_MODULE_EXTRAKEYS  1
+#define ENABLE_MODULE_SCHNORRSIG 1
 
 #pragma clang diagnostic push
 #pragma GCC diagnostic push
@@ -56,8 +62,13 @@
 #pragma GCC diagnostic ignored "-Wunused-function"
 #pragma clang diagnostic ignored "-Wconditional-uninitialized"
 #pragma GCC diagnostic ignored "-Wmaybe-uninitialized"
-#include "secp256k1/src/basic-config.h"
 #include "secp256k1/src/secp256k1.c"
+// Modern secp256k1 ships the ecmult tables as separate translation units instead
+// of generating them at runtime. Amalgamation-#include them here so every secp
+// symbol stays confined to this one compilation unit and the table config
+// (ECMULT_WINDOW_SIZE / ECMULT_GEN_PREC_BITS) is guaranteed to match secp256k1.c.
+#include "secp256k1/src/precomputed_ecmult.c"
+#include "secp256k1/src/precomputed_ecmult_gen.c"
 #pragma clang diagnostic pop
 #pragma GCC diagnostic pop
 
@@ -74,7 +85,7 @@ static void _ctx_init()
 int BRSecp256k1ModAdd(UInt256 *a, const UInt256 *b)
 {
     pthread_once(&_ctx_once, _ctx_init);
-    return secp256k1_ec_privkey_tweak_add(_ctx, (unsigned char *)a, (const unsigned char *)b);
+    return secp256k1_ec_seckey_tweak_add(_ctx, (unsigned char *)a, (const unsigned char *)b);
 }
 
 // multiplies 256bit big endian ints a and b (mod secp256k1 order) and stores the result in a
@@ -82,7 +93,7 @@ int BRSecp256k1ModAdd(UInt256 *a, const UInt256 *b)
 int BRSecp256k1ModMul(UInt256 *a, const UInt256 *b)
 {
     pthread_once(&_ctx_once, _ctx_init);
-    return secp256k1_ec_privkey_tweak_mul(_ctx, (unsigned char *)a, (const unsigned char *)b);
+    return secp256k1_ec_seckey_tweak_mul(_ctx, (unsigned char *)a, (const unsigned char *)b);
 }
 
 // multiplies secp256k1 generator by 256bit big endian int i and stores the result in p

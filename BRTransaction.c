@@ -34,6 +34,7 @@
 
 #define TX_VERSION           0x00000001
 #define TX_LOCKTIME          0x00000000
+#define SIGHASH_DEFAULT      0x00 // BIP-341 taproot: sign all in/outs; produces no explicit sighash-flag byte
 #define SIGHASH_ALL          0x01 // default, sign all of the outputs
 #define SIGHASH_NONE         0x02 // sign none of the outputs, I don't care where the bitcoins go
 #define SIGHASH_SINGLE       0x03 // sign one of the outputs, I don't care where the other outputs go
@@ -279,6 +280,132 @@ static size_t _BRTransactionWitnessData(const BRTransaction *tx, uint8_t *data, 
     if (data && off + sizeof(uint32_t) <= dataLen) UInt32SetLE(&data[off], hashType); // hash type
     off += sizeof(uint32_t);
     return (! data || off <= dataLen) ? off : 0;
+}
+
+// Computes the BIP-341 key-path (BIP-86, taproot) sighash for the tx input at
+// `index` and writes TaggedHash("TapSighash", sigMsg) to *out.
+// https://github.com/bitcoin/bips/blob/master/bip-0341.mediawiki
+//
+// Supports ONLY the key-path, no-annex, non-ANYONECANPAY case with hashType
+// SIGHASH_DEFAULT (0x00) or SIGHASH_ALL (0x01) — the shapes this wallet signs.
+// SIGHASH_SINGLE/NONE/ANYONECANPAY (and any annex/script-path spend) change the
+// message layout and are intentionally unsupported: the helper returns 0 for
+// them so the caller never signs a bogus digest.
+//
+// CRITICAL vs the BIP143 helper above (_BRTransactionWitnessData): every sha_*
+// midstate here is a SINGLE SHA256 (BIP143 uses double SHA256, BRSHA256_2), the
+// final hash is the BIP-340 TAGGED hash, and ALL inputs' prevout amounts AND
+// scriptPubKeys are committed (BIP143 committed only the current input's). A
+// wrong byte here yields an invalid signature and an unspendable P2TR output, so
+// this deliberately does not reuse the double-SHA / single-input machinery above.
+//
+// Because every spent input's amount + scriptPubKey is committed, they must all
+// be populated at sign time; a zero amount or NULL/empty script means the caller
+// forgot to attach the UTXO data and the digest would be silently wrong, so the
+// helper surfaces that by returning 0.
+//
+// `data`/`dataLen` is an optional caller scratch buffer: when non-NULL and large
+// enough the assembled sigMsg (a fixed 175 bytes for this case) is copied into
+// it. The tagged hash is always written to *out regardless (built from an
+// internal buffer). Returns the sigMsg length (175) on success, or 0 on failure.
+static size_t _BRTransactionTaprootSighash(const BRTransaction *tx, uint8_t *data, size_t dataLen,
+                                           size_t index, uint8_t hashType, UInt256 *out)
+{
+    size_t i, off = 0;
+    UInt256 shaPrevouts, shaAmounts, shaScripts, shaSequences, shaOutputs;
+    // fixed layout: epoch(1) + hashType(1) + version(4) + lockTime(4) + 5*sha(32) + spendType(1) + index(4)
+    uint8_t msg[1 + 1 + 4 + 4 + 5*sizeof(UInt256) + 1 + 4];
+
+    assert(tx != NULL);
+    assert(out != NULL);
+    if (! tx || ! out) return 0;
+    if (index >= tx->inCount) return 0;
+    // key-path DEFAULT/ALL only — anything else changes the message shape
+    if (hashType != SIGHASH_DEFAULT && hashType != SIGHASH_ALL) return 0;
+
+    // every spent input must carry its prevout amount + scriptPubKey (all are committed);
+    // a missing one means wrong digest — surface it rather than sign garbage
+    for (i = 0; i < tx->inCount; i++) {
+        if (tx->inputs[i].amount == 0 || tx->inputs[i].script == NULL || tx->inputs[i].scriptLen == 0) return 0;
+    }
+
+    // sha_prevouts = SHA256( txHash(32) || index(4 LE) for each input )   [single SHA256]
+    {
+        uint8_t buf[(sizeof(UInt256) + sizeof(uint32_t)) * tx->inCount];
+
+        for (i = 0; i < tx->inCount; i++) {
+            UInt256Set(&buf[(sizeof(UInt256) + sizeof(uint32_t))*i], tx->inputs[i].txHash);
+            UInt32SetLE(&buf[(sizeof(UInt256) + sizeof(uint32_t))*i + sizeof(UInt256)], tx->inputs[i].index);
+        }
+        BRSHA256(shaPrevouts.u8, buf, sizeof(buf));
+    }
+
+    // sha_amounts = SHA256( amount(8 LE) for each input )   [single SHA256]
+    {
+        uint8_t buf[sizeof(uint64_t) * tx->inCount];
+
+        for (i = 0; i < tx->inCount; i++) UInt64SetLE(&buf[sizeof(uint64_t)*i], tx->inputs[i].amount);
+        BRSHA256(shaAmounts.u8, buf, sizeof(buf));
+    }
+
+    // sha_scriptpubkeys = SHA256( varint(scriptLen) || scriptPubKey for each input )   [single SHA256]
+    {
+        uint8_t _sbuf[0x1000], *sbuf;
+        size_t sbufLen = 0, soff = 0;
+
+        for (i = 0; i < tx->inCount; i++) sbufLen += BRVarIntSize(tx->inputs[i].scriptLen) + tx->inputs[i].scriptLen;
+        sbuf = (sbufLen <= sizeof(_sbuf)) ? _sbuf : malloc(sbufLen);
+        assert(sbuf != NULL);
+        if (! sbuf) return 0;
+
+        for (i = 0; i < tx->inCount; i++) {
+            soff += BRVarIntSet(&sbuf[soff], sbufLen - soff, tx->inputs[i].scriptLen);
+            memcpy(&sbuf[soff], tx->inputs[i].script, tx->inputs[i].scriptLen);
+            soff += tx->inputs[i].scriptLen;
+        }
+        BRSHA256(shaScripts.u8, sbuf, sbufLen);
+        if (sbuf != _sbuf) free(sbuf);
+    }
+
+    // sha_sequences = SHA256( sequence(4 LE) for each input )   [single SHA256]
+    {
+        uint8_t buf[sizeof(uint32_t) * tx->inCount];
+
+        for (i = 0; i < tx->inCount; i++) UInt32SetLE(&buf[sizeof(uint32_t)*i], tx->inputs[i].sequence);
+        BRSHA256(shaSequences.u8, buf, sizeof(buf));
+    }
+
+    // sha_outputs = SHA256( value(8 LE) || varint(scriptLen) || script for each output )   [single SHA256]
+    // (reuses the same serialization _BRTransactionWitnessData feeds to BRSHA256_2; here single-SHA'd)
+    {
+        size_t bufLen = _BRTransactionOutputData(tx, NULL, 0, SIZE_MAX);
+        uint8_t _obuf[0x1000], *obuf = (bufLen <= sizeof(_obuf)) ? _obuf : malloc(bufLen);
+
+        assert(obuf != NULL);
+        if (! obuf) return 0;
+        bufLen = _BRTransactionOutputData(tx, obuf, bufLen, SIZE_MAX);
+        BRSHA256(shaOutputs.u8, obuf, bufLen);
+        if (obuf != _obuf) free(obuf);
+    }
+
+    // assemble sigMsg = epoch || hashType || nVersion || nLockTime ||
+    //                   sha_prevouts || sha_amounts || sha_scriptpubkeys || sha_sequences ||
+    //                   sha_outputs || spend_type || input_index
+    msg[off++] = 0x00;                                              // epoch
+    msg[off++] = hashType;                                         // hash_type (0x00 DEFAULT / 0x01 ALL)
+    UInt32SetLE(&msg[off], tx->version);      off += sizeof(uint32_t);  // nVersion
+    UInt32SetLE(&msg[off], tx->lockTime);     off += sizeof(uint32_t);  // nLockTime
+    UInt256Set(&msg[off], shaPrevouts);       off += sizeof(UInt256);
+    UInt256Set(&msg[off], shaAmounts);        off += sizeof(UInt256);
+    UInt256Set(&msg[off], shaScripts);        off += sizeof(UInt256);
+    UInt256Set(&msg[off], shaSequences);      off += sizeof(UInt256);
+    UInt256Set(&msg[off], shaOutputs);        off += sizeof(UInt256);
+    msg[off++] = 0x00;                                              // spend_type: key-path, no annex (ext_flag 0)
+    UInt32SetLE(&msg[off], (uint32_t)index);  off += sizeof(uint32_t);  // input_index
+
+    if (data && off <= dataLen) memcpy(data, msg, off);            // optional message copy-out
+    BRKeyTaggedHash("TapSighash", msg, off, out);                 // BIP-340 tagged hash (NOT double SHA256)
+    return off;
 }
 
 // writes the data that needs to be hashed and signed for the tx input at index

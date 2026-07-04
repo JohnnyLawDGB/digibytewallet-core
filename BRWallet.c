@@ -1126,6 +1126,9 @@ int BRWalletSignTransaction(BRWallet *wallet, BRTransaction *tx, int forkId, con
     // Legacy chain indices — use BRBIP32PrivKeyList (DigiByte seed, m/0H) for these
     uint32_t legacyInternalIdx[tx->inCount], legacyExternalIdx[tx->inCount];
     size_t legacyInternalCount = 0, legacyExternalCount = 0;
+    // Taproot chain indices — use BRBIP32PrivKeyListBIP86 (m/86'/20'/0') for these
+    uint32_t taprootInternalIdx[tx->inCount], taprootExternalIdx[tx->inCount];
+    size_t taprootInternalCount = 0, taprootExternalCount = 0;
     int r = 0;
 
     assert(wallet != NULL);
@@ -1176,11 +1179,27 @@ int BRWalletSignTransaction(BRWallet *wallet, BRTransaction *tx, int forkId, con
                     legacyExternalIdx[legacyExternalCount++] = j - 1;
             }
         }
+
+        // Taproot chains (taprootPubKey — m/86'/20'/0', same seed). P2TR inputs are
+        // matched by their dgb1p… address; the actual output-key match + Schnorr
+        // signing happens in BRTransactionSign's witness-v1 branch.
+        if (wallet->hasTaprootKey) {
+            for (j = (uint32_t)array_count(wallet->taprootInternalChain); j > 0; j--) {
+                if (BRAddressEq(tx->inputs[i].address, &wallet->taprootInternalChain[j - 1]))
+                    taprootInternalIdx[taprootInternalCount++] = j - 1;
+            }
+
+            for (j = (uint32_t)array_count(wallet->taprootExternalChain); j > 0; j--) {
+                if (BRAddressEq(tx->inputs[i].address, &wallet->taprootExternalChain[j - 1]))
+                    taprootExternalIdx[taprootExternalCount++] = j - 1;
+            }
+        }
     }
 
     pthread_mutex_unlock(&wallet->lock);
 
-    size_t totalKeys = bip84InternalCount + bip84ExternalCount + legacyInternalCount + legacyExternalCount;
+    size_t totalKeys = bip84InternalCount + bip84ExternalCount + legacyInternalCount + legacyExternalCount +
+                       taprootInternalCount + taprootExternalCount;
     BRKey keys[totalKeys];
 
     if (seed) {
@@ -1198,6 +1217,14 @@ int BRWalletSignTransaction(BRWallet *wallet, BRTransaction *tx, int forkId, con
         keyOff += legacyInternalCount;
         BRBIP32PrivKeyList(keys + keyOff, legacyExternalCount, seed, seedLen,
                            SEQUENCE_EXTERNAL_CHAIN, legacyExternalIdx);
+        keyOff += legacyExternalCount;
+        // Taproot keys: use "Bitcoin seed" + m/86'/20'/0' (BIP86). The child privkey
+        // here is the INTERNAL key d; BRKeyTaprootSchnorrSign applies the BIP86 taptweak.
+        BRBIP32PrivKeyListBIP86(keys + keyOff, taprootInternalCount, seed, seedLen,
+                                SEQUENCE_INTERNAL_CHAIN, taprootInternalIdx);
+        keyOff += taprootInternalCount;
+        BRBIP32PrivKeyListBIP86(keys + keyOff, taprootExternalCount, seed, seedLen,
+                                SEQUENCE_EXTERNAL_CHAIN, taprootExternalIdx);
         // TODO: XXX wipe seed callback
         seed = NULL;
         if (tx) r = BRTransactionSign(tx, forkId, keys, totalKeys);

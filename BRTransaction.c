@@ -827,6 +827,46 @@ int BRTransactionSign(BRTransaction *tx, int forkId, BRKey keys[], size_t keysCo
     for (i = 0; tx && i < tx->inCount; i++) {
         BRTxInput *input = &tx->inputs[i];
 
+        // --- Taproot key-path spend (witness v1): scriptPubKey == {OP_1, 0x20, X(Q)} ---
+        // A P2TR scriptPubKey carries no hash160, so the BRScriptPKH match below can't
+        // find it. Handle it here as a distinct path (and always `continue` afterward so
+        // the hash160 loop never continue-skips an unhandled P2TR input).
+        {
+            const uint8_t *twElems[BRScriptElements(NULL, 0, input->script, input->scriptLen)];
+            size_t twCount = BRScriptElements(twElems, sizeof(twElems)/sizeof(*twElems),
+                                              input->script, input->scriptLen);
+
+            if (twCount == 2 && *twElems[0] == OP_1 && *twElems[1] == 32) {
+                const uint8_t *program = input->script + input->scriptLen - 32; // X(Q)
+                size_t tj;
+                uint8_t k32[32];
+
+                // Match by taproot OUTPUT key X(Q), not hash160 (keysCount is small).
+                for (tj = 0; tj < keysCount; tj++) {
+                    if (BRKeyTaprootOutputKey(&keys[tj], k32) && memcmp(k32, program, 32) == 0) break;
+                }
+
+                if (tj < keysCount) {
+                    UInt256 tmd = UINT256_ZERO;
+                    uint8_t sig64[64], wit[1 + sizeof(sig64)];
+                    size_t witLen;
+
+                    // BIP-341 key-path sighash (SIGHASH_DEFAULT → 64-byte sig, no trailing flag)
+                    if (_BRTransactionTaprootSighash(tx, NULL, 0, i, SIGHASH_DEFAULT, &tmd) > 0 &&
+                        BRKeyTaprootSchnorrSign(&keys[tj], sig64, tmd) == 64) {
+                        // key-path witness = a stack of exactly ONE item: the 64-byte sig.
+                        // BRScriptPushData writes [0x40][64 bytes]; the serializer counts
+                        // that as a single stack item (same item-encoding as P2WPKH).
+                        witLen = BRScriptPushData(wit, sizeof(wit), sig64, sizeof(sig64));
+                        BRTxInputSetSignature(input, wit, 0);   // empty scriptSig (non-NULL ⇒ IsSigned gate passes)
+                        BRTxInputSetWitness(input, wit, witLen);
+                    }
+                }
+
+                continue; // P2TR fully handled (signed, or no matching key) — do not fall through
+            }
+        }
+
         const uint8_t *hash = BRScriptPKH(input->script, input->scriptLen);
         j = 0;
         while (j < keysCount && (! hash || ! UInt160Eq(pkh[j], UInt160Get(hash)))) j++;

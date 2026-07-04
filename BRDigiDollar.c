@@ -36,14 +36,17 @@ static int _ddReadScriptNum(const uint8_t *data, size_t len, int64_t *out)
     if ((data[len - 1] & 0x7f) == 0) {
         if (len == 1 || (data[len - 2] & 0x80) == 0) return 0; // non-minimal
     }
-    int64_t result = 0;
-    for (size_t i = 0; i < len; i++) result |= (int64_t)data[i] << (8 * i);
+    // accumulate in uint64_t to avoid signed-shift/overflow UB on an 8-byte,
+    // high-bit-set push (real DD amounts are <= 4 bytes, but fail closed safely)
+    uint64_t acc = 0;
+    for (size_t i = 0; i < len; i++) acc |= (uint64_t)data[i] << (8 * i);
     if (data[len - 1] & 0x80) { // negative
-        int64_t mask = (int64_t)1 << (8 * len - 1);
-        result &= ~mask;
-        result = -result;
+        uint64_t mask = (uint64_t)1 << (8 * len - 1);
+        acc &= ~mask;
+        *out = -(int64_t)acc;
+    } else {
+        *out = (int64_t)acc;
     }
-    *out = result;
     return 1;
 }
 

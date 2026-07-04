@@ -354,6 +354,67 @@ void BRBIP32PrivKeyListBIP84(BRKey keys[], size_t keysCount, const void *seed, s
     }
 }
 
+// BIP86 (Taproot) private key: m/86'/20'/0'/chain/index with "Bitcoin seed"
+void BRBIP32PrivKeyBIP86(BRKey *key, const void *seed, size_t seedLen, uint32_t chain, uint32_t index)
+{
+    UInt512 I;
+    UInt256 secret, chainCode;
+
+    assert(key != NULL);
+    assert(seed != NULL || seedLen == 0);
+
+    if (key && (seed || seedLen == 0)) {
+        BRHMAC(&I, BRSHA512, sizeof(UInt512), BIP32_SEED_KEY_STANDARD,
+               strlen(BIP32_SEED_KEY_STANDARD), seed, seedLen);
+        secret = *(UInt256 *)&I;
+        chainCode = *(UInt256 *)&I.u8[sizeof(UInt256)];
+        var_clean(&I);
+
+        _CKDpriv(&secret, &chainCode, BIP86_PURPOSE | BIP32_HARD); // 86'
+        _CKDpriv(&secret, &chainCode, DGB_COIN_TYPE | BIP32_HARD);  // 20'
+        _CKDpriv(&secret, &chainCode, BIP84_ACCOUNT | BIP32_HARD);  // 0'
+        _CKDpriv(&secret, &chainCode, chain);                        // chain
+        _CKDpriv(&secret, &chainCode, index);                        // index
+
+        BRKeySetSecret(key, &secret, 1);
+        var_clean(&secret, &chainCode);
+    }
+}
+
+// BIP86 batch private key derivation for transaction signing
+void BRBIP32PrivKeyListBIP86(BRKey keys[], size_t keysCount, const void *seed, size_t seedLen,
+                             uint32_t chain, const uint32_t indexes[])
+{
+    UInt512 I;
+    UInt256 secret, chainCode, s, c;
+
+    assert(keys != NULL || keysCount == 0);
+    assert(seed != NULL || seedLen == 0);
+    assert(indexes != NULL || keysCount == 0);
+
+    if (keys && keysCount > 0 && (seed || seedLen == 0) && indexes) {
+        BRHMAC(&I, BRSHA512, sizeof(UInt512), BIP32_SEED_KEY_STANDARD,
+               strlen(BIP32_SEED_KEY_STANDARD), seed, seedLen);
+        secret = *(UInt256 *)&I;
+        chainCode = *(UInt256 *)&I.u8[sizeof(UInt256)];
+        var_clean(&I);
+
+        _CKDpriv(&secret, &chainCode, BIP86_PURPOSE | BIP32_HARD); // 86'
+        _CKDpriv(&secret, &chainCode, DGB_COIN_TYPE | BIP32_HARD);  // 20'
+        _CKDpriv(&secret, &chainCode, BIP84_ACCOUNT | BIP32_HARD);  // 0'
+        _CKDpriv(&secret, &chainCode, chain);                        // chain
+
+        for (size_t i = 0; i < keysCount; i++) {
+            s = secret;
+            c = chainCode;
+            _CKDpriv(&s, &c, indexes[i]);
+            BRKeySetSecret(&keys[i], &s, 1);
+        }
+
+        var_clean(&secret, &chainCode, &c, &s);
+    }
+}
+
 // sets the private key for the specified path to key
 // depth is the number of arguments used to specify the path
 void BRBIP32PrivKeyPath(BRKey *key, const void *seed, size_t seedLen, int depth, ...)

@@ -90,6 +90,14 @@ void BRBIP32PrivKeyBIP84(BRKey *key, const void *seed, size_t seedLen, uint32_t 
 void BRBIP32PrivKeyListBIP84(BRKey keys[], size_t keysCount, const void *seed, size_t seedLen,
                              uint32_t chain, const uint32_t indexes[]);
 
+// sets the private key for BIP86 (Taproot) path m/86'/20'/0'/chain/index
+// uses "Bitcoin seed" HMAC key
+void BRBIP32PrivKeyBIP86(BRKey *key, const void *seed, size_t seedLen, uint32_t chain, uint32_t index);
+
+// batch version — sets private key for each element in keys
+void BRBIP32PrivKeyListBIP86(BRKey keys[], size_t keysCount, const void *seed, size_t seedLen,
+                             uint32_t chain, const uint32_t indexes[]);
+
 // writes the public key for path N(m/0H/chain/index) to pubKey
 // returns number of bytes written, or pubKeyLen needed if pubKey is NULL
 size_t BRBIP32PubKey(uint8_t *pubKey, size_t pubKeyLen, BRMasterPubKey mpk, uint32_t chain, uint32_t index);

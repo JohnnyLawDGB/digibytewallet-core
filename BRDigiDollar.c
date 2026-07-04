@@ -5,12 +5,15 @@
 //  public API contract and docs/superpowers/specs/2026-07-04-digidollar-wire-format.md
 //  for the pinned wire format.
 //
-//  Task 1 (.superpowers/sdd/task-1-brief.md) implements only the tx-version
-//  classifier, BRDigiDollarTxType. BRDigiDollarDecodeAmounts and
-//  BRDigiDollarOutputAmount are stubbed here and implemented in later tasks.
+//  Task 1 (.superpowers/sdd/task-1-brief.md) implemented the tx-version
+//  classifier, BRDigiDollarTxType. Task 2 (.superpowers/sdd/task-2-brief.md)
+//  implements BRDigiDollarDecodeAmounts (OP_RETURN "DD" push-walker + minimal
+//  CScriptNum amount decode). BRDigiDollarOutputAmount is stubbed here and
+//  implemented in a later task.
 //
 
 #include "BRDigiDollar.h"
+#include "BRAddress.h" // OP_RETURN
 
 int BRDigiDollarTxType(const BRTransaction *tx)
 {
@@ -21,6 +24,95 @@ int BRDigiDollarTxType(const BRTransaction *tx)
     return 0;
 }
 
-// stubs (implemented in later tasks)
-int BRDigiDollarDecodeAmounts(const BRTransaction *tx, int64_t *amounts, size_t maxAmounts) { return -1; }
+// Minimal-encoded signed little-endian CScriptNum decode (Satoshi rules), <= 8 bytes.
+// Returns 1 and sets *out on success; returns 0 on non-minimal encoding or len > 8.
+// Empty (len==0) decodes to 0 with success (caller decides whether to skip).
+static int _ddReadScriptNum(const uint8_t *data, size_t len, int64_t *out)
+{
+    if (len > 8) return 0;
+    if (len == 0) { *out = 0; return 1; }
+    // minimal-encoding check: top byte can't be 0x00 unless it sets the sign bit of the next
+    if ((data[len - 1] & 0x7f) == 0) {
+        if (len == 1 || (data[len - 2] & 0x80) == 0) return 0; // non-minimal
+    }
+    int64_t result = 0;
+    for (size_t i = 0; i < len; i++) result |= (int64_t)data[i] << (8 * i);
+    if (data[len - 1] & 0x80) { // negative
+        int64_t mask = (int64_t)1 << (8 * len - 1);
+        result &= ~mask;
+        result = -result;
+    }
+    *out = result;
+    return 1;
+}
+
+// Advance a script-push cursor. On entry *pos indexes an opcode in script[0..scriptLen).
+// On success sets *dataOff/*dataLen for the pushed bytes, advances *pos past the push,
+// returns 1. Returns 0 at end-of-script or on a non-push / OP_PUSHDATA it can't read.
+// Handles direct pushes 0x01..0x4b and OP_PUSHDATA1 (0x4c). An empty push (OP_0/0x00)
+// yields dataLen 0. (DD metadata never uses larger pushdata; reject them = fail closed.)
+static int _ddNextPush(const uint8_t *script, size_t scriptLen, size_t *pos,
+                       size_t *dataOff, size_t *dataLen)
+{
+    if (*pos >= scriptLen) return 0;
+    uint8_t op = script[*pos];
+    if (op == 0x00) { *dataOff = *pos + 1; *dataLen = 0; *pos += 1; return 1; } // OP_0 / empty
+    if (op >= 0x01 && op <= 0x4b) {
+        size_t l = op;
+        if (*pos + 1 + l > scriptLen) return 0;
+        *dataOff = *pos + 1; *dataLen = l; *pos += 1 + l; return 1;
+    }
+    if (op == 0x4c) { // OP_PUSHDATA1
+        if (*pos + 2 > scriptLen) return 0;
+        size_t l = script[*pos + 1];
+        if (*pos + 2 + l > scriptLen) return 0;
+        *dataOff = *pos + 2; *dataLen = l; *pos += 2 + l; return 1;
+    }
+    return 0; // any other opcode (incl OP_N numeric) is not a DD metadata push
+}
+
+// Find the first output that is an OP_RETURN whose FIRST push is the 2 bytes "DD" (44 44).
+// Returns the output index, or -1.
+static long _ddFindDDOpReturn(const BRTransaction *tx)
+{
+    for (size_t i = 0; i < tx->outCount; i++) {
+        const BRTxOutput *o = &tx->outputs[i];
+        if (o->scriptLen < 4 || ! o->script || o->script[0] != OP_RETURN) continue;
+        size_t pos = 1, off = 0, len = 0;
+        if (! _ddNextPush(o->script, o->scriptLen, &pos, &off, &len)) continue;
+        if (len == 2 && o->script[off] == 0x44 && o->script[off + 1] == 0x44) return (long)i;
+    }
+    return -1;
+}
+
+int BRDigiDollarDecodeAmounts(const BRTransaction *tx, int64_t *amounts, size_t maxAmounts)
+{
+    int type = BRDigiDollarTxType(tx);
+    if (type == 0) return -1;
+    long ri = _ddFindDDOpReturn(tx);
+    if (ri < 0) return -1;
+    const BRTxOutput *o = &tx->outputs[ri];
+
+    size_t pos = 1, off = 0, len = 0;
+    // push 0: "DD" (already validated by _ddFindDDOpReturn)
+    if (! _ddNextPush(o->script, o->scriptLen, &pos, &off, &len)) return -1;
+    // push 1: txType
+    if (! _ddNextPush(o->script, o->scriptLen, &pos, &off, &len)) return -1;
+    int64_t tt;
+    if (! _ddReadScriptNum(o->script + off, len, &tt) || (int)tt != type) return -1;
+
+    int count = 0;
+    while (_ddNextPush(o->script, o->scriptLen, &pos, &off, &len)) {
+        if (len == 0) continue;               // empty push consumes no slot (spec §3.2)
+        int64_t v;
+        if (! _ddReadScriptNum(o->script + off, len, &v)) return -1; // non-minimal -> fail closed
+        if (v <= 0) return -1;                 // amounts must be positive
+        if ((size_t)count >= maxAmounts) return -1;
+        amounts[count++] = v;
+        if (type != DD_TYPE_TRANSFER) break;   // MINT/REDEEM: first push only
+    }
+    if (count == 0) return -1;
+    return count;
+}
+
 int64_t BRDigiDollarOutputAmount(const BRTransaction *tx, size_t voutIndex) { return -1; }

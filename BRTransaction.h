@@ -58,7 +58,7 @@ uint32_t BRRand(uint32_t upperBound);
 typedef struct {
     UInt256 txHash;
     uint32_t index;
-    char address[44];
+    char address[76]; // must hold any address BRAddress.s can (76) — incl. bech32m P2TR (dgb1p…, 63 chars). Was 44 (P2WPKH-only), which silently dropped Taproot addresses.
     uint64_t amount;
     uint8_t *script;
     size_t scriptLen;
@@ -77,7 +77,7 @@ void BRTxInputSetSignature(BRTxInput *input, const uint8_t *signature, size_t si
 void BRTxInputSetWitness(BRTxInput *input, const uint8_t *witness, size_t witLen);
 
 typedef struct {
-    char address[44];
+    char address[76]; // must hold any address BRAddress.s can (76) — incl. bech32m P2TR (dgb1p…, 63 chars). Was 44 (P2WPKH-only), which silently dropped Taproot addresses.
     uint64_t amount;
     uint8_t *script;
     size_t scriptLen;

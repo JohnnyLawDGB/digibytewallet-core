@@ -475,6 +475,24 @@ void BRWalletSetTaprootKey(BRWallet *wallet, BRMasterPubKey taprootMpk)
     // wallet->lock here — BRWalletUnusedAddrs takes it internally (non-recursive).
     BRWalletUnusedAddrs(wallet, NULL, SEQUENCE_GAP_LIMIT_EXTERNAL + 100, 0, 2);
     BRWalletUnusedAddrs(wallet, NULL, SEQUENCE_GAP_LIMIT_INTERNAL + 100, 1, 2);
+
+    // Re-run the balance computation now that the taproot (m/86') addresses are in
+    // wallet->allAddrs. On the recover path (recoverWalletFromBytes → BRWalletNewDual →
+    // BRWalletSetTaprootKey), BRWalletNewDual has already bulk-loaded the saved
+    // transactions and run _BRWalletUpdateBalance while hasTaprootKey==0 and the taproot
+    // chains were empty — so any saved P2TR output failed
+    // BRSetContains(wallet->allAddrs, output.address) and was dropped from utxos/balance
+    // (the "post-upgrade zero-balance" failure class, here for Taproot receives; a resync
+    // does NOT recover it because the relayed-back tx is already in allTx and
+    // BRWalletRegisterTransaction early-returns without recomputing). Now that the P2TR
+    // addresses are registered, re-scan the wallet's transactions so those outputs are
+    // credited immediately, without waiting for an unrelated balance event. On the
+    // fresh-create path (BRWalletNew, no transactions) this is a harmless no-op.
+    // _BRWalletUpdateBalance does not lock internally, so hold wallet->lock here (matches
+    // the BRWalletNewDual call site at BRWallet.c:453-455).
+    pthread_mutex_lock(&wallet->lock);
+    _BRWalletUpdateBalance(wallet);
+    pthread_mutex_unlock(&wallet->lock);
 }
 
 // returns non-zero if any UTXO in the wallet belongs to the legacy key chains (old m/0H addresses)

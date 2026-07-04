@@ -8,8 +8,9 @@
 //  Task 1 (.superpowers/sdd/task-1-brief.md) implemented the tx-version
 //  classifier, BRDigiDollarTxType. Task 2 (.superpowers/sdd/task-2-brief.md)
 //  implements BRDigiDollarDecodeAmounts (OP_RETURN "DD" push-walker + minimal
-//  CScriptNum amount decode). BRDigiDollarOutputAmount is stubbed here and
-//  implemented in a later task.
+//  CScriptNum amount decode). Task 3 (.superpowers/sdd/task-3-brief.md)
+//  implements BRDigiDollarOutputAmount (positional DD-output-ordinal binding
+//  of decoded amounts to a specific vout; fails closed on any ambiguity).
 //
 
 #include "BRDigiDollar.h"
@@ -115,4 +116,27 @@ int BRDigiDollarDecodeAmounts(const BRTransaction *tx, int64_t *amounts, size_t 
     return count;
 }
 
-int64_t BRDigiDollarOutputAmount(const BRTransaction *tx, size_t voutIndex) { return -1; }
+int64_t BRDigiDollarOutputAmount(const BRTransaction *tx, size_t voutIndex)
+{
+    if (! tx || voutIndex >= tx->outCount) return -1;
+    int64_t amounts[64];
+    int n = BRDigiDollarDecodeAmounts(tx, amounts, 64);
+    if (n < 0) return -1;
+
+    size_t k = 0;
+    for (size_t i = 0; i < tx->outCount; i++) {
+        const BRTxOutput *o = &tx->outputs[i];
+        if (o->scriptLen >= 1 && o->script && o->script[0] == OP_RETURN) continue; // skip metadata
+        if (o->amount != 0) continue;                                              // skip DGB/collateral
+        if (o->scriptLen == 34 && o->script && o->script[0] == 0x51) {             // a DD (zero-value P2TR) output
+            if (i == voutIndex) {
+                if (k < (size_t)n) return amounts[k];
+                return -1;                                                         // ordinal past amount list
+            }
+            k++;                                                                   // advance for every DD output
+        } else if (i == voutIndex) {
+            return -1;                                                             // target isn't a DD output
+        }
+    }
+    return -1;
+}

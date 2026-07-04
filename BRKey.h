@@ -126,6 +126,17 @@ void BRKeyTaggedHash(const char *tag, const uint8_t *msg, size_t msgLen, UInt256
 // signature must tweak key->secret before calling this.
 size_t BRKeySchnorrSign(BRKey *key, uint8_t *sig64, UInt256 md);
 
+// BIP-341 key-path (BIP-86) tap-tweaked Schnorr sign. `key` holds the
+// UNTWEAKED child secret d; this applies the BIP-86 taptweak
+// (t = TaggedHash("TapTweak", x-only(pubkey(d))), NO merkle root -- empty
+// script tree) INTERNALLY via secp256k1_keypair_xonly_tweak_add (which handles
+// the BIP-341 key-negation/parity) and signs md for the output key
+// Q = P + t*G, writing a 64-byte signature to sig64. Returns 64 on success,
+// 0 on failure. The signature verifies under the x-only output key X(Q) -- the
+// key a BIP-86 P2TR UTXO locks to. aux_rand is NULL (deterministic), matching
+// how the BIP-341 wallet test vectors' key-path witness signatures were made.
+size_t BRKeyTaprootSchnorrSign(BRKey *key, uint8_t *sig64, UInt256 md);
+
 // BIP-86 key-path-only Taproot output key: P = x-only(pubkey(key));
 // t = TaggedHash("TapTweak", P) (NO merkle root appended -- BIP-86 always
 // uses an empty script tree, which is the entire point of key-path-only

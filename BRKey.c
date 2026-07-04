@@ -514,6 +514,56 @@ size_t BRKeySchnorrSign(BRKey *key, uint8_t *sig64, UInt256 md)
     return r;
 }
 
+// BIP-341 key-path (BIP-86) tap-tweaked Schnorr sign. `key` holds the UNTWEAKED
+// child secret d; this applies the BIP-86 taptweak INTERNALLY and signs md for
+// the output key Q, writing a 64-byte signature to sig64. Returns 64 on
+// success, 0 on failure.
+//
+// Steps: P = x-only(pubkey(d)); t = TaggedHash("TapTweak", P) -- BIP-86 uses an
+// EMPTY script tree, so NO merkle root is appended (identical tweak to
+// BRKeyTaprootOutputKey). The keypair is tweaked with
+// secp256k1_keypair_xonly_tweak_add, which negates d as needed so the result
+// signs for the even-Y output key Q = P + t*G (the x-only key a P2TR UTXO locks
+// to); the parity handling required by BIP-341 is done inside secp256k1 rather
+// than by hand here. The produced signature verifies under X(Q).
+//
+// aux_rand is passed as NULL (secp256k1_schnorrsig_sign32 treats NULL the same
+// as a 32-byte all-zero buffer), making this a deterministic function of
+// (key, md) -- which is exactly how the BIP-341 wallet-test-vectors key-path
+// witness signatures were produced (aux = 32 zero bytes), so this reproduces
+// them byte-for-byte. Production nonce randomization is left to a later phase,
+// as with BRKeySchnorrSign.
+size_t BRKeyTaprootSchnorrSign(BRKey *key, uint8_t *sig64, UInt256 md)
+{
+    secp256k1_keypair kp;
+    secp256k1_xonly_pubkey xo;
+    uint8_t p32[32];
+    UInt256 t = UINT256_ZERO;
+    size_t r = 0;
+
+    assert(key != NULL);
+    assert(sig64 != NULL);
+
+    pthread_once(&_ctx_once, _ctx_init);
+
+    if (secp256k1_keypair_create(_ctx, &kp, key->secret.u8) &&
+        secp256k1_keypair_xonly_pub(_ctx, &xo, NULL, &kp) &&
+        secp256k1_xonly_pubkey_serialize(_ctx, p32, &xo)) {
+
+        BRKeyTaggedHash("TapTweak", p32, sizeof(p32), &t); // BIP-86: no merkle root
+
+        if (secp256k1_keypair_xonly_tweak_add(_ctx, &kp, t.u8) && // parity handled internally
+            secp256k1_schnorrsig_sign32(_ctx, sig64, md.u8, &kp, NULL)) {
+            r = 64;
+        }
+    }
+
+    var_clean(&kp);
+    var_clean(&t);
+
+    return r;
+}
+
 // BIP-86 key-path-only Taproot output key. P = x-only(pubkey(key));
 // t = TaggedHash("TapTweak", P) -- BIP-86 always uses an EMPTY script tree,
 // so NO merkle root is appended to the tagged hash (that omission is the

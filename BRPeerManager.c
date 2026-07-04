@@ -357,7 +357,12 @@ static void _BRPeerManagerLoadBloomFilter(BRPeerManager *manager, BRPeer *peer)
     BRWalletUnusedAddrs(manager->wallet, NULL, SEQUENCE_GAP_LIMIT_INTERNAL + 100, 1, 1);
     BRWalletUnusedAddrs(manager->wallet, NULL, SEQUENCE_GAP_LIMIT_EXTERNAL + 100, 0, 0);
     BRWalletUnusedAddrs(manager->wallet, NULL, SEQUENCE_GAP_LIMIT_INTERNAL + 100, 1, 0);
-    
+    // Pre-gen the taproot (P2TR / BIP86) gap window into allAddrs so the next
+    // taproot addresses are watched. Bloom can't match P2TR (no hash160), but
+    // allAddrs also feeds BIP158 (BRWalletGetFilterElements), which does.
+    BRWalletUnusedAddrs(manager->wallet, NULL, SEQUENCE_GAP_LIMIT_EXTERNAL + 100, 0, 2);
+    BRWalletUnusedAddrs(manager->wallet, NULL, SEQUENCE_GAP_LIMIT_INTERNAL + 100, 1, 2);
+
     BRSetApply(manager->orphans, NULL, _setApplyFreeBlock);
     BRSetClear(manager->orphans); // clear out orphans that may have been received on an old filter
     manager->lastOrphan = NULL;
@@ -1172,7 +1177,7 @@ static void _peerRelayedTx(void *info, BRTransaction *tx)
             // Do the same for segwit addresses again
             BRWalletUnusedAddrs(manager->wallet, addrs, SEQUENCE_GAP_LIMIT_EXTERNAL, 0, 1);
             BRWalletUnusedAddrs(manager->wallet, addrs + SEQUENCE_GAP_LIMIT_EXTERNAL, SEQUENCE_GAP_LIMIT_INTERNAL, 1, 1);
-            
+
             for (size_t i = 0; i < SEQUENCE_GAP_LIMIT_EXTERNAL + SEQUENCE_GAP_LIMIT_INTERNAL; i++) {
                 if (! BRAddressHash160(&hash, addrs[i].s) ||
                     BRBloomFilterContainsData(manager->bloomFilter, hash.u8, sizeof(hash))) continue;
@@ -1180,6 +1185,16 @@ static void _peerRelayedTx(void *info, BRTransaction *tx)
                 manager->bloomFilter = NULL; // reset bloom filter so it's recreated with new wallet addresses
                 _BRPeerManagerUpdateFilter(manager);
                 break;
+            }
+
+            // Extend the taproot (P2TR / BIP86) gap so the next taproot window stays
+            // watched. Taproot outputs are matched via BIP158 (which reads allAddrs
+            // through BRWalletGetFilterElements), not the BIP37 bloom filter — P2TR
+            // has no hash160 to test against manager->bloomFilter — so there is no
+            // hash160 recheck here; the pregen alone advances the watched window.
+            if (manager->wallet) {
+                BRWalletUnusedAddrs(manager->wallet, NULL, SEQUENCE_GAP_LIMIT_EXTERNAL, 0, 2);
+                BRWalletUnusedAddrs(manager->wallet, NULL, SEQUENCE_GAP_LIMIT_INTERNAL, 1, 2);
             }
         }
     }

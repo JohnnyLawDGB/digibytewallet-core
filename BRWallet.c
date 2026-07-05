@@ -759,6 +759,18 @@ size_t BRWalletUTXOs(BRWallet *wallet, BRUTXO *utxos, size_t utxosCount)
     return utxosCount;
 }
 
+// populates utxos with the wallet's unspent DigiDollar token outputs and returns their
+// number. Returns the count if utxos is NULL. (Pair each with BRDigiDollarOutputAmount for cents.)
+size_t BRWalletDigiDollarUTXOs(BRWallet *wallet, BRUTXO *utxos, size_t utxosCount)
+{
+    assert(wallet != NULL);
+    pthread_mutex_lock(&wallet->lock);
+    if (! utxos || array_count(wallet->ddUtxos) < utxosCount) utxosCount = array_count(wallet->ddUtxos);
+    for (size_t i = 0; utxos && i < utxosCount; i++) utxos[i] = wallet->ddUtxos[i];
+    pthread_mutex_unlock(&wallet->lock);
+    return utxosCount;
+}
+
 // writes transactions registered in the wallet, sorted by date, oldest first, to the given transactions array
 // returns the number of transactions written, or total number available if transactions is NULL
 size_t BRWalletTransactions(BRWallet *wallet, BRTransaction *transactions[], size_t txCount)

@@ -178,6 +178,9 @@ uint64_t BRWalletTotalReceived(BRWallet *wallet);
 // writes unspent outputs to utxos and returns the number of outputs written, or number available if utxos is NULL
 size_t BRWalletUTXOs(BRWallet *wallet, BRUTXO utxos[], size_t utxosCount);
 
+// wallet's unspent DigiDollar token UTXOs (SEND coin-selection input)
+size_t BRWalletDigiDollarUTXOs(BRWallet *wallet, BRUTXO utxos[], size_t utxosCount);
+
 // fee-per-kb of transaction size to use when creating a transaction
 uint64_t BRWalletFeePerKb(BRWallet *wallet);
 void BRWalletSetFeePerKb(BRWallet *wallet, uint64_t feePerKb);

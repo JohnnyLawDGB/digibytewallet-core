@@ -1112,6 +1112,108 @@ BRTransaction *BRWalletForceCreateTxForOutputs(BRWallet *wallet, const BRTxOutpu
     return BRWalletCreateTxForOutputsEx(wallet, outputs, outCount, 1);
 }
 
+#define DD_MIN_FEE 10000000ULL   // 0.1 DGB floor, matching the DigiByte Core DD builder (wire spec §6)
+
+// Builds an UNSIGNED DigiDollar transfer paying `cents` to `recipientKey32`. Selects DD UTXOs to cover
+// `cents` and DGB UTXOs for the fee, emits recipient DD + DD change + DGB change + OP_RETURN, version
+// 0x02000770. Returns the unsigned tx (caller signs with BRWalletSignTransaction), or NULL on failure.
+BRTransaction *BRWalletCreateDigiDollarTransfer(BRWallet *wallet, const uint8_t recipientKey32[32],
+                                                uint64_t cents)
+{
+    assert(wallet != NULL); assert(recipientKey32 != NULL);
+    if (cents == 0 || ! wallet->hasTaprootKey) return NULL;
+
+    BRTransaction *tx = BRTransactionNew();
+    tx->version = 0x02000770;
+
+    pthread_mutex_lock(&wallet->lock);
+
+    // --- collect (utxo, cents) for our DD UTXOs, sort smallest-first ---
+    size_t ddN = array_count(wallet->ddUtxos);
+    struct _ddSel { BRUTXO u; int64_t c; } sel[ddN > 0 ? ddN : 1]; // named tag: same type reused below (two
+                                                                     // anonymous-struct decls are NOT compatible types in C)
+    size_t m = 0;
+    for (size_t i = 0; i < ddN; i++) {
+        BRTransaction *dt = BRSetGet(wallet->allTx, &wallet->ddUtxos[i].hash);
+        if (! dt) continue;
+        int64_t c = BRDigiDollarOutputAmount(dt, wallet->ddUtxos[i].n);
+        if (c <= 0) continue;
+        sel[m].u = wallet->ddUtxos[i]; sel[m].c = c; m++;
+    }
+    for (size_t i = 1; i < m; i++) { // insertion sort ascending by cents
+        struct _ddSel k = sel[i]; size_t j = i;
+        while (j > 0 && sel[j-1].c > k.c) { sel[j] = sel[j-1]; j--; }
+        sel[j] = k;
+    }
+    uint64_t selDD = 0; size_t ddIn = 0;
+    for (size_t i = 0; i < m && selDD < cents; i++) { selDD += (uint64_t)sel[i].c; ddIn++; }
+    if (selDD < cents) { pthread_mutex_unlock(&wallet->lock); BRTransactionFree(tx); return NULL; }
+    uint64_t ddChange = selDD - cents;
+
+    // Release the lock before calling BRWalletUnusedAddrs/BRWalletMinOutputAmount: both take
+    // wallet->lock internally (non-recursive) -- holding it here would self-deadlock (see the
+    // identical "Do NOT hold wallet->lock here" note at BRWalletSetTaprootKey, BRWallet.c:497-498).
+    pthread_mutex_unlock(&wallet->lock);
+
+    // --- outputs: recipient DD, then DD change (order matters; OP_RETURN added last) ---
+    uint8_t rspk[34] = { 0x51, 0x20 }; memcpy(rspk + 2, recipientKey32, 32);
+    BRTransactionAddOutput(tx, 0, rspk, 34);                     // vout0 recipient (verbatim, no re-tweak)
+    if (ddChange > 0) {
+        BRAddress ca = BR_ADDRESS_NONE;
+        BRWalletUnusedAddrs(wallet, &ca, 1, 1, 2);               // internal taproot change (we own it)
+        uint8_t cspk[42]; size_t cl = BRAddressScriptPubKey(cspk, sizeof(cspk), ca.s);
+        BRTransactionAddOutput(tx, 0, cspk, cl);                 // vout1 DD change, value 0
+    }
+    uint64_t dust = BRWalletMinOutputAmount(wallet);
+
+    pthread_mutex_lock(&wallet->lock);
+
+    // --- DD inputs (value 0) ---
+    for (size_t i = 0; i < ddIn; i++) {
+        BRTransaction *dt = BRSetGet(wallet->allTx, &sel[i].u.hash);
+        BRTransactionAddInput(tx, sel[i].u.hash, sel[i].u.n, 0,
+                              dt->outputs[sel[i].u.n].script, dt->outputs[sel[i].u.n].scriptLen,
+                              NULL, 0, NULL, 0, TXIN_SEQUENCE);
+    }
+
+    // --- build OP_RETURN bytes (added last) ---
+    uint8_t orr[32]; size_t ol = 0;
+    orr[ol++] = 0x6a; orr[ol++] = 0x02; orr[ol++] = 0x44; orr[ol++] = 0x44;  // OP_RETURN "DD"
+    orr[ol++] = 0x01; orr[ol++] = 0x02;                                      // push txType 2
+    uint8_t enc[9]; size_t el = BRDigiDollarWriteScriptNum((int64_t)cents, enc);
+    orr[ol++] = (uint8_t)el; memcpy(orr + ol, enc, el); ol += el;
+    if (ddChange > 0) { el = BRDigiDollarWriteScriptNum((int64_t)ddChange, enc);
+                        orr[ol++] = (uint8_t)el; memcpy(orr + ol, enc, el); ol += el; }
+
+    // --- DGB fee inputs; compute fee; DGB change ---
+    uint64_t dgbIn = 0, fee = DD_MIN_FEE;
+    for (size_t i = 0; i < array_count(wallet->utxos); i++) {
+        BRUTXO *o = &wallet->utxos[i];
+        BRTransaction *ut = BRSetGet(wallet->allTx, o);
+        if (! ut || o->n >= ut->outCount) continue;
+        BRTransactionAddInput(tx, ut->txHash, o->n, ut->outputs[o->n].amount,
+                              ut->outputs[o->n].script, ut->outputs[o->n].scriptLen, NULL, 0, NULL, 0, TXIN_SEQUENCE);
+        dgbIn += ut->outputs[o->n].amount;
+        size_t est = BRTransactionVSize(tx) + ol + TX_OUTPUT_SIZE;  // + OP_RETURN + possible DGB change
+        fee = _txFee(wallet->feePerKb, est);
+        if (fee < DD_MIN_FEE) fee = DD_MIN_FEE;
+        if (dgbIn >= fee) break;
+    }
+    if (dgbIn < fee) { pthread_mutex_unlock(&wallet->lock); BRTransactionFree(tx); return NULL; }
+
+    pthread_mutex_unlock(&wallet->lock); // BRWalletUnusedAddrs takes wallet->lock internally (non-recursive)
+
+    if (dgbIn - fee >= dust) {                                    // DGB change (P2WPKH), else remainder -> fee
+        BRAddress dca = BR_ADDRESS_NONE;
+        BRWalletUnusedAddrs(wallet, &dca, 1, 1, 1);              // internal P2WPKH change
+        uint8_t dspk[42]; size_t dl = BRAddressScriptPubKey(dspk, sizeof(dspk), dca.s);
+        BRTransactionAddOutput(tx, dgbIn - fee, dspk, dl);
+    }
+    BRTransactionAddOutput(tx, 0, orr, ol);                      // OP_RETURN LAST
+
+    return tx;                                                    // NO shuffle (order is consensus-significant)
+}
+
 // returns an unsigned transaction that satisifes the given transaction outputs
 // result must be freed by calling BRTransactionFree()
 BRTransaction *BRWalletCreateTxForOutputs(BRWallet *wallet, const BRTxOutput outputs[], size_t outCount)

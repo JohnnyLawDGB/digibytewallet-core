@@ -45,6 +45,11 @@ int64_t BRDigiDollarOutputAmount(const BRTransaction *tx, size_t voutIndex);
 // output key. Returns 1 on success (writes key32), 0 on failure (bad checksum/version/length).
 int BRDigiDollarAddressDecode(uint8_t key32[32], const char *addr, int isTestnet);
 
+// Minimal signed little-endian CScriptNum encode of a non-negative value; writes to out (<=9 bytes),
+// returns the byte length (0 if v==0). Inverse of the internal DD script-num decoder. Positive-only
+// (DD amounts are > 0).
+size_t BRDigiDollarWriteScriptNum(int64_t v, uint8_t out[9]);
+
 #ifdef __cplusplus
 }
 #endif

@@ -193,6 +193,11 @@ BRTransaction *BRWalletCreateTransaction(BRWallet *wallet, uint64_t amount, cons
 // result must be freed using BRTransactionFree()
 BRTransaction *BRWalletCreateTxForOutputs(BRWallet *wallet, const BRTxOutput outputs[], size_t outCount);
 
+// Build an unsigned DigiDollar transfer of `cents` to `recipientKey32` (decoded TD-address key);
+// NULL on shortfall. Sign with BRWalletSignTransaction. Result freed by BRTransactionFree().
+BRTransaction *BRWalletCreateDigiDollarTransfer(BRWallet *wallet, const uint8_t recipientKey32[32],
+                                                uint64_t cents);
+
 int BRWalletGetAddressPrivateKey(BRWallet* wallet, BRKey* key, const char* address, size_t addressLen, const void *seed, size_t seedLen);
 
 // signs any inputs in tx that can be signed using private keys from the wallet

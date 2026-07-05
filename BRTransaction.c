@@ -323,10 +323,12 @@ static size_t _BRTransactionTaprootSighash(const BRTransaction *tx, uint8_t *dat
     // key-path DEFAULT/ALL only — anything else changes the message shape
     if (hashType != SIGHASH_DEFAULT && hashType != SIGHASH_ALL) return 0;
 
-    // every spent input must carry its prevout amount + scriptPubKey (all are committed);
-    // a missing one means wrong digest — surface it rather than sign garbage
+    // every spent input must carry its prevout scriptPubKey (all are committed); a missing one means
+    // wrong digest — surface it rather than sign garbage. NOTE: amount==0 is LEGITIMATE — a DigiDollar
+    // token input is genuinely a zero-satoshi P2TR, and the BIP341 sighash correctly commits amount 0.
+    // Only a missing script (NULL/0-len) signals the caller forgot to attach prevout data.
     for (i = 0; i < tx->inCount; i++) {
-        if (tx->inputs[i].amount == 0 || tx->inputs[i].script == NULL || tx->inputs[i].scriptLen == 0) return 0;
+        if (tx->inputs[i].script == NULL || tx->inputs[i].scriptLen == 0) return 0;
     }
 
     // sha_prevouts = SHA256( txHash(32) || index(4 LE) for each input )   [single SHA256]

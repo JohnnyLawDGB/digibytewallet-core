@@ -41,6 +41,10 @@ int BRDigiDollarDecodeAmounts(const BRTransaction *tx, int64_t *amounts, size_t 
 // nonzero value, or not a 34-byte OP_1 P2TR) or if no amount slot binds to it.
 int64_t BRDigiDollarOutputAmount(const BRTransaction *tx, size_t voutIndex);
 
+// Decode a DigiDollar address (TD… testnet / DD… mainnet Base58Check) to its 32-byte taproot
+// output key. Returns 1 on success (writes key32), 0 on failure (bad checksum/version/length).
+int BRDigiDollarAddressDecode(uint8_t key32[32], const char *addr, int isTestnet);
+
 #ifdef __cplusplus
 }
 #endif

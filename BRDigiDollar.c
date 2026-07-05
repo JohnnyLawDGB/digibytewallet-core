@@ -15,6 +15,7 @@
 
 #include "BRDigiDollar.h"
 #include "BRAddress.h" // OP_RETURN
+#include "BRBase58.h"
 
 int BRDigiDollarTxType(const BRTransaction *tx)
 {
@@ -142,4 +143,18 @@ int64_t BRDigiDollarOutputAmount(const BRTransaction *tx, size_t voutIndex)
         }
     }
     return -1;
+}
+
+// Decodes a DigiDollar address ("TD…" testnet / "DD…" mainnet, Base58Check) into its 32-byte
+// taproot output key. Returns 1 on success, 0 on any failure (fail closed).
+int BRDigiDollarAddressDecode(uint8_t key32[32], const char *addr, int isTestnet)
+{
+    if (! addr || ! key32) return 0;
+    uint8_t data[64];
+    size_t len = BRBase58CheckDecode(data, sizeof(data), addr); // verifies 4-byte double-SHA256 checksum
+    if (len != 34) return 0;                                     // 2-byte version + 32-byte key
+    uint8_t v0 = isTestnet ? 0xb1 : 0x52, v1 = isTestnet ? 0x29 : 0x85; // "TD" / "DD"
+    if (data[0] != v0 || data[1] != v1) return 0;
+    memcpy(key32, data + 2, 32);
+    return 1;
 }

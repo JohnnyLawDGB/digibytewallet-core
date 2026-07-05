@@ -166,6 +166,9 @@ size_t BRWalletTxUnconfirmedBefore(BRWallet *wallet, BRTransaction *transactions
 // current wallet balance, not including transactions known to be invalid
 uint64_t BRWalletBalance(BRWallet *wallet);
 
+// wallet DigiDollar balance in cents (USD) — separate from the satoshi balance
+uint64_t BRWalletDigiDollarBalance(BRWallet *wallet);
+
 // total amount spent from the wallet (exluding change)
 uint64_t BRWalletTotalSent(BRWallet *wallet);
 

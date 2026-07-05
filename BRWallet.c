@@ -28,6 +28,7 @@
 #include "BRArray.h"
 #include "BRBech32.h"
 #include "BRDigiAsset.h"
+#include "BRDigiDollar.h"
 #include <stdlib.h>
 #include <inttypes.h>
 #include <limits.h>
@@ -40,6 +41,8 @@ struct BRWalletStruct {
     uint32_t blockHeight;
     BRUTXO *utxos;
     BRUTXO *assetUtxos;
+    BRUTXO *ddUtxos;      // DigiDollar token UTXOs (zero-value P2TR, cents-denominated)
+    uint64_t ddBalance;   // DigiDollar balance in CENTS (never mixed with the sat balance)
     BRTransaction **transactions;
     BRMasterPubKey masterPubKey;
     BRAddress *internalChain, *externalChain;
@@ -176,6 +179,7 @@ static void _BRWalletUpdateBalance(BRWallet *wallet)
 {
     int isInvalid, isPending;
     uint64_t balance = 0, prevBalance = 0;
+    uint64_t ddBalance = 0;
     time_t now = time(NULL);
     size_t i, j;
     BRTransaction *tx, *t;
@@ -183,6 +187,7 @@ static void _BRWalletUpdateBalance(BRWallet *wallet)
 
     array_clear(wallet->utxos);
     array_clear(wallet->assetUtxos);
+    array_clear(wallet->ddUtxos);
     array_clear(wallet->balanceHist);
     BRSetClear(wallet->spentOutputs);
     BRSetClear(wallet->invalidTx);
@@ -252,7 +257,12 @@ static void _BRWalletUpdateBalance(BRWallet *wallet)
 #if DEBUG
                     printf("ASSETS: Checking %s:%d\n", u256hex(UInt256Reverse(tx->txHash)), j);
 #endif
-                    if (BRTxOutputIsAsset(tx, &tx->outputs[j])) {
+                    int64_t ddCents = BRDigiDollarOutputAmount(tx, (uint32_t)j);
+                    if (ddCents >= 0) {
+                        array_add(wallet->ddUtxos, ((BRUTXO) { tx->txHash, (uint32_t)j }));
+                        ddBalance += (uint64_t)ddCents;
+                        balance += 0; // DD tokens are zero-value; never touch the DGB balance
+                    } else if (BRTxOutputIsAsset(tx, &tx->outputs[j])) {
                         array_add(wallet->assetUtxos, ((BRUTXO) { tx->txHash, (uint32_t)j }));
                         balance += 0;
                     } else {
@@ -283,6 +293,18 @@ static void _BRWalletUpdateBalance(BRWallet *wallet)
 
     //No longer applicable, balance is not for all transactions considering assets
     assert(array_count(wallet->balanceHist) == array_count(wallet->transactions));
+
+    // prune spent DD UTXOs so ddBalance is spendable, not cumulative (spentOutputs is
+    // fully populated after the tx loop). Mirrors the DGB utxo prune at :269-276.
+    for (j = array_count(wallet->ddUtxos); j > 0; j--) {
+        if (BRSetContains(wallet->spentOutputs, &wallet->ddUtxos[j - 1])) {
+            BRTransaction *dt = BRSetGet(wallet->allTx, &wallet->ddUtxos[j - 1].hash);
+            int64_t c = dt ? BRDigiDollarOutputAmount(dt, wallet->ddUtxos[j - 1].n) : -1;
+            if (c > 0 && ddBalance >= (uint64_t)c) ddBalance -= (uint64_t)c;
+            array_rm(wallet->ddUtxos, j - 1);
+        }
+    }
+    wallet->ddBalance = ddBalance;
     wallet->balance = balance;
 }
 
@@ -297,6 +319,7 @@ BRWallet *BRWalletNew(BRTransaction *transactions[], size_t txCount, BRMasterPub
     assert(wallet != NULL);
     array_new(wallet->utxos, 100);
     array_new(wallet->assetUtxos, 30);
+    array_new(wallet->ddUtxos, 30);
     array_new(wallet->transactions, txCount + 100);
     wallet->feePerKb = DEFAULT_FEE_PER_KB;
     wallet->masterPubKey = mpk;
@@ -708,6 +731,17 @@ uint64_t BRWalletBalance(BRWallet *wallet)
     balance = wallet->balance;
     pthread_mutex_unlock(&wallet->lock);
     return balance;
+}
+
+// DigiDollar balance in CENTS (USD). Separate from BRWalletBalance (satoshis).
+uint64_t BRWalletDigiDollarBalance(BRWallet *wallet)
+{
+    uint64_t b;
+    assert(wallet != NULL);
+    pthread_mutex_lock(&wallet->lock);
+    b = wallet->ddBalance;
+    pthread_mutex_unlock(&wallet->lock);
+    return b;
 }
 
 // writes unspent outputs to utxos and returns the number of outputs written, or total number available if utxos is NULL
@@ -1773,6 +1807,7 @@ void BRWalletFree(BRWallet *wallet)
     array_free(wallet->transactions);
     array_free(wallet->utxos);
     array_free(wallet->assetUtxos);
+    array_free(wallet->ddUtxos);
     pthread_mutex_unlock(&wallet->lock);
     pthread_mutex_destroy(&wallet->lock);
     free(wallet);

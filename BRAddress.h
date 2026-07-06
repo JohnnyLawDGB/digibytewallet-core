@@ -51,7 +51,13 @@ extern "C" {
 #else
 #define DIGIBYTE_PUBKEY_BECH32                "dgb"
 #endif
-    
+
+// Runtime-selected DigiByte bech32 HRP ("dgb" mainnet / "dgbt" testnet), per
+// BRNetworkIsTestnet() (see BRNetwork.h). DIGIBYTE_PUBKEY_BECH32 above stays
+// for any remaining compile-time literal use, but all encode/decode paths
+// that need to respect the runtime network toggle must call this instead.
+const char *BRDigiByteBech32Hrp(void);
+
 #define BITCOIN_PUBKEY_ADDRESS_TEST 111  //TODO: Replace these values when the testnet becomes available.
 #define BITCOIN_SCRIPT_ADDRESS_TEST 196  //TODO: Replace these values when the testnet becomes available.
 

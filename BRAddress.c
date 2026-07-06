@@ -26,6 +26,7 @@
 #include "BRBase58.h"
 #include "BRBech32.h"
 #include "BRInt.h"
+#include "BRNetwork.h"
 #include <inttypes.h>
 #include <assert.h>
 
@@ -257,13 +258,20 @@ const uint8_t *BRScriptPKH(const uint8_t *script, size_t scriptLen)
 // we are unable to correctly sign later, then the entire wallet balance after that point would become stuck with the
 // current coin selection code
 
+// runtime-selected DigiByte bech32 HRP ("dgb" mainnet / "dgbt" testnet), per
+// BRNetworkIsTestnet() (see BRAddress.h / BRNetwork.h)
+const char *BRDigiByteBech32Hrp(void)
+{
+    return BRNetworkIsTestnet() ? "dgbt" : "dgb";
+}
+
 // writes the bitcoin address for a scriptPubKey to addr
 // returns the number of bytes written, or addrLen needed if addr is NULL
 size_t BRAddressFromScriptPubKey(char *addr, size_t addrLen, const uint8_t *script, size_t scriptLen)
 {
     assert(script != NULL || scriptLen == 0);
     if (! script || scriptLen == 0 || scriptLen > MAX_SCRIPT_LENGTH) return 0;
-    
+
     uint8_t data[21];
     const uint8_t *d, *elems[BRScriptElements(NULL, 0, script, scriptLen)];
     char a[91];
@@ -271,28 +279,19 @@ size_t BRAddressFromScriptPubKey(char *addr, size_t addrLen, const uint8_t *scri
     if ((count == 5 || count == 8) && *elems[0] == OP_DUP && *elems[1] == OP_HASH160 && *elems[2] == 20 && *elems[3] == OP_EQUALVERIFY
         && *elems[4] == OP_CHECKSIG) {
         // pay-to-pubkey-hash scriptPubKey
-        data[0] = DIGIBYTE_PUBKEY_LEGACY;
-#if BITCOIN_TESTNET
-        data[0] = BITCOIN_PUBKEY_ADDRESS_TEST;
-#endif
+        data[0] = BRNetworkIsTestnet() ? BITCOIN_PUBKEY_ADDRESS_TEST : DIGIBYTE_PUBKEY_LEGACY;
         memcpy(&data[1], BRScriptData(elems[2], &l), 20);
         r = BRBase58CheckEncode(addr, addrLen, data, 21);
     }
     else if (count == 3 && *elems[0] == OP_HASH160 && *elems[1] == 20 && *elems[2] == OP_EQUAL) {
         // pay-to-script-hash scriptPubKey
-        data[0] = DIGIBYTE_SCRIPT_ADDRESS;
-#if BITCOIN_TESTNET
-        data[0] = BITCOIN_SCRIPT_ADDRESS_TEST;
-#endif
+        data[0] = BRNetworkIsTestnet() ? BITCOIN_SCRIPT_ADDRESS_TEST : DIGIBYTE_SCRIPT_ADDRESS;
         memcpy(&data[1], BRScriptData(elems[1], &l), 20);
         r = BRBase58CheckEncode(addr, addrLen, data, 21);
     }
     else if (count == 2 && (*elems[0] == 65 || *elems[0] == 33) && *elems[1] == OP_CHECKSIG) {
         // pay-to-pubkey scriptPubKey
-        data[0] = DIGIBYTE_PUBKEY_LEGACY;
-#if BITCOIN_TESTNET
-        data[0] = BITCOIN_PUBKEY_ADDRESS_TEST;
-#endif
+        data[0] = BRNetworkIsTestnet() ? BITCOIN_PUBKEY_ADDRESS_TEST : DIGIBYTE_PUBKEY_LEGACY;
         d = BRScriptData(elems[0], &l);
         BRHash160(&data[1], d, l);
         r = BRBase58CheckEncode(addr, addrLen, data, 21);
@@ -300,14 +299,11 @@ size_t BRAddressFromScriptPubKey(char *addr, size_t addrLen, const uint8_t *scri
     else if (count == 2 && ((*elems[0] == OP_0 && (*elems[1] == 20 || *elems[1] == 32)) ||
                             (*elems[0] >= OP_1 && *elems[0] <= OP_16 && *elems[1] >= 2 && *elems[1] <= 40))) {
         // pay-to-witness scriptPubKey
-        r = BRBech32Encode(a, "dgb", script);
-#if BITCOIN_TESTNET
-        r = BRBech32Encode(a, "dgbt", script);
-#endif
+        r = BRBech32Encode(a, BRDigiByteBech32Hrp(), script);
         if (addr && r > addrLen) r = 0;
         if (addr) memcpy(addr, a, r);
     }
-    
+
     return r;
 }
 
@@ -322,11 +318,8 @@ size_t BRAddressFromScriptSig(char *addr, size_t addrLen, const uint8_t *script,
     const uint8_t *d = NULL, *elems[BRScriptElements(NULL, 0, script, scriptLen)];
     size_t l = 0, count = BRScriptElements(elems, sizeof(elems)/sizeof(*elems), script, scriptLen);
     
-    data[0] = DIGIBYTE_PUBKEY_LEGACY;
-#if BITCOIN_TESTNET
-    data[0] = BITCOIN_PUBKEY_ADDRESS_TEST;
-#endif
-    
+    data[0] = BRNetworkIsTestnet() ? BITCOIN_PUBKEY_ADDRESS_TEST : DIGIBYTE_PUBKEY_LEGACY;
+
     if (count >= 2 && *elems[count - 2] <= OP_PUSHDATA4 &&
         (*elems[count - 1] == 65 || *elems[count - 1] == 33)) { // pay-to-pubkey-hash scriptSig
         d = BRScriptData(elems[count - 1], &l);
@@ -335,10 +328,7 @@ size_t BRAddressFromScriptSig(char *addr, size_t addrLen, const uint8_t *script,
     }
     else if (count >= 2 && *elems[count - 2] <= OP_PUSHDATA4 && *elems[count - 1] <= OP_PUSHDATA4 &&
              *elems[count - 1] > 0) { // pay-to-script-hash scriptSig
-        data[0] = DIGIBYTE_SCRIPT_ADDRESS;
-#if BITCOIN_TESTNET
-        data[0] = BITCOIN_SCRIPT_ADDRESS_TEST;
-#endif
+        data[0] = BRNetworkIsTestnet() ? BITCOIN_SCRIPT_ADDRESS_TEST : DIGIBYTE_SCRIPT_ADDRESS;
         d = BRScriptData(elems[count - 1], &l);
         if (d) BRHash160(&data[1], d, l);
     }
@@ -364,20 +354,17 @@ size_t BRAddressScriptPubKey(uint8_t *script, size_t scriptLen, const char *addr
 {
     uint8_t pubkeyAddress = DIGIBYTE_PUBKEY_LEGACY, scriptAddress = DIGIBYTE_SCRIPT_ADDRESS, scriptAddressLegacy = DIGIBYTE_SCRIPT_ADDRESS_LEGACY;
     uint8_t data[42];
-#if BITCOIN_TESTNET
-    char hrp[84], bech32Prefix[] = "dgbt";
-#else
-    char hrp[84], bech32Prefix[] = "dgb";
-#endif
+    char hrp[84];
+    const char *bech32Prefix = BRDigiByteBech32Hrp();
     size_t dataLen, r = 0;
-    
+
     assert(addr != NULL);
 
-#if BITCOIN_TESTNET
-    pubkeyAddress = BITCOIN_PUBKEY_ADDRESS_TEST;
-    scriptAddress = BITCOIN_SCRIPT_ADDRESS_TEST;
-#endif
-    
+    if (BRNetworkIsTestnet()) {
+        pubkeyAddress = BITCOIN_PUBKEY_ADDRESS_TEST;
+        scriptAddress = BITCOIN_SCRIPT_ADDRESS_TEST;
+    }
+
     if (BRBase58CheckDecode(data, sizeof(data), addr) == 21) {
         if (data[0] == pubkeyAddress) {
             if (script && 25 <= scriptLen) {
@@ -424,21 +411,18 @@ int BRAddressIsValid(const char *addr)
     assert(addr != NULL);
     
     if (BRBase58CheckDecode(data, sizeof(data), addr) == 21) {
-        r = (data[0] == DIGIBYTE_PUBKEY_LEGACY || data[0] == DIGIBYTE_SCRIPT_ADDRESS_LEGACY);
-        if (!r) r = (data[0] == DIGIBYTE_SCRIPT_ADDRESS); // check new multisig
-    
-#if BITCOIN_TESTNET
-        r = (data[0] == BITCOIN_PUBKEY_ADDRESS_TEST || data[0] == BITCOIN_SCRIPT_ADDRESS_TEST);
-#endif
+        if (BRNetworkIsTestnet()) {
+            r = (data[0] == BITCOIN_PUBKEY_ADDRESS_TEST || data[0] == BITCOIN_SCRIPT_ADDRESS_TEST);
+        }
+        else {
+            r = (data[0] == DIGIBYTE_PUBKEY_LEGACY || data[0] == DIGIBYTE_SCRIPT_ADDRESS_LEGACY);
+            if (!r) r = (data[0] == DIGIBYTE_SCRIPT_ADDRESS); // check new multisig
+        }
     }
     else if (BRBech32Decode(hrp, data, addr) > 2) {
-        r = (strcmp(hrp, DIGIBYTE_PUBKEY_BECH32) == 0 && (data[0] != OP_0 || data[1] == 20 || data[1] == 32));
-
-#if BITCOIN_TESTNET
-        r = (strcmp(hrp, "dgbt") == 0 && (data[0] != OP_0 || data[1] == 20 || data[1] == 32));
-#endif
+        r = (strcmp(hrp, BRDigiByteBech32Hrp()) == 0 && (data[0] != OP_0 || data[1] == 20 || data[1] == 32));
     }
-    
+
     return r;
 }
 

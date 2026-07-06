@@ -30,6 +30,7 @@
 #include "BRAddress.h"
 #include "BRBase58.h"
 #include "BRBech32.h"
+#include "BRNetwork.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -149,16 +150,17 @@ int BRPrivKeyIsValid(const char *privKey)
     strLen = strlen(privKey);
     
     if (dataLen == 33 || dataLen == 34) { // wallet import format: https://en.bitcoin.it/wiki/Wallet_import_format
-#if BITCOIN_TESTNET
-        r = (data[0] == BITCOIN_PRIVKEY_TEST);
-#else
-        if(data[0] == BITCOIN_PRIVKEY) {
-            r = 1;
+        if (BRNetworkIsTestnet()) {
+            r = (data[0] == BITCOIN_PRIVKEY_TEST);
         }
-        if(data[0] == BITCOIN_PRIVKEY_LEGACY) {
-            r = 1;
+        else {
+            if(data[0] == BITCOIN_PRIVKEY) {
+                r = 1;
+            }
+            if(data[0] == BITCOIN_PRIVKEY_LEGACY) {
+                r = 1;
+            }
         }
-#endif
     }
     else if ((strLen == 30 || strLen == 22) && privKey[0] == 'S') { // mini private key format
         char s[strLen + 2];
@@ -193,12 +195,8 @@ int BRKeySetSecret(BRKey *key, const UInt256 *secret, int compressed)
 int BRKeySetPrivKey(BRKey *key, const char *privKey)
 {
     size_t len = strlen(privKey);
-    uint8_t data[34], version = BITCOIN_PRIVKEY;
+    uint8_t data[34], version = BRNetworkIsTestnet() ? BITCOIN_PRIVKEY_TEST : BITCOIN_PRIVKEY;
     int r = 0;
-    
-#if BITCOIN_TESTNET
-    version = BITCOIN_PRIVKEY_TEST;
-#endif
 
     assert(key != NULL);
     assert(privKey != NULL);
@@ -256,11 +254,8 @@ size_t BRKeyPrivKey(const BRKey *key, char *privKey, size_t pkLen)
     assert(key != NULL);
     
     if (secp256k1_ec_seckey_verify(_ctx, key->secret.u8)) {
-        data[0] = BITCOIN_PRIVKEY;
-#if BITCOIN_TESTNET
-        data[0] = BITCOIN_PRIVKEY_TEST;
-#endif
-        
+        data[0] = BRNetworkIsTestnet() ? BITCOIN_PRIVKEY_TEST : BITCOIN_PRIVKEY;
+
         UInt256Set(&data[1], key->secret);
         if (key->compressed) data[33] = 0x01;
         pkLen = BRBase58CheckEncode(privKey, pkLen, data, (key->compressed) ? 34 : 33);
@@ -315,10 +310,7 @@ size_t BRKeyAddress(BRKey *key, char *addr, size_t addrLen)
     assert(key != NULL);
     
     hash = BRKeyHash160(key);
-    data[0] = DIGIBYTE_PUBKEY_LEGACY;
-#if BITCOIN_TESTNET
-    data[0] = BITCOIN_PUBKEY_ADDRESS_TEST;
-#endif
+    data[0] = BRNetworkIsTestnet() ? BITCOIN_PUBKEY_ADDRESS_TEST : DIGIBYTE_PUBKEY_LEGACY;
     UInt160Set(&data[1], hash);
 
     if (! UInt160IsZero(hash)) {
@@ -344,9 +336,9 @@ size_t BRKeySegwitAddress(BRKey* key, char* addr, size_t addrLen, uint8_t segwit
     UInt160 hash = BRKeyHash160(key);
     memcpy(&data[2], &hash, sizeof(UInt160));
     
-    count = BRBech32Encode(&result[0], DIGIBYTE_PUBKEY_BECH32, &data[0]);
+    count = BRBech32Encode(&result[0], BRDigiByteBech32Hrp(), &data[0]);
     assert(count < addrLen);
-    
+
     if (addr && count < addrLen)
         // copy the result
         memcpy(addr, &result[0], count);
@@ -621,7 +613,7 @@ size_t BRKeyTaprootAddress(BRKey *key, char *addr, size_t addrLen)
 
     if (! BRKeyTaprootOutputKey(key, &data[2])) return 0;
 
-    count = BRBech32Encode(&result[0], DIGIBYTE_PUBKEY_BECH32, &data[0]);
+    count = BRBech32Encode(&result[0], BRDigiByteBech32Hrp(), &data[0]);
     assert(count < addrLen);
 
     if (addr && count < addrLen)

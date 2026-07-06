@@ -25,6 +25,7 @@
 #include "BRMerkleBlock.h"
 #include "BRCrypto.h"
 #include "BRAddress.h"
+#include "BRNetwork.h"
 #include <stdlib.h>
 #include <inttypes.h>
 #include <limits.h>
@@ -384,10 +385,10 @@ int BRMerkleBlockVerifyDifficulty(const BRMerkleBlock *block, const BRMerkleBloc
     if (!previous || !UInt256Eq(block->prevBlock, previous->blockHash) || block->height != previous->height + 1)
         r = 0;
 
-#if BITCOIN_TESTNET
-    // TODO: implement testnet difficulty rule check
-    return r; // don't worry about difficulty on testnet for now
-#endif
+    if (BRNetworkIsTestnet()) {
+        // TODO: implement testnet difficulty rule check
+        return r; // don't worry about difficulty on testnet for now
+    }
 
     // TODO: fix difficulty target check for Digibyte (Multishield)
     /*if (r && (block->height % BLOCK_DIFFICULTY_INTERVAL) == 0) {

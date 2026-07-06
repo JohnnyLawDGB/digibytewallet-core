@@ -133,8 +133,8 @@ static const BRCheckPoint BRMainNetCheckpoints[] = {
 };
 
 static const BRCheckPoint BRTestNetCheckpoints[] = {
-    {     0, "0c9af936f28f7bd0e90c8f6235399063a026ed267bb53da398313b5d7aa55d82", 1780156800, 0x1e0ffff0 },
-    { 80000, "66b32adec9b7eeecfae28899679a64e5994aee5babe75fc881d0ef07c0e16f85", 1783178076, 0x1e020dd4 }
+    {     0, uint256("0c9af936f28f7bd0e90c8f6235399063a026ed267bb53da398313b5d7aa55d82"), 1780156800, 0x1e0ffff0 },
+    { 80000, uint256("66b32adec9b7eeecfae28899679a64e5994aee5babe75fc881d0ef07c0e16f85"), 1783178076, 0x1e020dd4 }
 };
 
 static int BRTestNetVerifyDifficulty(const BRMerkleBlock *block, const BRMerkleBlock *previous, uint32_t transitionTime)

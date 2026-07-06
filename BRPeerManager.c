@@ -30,6 +30,7 @@
 #include "BRCompactFilterChain.h"
 #include "BRGCSFilter.h"
 #include "BRWalletFilterElements.h"
+#include "BRNetwork.h"
 #include <stdlib.h>
 #include <stdio.h>
 #include <inttypes.h>
@@ -913,7 +914,12 @@ static void _peerConnected(void *info)
         peer_log(peer, "node isn't synced");
         BRPeerDisconnect(peer);
     }
-    else if (BRPeerVersion(peer) >= 70011 && (peer->services & SERVICES_NODE_BLOOM) != SERVICES_NODE_BLOOM) {
+    else if (BRPeerVersion(peer) >= 70011 && (peer->services & SERVICES_NODE_BLOOM) != SERVICES_NODE_BLOOM &&
+             // Testnet26 nodes serve BIP157/158 compact filters but NOT bloom (bloom is
+             // deprecated/off by default on modern Core). Accept a compact-filter-capable
+             // peer as SPV-usable on testnet so the block-filter path can sync; mainnet
+             // is unchanged (still requires NODE_BLOOM for its bloom peers).
+             !(BRNetworkIsTestnet() && (peer->services & SERVICES_NODE_COMPACT_FILTERS) == SERVICES_NODE_COMPACT_FILTERS)) {
         peer_log(peer, "node doesn't support SPV mode");
         BRPeerDisconnect(peer);
     }
@@ -1078,8 +1084,12 @@ static void _peerRelayedPeers(void *info, const BRPeer peers[], size_t peersCoun
 
     // Only add peers that advertise NODE_BLOOM — non-bloom peers are useless
     // for SPV mode and flood the pool, drowning out bloom seeder peers.
+    // Exception (testnet): also keep compact-filter-capable peers, since
+    // testnet26 nodes serve BIP157/158 filters instead of bloom.
     for (size_t i = 0; i < peersCount; i++) {
-        if ((peers[i].services & SERVICES_NODE_BLOOM) == SERVICES_NODE_BLOOM) {
+        if ((peers[i].services & SERVICES_NODE_BLOOM) == SERVICES_NODE_BLOOM ||
+            (BRNetworkIsTestnet() &&
+             (peers[i].services & SERVICES_NODE_COMPACT_FILTERS) == SERVICES_NODE_COMPACT_FILTERS)) {
             _BRPeerManagerAddPeer(manager, (BRPeer *)&peers[i]);
         }
     }

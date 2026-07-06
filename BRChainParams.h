@@ -162,7 +162,7 @@ static const BRChainParams BRMainNetParams = {
 static const BRChainParams BRTestNetParams = {
     BRTestNetDNSSeeds,
     12033,      // standardPort
-    0xe2b8d1fc, // magicNumber
+    0xe7b9c6fe, // magicNumber (testnet26; wire bytes fe c6 b9 e7, confirmed via live 9.26.3 handshake 2026-07-06)
     0,          // services
     BRTestNetVerifyDifficulty,
     BRTestNetCheckpoints,

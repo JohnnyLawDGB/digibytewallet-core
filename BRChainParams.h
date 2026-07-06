@@ -63,8 +63,7 @@ static const char *BRMainNetDNSSeeds[] = {
 };
 
 static const char *BRTestNetDNSSeeds[] = {
-        "testnet-1.us.digibyteservers.io",
-        "testnetexplorer.digibyteservers.io", NULL
+    "testnetseed.digibyte.io", "testnetseed.digibyte.link", "testnetseed.digibyte.services", NULL
 };
 
 // blockchain checkpoints - these are also used as starting points for partial chain downloads, so they must be at
@@ -134,13 +133,8 @@ static const BRCheckPoint BRMainNetCheckpoints[] = {
 };
 
 static const BRCheckPoint BRTestNetCheckpoints[] = {
-    {0, "2a0f89abc8b26dc42791b5945295788c21d58f46fb5854bea0ce2a0c42dc65e8", 1609556859, 549454338 }
-        //   {     0, "852c475c605e1f20bbe60219c811abaeef08bf0d4ff87eef59200fd7a7567fa7", 1413145109, 0x1b336ce6 },
-        // Sitt 2016-02-18 Use Checkpoint from the First day of digiwallet fork (from breadWallet)
-//        {  145000, uint256("f8d650dda836d5e3809b928b8523f050891c3bb9fa2c201bb04824a8a2fe7df6"), 1409596362, 0x1c01f271},
-//        { 1800000, uint256("72f46e1fff56518dce7e540b407260ea827cb1c4652f24eb1d1917f54b95d65a"), 1454769372, 0x1c021355},
-//        { 2149922, uint256("557846763a5f1eb3205d175724bd26ba7123c17c49eaaadf20b67c7e20e3118a"), 1460001303, 0x1c012a26},
-//        { 4444444, uint256("0000000000000114de2ba1462056d2a9bd9ccfbd406cd2dfedaaef2c12910659"), 1494132592, 0x1a01152f}
+    {     0, "0c9af936f28f7bd0e90c8f6235399063a026ed267bb53da398313b5d7aa55d82", 1780156800, 0x1e0ffff0 },
+    { 80000, "66b32adec9b7eeecfae28899679a64e5994aee5babe75fc881d0ef07c0e16f85", 1783178076, 0x1e020dd4 }
 };
 
 static int BRTestNetVerifyDifficulty(const BRMerkleBlock *block, const BRMerkleBlock *previous, uint32_t transitionTime)
@@ -167,8 +161,8 @@ static const BRChainParams BRMainNetParams = {
 
 static const BRChainParams BRTestNetParams = {
     BRTestNetDNSSeeds,
-    12026,      // standardPort
-    0xeeb791d1, // magicNumber
+    12033,      // standardPort
+    0xe2b8d1fc, // magicNumber
     0,          // services
     BRTestNetVerifyDifficulty,
     BRTestNetCheckpoints,

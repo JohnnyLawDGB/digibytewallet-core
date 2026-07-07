@@ -2450,7 +2450,18 @@ void BRPeerManagerConnect(BRPeerManager *manager)
                 }
                 if (alreadyConnected) continue;
 
-                peer_log(&manager->peers[k], "BIP158: connecting filter-capable peer first");
+                // NOTE: manager->peers holds plain BRPeer structs, NOT BRPeerContext.
+                // peer_log() -> BRPeerHost() casts the arg to BRPeerContext* and writes
+                // the formatted host string into ctx->host, which lives PAST the end of a
+                // bare BRPeer (host is after {BRPeer peer; uint32_t magicNumber;}). On a
+                // candidate-array element that write lands in the NEXT array slot,
+                // corrupting peers[k+1]'s address (and compounding down the loop). Format
+                // the IPv4 octets from a LOCAL copy instead so the log is memory-safe.
+                {
+                    const uint8_t *ip = (const uint8_t *)&manager->peers[k].address.u32[3];
+                    _peer_log("%u.%u.%u.%u:%"PRIu16" BIP158: connecting filter-capable peer first\n",
+                              ip[0], ip[1], ip[2], ip[3], manager->peers[k].port);
+                }
                 _BRPeerManagerBeginConnect(manager, &manager->peers[k]);
             }
         }

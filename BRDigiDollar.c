@@ -170,3 +170,18 @@ int BRDigiDollarAddressDecode(uint8_t key32[32], const char *addr, int isTestnet
     memcpy(key32, data + 2, 32);
     return 1;
 }
+
+// Encodes a 32-byte taproot output key as a DigiDollar receive address ("TD…" testnet / "DD…"
+// mainnet, Base58Check). Exact inverse of BRDigiDollarAddressDecode: prepends the 2-byte network
+// version and appends the 4-byte double-SHA256 checksum via BRBase58CheckEncode. Returns the string
+// length written (excl. NUL), or 0 on failure.
+size_t BRDigiDollarAddressEncode(char *addr, size_t addrLen, const uint8_t key32[32], int isTestnet)
+{
+    if (! addr || ! key32) return 0;
+    uint8_t data[34];
+    data[0] = isTestnet ? 0xb1 : 0x52; // "T"/"D" version high byte
+    data[1] = isTestnet ? 0x29 : 0x85; // "D" version low byte
+    memcpy(data + 2, key32, 32);
+    size_t n = BRBase58CheckEncode(addr, addrLen, data, 34);
+    return (n > 1) ? n - 1 : 0; // BRBase58CheckEncode returns length incl. NUL
+}

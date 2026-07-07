@@ -45,6 +45,11 @@ int64_t BRDigiDollarOutputAmount(const BRTransaction *tx, size_t voutIndex);
 // output key. Returns 1 on success (writes key32), 0 on failure (bad checksum/version/length).
 int BRDigiDollarAddressDecode(uint8_t key32[32], const char *addr, int isTestnet);
 
+// Encode a 32-byte taproot output key as a DigiDollar receive address (TD… testnet / DD… mainnet
+// Base58Check). Exact inverse of BRDigiDollarAddressDecode. Writes a NUL-terminated string to addr
+// and returns its length (excl. NUL), or 0 on failure (buffer too small / bad args).
+size_t BRDigiDollarAddressEncode(char *addr, size_t addrLen, const uint8_t key32[32], int isTestnet);
+
 // Minimal signed little-endian CScriptNum encode of a non-negative value; writes to out (<=9 bytes),
 // returns the byte length (0 if v==0). Inverse of the internal DD script-num decoder. Positive-only
 // (DD amounts are > 0).

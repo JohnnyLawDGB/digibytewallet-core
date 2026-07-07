@@ -206,6 +206,7 @@ typedef struct {
     double startTime, pingTime;
     volatile double disconnectTime, mempoolTime;
     int sentVerack, gotVerack, sentGetaddr, sentFilter, sentGetdata, sentMempool, sentGetblocks;
+    int compactFiltersOnly; // BR_SYNC_MODE_COMPACT_FILTERS_ONLY: pull headers to tip, never getblocks
     UInt256 lastBlockHash;
     BRMerkleBlock *currentBlock;
     UInt256 *currentBlockTxHashes, *knownBlockHashes, *knownTxHashes;
@@ -575,7 +576,8 @@ static int _BRPeerAcceptHeadersMessage(BRPeer *peer, const uint8_t *msg, size_t 
             BRSHA256_2(&locators[0], &msg[off + 81*(count - 1)], 80);
             BRSHA256_2(&locators[1], &msg[off], 80);
 
-            if (timestamp > 0 && timestamp + 7*24*60*60 + BLOCK_MAX_TIME_DRIFT >= ctx->earliestKeyTime) {
+            if (! ctx->compactFiltersOnly &&
+                timestamp > 0 && timestamp + 7*24*60*60 + BLOCK_MAX_TIME_DRIFT >= ctx->earliestKeyTime) {
                 // request blocks for the remainder of the chain
                 timestamp = (++last < count) ? UInt32GetLE(&msg[off + 81*last + 68]) : 0;
 
@@ -601,6 +603,12 @@ static int _BRPeerAcceptHeadersMessage(BRPeer *peer, const uint8_t *msg, size_t 
                 }
                 else BRMerkleBlockFree(block);
             }
+        }
+        else if (ctx->compactFiltersOnly && count == 0) {
+            // compact-filters mode pulls plain headers to the tip; an empty headers reply just means
+            // we've reached the tip (getcfheaders can now anchor to it) — not a protocol error, so
+            // leave r = 1 and do not disconnect the download peer
+            peer_log(peer, "reached header chain tip (compact-filters mode)");
         }
         else {
             peer_log(peer, "non-standard headers message, %zu is fewer header(s) than expected", count);
@@ -1521,6 +1529,13 @@ void BRPeerSetCallbacks(BRPeer *peer, void *info,
 void BRPeerSetEarliestKeyTime(BRPeer *peer, uint32_t earliestKeyTime)
 {
     ((BRPeerContext *)peer)->earliestKeyTime = earliestKeyTime;
+}
+
+// set nonzero in BR_SYNC_MODE_COMPACT_FILTERS_ONLY so _BRPeerAcceptHeadersMessage keeps requesting
+// plain headers to the tip instead of switching to getblocks (no bloom filter exists to match)
+void BRPeerSetCompactFiltersOnly(BRPeer *peer, int compactFiltersOnly)
+{
+    ((BRPeerContext *)peer)->compactFiltersOnly = (compactFiltersOnly) ? 1 : 0;
 }
 
 // call this when local block height changes (helps detect tarpit nodes)

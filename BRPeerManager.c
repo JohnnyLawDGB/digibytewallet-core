@@ -953,10 +953,11 @@ static void _peerConnected(void *info)
 
             // request just block headers up to a week before earliestKeyTime, and then merkleblocks after that
             // we do not reset connect failure count yet incase this request times out
-            if (manager->lastBlock->timestamp + 7*24*60*60 >= manager->earliestKeyTime) {
+            if (manager->syncMode != BR_SYNC_MODE_COMPACT_FILTERS_ONLY &&
+                manager->lastBlock->timestamp + 7*24*60*60 >= manager->earliestKeyTime) {
                 BRPeerSendGetblocks(peer, locators, count, UINT256_ZERO);
             }
-            else BRPeerSendGetheaders(peer, locators, count, UINT256_ZERO);
+            else BRPeerSendGetheaders(peer, locators, count, UINT256_ZERO); // compact-only always pulls plain headers
         }
         else { // we're already synced
             manager->connectFailureCount = 0; // reset connect failure count
@@ -1435,11 +1436,12 @@ static void _peerRelayedBlock(void *info, BRMerkleBlock *block)
     }
 
     // ignore block headers that are newer than one week before earliestKeyTime (it's a header if it has 0 totalTx)
-    if (block->totalTx == 0 && block->timestamp + 7*24*60*60 > manager->earliestKeyTime + 2*60*60) {
+    if (manager->syncMode != BR_SYNC_MODE_COMPACT_FILTERS_ONLY &&
+        block->totalTx == 0 && block->timestamp + 7*24*60*60 > manager->earliestKeyTime + 2*60*60) {
         BRMerkleBlockFree(block);
         block = NULL;
     }
-    else if (manager->bloomFilter == NULL) { // ingore potentially incomplete blocks when a filter update is pending
+    else if (manager->syncMode != BR_SYNC_MODE_COMPACT_FILTERS_ONLY && manager->bloomFilter == NULL) { // bloom/BOTH only; compact-only keeps bloomFilter==NULL by design so this must not fire
         BRMerkleBlockFree(block);
         block = NULL;
 
@@ -2365,6 +2367,7 @@ static void _BRPeerManagerBeginConnect(BRPeerManager *manager, const BRPeer *tmp
                        _peerRelayedTx, _peerHasTx, _peerRejectedTx, _peerRelayedBlock, _peerDataNotfound,
                        _peerSetFeePerKb, _peerRequestedTx, _peerNetworkIsReachable, _peerThreadCleanup);
     BRPeerSetEarliestKeyTime(info->peer, manager->earliestKeyTime);
+    BRPeerSetCompactFiltersOnly(info->peer, manager->syncMode == BR_SYNC_MODE_COMPACT_FILTERS_ONLY);
     BRPeerConnect(info->peer);
 
     if (BRPeerConnectStatus(info->peer) == BRPeerStatusDisconnected) {
@@ -2503,6 +2506,7 @@ void BRPeerManagerConnect(BRPeerManager *manager)
                                    _peerRelayedTx, _peerHasTx, _peerRejectedTx, _peerRelayedBlock, _peerDataNotfound,
                                    _peerSetFeePerKb, _peerRequestedTx, _peerNetworkIsReachable, _peerThreadCleanup);
                 BRPeerSetEarliestKeyTime(info->peer, manager->earliestKeyTime);
+                BRPeerSetCompactFiltersOnly(info->peer, manager->syncMode == BR_SYNC_MODE_COMPACT_FILTERS_ONLY);
                 BRPeerConnect(info->peer);
                 
                 if (BRPeerConnectStatus(info->peer) == BRPeerStatusDisconnected) {

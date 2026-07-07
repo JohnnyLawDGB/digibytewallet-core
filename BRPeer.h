@@ -179,6 +179,11 @@ void BRPeerSetCallbacks(BRPeer *peer, void *info,
 // set earliestKeyTime to wallet creation time in order to speed up initial sync
 void BRPeerSetEarliestKeyTime(BRPeer *peer, uint32_t earliestKeyTime);
 
+// In BR_SYNC_MODE_COMPACT_FILTERS_ONLY the manager sets this so the headers handler keeps
+// requesting plain block headers to the chain tip and never switches to getblocks/merkleblocks
+// (there is no bloom filter to match against). Set once before BRPeerConnect. Default 0 = legacy.
+void BRPeerSetCompactFiltersOnly(BRPeer *peer, int compactFiltersOnly);
+
 // call this when local best block height changes (helps detect tarpit nodes)
 void BRPeerSetCurrentBlockHeight(BRPeer *peer, uint32_t currentBlockHeight);
 

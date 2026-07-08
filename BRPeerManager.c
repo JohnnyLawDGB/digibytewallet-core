@@ -31,6 +31,7 @@
 #include "BRGCSFilter.h"
 #include "BRWalletFilterElements.h"
 #include "BRNetwork.h"
+#include "BRPeerServices.h"
 #include <stdlib.h>
 #include <stdio.h>
 #include <inttypes.h>
@@ -914,12 +915,15 @@ static void _peerConnected(void *info)
         peer_log(peer, "node isn't synced");
         BRPeerDisconnect(peer);
     }
-    else if (BRPeerVersion(peer) >= 70011 && (peer->services & SERVICES_NODE_BLOOM) != SERVICES_NODE_BLOOM &&
-             // Testnet26 nodes serve BIP157/158 compact filters but NOT bloom (bloom is
-             // deprecated/off by default on modern Core). Accept a compact-filter-capable
-             // peer as SPV-usable on testnet so the block-filter path can sync; mainnet
-             // is unchanged (still requires NODE_BLOOM for its bloom peers).
-             !(BRNetworkIsTestnet() && (peer->services & SERVICES_NODE_COMPACT_FILTERS) == SERVICES_NODE_COMPACT_FILTERS)) {
+    else if (BRPeerVersion(peer) >= 70011 &&
+             ! BRPeerServicesAllowedForSyncMode(peer->services, manager->syncMode)) {
+        // Bloom OR (compact filters while not in bloom-only mode). Generalizes the
+        // former testnet-only compact-filter exception to mainnet so CF-only nodes
+        // (bloom off by default on modern Core) are SPV-usable on the filter path.
+        // NOTE: this also means testnet no longer keeps CF peers under BLOOM_ONLY —
+        // intentional and unreachable, since the app always forces testnet to
+        // COMPACT_FILTERS_ONLY. Gossip retention (BRPeerManager.c:1086-1096) is left
+        // testnet-only here; its mainnet generalization ships with oracle-bootstrap.
         peer_log(peer, "node doesn't support SPV mode");
         BRPeerDisconnect(peer);
     }

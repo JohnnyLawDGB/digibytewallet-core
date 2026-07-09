@@ -1711,6 +1711,55 @@ static void _peerRelayedBlock(void *info, BRMerkleBlock *block)
     if (next) _peerRelayedBlock(info, next);
 }
 
+// Confirms wallet txs delivered via a compact-filter-driven full "block" message (see BRPeer.c
+// _BRPeerAcceptBlockMessage). Chain extension for the block itself is handled entirely by the
+// regular headers/merkleblock path (_peerRelayedBlock above); this handler only fires once that
+// block's header is already known, so it can attach a confirmation height/timestamp to the txs.
+static void _peerRelayedBlockTxns(void *info, UInt256 blockHash, const UInt256 txHashes[], size_t txCount)
+{
+    BRPeerManager *manager = ((BRPeerCallbackInfo *)info)->manager;
+    BRMerkleBlock *b, *b2;
+    int confirmed = 0;
+
+    if (txCount == 0) return;
+
+    pthread_mutex_lock(&manager->lock);
+    b = BRSetGet(manager->blocks, &blockHash);
+
+    if (! b) { // header not synced yet; the block will be re-requested/re-relayed once it is
+        pthread_mutex_unlock(&manager->lock);
+        return;
+    }
+
+    b2 = manager->lastBlock;
+    while (b2 && b2->height > b->height) b2 = BRSetGet(manager->blocks, &b2->prevBlock); // is block in main chain?
+
+    if (! BRMerkleBlockEq(b2, b)) { // block is on a fork, not the main chain; don't confirm against it
+        pthread_mutex_unlock(&manager->lock);
+        return;
+    }
+
+    UInt256 *walletHashes = malloc(txCount*sizeof(*walletHashes));
+    size_t walletCount = 0;
+
+    assert(walletHashes != NULL);
+
+    for (size_t i = 0; i < txCount; i++) {
+        if (BRWalletTransactionForHash(manager->wallet, txHashes[i])) walletHashes[walletCount++] = txHashes[i];
+    }
+
+    if (walletCount > 0) {
+        _BRPeerManagerUpdateTx(manager, walletHashes, walletCount, b->height, b->timestamp);
+        confirmed = 1;
+    }
+
+    free(walletHashes);
+    pthread_mutex_unlock(&manager->lock);
+
+    // notify outside the lock, matching _peerRelayedBlock's txStatusUpdate call below
+    if (confirmed && manager->txStatusUpdate) manager->txStatusUpdate(manager->info);
+}
+
 static void _peerDataNotfound(void *info, const UInt256 txHashes[], size_t txCount,
                              const UInt256 blockHashes[], size_t blockCount)
 {
@@ -2437,8 +2486,9 @@ static void _BRPeerManagerBeginConnect(BRPeerManager *manager, const BRPeer *tmp
     manager->peerThreadCount++;
     array_add(manager->connectedPeers, info->peer);
     BRPeerSetCallbacks(info->peer, info, _peerConnected, _peerDisconnected, _peerRelayedPeers,
-                       _peerRelayedTx, _peerHasTx, _peerRejectedTx, _peerRelayedBlock, NULL, _peerDataNotfound,
-                       _peerSetFeePerKb, _peerRequestedTx, _peerNetworkIsReachable, _peerThreadCleanup);
+                       _peerRelayedTx, _peerHasTx, _peerRejectedTx, _peerRelayedBlock, _peerRelayedBlockTxns,
+                       _peerDataNotfound, _peerSetFeePerKb, _peerRequestedTx, _peerNetworkIsReachable,
+                       _peerThreadCleanup);
     BRPeerSetEarliestKeyTime(info->peer, manager->earliestKeyTime);
     BRPeerSetCompactFiltersOnly(info->peer, manager->syncMode == BR_SYNC_MODE_COMPACT_FILTERS_ONLY);
     BRPeerConnect(info->peer);
@@ -2585,9 +2635,9 @@ void BRPeerManagerConnect(BRPeerManager *manager)
                 array_add(manager->connectedPeers, info->peer);
                 manager->peerThreadCount++;
                 BRPeerSetCallbacks(info->peer, info, _peerConnected, _peerDisconnected, _peerRelayedPeers,
-                                   _peerRelayedTx, _peerHasTx, _peerRejectedTx, _peerRelayedBlock, NULL,
-                                   _peerDataNotfound, _peerSetFeePerKb, _peerRequestedTx, _peerNetworkIsReachable,
-                                   _peerThreadCleanup);
+                                   _peerRelayedTx, _peerHasTx, _peerRejectedTx, _peerRelayedBlock,
+                                   _peerRelayedBlockTxns, _peerDataNotfound, _peerSetFeePerKb, _peerRequestedTx,
+                                   _peerNetworkIsReachable, _peerThreadCleanup);
                 BRPeerSetEarliestKeyTime(info->peer, manager->earliestKeyTime);
                 BRPeerSetCompactFiltersOnly(info->peer, manager->syncMode == BR_SYNC_MODE_COMPACT_FILTERS_ONLY);
                 BRPeerConnect(info->peer);

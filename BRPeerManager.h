@@ -38,7 +38,12 @@
 extern "C" {
 #endif
 
-#define PEER_MAX_CONNECTIONS 5
+// Max simultaneous peer connections. Raised 5 -> 8 (Bitcoin Core's default
+// outbound) to improve discovery of scarce compact-filter (BIP157/158) peers on
+// mainnet: with only ~a handful of filter-serving nodes, 5 slots were too few to
+// reliably hold a synced filter peer. Revisit toward 12-16 as the filter-node
+// population grows (oracle-bootstrap). Bloom-mode sync is unaffected.
+#define PEER_MAX_CONNECTIONS 8
 
 /* defines, how many blocks to be held in sqlite DB */
 #define SAVE_BLOCK_COUNT 300

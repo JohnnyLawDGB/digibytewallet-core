@@ -962,6 +962,16 @@ static int _BRPeerAcceptBlockMessage(BRPeer *peer, const uint8_t *msg, size_t ms
         return 0;
     }
 
+    // Each tx serializes to >= 1 byte, so a txCount larger than the bytes remaining
+    // after the header is malformed. Reject here — BEFORE the calloc below — so a peer
+    // can't send a tiny block claiming a huge txCount and force a large allocation
+    // (memory-amplification). off <= msgLen is guaranteed by the checks above.
+    if (off > msgLen || txCount > msgLen - off) {
+        peer_log(peer, "malformed block: tx count %zu exceeds %zu remaining byte(s)",
+                 txCount, (off <= msgLen ? msgLen - off : (size_t)0));
+        return 0;
+    }
+
     peer_log(peer, "got block with %zu tx(s), %zu bytes", txCount, msgLen);
 
     UInt256 *txHashes = NULL;

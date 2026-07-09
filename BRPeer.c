@@ -220,6 +220,7 @@ typedef struct {
     void (*hasTx)(void *info, UInt256 txHash);
     void (*rejectedTx)(void *info, UInt256 txHash, uint8_t code);
     void (*relayedBlock)(void *info, BRMerkleBlock *block);
+    void (*relayedBlockTxns)(void *info, UInt256 blockHash, const UInt256 txHashes[], size_t txCount);
     void (*notfound)(void *info, const UInt256 txHashes[], size_t txCount, const UInt256 blockHashes[],
                      size_t blockCount);
     void (*setFeePerKb)(void *info, uint64_t feePerKb);
@@ -935,7 +936,10 @@ static int _BRPeerAcceptFeeFilterMessage(BRPeer *peer, const uint8_t *msg, size_
 // then this handler walks the txs to find the ones touching our wallet.
 // Chain extension is handled by the regular "headers"/"merkleblock" path
 // independent of this handler, so we deliberately do not call relayedBlock
-// from here.
+// from here. Instead, once all txs are parsed and handed to relayedTx, we
+// fire relayedBlockTxns with the block hash and the hashes of the txs we
+// just delivered, so the manager can confirm them into the block (whose
+// header/height it tracks separately via the headers path) once known.
 static int _BRPeerAcceptBlockMessage(BRPeer *peer, const uint8_t *msg, size_t msgLen)
 {
     BRPeerContext *ctx = (BRPeerContext *)peer;
@@ -944,6 +948,9 @@ static int _BRPeerAcceptBlockMessage(BRPeer *peer, const uint8_t *msg, size_t ms
         peer_log(peer, "malformed block message, length is %zu, should be >= 81", msgLen);
         return 0;
     }
+
+    UInt256 blockHash;
+    BRSHA256_2(&blockHash, msg, 80); // same computation BRMerkleBlockParse uses for blockHash
 
     size_t off = 80; // skip the block header
     size_t varLen = 0;
@@ -957,24 +964,38 @@ static int _BRPeerAcceptBlockMessage(BRPeer *peer, const uint8_t *msg, size_t ms
 
     peer_log(peer, "got block with %zu tx(s), %zu bytes", txCount, msgLen);
 
+    UInt256 *txHashes = NULL;
+    if (txCount > 0) {
+        txHashes = calloc(txCount, sizeof(UInt256));
+        if (!txHashes) {
+            peer_log(peer, "malformed block: txHashes calloc failed for %zu tx(s)", txCount);
+            return 0;
+        }
+    }
+
     size_t delivered = 0;
     for (size_t i = 0; i < txCount; i++) {
         if (off >= msgLen) {
             peer_log(peer, "malformed block: ran off end at tx %zu of %zu", i, txCount);
+            free(txHashes);
             return 0;
         }
         BRTransaction *tx = BRTransactionParse(&msg[off], msgLen - off);
         if (!tx) {
             peer_log(peer, "malformed block: tx %zu failed to parse", i);
+            free(txHashes);
             return 0;
         }
         size_t consumed = BRTransactionSerialize(tx, NULL, 0);
         if (consumed == 0 || off + consumed > msgLen) {
             peer_log(peer, "malformed block: tx %zu consumed %zu would overrun", i, consumed);
             BRTransactionFree(tx);
+            free(txHashes);
             return 0;
         }
         off += consumed;
+
+        txHashes[i] = tx->txHash; // read before relayedTx takes ownership below
 
         if (ctx->relayedTx) {
             ctx->relayedTx(ctx->info, tx); // callback takes ownership
@@ -984,6 +1005,11 @@ static int _BRPeerAcceptBlockMessage(BRPeer *peer, const uint8_t *msg, size_t ms
             BRTransactionFree(tx);
         }
     }
+
+    if (ctx->relayedBlockTxns && txCount > 0) {
+        ctx->relayedBlockTxns(ctx->info, blockHash, txHashes, txCount);
+    }
+    free(txHashes);
 
     peer_log(peer, "block: delivered %zu/%zu tx(s) via relayedTx", delivered, txCount);
     return 1;
@@ -1489,6 +1515,9 @@ BRPeer *BRPeerNew(uint32_t magicNumber)
 // void hasTx(void *, UInt256 txHash) - called when an "inv" message with an already-known tx hash is received from peer
 // void rejectedTx(void *, UInt256 txHash, uint8_t) - called when a "reject" message is received from peer
 // void relayedBlock(void *, BRMerkleBlock *) - called when a "merkleblock" or "headers" message is received from peer
+// void relayedBlockTxns(void *, UInt256, const UInt256[], size_t) - called after a full "block" message's txs are
+//     all delivered via relayedTx, with the block hash and the hashes of the txs just delivered (BIP158 CF
+//     confirmation path: lets the manager confirm those txs into the block once its header/height is known)
 // void notfound(void *, const UInt256[], size_t, const UInt256[], size_t) - called when "notfound" message is received
 // BRTransaction *requestedTx(void *, UInt256) - called when "getdata" message with a tx hash is received from peer
 // int networkIsReachable(void *) - must return true when networking is available, false otherwise
@@ -1501,6 +1530,8 @@ void BRPeerSetCallbacks(BRPeer *peer, void *info,
                         void (*hasTx)(void *info, UInt256 txHash),
                         void (*rejectedTx)(void *info, UInt256 txHash, uint8_t code),
                         void (*relayedBlock)(void *info, BRMerkleBlock *block),
+                        void (*relayedBlockTxns)(void *info, UInt256 blockHash, const UInt256 txHashes[],
+                                                  size_t txCount),
                         void (*notfound)(void *info, const UInt256 txHashes[], size_t txCount,
                                          const UInt256 blockHashes[], size_t blockCount),
                         void (*setFeePerKb)(void *info, uint64_t feePerKb),
@@ -1509,7 +1540,7 @@ void BRPeerSetCallbacks(BRPeer *peer, void *info,
                         void (*threadCleanup)(void *info))
 {
     BRPeerContext *ctx = (BRPeerContext *)peer;
-    
+
     ctx->info = info;
     ctx->connected = connected;
     ctx->disconnected = disconnected;
@@ -1518,6 +1549,7 @@ void BRPeerSetCallbacks(BRPeer *peer, void *info,
     ctx->hasTx = hasTx;
     ctx->rejectedTx = rejectedTx;
     ctx->relayedBlock = relayedBlock;
+    ctx->relayedBlockTxns = relayedBlockTxns;
     ctx->notfound = notfound;
     ctx->setFeePerKb = setFeePerKb;
     ctx->requestedTx = requestedTx;

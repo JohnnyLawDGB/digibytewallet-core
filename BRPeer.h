@@ -157,6 +157,9 @@ BRPeer *BRPeerNew(uint32_t magicNumber);
 // void hasTx(void *, UInt256 txHash) - called when an "inv" message with an already-known tx hash is received from peer
 // void rejectedTx(void *, UInt256 txHash, uint8_t) - called when a "reject" message is received from peer
 // void relayedBlock(void *, BRMerkleBlock *) - called when a "merkleblock" or "headers" message is received from peer
+// void relayedBlockTxns(void *, UInt256, const UInt256[], size_t) - called after a full "block" message's txs are
+//     all delivered via relayedTx, with the block hash and the hashes of the txs just delivered (BIP158 CF
+//     confirmation path: lets the manager confirm those txs into the block once its header/height is known)
 // void notfound(void *, const UInt256[], size_t, const UInt256[], size_t) - called when "notfound" message is received
 // BRTransaction *requestedTx(void *, UInt256) - called when "getdata" message with a tx hash is received from peer
 // int networkIsReachable(void *) - must return true when networking is available, false otherwise
@@ -169,6 +172,8 @@ void BRPeerSetCallbacks(BRPeer *peer, void *info,
                         void (*hasTx)(void *info, UInt256 txHash),
                         void (*rejectedTx)(void *info, UInt256 txHash, uint8_t code),
                         void (*relayedBlock)(void *info, BRMerkleBlock *block),
+                        void (*relayedBlockTxns)(void *info, UInt256 blockHash, const UInt256 txHashes[],
+                                                  size_t txCount),
                         void (*notfound)(void *info, const UInt256 txHashes[], size_t txCount,
                                          const UInt256 blockHashes[], size_t blockCount),
                         void (*setFeePerKb)(void *info, uint64_t feePerKb),

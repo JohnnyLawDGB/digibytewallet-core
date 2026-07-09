@@ -2437,7 +2437,7 @@ static void _BRPeerManagerBeginConnect(BRPeerManager *manager, const BRPeer *tmp
     manager->peerThreadCount++;
     array_add(manager->connectedPeers, info->peer);
     BRPeerSetCallbacks(info->peer, info, _peerConnected, _peerDisconnected, _peerRelayedPeers,
-                       _peerRelayedTx, _peerHasTx, _peerRejectedTx, _peerRelayedBlock, _peerDataNotfound,
+                       _peerRelayedTx, _peerHasTx, _peerRejectedTx, _peerRelayedBlock, NULL, _peerDataNotfound,
                        _peerSetFeePerKb, _peerRequestedTx, _peerNetworkIsReachable, _peerThreadCleanup);
     BRPeerSetEarliestKeyTime(info->peer, manager->earliestKeyTime);
     BRPeerSetCompactFiltersOnly(info->peer, manager->syncMode == BR_SYNC_MODE_COMPACT_FILTERS_ONLY);
@@ -2585,8 +2585,9 @@ void BRPeerManagerConnect(BRPeerManager *manager)
                 array_add(manager->connectedPeers, info->peer);
                 manager->peerThreadCount++;
                 BRPeerSetCallbacks(info->peer, info, _peerConnected, _peerDisconnected, _peerRelayedPeers,
-                                   _peerRelayedTx, _peerHasTx, _peerRejectedTx, _peerRelayedBlock, _peerDataNotfound,
-                                   _peerSetFeePerKb, _peerRequestedTx, _peerNetworkIsReachable, _peerThreadCleanup);
+                                   _peerRelayedTx, _peerHasTx, _peerRejectedTx, _peerRelayedBlock, NULL,
+                                   _peerDataNotfound, _peerSetFeePerKb, _peerRequestedTx, _peerNetworkIsReachable,
+                                   _peerThreadCleanup);
                 BRPeerSetEarliestKeyTime(info->peer, manager->earliestKeyTime);
                 BRPeerSetCompactFiltersOnly(info->peer, manager->syncMode == BR_SYNC_MODE_COMPACT_FILTERS_ONLY);
                 BRPeerConnect(info->peer);

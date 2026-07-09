@@ -32,6 +32,7 @@
 #include "BRWalletFilterElements.h"
 #include "BRNetwork.h"
 #include "BRPeerServices.h"
+#include "BRPeerPenalty.h"
 #include <stdlib.h>
 #include <stdio.h>
 #include <inttypes.h>
@@ -48,6 +49,16 @@
 #define MAX_CONNECT_FAILURES  20 // notify user of network problems after this many connect failures in a row
 #define PEER_FLAG_SYNCED      0x01
 #define PEER_FLAG_NEEDSUPDATE 0x02
+
+// Session-scoped "don't re-dial this peer yet" penalty (churn fix). A peer
+// rejected by _peerConnected as "node isn't synced" (BRPeerManager.c ~914)
+// goes on this list so the filter-first dial loop (BRPeerManagerConnect,
+// ~2448) skips it for PEER_PENALTY_SECONDS instead of immediately re-dialing
+// the same still-behind peer every connect pass -- observed live as one
+// peer dialed 122x in a tight loop while the wallet held 0 peers. Fixed-size
+// ring buffer, not persisted across process restarts.
+#define PEER_PENALTY_MAX     32
+#define PEER_PENALTY_SECONDS (10*60) // 10 min; a genuinely-behind node is skipped this long
 
 #define genesis_block_hash(params) UInt256Reverse((params)->checkpoints[0].hash)
 
@@ -235,6 +246,14 @@ struct BRPeerManagerStruct {
     // CONSECUTIVE diverged rounds instead; at CF_SINGLE_PEER_REANCHOR_ROUNDS force
     // a (still CF_CONTINUITY_REANCHOR_MAX-bounded) re-anchor.
     uint8_t  cfSingleDisagreeRounds;
+    // Session-scoped re-dial penalty (churn fix, see PEER_PENALTY_* above).
+    // Ring buffer: penaltyCount only ever grows (mod PEER_PENALTY_MAX indexing
+    // on insert), never shrinks -- entries just age out via BRPeerPenaltyContains'
+    // until-vs-now check. Zero-initialized by BRPeerManagerNewEx's calloc.
+    UInt128  penaltyAddr[PEER_PENALTY_MAX];
+    uint16_t penaltyPort[PEER_PENALTY_MAX];
+    time_t   penaltyUntil[PEER_PENALTY_MAX];
+    size_t   penaltyCount;
     pthread_mutex_t lock;
 };
 
@@ -892,6 +911,26 @@ static void _BRPeerManagerProbeOtherFilterPeersForCFHeaders(BRPeerManager *manag
                                                             uint8_t filterType, uint32_t startHeight,
                                                             UInt256 stopHash);
 
+// Ring-buffer insert/refresh for the churn-fix penalty set (see PEER_PENALTY_*
+// above). If (addr, port) is already on the list its window is refreshed;
+// otherwise it's inserted at penaltyCount % PEER_PENALTY_MAX (oldest entry
+// evicted once the buffer wraps). Caller holds manager->lock.
+static void _penalize(BRPeerManager *manager, UInt128 addr, uint16_t port, time_t now)
+{
+    for (size_t i = 0; i < manager->penaltyCount && i < PEER_PENALTY_MAX; i++) {
+        if (manager->penaltyPort[i] == port && UInt128Eq(manager->penaltyAddr[i], addr)) {
+            manager->penaltyUntil[i] = now + PEER_PENALTY_SECONDS;
+            return;
+        }
+    }
+
+    size_t idx = manager->penaltyCount % PEER_PENALTY_MAX;
+    manager->penaltyAddr[idx] = addr;
+    manager->penaltyPort[idx] = port;
+    manager->penaltyUntil[idx] = now + PEER_PENALTY_SECONDS;
+    manager->penaltyCount++;
+}
+
 static void _peerConnected(void *info)
 {
     BRPeer *peer = ((BRPeerCallbackInfo *)info)->peer;
@@ -913,6 +952,11 @@ static void _peerConnected(void *info)
     }
     else if (BRPeerLastBlock(peer) + 10 < manager->lastBlock->height) {
         peer_log(peer, "node isn't synced");
+        // Churn fix: remember this (addr, port) for PEER_PENALTY_SECONDS so
+        // the filter-first dial loop (BRPeerManagerConnect) doesn't
+        // immediately re-dial the same still-behind peer on the very next
+        // connect pass. See BRPeerPenalty.h.
+        _penalize(manager, peer->address, peer->port, now);
         BRPeerDisconnect(peer);
     }
     else if (BRPeerVersion(peer) >= 70011 &&
@@ -2456,6 +2500,15 @@ void BRPeerManagerConnect(BRPeerManager *manager)
                     if (BRPeerEq(&manager->peers[k], manager->connectedPeers[j - 1])) { alreadyConnected = 1; break; }
                 }
                 if (alreadyConnected) continue;
+
+                // Churn fix: skip a candidate we rejected as "not synced" (or
+                // otherwise penalized) within the last PEER_PENALTY_SECONDS,
+                // instead of re-dialing it every single connect pass. See
+                // BRPeerPenalty.h / _penalize.
+                if (BRPeerPenaltyContains(manager->penaltyAddr, manager->penaltyPort, manager->penaltyUntil,
+                                          manager->penaltyCount < PEER_PENALTY_MAX ? manager->penaltyCount : PEER_PENALTY_MAX,
+                                          manager->peers[k].address, manager->peers[k].port, now))
+                    continue;
 
                 // NOTE: manager->peers holds plain BRPeer structs, NOT BRPeerContext.
                 // peer_log() -> BRPeerHost() casts the arg to BRPeerContext* and writes

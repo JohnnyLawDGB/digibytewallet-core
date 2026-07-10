@@ -747,16 +747,19 @@ size_t BRTransactionSize(const BRTransaction *tx)
             size += sizeof(UInt256) + sizeof(uint32_t) + BRVarIntSize(input->sigLen) + input->sigLen + sizeof(uint32_t);
             witSize += input->witLen;
         }
-        else if (input->script && input->scriptLen > 0 && input->script[0] == OP_0) { // estimated P2WPKH signature size
+        else if (input->script && input->scriptLen > 0 && input->script[0] == OP_0) { // estimated P2WPKH input
+            // Include the base input bytes for an unsigned P2WPKH input (see BRTransactionVSize
+            // for why — this omission under-counted the fee and got sends rejected below min relay).
+            size += sizeof(UInt256) + sizeof(uint32_t) + 1 + sizeof(uint32_t);
             witSize += TX_INPUT_SIZE;
         }
         else size += TX_INPUT_SIZE; // estimated P2PKH signature size
     }
-    
+
     for (size_t i = 0; tx && i < tx->outCount; i++) {
         size += sizeof(uint64_t) + BRVarIntSize(tx->outputs[i].scriptLen) + tx->outputs[i].scriptLen;
     }
-    
+
     if (witSize > 0) witSize += 2 + tx->inCount;
     return size + witSize;
 }
@@ -772,21 +775,28 @@ size_t BRTransactionVSize(const BRTransaction *tx)
     
     for (size_t i = 0; i < tx->inCount; i++) {
         input = &tx->inputs[i];
-        
+
         if (input->signature && input->witness) {
             size += sizeof(UInt256) + sizeof(uint32_t) + BRVarIntSize(input->sigLen) + input->sigLen + sizeof(uint32_t);
             witSize += tx->inputs[i].witLen;
         }
-        else if (input->script && input->scriptLen > 0 && input->script[0] == OP_0) { // estimated P2WPKH signature size
+        else if (input->script && input->scriptLen > 0 && input->script[0] == OP_0) { // estimated P2WPKH input
+            // Count the BASE input bytes (outpoint + index + empty-scriptSig varint + sequence)
+            // for an UNSIGNED P2WPKH input, matching the signed branch above. These were
+            // previously omitted, so the pre-sign fee estimate under-counted every native-segwit
+            // input by ~41 vbytes; the tx then paid below the min relay fee and peers silently
+            // rejected it — the true root cause of "sends never confirm". Witness stays estimated
+            // at TX_INPUT_SIZE (a safe over-estimate vs the real ~107-byte P2WPKH witness).
+            size += sizeof(UInt256) + sizeof(uint32_t) + 1 + sizeof(uint32_t);
             witSize += TX_INPUT_SIZE;
         }
         else size += TX_INPUT_SIZE; // estimated P2PKH signature size
     }
-    
+
     for (size_t i = 0; i < tx->outCount; i++) {
         size += sizeof(uint64_t) + BRVarIntSize(tx->outputs[i].scriptLen) + tx->outputs[i].scriptLen;
     }
-    
+
     if (witSize > 0) witSize += 2 + tx->inCount;
     return (size*4 + witSize + 3)/4;
 }

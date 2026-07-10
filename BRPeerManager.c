@@ -1143,14 +1143,15 @@ static void _peerRelayedPeers(void *info, const BRPeer peers[], size_t peersCoun
     pthread_mutex_lock(&manager->lock);
     peer_log(peer, "relayed %zu peer(s)", peersCount);
 
-    // Only add peers that advertise NODE_BLOOM — non-bloom peers are useless
-    // for SPV mode and flood the pool, drowning out bloom seeder peers.
-    // Exception (testnet): also keep compact-filter-capable peers, since
-    // testnet26 nodes serve BIP157/158 filters instead of bloom.
+    // Retain any peer usable for the current sync mode: compact-filter (0x40) peers
+    // whenever we're not in legacy BLOOM_ONLY, and bloom peers otherwise. Same policy
+    // the connect accept gate uses (BRPeerServicesAllowedForSyncMode). Previously the
+    // 0x40 exception was hardcoded to testnet only, so on MAINNET every gossiped
+    // BIP157/158 node (modern DigiByte Core ships bloom OFF) was discarded — the
+    // CF-only pool couldn't self-heal from churn and collapsed onto the injected
+    // seeder set, stranding the wallet on a single filter peer.
     for (size_t i = 0; i < peersCount; i++) {
-        if ((peers[i].services & SERVICES_NODE_BLOOM) == SERVICES_NODE_BLOOM ||
-            (BRNetworkIsTestnet() &&
-             (peers[i].services & SERVICES_NODE_COMPACT_FILTERS) == SERVICES_NODE_COMPACT_FILTERS)) {
+        if (BRPeerServicesAllowedForSyncMode(peers[i].services, manager->syncMode)) {
             _BRPeerManagerAddPeer(manager, (BRPeer *)&peers[i]);
         }
     }

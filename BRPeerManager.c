@@ -239,6 +239,10 @@ struct BRPeerManagerStruct {
     UInt128  cfHeadersPeerAddr;          // peer the in-flight request was sent to, so a
                                          // timed-out (blackholing) filter peer is rotated
                                          // away from on retry instead of re-dialed forever
+    UInt128  cfTriedPeers[16];           // filter peers already tried for the CURRENT batch;
+    uint8_t  cfTriedCount;               // when all connected filter peers are in here and
+                                         // none answered, the whole set is stalled → drop one
+                                         // for a fresh peer (self-heal). Reset on batch advance.
     // Lock-free mirrors of the scalar status values the Android UI polls for the
     // sync overlay. Written by the sync/worker threads WHERE THEY ALREADY HOLD
     // manager->lock (via _BRPeerManagerRefreshCachedStatus); read by the JNI status
@@ -2157,21 +2161,43 @@ static BRPeer *_BRPeerManagerAnyFilterCapablePeer(BRPeerManager *manager)
     return NULL;
 }
 
-// Like _BRPeerManagerAnyFilterCapablePeer but skips the peer at `avoid`. Used to
-// rotate the cfheaders driver off a filter peer that stopped answering: the
-// block-extend kick otherwise re-dials the same deterministic peer every retry,
-// so one stalled/blackholing filter node wedges the entire cfheaders sync.
-// Returns NULL if no OTHER connected filter-capable peer exists (caller then
-// falls back to retrying the same peer). Caller must hold manager->lock.
-static BRPeer *_BRPeerManagerAnyFilterCapablePeerExcept(BRPeerManager *manager, UInt128 avoid)
+// Returns a connected filter-capable peer NOT already tried for the current
+// cfheaders batch (i.e. not in manager->cfTriedPeers). This is how the driver
+// cycles through ALL filter peers on successive timeouts instead of alternating
+// two. Returns NULL when every connected filter peer has been tried. Caller must
+// hold manager->lock.
+static BRPeer *_BRPeerManagerNextUntriedFilterPeer(BRPeerManager *manager)
 {
     for (size_t i = array_count(manager->connectedPeers); i > 0; i--) {
         BRPeer *p = manager->connectedPeers[i - 1];
         if (BRPeerConnectStatus(p) != BRPeerStatusConnected) continue;
-        if (UInt128Eq(p->address, avoid)) continue;
-        if (_BRPeerManagerPeerSupportsCompactFilters(manager, p)) return p;
+        if (!_BRPeerManagerPeerSupportsCompactFilters(manager, p)) continue;
+        int tried = 0;
+        for (uint8_t k = 0; k < manager->cfTriedCount; k++) {
+            if (UInt128Eq(manager->cfTriedPeers[k], p->address)) { tried = 1; break; }
+        }
+        if (!tried) return p;
     }
     return NULL;
+}
+
+// Self-heal for a cfheaders batch on which EVERY connected filter peer has stalled:
+// disconnect the last-tried filter peer so the manager dials a fresh filter node in
+// its place (what a manual app-restart used to do, but automatic). Dropping just one
+// per stall round keeps the rest of the pool up while the set gradually refreshes.
+// Caller must hold manager->lock (BRPeerDisconnect under the lock is the existing
+// pattern in _peerConnected / _peerRelayedBlock; _peerDisconnected fires async).
+static void _BRPeerManagerDropStalledFilterPeer(BRPeerManager *manager)
+{
+    if (UInt128IsZero(manager->cfHeadersPeerAddr)) return;
+    for (size_t i = array_count(manager->connectedPeers); i > 0; i--) {
+        BRPeer *p = manager->connectedPeers[i - 1];
+        if (UInt128Eq(p->address, manager->cfHeadersPeerAddr)) {
+            peer_log(p, "cfheaders: whole filter set stalled on batch — dropping this peer to force a fresh one");
+            BRPeerDisconnect(p);
+            return;
+        }
+    }
 }
 
 // Drive the cfheaders fetch loop. Asks `peer` for the next batch
@@ -2261,21 +2287,39 @@ static void _BRPeerManagerRequestNextCFHeaders(BRPeerManager *manager, BRPeer *p
         }
     }
 
-    // On a timeout retry, dial a DIFFERENT connected filter peer than the one that
-    // just went unanswered. The block-extend kick always hands us the same
-    // deterministic peer (_BRPeerManagerAnyFilterCapablePeer), so without this a
-    // single stalled/blackholing filter node pins cfheaders at one height forever
-    // while other healthy filter peers sit idle. Falls back to `peer` if no other
-    // filter-capable peer is connected.
+    // On a timeout retry, cycle to a filter peer we haven't tried yet for THIS batch.
+    // The block-extend kick always hands us the same deterministic peer, so without
+    // rotation one blackholing filter node pins cfheaders at a height forever. We track
+    // every tried peer (cfTriedPeers) so successive timeouts walk through ALL connected
+    // filter peers, not just alternate two. When the whole connected filter set has been
+    // tried and none answered, self-heal: drop one stalled peer so a fresh filter node
+    // connects, then start a new round. Falls back to `peer` if nothing better exists.
     BRPeer *reqPeer = peer;
-    if (isTimeoutRetry && !UInt128IsZero(manager->cfHeadersPeerAddr)) {
-        BRPeer *alt = _BRPeerManagerAnyFilterCapablePeerExcept(manager, manager->cfHeadersPeerAddr);
-        if (alt && _BRPeerManagerPeerSupportsCompactFilters(manager, alt)) {
-            peer_log(alt, "cfheaders: previous peer unanswered past %ds — rotating to this peer",
-                     CF_HEADERS_REQUEST_TIMEOUT_SECS);
+    if (isTimeoutRetry) {
+        if (!UInt128IsZero(manager->cfHeadersPeerAddr) &&
+            manager->cfTriedCount < (uint8_t)(sizeof(manager->cfTriedPeers)/sizeof(manager->cfTriedPeers[0]))) {
+            int present = 0;
+            for (uint8_t k = 0; k < manager->cfTriedCount; k++) {
+                if (UInt128Eq(manager->cfTriedPeers[k], manager->cfHeadersPeerAddr)) { present = 1; break; }
+            }
+            if (!present) manager->cfTriedPeers[manager->cfTriedCount++] = manager->cfHeadersPeerAddr;
+        }
+
+        BRPeer *alt = _BRPeerManagerNextUntriedFilterPeer(manager);
+        if (!alt) {
+            // Every connected filter peer tried, all stalled → drop one for a fresh peer
+            // and start a fresh round on the remaining/new set.
+            _BRPeerManagerDropStalledFilterPeer(manager);
+            manager->cfTriedCount = 0;
+            alt = _BRPeerManagerNextUntriedFilterPeer(manager);
+        }
+        if (alt) {
+            peer_log(alt, "cfheaders: rotating to untried filter peer for batch [%u..%u]", next, batchEnd);
             reqPeer = alt;
         }
     }
+
+    if (!_BRPeerManagerPeerSupportsCompactFilters(manager, reqPeer)) return; // no usable filter peer this pass
 
     peer_log(reqPeer, "cfheaders: requesting [%u..%u] (%u headers)",
              next, batchEnd, batchEnd - next + 1);
@@ -2482,6 +2526,7 @@ static void _peerRelayedCFHeaders(void *info, uint8_t filterType, UInt256 stopHa
     manager->cfHeadersRequestedThrough = chainTip;
     manager->cfDisagreedCount = 0;   // appended cleanly — clear the disagreement window
     manager->cfSingleDisagreeRounds = 0;   // ...and the single-peer diverged-round counter
+    manager->cfTriedCount = 0;       // batch advanced — fresh rotation round for the next one
     peer_log(peer, "cfheaders: chain extended to height %u (added %zu, stop %s)",
              chainTip, count, log_u256_hex_encode(stopHash));
 

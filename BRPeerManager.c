@@ -922,7 +922,6 @@ static void _BRPeerManagerFindPeers(BRPeerManager *manager)
     struct timespec ts;
     pthread_t thread;
     pthread_attr_t attr;
-    UInt128 *addr, *addrList;
     BRFindPeersInfo *info;
     
     if (! UInt128IsZero(manager->fixedPeer.address)) {
@@ -932,7 +931,14 @@ static void _BRPeerManagerFindPeers(BRPeerManager *manager)
         manager->peers[0].timestamp = now;
     }
     else {
-        for (size_t i = 1; manager->params->dnsSeeds[i]; i++) {
+        // Resolve EVERY DNS seed on a detached worker thread, index 0 included. Seed[0] used to
+        // be resolved SYNCHRONOUSLY here (getaddrinfo) while holding manager->lock, so a slow or
+        // timing-out DNS lookup pinned the lock for seconds. During reconnect in the middle of a
+        // heavy compact-filter rescan that starved the UI thread into an ANR on weaker devices
+        // (Note 8 / API 28). Threading seed[0] too keeps all blocking DNS off the lock; the wait
+        // loop below still gates the connect on peers arriving, but it RELEASES the lock while it
+        // sleeps, so the UI thread can always acquire the lock between iterations.
+        for (size_t i = 0; manager->params->dnsSeeds[i]; i++) {
             info = calloc(1, sizeof(BRFindPeersInfo));
             assert(info != NULL);
             info->manager = manager;
@@ -942,12 +948,6 @@ static void _BRPeerManagerFindPeers(BRPeerManager *manager)
                 pthread_create(&thread, &attr, _findPeersThreadRoutine, info) == 0) manager->dnsThreadCount++;
         }
 
-        for (addr = addrList = _addressLookup(manager->params->dnsSeeds[0]); addr && ! UInt128IsZero(*addr); addr++) {
-			BRPeer peer = {*addr, manager->params->standardPort, services, now, 0};
-			_BRPeerManagerAddPeer(manager,&peer);
-        }
-
-        if (addrList) free(addrList);
         ts.tv_sec = 0;
         ts.tv_nsec = 1;
 

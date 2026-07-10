@@ -919,6 +919,7 @@ static size_t _BRPeerManagerRequestCFiltersLocked(BRPeerManager *manager,
 static BRPeer *_BRPeerManagerAnyFilterCapablePeer(BRPeerManager *manager);
 static void _BRPeerManagerRequestNextCFHeaders(BRPeerManager *manager, BRPeer *peer);
 static int _BRPeerManagerReanchorAtFloorLocked(BRPeerManager *manager, int force);
+static uint32_t _BRPeerManagerBlockFloor(BRPeerManager *manager);
 static void _BRPeerManagerProbeOtherFilterPeersForCFHeaders(BRPeerManager *manager, BRPeer *current,
                                                             uint8_t filterType, uint32_t startHeight,
                                                             UInt256 stopHash);
@@ -1387,10 +1388,28 @@ static void _BRPeerManagerClearMemory(BRPeerManager* manager) {
     // once filters keep pace the retained span collapses back to the normal
     // tail. Zero in BLOOM_ONLY / no-chain so pruning behaves exactly as before.
     uint32_t cfFloor = 0;
-    if (manager->syncMode != BR_SYNC_MODE_BLOOM_ONLY && manager->compactFilterChain) {
-        uint32_t cfNext = BRCompactFilterChainNextHeight(manager->compactFilterChain);
-        if (cfNext > CLEAR_MEM_CF_RETENTION_MARGIN) cfFloor = cfNext - CLEAR_MEM_CF_RETENTION_MARGIN;
-        else if (cfNext > 0) cfFloor = 1;
+    if (manager->syncMode != BR_SYNC_MODE_BLOOM_ONLY) {
+        if (manager->compactFilterChain) {
+            uint32_t cfNext = BRCompactFilterChainNextHeight(manager->compactFilterChain);
+            if (cfNext > CLEAR_MEM_CF_RETENTION_MARGIN) cfFloor = cfNext - CLEAR_MEM_CF_RETENTION_MARGIN;
+            else if (cfNext > 0) cfFloor = 1;
+        }
+        else if (manager->autoFetchCFiltersEnabled && manager->autoFetchCFiltersStart > 0) {
+            // Bootstrap: the compact-filter chain is created lazily on the FIRST
+            // cfheaders RESPONSE. Until it exists, retain block headers at/above the
+            // armed CF birth height so that first getcfheaders request can resolve
+            // its stop hash. Without this the tail pruner frees the birth-height
+            // block before the first request lands (header sync races ~80 blocks/sec
+            // ahead while the birth may be 100k+ blocks below the tip); the stop hash
+            // then becomes unresolvable, the driver defers forever, the chain is
+            // never created, and pruning is never protected — a permanent "no block
+            // hash for height H, deferring" deadlock on a fresh rescan. Once the
+            // chain exists the cfNext branch above takes over and the retained span
+            // collapses to the normal frontier window.
+            uint32_t start = manager->autoFetchCFiltersStart;
+            if (start > CLEAR_MEM_CF_RETENTION_MARGIN) cfFloor = start - CLEAR_MEM_CF_RETENTION_MARGIN;
+            else cfFloor = 1;
+        }
     }
 
     if (count >= CLEAR_MEM_BLOCKS_COUNT_TRIGGER) {
@@ -2125,8 +2144,38 @@ static void _BRPeerManagerRequestNextCFHeaders(BRPeerManager *manager, BRPeer *p
 
     UInt256 stopHash = _BRPeerManagerBlockHashAtHeight(manager, batchEnd);
     if (UInt256IsZero(stopHash)) {
-        peer_log(peer, "cfheaders: no block hash for height %u, deferring", batchEnd);
-        return;
+        // batchEnd is below the walkable block-header floor, so its hash can't be
+        // resolved and the whole [next..batchEnd] batch is unreachable. This is the
+        // post-rescan case: the rebuild armed the CF start (autoFetchCFiltersStart)
+        // below the checkpoint the block-header chain actually anchored at. Headers
+        // only walk back to their anchoring checkpoint — there is no block hash below
+        // it — and CF scanning below the block floor is impossible anyway (no
+        // in-memory block to match a filter against). So snap the CF start UP to the
+        // resolvable block floor and retry, instead of busy-looping "no block hash for
+        // height H, deferring" forever. The floor is <= the wallet's birth height
+        // (the header chain anchors at the last checkpoint at/before wallet birth),
+        // so this never skips a wallet transaction.
+        uint32_t floor = _BRPeerManagerBlockFloor(manager);
+        if (floor > next) {
+            peer_log(peer, "cfheaders: CF start %u below block floor %u — snapping start up to floor",
+                     next, floor);
+            if (manager->compactFilterChain) {
+                BRCompactFilterChainFree(manager->compactFilterChain);
+                manager->compactFilterChain = NULL;
+            }
+            manager->autoFetchCFiltersEnabled  = 1;
+            manager->autoFetchCFiltersStart    = floor;
+            manager->autoFetchCFiltersThrough  = floor > 0 ? floor - 1 : 0;
+            manager->cfHeadersRequestedThrough = 0;
+            next     = floor;
+            batchEnd = next + (MAX_CFHEADERS_RESULTS - 1);
+            if (batchEnd > tip) batchEnd = tip;
+            stopHash = _BRPeerManagerBlockHashAtHeight(manager, batchEnd);
+        }
+        if (UInt256IsZero(stopHash)) {
+            peer_log(peer, "cfheaders: no block hash for height %u, deferring", batchEnd);
+            return;
+        }
     }
 
     peer_log(peer, "cfheaders: requesting [%u..%u] (%u headers)",

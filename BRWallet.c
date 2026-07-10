@@ -591,6 +591,16 @@ size_t BRWalletUnusedAddrs(BRWallet *wallet, BRAddress addrs[], uint32_t gapLimi
     assert(scriptType == 0 || scriptType == 1 || scriptType == 2);
     pthread_mutex_lock(&wallet->lock);
 
+    // No BIP86 key installed → there is no taproot chain to walk. Return early
+    // instead of deriving over a zeroed master pubkey, which trips the
+    // assert(mpk != BR_MASTER_PUBKEY_NONE) in BRBIP32PubKey under a debug build.
+    // Callers that pre-gen the P2TR window before a key exists (bloom filter load,
+    // compact-filter peer connect) rely on this being a clean no-op.
+    if (scriptType == 2 && ! wallet->hasTaprootKey) {
+        pthread_mutex_unlock(&wallet->lock);
+        return 0;
+    }
+
     if (scriptType == 2) {
         addrChain = (internal) ? wallet->taprootInternalChain : wallet->taprootExternalChain;
     } else if (scriptType == 1) {
@@ -1444,6 +1454,14 @@ int BRWalletRegisterTransaction(BRWallet *wallet, BRTransaction *tx)
         // when a wallet address is used in a transaction, generate a new address to replace it
         BRWalletUnusedAddrs(wallet, NULL, SEQUENCE_GAP_LIMIT_EXTERNAL, 0, 1);
         BRWalletUnusedAddrs(wallet, NULL, SEQUENCE_GAP_LIMIT_INTERNAL, 1, 1);
+        // Legacy P2PKH (scriptType 0) must walk forward too. In bloom mode this
+        // extension lived in _peerRelayedTx behind `if (manager->bloomFilter != NULL)`,
+        // which never runs in COMPACT_FILTERS_ONLY — so the legacy watched window
+        // froze at its initial pregen and a legacy receive past that cushion was
+        // silently missed (block never cfilter-matched). Extend it here,
+        // mode-independent, alongside the segwit chain.
+        BRWalletUnusedAddrs(wallet, NULL, SEQUENCE_GAP_LIMIT_EXTERNAL, 0, 0);
+        BRWalletUnusedAddrs(wallet, NULL, SEQUENCE_GAP_LIMIT_INTERNAL, 1, 0);
         // Extend the taproot (P2TR / BIP86) gap too, so when a taproot address is
         // used the next taproot window is generated into allAddrs and stays watched
         // by bloom + BIP158 (BRWalletAllAddrs). No-op until the BIP86 key is installed.

@@ -221,6 +221,7 @@ typedef struct {
     void (*rejectedTx)(void *info, UInt256 txHash, uint8_t code);
     void (*relayedBlock)(void *info, BRMerkleBlock *block);
     void (*relayedBlockTxns)(void *info, UInt256 blockHash, const UInt256 txHashes[], size_t txCount);
+    void (*relayedBlockInv)(void *info, UInt256 blockHash);
     void (*notfound)(void *info, const UInt256 txHashes[], size_t txCount, const UInt256 blockHashes[],
                      size_t blockCount);
     void (*setFeePerKb)(void *info, uint64_t feePerKb);
@@ -452,13 +453,34 @@ static int _BRPeerAcceptInvMessage(BRPeer *peer, const uint8_t *msg, size_t msgL
             peer_log(peer, "too many transactions, disconnecting");
             r = 0;
         }
-        else if (ctx->currentBlockHeight > 0 && blockCount > 2 && blockCount < 500 &&
+        else if (! ctx->compactFiltersOnly && ctx->currentBlockHeight > 0 && blockCount > 2 && blockCount < 500 &&
                  ctx->currentBlockHeight + array_count(ctx->knownBlockHashes) + blockCount < ctx->lastblock) {
+            // This "fewer hashes than expected" disconnect encodes a getblocks-batch
+            // expectation (a far-behind peer streams ~500 hashes). CF-only never sends
+            // getblocks, so a multi-block inv is legitimate — don't disconnect; the
+            // compactFiltersOnly branch below turns it into a getheaders tip-advance.
             peer_log(peer, "non-standard inv, %zu is fewer block hash(es) than expected", blockCount);
             r = 0;
         }
         else {
-            if (! ctx->sentFilter && ! ctx->sentGetblocks) blockCount = 0;
+            if (ctx->compactFiltersOnly) {
+                // CF-only: no bloom filter and no getblocks, so a block inv is the
+                // only signal that the chain tip advanced. Hand each announced block
+                // to the manager, which pulls plain headers (getheaders) so it
+                // connects via relayedBlock and re-kicks the cfheaders/cfilter driver.
+                // Fall through with blockCount = 0 so the bloom-era getdata(merkleblock)
+                // / knownBlockHashes / getblocks path below is skipped (fetching a full
+                // block per inv would defeat CF privacy and bandwidth).
+                // Fire the tip-advance once (on the newest announced hash): the manager
+                // builds getheaders from OUR tip, so a single request pulls the whole
+                // announced gap — firing per hash would emit K identical getheaders for
+                // a K-block inv (the dedup can't trip mid-loop; replies read after return).
+                if (ctx->relayedBlockInv && blockCount > 0) {
+                    ctx->relayedBlockInv(ctx->info, UInt256Get(blocks[blockCount - 1]));
+                }
+                blockCount = 0;
+            }
+            else if (! ctx->sentFilter && ! ctx->sentGetblocks) blockCount = 0;
             if (blockCount == 1 && UInt256Eq(ctx->lastBlockHash, UInt256Get(blocks[0]))) blockCount = 0;
             if (blockCount == 1) ctx->lastBlockHash = UInt256Get(blocks[0]);
 
@@ -1542,6 +1564,7 @@ void BRPeerSetCallbacks(BRPeer *peer, void *info,
                         void (*relayedBlock)(void *info, BRMerkleBlock *block),
                         void (*relayedBlockTxns)(void *info, UInt256 blockHash, const UInt256 txHashes[],
                                                   size_t txCount),
+                        void (*relayedBlockInv)(void *info, UInt256 blockHash),
                         void (*notfound)(void *info, const UInt256 txHashes[], size_t txCount,
                                          const UInt256 blockHashes[], size_t blockCount),
                         void (*setFeePerKb)(void *info, uint64_t feePerKb),
@@ -1560,6 +1583,7 @@ void BRPeerSetCallbacks(BRPeer *peer, void *info,
     ctx->rejectedTx = rejectedTx;
     ctx->relayedBlock = relayedBlock;
     ctx->relayedBlockTxns = relayedBlockTxns;
+    ctx->relayedBlockInv = relayedBlockInv;
     ctx->notfound = notfound;
     ctx->setFeePerKb = setFeePerKb;
     ctx->requestedTx = requestedTx;

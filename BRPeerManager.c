@@ -361,6 +361,25 @@ int BRPeerManagerAddPeer(BRPeerManager *manager, UInt128 address, uint16_t port,
     return (int)added;
 }
 
+// Generate the gap+100 look-ahead address window for every script type
+// (segwit, legacy, taproot; external+internal) into the wallet's allAddrs.
+// allAddrs feeds BOTH the bloom filter and compact filters
+// (BRWalletGetFilterElements), so incoming payments up to ~100 indices ahead of
+// the highest-used address stay watched. This is bloom-INDEPENDENT: it must run
+// in COMPACT_FILTERS_ONLY too (where no bloom filter is ever loaded), otherwise
+// the CF match window decays to the bare gap limit as addresses are consumed and
+// a look-ahead receive is missed. BRWalletUnusedAddrs is idempotent once the
+// window is generated; scriptType-2 no-ops until the BIP86 key is installed.
+static void _BRPeerManagerPregenAddrWindow(BRPeerManager *manager)
+{
+    BRWalletUnusedAddrs(manager->wallet, NULL, SEQUENCE_GAP_LIMIT_EXTERNAL + 100, 0, 1);
+    BRWalletUnusedAddrs(manager->wallet, NULL, SEQUENCE_GAP_LIMIT_INTERNAL + 100, 1, 1);
+    BRWalletUnusedAddrs(manager->wallet, NULL, SEQUENCE_GAP_LIMIT_EXTERNAL + 100, 0, 0);
+    BRWalletUnusedAddrs(manager->wallet, NULL, SEQUENCE_GAP_LIMIT_INTERNAL + 100, 1, 0);
+    BRWalletUnusedAddrs(manager->wallet, NULL, SEQUENCE_GAP_LIMIT_EXTERNAL + 100, 0, 2);
+    BRWalletUnusedAddrs(manager->wallet, NULL, SEQUENCE_GAP_LIMIT_INTERNAL + 100, 1, 2);
+}
+
 static void _BRPeerManagerLoadBloomFilter(BRPeerManager *manager, BRPeer *peer)
 {
     // Privacy-first: skip bloom filterload entirely when the wallet is
@@ -373,16 +392,9 @@ static void _BRPeerManagerLoadBloomFilter(BRPeerManager *manager, BRPeer *peer)
 
     // every time a new wallet address is added, the bloom filter has to be rebuilt, and each address is only used
     // for one transaction, so here we generate some spare addresses to avoid rebuilding the filter each time a
-    // wallet transaction is encountered during the chain sync
-    BRWalletUnusedAddrs(manager->wallet, NULL, SEQUENCE_GAP_LIMIT_EXTERNAL + 100, 0, 1);
-    BRWalletUnusedAddrs(manager->wallet, NULL, SEQUENCE_GAP_LIMIT_INTERNAL + 100, 1, 1);
-    BRWalletUnusedAddrs(manager->wallet, NULL, SEQUENCE_GAP_LIMIT_EXTERNAL + 100, 0, 0);
-    BRWalletUnusedAddrs(manager->wallet, NULL, SEQUENCE_GAP_LIMIT_INTERNAL + 100, 1, 0);
-    // Pre-gen the taproot (P2TR / BIP86) gap window into allAddrs so the next
-    // taproot addresses are watched. Bloom can't match P2TR (no hash160), but
-    // allAddrs also feeds BIP158 (BRWalletGetFilterElements), which does.
-    BRWalletUnusedAddrs(manager->wallet, NULL, SEQUENCE_GAP_LIMIT_EXTERNAL + 100, 0, 2);
-    BRWalletUnusedAddrs(manager->wallet, NULL, SEQUENCE_GAP_LIMIT_INTERNAL + 100, 1, 2);
+    // wallet transaction is encountered during the chain sync. Same +100 window is
+    // maintained on the compact-filter path via _BRPeerManagerPregenAddrWindow.
+    _BRPeerManagerPregenAddrWindow(manager);
 
     BRSetApply(manager->orphans, NULL, _setApplyFreeBlock);
     BRSetClear(manager->orphans); // clear out orphans that may have been received on an old filter
@@ -1760,6 +1772,34 @@ static void _peerRelayedBlockTxns(void *info, UInt256 blockHash, const UInt256 t
     if (confirmed && manager->txStatusUpdate) manager->txStatusUpdate(manager->info);
 }
 
+// CF-only new-tip driver. In COMPACT_FILTERS_ONLY the wallet loads no bloom filter and
+// syncs headers with getheaders (never getblocks), so once caught up the only signal that
+// the chain advanced is a block `inv`. _BRPeerAcceptInvMessage forwards each announced
+// block hash here; we pull plain headers from our current tip so the new header connects
+// via _peerRelayedBlock (which re-kicks the cfheaders/cfilter driver and, on a wallet
+// match, the confirmation path). No-op if we already have the header, the peer dropped,
+// or we're not in CF-only (BLOOM_ONLY/BOTH use the inv -> getdata(merkleblock) path).
+static void _peerRelayedBlockInv(void *info, UInt256 blockHash)
+{
+    BRPeer *peer = ((BRPeerCallbackInfo *)info)->peer;
+    BRPeerManager *manager = ((BRPeerCallbackInfo *)info)->manager;
+
+    pthread_mutex_lock(&manager->lock);
+
+    if (manager->syncMode == BR_SYNC_MODE_COMPACT_FILTERS_ONLY && manager->lastBlock &&
+        BRPeerConnectStatus(peer) == BRPeerStatusConnected &&
+        ! BRSetGet(manager->blocks, &blockHash)) { // header not yet known — pull it from our tip
+        UInt256 locators[_BRPeerManagerBlockLocators(manager, NULL, 0)];
+        size_t count = _BRPeerManagerBlockLocators(manager, locators, sizeof(locators)/sizeof(*locators));
+
+        peer_log(peer, "cf-only: block inv %s — requesting headers from tip %"PRIu32,
+                 log_u256_hex_encode(blockHash), manager->lastBlock->height);
+        BRPeerSendGetheaders(peer, locators, count, UINT256_ZERO);
+    }
+
+    pthread_mutex_unlock(&manager->lock);
+}
+
 static void _peerDataNotfound(void *info, const UInt256 txHashes[], size_t txCount,
                              const UInt256 blockHashes[], size_t blockCount)
 {
@@ -2407,6 +2447,12 @@ static void _BRPeerManagerOnFilterCapablePeerConnected(BRPeerManager *manager, v
     if (!_BRPeerManagerPeerSupportsCompactFilters(manager, peer)) return;
 
     BRPeerSetCompactFilterCallbacks(peer, _peerRelayedCFHeaders, _peerRelayedCFilter, _peerRelayedCFCheckpt);
+    // Maintain the gap+100 look-ahead window on the compact-filter path — the bloom
+    // path does this in _BRPeerManagerLoadBloomFilter, which early-returns in
+    // CF-only. Without it the cfilter match set decays to the bare gap limit as
+    // addresses are used and a look-ahead receive would be missed. Follows the same
+    // manager->wallet lock ordering as the bloom path's pregen.
+    _BRPeerManagerPregenAddrWindow(manager);
     _BRPeerManagerRequestNextCFHeaders(manager, peer);
 }
 
@@ -2487,8 +2533,8 @@ static void _BRPeerManagerBeginConnect(BRPeerManager *manager, const BRPeer *tmp
     array_add(manager->connectedPeers, info->peer);
     BRPeerSetCallbacks(info->peer, info, _peerConnected, _peerDisconnected, _peerRelayedPeers,
                        _peerRelayedTx, _peerHasTx, _peerRejectedTx, _peerRelayedBlock, _peerRelayedBlockTxns,
-                       _peerDataNotfound, _peerSetFeePerKb, _peerRequestedTx, _peerNetworkIsReachable,
-                       _peerThreadCleanup);
+                       _peerRelayedBlockInv, _peerDataNotfound, _peerSetFeePerKb, _peerRequestedTx,
+                       _peerNetworkIsReachable, _peerThreadCleanup);
     BRPeerSetEarliestKeyTime(info->peer, manager->earliestKeyTime);
     BRPeerSetCompactFiltersOnly(info->peer, manager->syncMode == BR_SYNC_MODE_COMPACT_FILTERS_ONLY);
     BRPeerConnect(info->peer);
@@ -2636,8 +2682,8 @@ void BRPeerManagerConnect(BRPeerManager *manager)
                 manager->peerThreadCount++;
                 BRPeerSetCallbacks(info->peer, info, _peerConnected, _peerDisconnected, _peerRelayedPeers,
                                    _peerRelayedTx, _peerHasTx, _peerRejectedTx, _peerRelayedBlock,
-                                   _peerRelayedBlockTxns, _peerDataNotfound, _peerSetFeePerKb, _peerRequestedTx,
-                                   _peerNetworkIsReachable, _peerThreadCleanup);
+                                   _peerRelayedBlockTxns, _peerRelayedBlockInv, _peerDataNotfound, _peerSetFeePerKb,
+                                   _peerRequestedTx, _peerNetworkIsReachable, _peerThreadCleanup);
                 BRPeerSetEarliestKeyTime(info->peer, manager->earliestKeyTime);
                 BRPeerSetCompactFiltersOnly(info->peer, manager->syncMode == BR_SYNC_MODE_COMPACT_FILTERS_ONLY);
                 BRPeerConnect(info->peer);

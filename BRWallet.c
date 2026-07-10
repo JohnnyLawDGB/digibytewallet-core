@@ -401,7 +401,18 @@ static void _BRWalletPregenLegacyChain(BRWallet *wallet, BRAddress **addrChainPt
                 BRAddressEq(&address, &BR_ADDRESS_NONE)) break;
         }
         array_add(addrChain, address);
-        BRSetAdd(wallet->allAddrs, &addrChain[array_count(addrChain) - 1]);
+    }
+    // Add to allAddrs only AFTER the array has reached its final size. array_add()
+    // above reallocs the chain when it grows past its initial capacity (50); with
+    // count=150 (SEQUENCE_GAP_LIMIT_EXTERNAL_LEGACY) that realloc ALWAYS happens
+    // mid-loop. Storing &addrChain[i] into allAddrs inside the loop left pointers into
+    // the pre-realloc (freed) block — a use-after-free that crashed
+    // BRWalletContainsAddress (strlen on freed memory) and corrupted address matching
+    // once the freed block was reused. Re-point from the final base here. This chain
+    // starts empty at init (startCount==0), so every entry is (re)added from the
+    // stable location. Regression-guarded by legacy_gap_uaf_kat (ASan).
+    for (uint32_t idx = startCount; idx < (uint32_t)array_count(addrChain); idx++) {
+        BRSetAdd(wallet->allAddrs, &addrChain[idx]);
     }
     *addrChainPtr = addrChain;
 }

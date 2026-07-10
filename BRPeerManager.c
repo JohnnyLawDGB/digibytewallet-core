@@ -34,6 +34,7 @@
 #include "BRPeerServices.h"
 #include "BRPeerPenalty.h"
 #include <stdlib.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <inttypes.h>
 #include <limits.h>
@@ -235,6 +236,24 @@ struct BRPeerManagerStruct {
     // requested until the in-flight one lands, fails, or times out.
     uint32_t cfHeadersRequestedThrough;  // batchEnd of the in-flight request (0 = none)
     time_t   cfHeadersRequestTime;       // when it was sent, for the timeout
+    UInt128  cfHeadersPeerAddr;          // peer the in-flight request was sent to, so a
+                                         // timed-out (blackholing) filter peer is rotated
+                                         // away from on retry instead of re-dialed forever
+    // Lock-free mirrors of the scalar status values the Android UI polls for the
+    // sync overlay. Written by the sync/worker threads WHERE THEY ALREADY HOLD
+    // manager->lock (via _BRPeerManagerRefreshCachedStatus); read by the JNI status
+    // accessors WITHOUT manager->lock. This stops a heavy compact-filter sync
+    // (worker holding manager->lock ~continuously) from starving the UI thread into
+    // a 10s ANR at the PIN screen. Relaxed ordering: values are monotonic-ish and a
+    // one-cycle lag is harmless for a progress overlay.
+    _Atomic uint32_t cachedLastHeight;
+    _Atomic uint32_t cachedLastTimestamp;
+    _Atomic uint32_t cachedEstimatedHeight;
+    _Atomic uint32_t cachedSyncStartHeight;
+    _Atomic uint32_t cachedCFTip;
+    _Atomic int      cachedPeerCount;
+    _Atomic int      cachedHasDownloadPeer;
+    _Atomic int      cachedSyncMode;
     // Distinct peers that failed the cfheaders continuity check since the last
     // successful append. K of them disagreeing means WE are the outlier.
     UInt128  cfDisagreedPeers[CF_CONTINUITY_REANCHOR_K];
@@ -256,6 +275,34 @@ struct BRPeerManagerStruct {
     size_t   penaltyCount;
     pthread_mutex_t lock;
 };
+
+// Snapshot the scalar status values the Android UI polls into the lock-free atomic
+// mirrors. MUST be called with manager->lock held (so lastBlock / compactFilterChain
+// / connectedPeers are valid to read). Cheap: a few scalar reads plus one short walk
+// of connectedPeers. Called from the worker/sync paths that already hold the lock so
+// the JNI status accessors can read the mirrors WITHOUT the lock and never block
+// behind a heavy compact-filter sync (which is what ANR'd the PIN screen).
+static void _BRPeerManagerRefreshCachedStatus(BRPeerManager *manager)
+{
+    if (manager->lastBlock) {
+        atomic_store_explicit(&manager->cachedLastHeight, manager->lastBlock->height, memory_order_relaxed);
+        atomic_store_explicit(&manager->cachedLastTimestamp, manager->lastBlock->timestamp, memory_order_relaxed);
+    }
+    atomic_store_explicit(&manager->cachedEstimatedHeight, manager->estimatedHeight, memory_order_relaxed);
+    atomic_store_explicit(&manager->cachedSyncStartHeight, manager->syncStartHeight, memory_order_relaxed);
+    atomic_store_explicit(&manager->cachedHasDownloadPeer, manager->downloadPeer ? 1 : 0, memory_order_relaxed);
+    atomic_store_explicit(&manager->cachedSyncMode, (int)manager->syncMode, memory_order_relaxed);
+
+    uint32_t cfTip = manager->compactFilterChain
+                     ? BRCompactFilterChainNextHeight(manager->compactFilterChain) : 0;
+    atomic_store_explicit(&manager->cachedCFTip, cfTip, memory_order_relaxed);
+
+    int pc = 0;
+    for (size_t i = array_count(manager->connectedPeers); i > 0; i--) {
+        if (BRPeerConnectStatus(manager->connectedPeers[i - 1]) != BRPeerStatusDisconnected) pc++;
+    }
+    atomic_store_explicit(&manager->cachedPeerCount, pc, memory_order_relaxed);
+}
 
 void BRPeerManagerSetStartBlock(BRPeerManager* manager, BRMerkleBlock* start) {
     if (!manager || !start) return;
@@ -1045,6 +1092,9 @@ static void _peerConnected(void *info)
         _BRPeerManagerOnFilterCapablePeerConnected(manager, info, peer);
     }
 
+    // Refresh peer-count/downloadPeer mirrors so the connect-phase overlay shows the
+    // live peer count before the first block arrives.
+    _BRPeerManagerRefreshCachedStatus(manager);
     pthread_mutex_unlock(&manager->lock);
 }
 
@@ -1123,8 +1173,11 @@ static void _peerDisconnected(void *info, int error)
     }
 
     BRPeerFree(peer);
+    // Peer left connectedPeers (and possibly was the downloadPeer) — refresh the
+    // mirrors so the overlay's peer count reflects the drop without taking the lock.
+    _BRPeerManagerRefreshCachedStatus(manager);
     pthread_mutex_unlock(&manager->lock);
-    
+
     for (size_t i = 0; i < txCount; i++) {
         txCallback[i](txInfo[i], txError);
     }
@@ -1724,12 +1777,16 @@ static void _peerRelayedBlock(void *info, BRMerkleBlock *block)
             b = BRSetGet(manager->blocks, &b->prevBlock);
         }
     }
-    
 
-    
+
+    // Refresh the lock-free UI status mirrors before releasing the lock. This is the
+    // hot path (runs on every relayed block) so it keeps height/estimate/peer-count/
+    // cfTip current for the overlay without the UI ever taking manager->lock.
+    _BRPeerManagerRefreshCachedStatus(manager);
+
     /* save the blocks */
     pthread_mutex_unlock(&manager->lock);
-    
+
     if (i > 0 && manager->saveBlocks) {
         debug_log("[STATS]: orphan_count = %ld, block_count = %ld\n", BRSetCount(manager->orphans), BRSetCount(manager->blocks));
         manager->saveBlocks(manager->info, REPLACE_SAVED_BLOCKS, saveBlocks, i, (uint64_t*) &stackIntegrityCheck);
@@ -2052,6 +2109,10 @@ BRPeerManager *BRPeerManagerNewEx(const BRChainParams *params, BRWallet *wallet,
     manager->dandelionEnabled = 1;   // default on; Kotlin overrides from the saved setting
     pthread_mutex_init(&manager->lock, NULL);
     manager->threadCleanup = _dummyThreadCleanup;
+    // Initialize the lock-free UI status mirrors (safe here: manager is single-threaded
+    // until Connect spawns peer threads). Without this the overlay reads 0 for
+    // height/syncMode until the first block lands.
+    _BRPeerManagerRefreshCachedStatus(manager);
     return manager;
 }
 
@@ -2091,6 +2152,23 @@ static BRPeer *_BRPeerManagerAnyFilterCapablePeer(BRPeerManager *manager)
     for (size_t i = array_count(manager->connectedPeers); i > 0; i--) {
         BRPeer *p = manager->connectedPeers[i - 1];
         if (BRPeerConnectStatus(p) != BRPeerStatusConnected) continue;
+        if (_BRPeerManagerPeerSupportsCompactFilters(manager, p)) return p;
+    }
+    return NULL;
+}
+
+// Like _BRPeerManagerAnyFilterCapablePeer but skips the peer at `avoid`. Used to
+// rotate the cfheaders driver off a filter peer that stopped answering: the
+// block-extend kick otherwise re-dials the same deterministic peer every retry,
+// so one stalled/blackholing filter node wedges the entire cfheaders sync.
+// Returns NULL if no OTHER connected filter-capable peer exists (caller then
+// falls back to retrying the same peer). Caller must hold manager->lock.
+static BRPeer *_BRPeerManagerAnyFilterCapablePeerExcept(BRPeerManager *manager, UInt128 avoid)
+{
+    for (size_t i = array_count(manager->connectedPeers); i > 0; i--) {
+        BRPeer *p = manager->connectedPeers[i - 1];
+        if (BRPeerConnectStatus(p) != BRPeerStatusConnected) continue;
+        if (UInt128Eq(p->address, avoid)) continue;
         if (_BRPeerManagerPeerSupportsCompactFilters(manager, p)) return p;
     }
     return NULL;
@@ -2139,6 +2217,11 @@ static void _BRPeerManagerRequestNextCFHeaders(BRPeerManager *manager, BRPeer *p
         return;
     }
 
+    // We got past the guard with a request already outstanding for this height only
+    // if it timed out (the guard's < TIMEOUT arm is what would have returned). That
+    // means the peer we last sent to never answered — rotate away from it below.
+    int isTimeoutRetry = (manager->cfHeadersRequestedThrough >= next);
+
     uint32_t batchEnd = next + (MAX_CFHEADERS_RESULTS - 1);
     if (batchEnd > tip) batchEnd = tip;
 
@@ -2178,11 +2261,28 @@ static void _BRPeerManagerRequestNextCFHeaders(BRPeerManager *manager, BRPeer *p
         }
     }
 
-    peer_log(peer, "cfheaders: requesting [%u..%u] (%u headers)",
+    // On a timeout retry, dial a DIFFERENT connected filter peer than the one that
+    // just went unanswered. The block-extend kick always hands us the same
+    // deterministic peer (_BRPeerManagerAnyFilterCapablePeer), so without this a
+    // single stalled/blackholing filter node pins cfheaders at one height forever
+    // while other healthy filter peers sit idle. Falls back to `peer` if no other
+    // filter-capable peer is connected.
+    BRPeer *reqPeer = peer;
+    if (isTimeoutRetry && !UInt128IsZero(manager->cfHeadersPeerAddr)) {
+        BRPeer *alt = _BRPeerManagerAnyFilterCapablePeerExcept(manager, manager->cfHeadersPeerAddr);
+        if (alt && _BRPeerManagerPeerSupportsCompactFilters(manager, alt)) {
+            peer_log(alt, "cfheaders: previous peer unanswered past %ds — rotating to this peer",
+                     CF_HEADERS_REQUEST_TIMEOUT_SECS);
+            reqPeer = alt;
+        }
+    }
+
+    peer_log(reqPeer, "cfheaders: requesting [%u..%u] (%u headers)",
              next, batchEnd, batchEnd - next + 1);
-    BRPeerSendGetCFHeaders(peer, filterType, next, stopHash);
+    BRPeerSendGetCFHeaders(reqPeer, filterType, next, stopHash);
     manager->cfHeadersRequestedThrough = batchEnd;
     manager->cfHeadersRequestTime = time(NULL);
+    manager->cfHeadersPeerAddr = reqPeer->address;
 }
 
 // On the FIRST continuity mismatch (one disagreer recorded, still below the
@@ -2412,6 +2512,9 @@ static void _peerRelayedCFHeaders(void *info, uint8_t filterType, UInt256 stopHa
 
     // Request the next batch if still behind the local block tip.
     _BRPeerManagerRequestNextCFHeaders(manager, peer);
+    // cfheaders advanced — refresh cachedCFTip so the watchdog/overlay see progress
+    // between blocks (cfheaders can climb faster than new blocks arrive).
+    _BRPeerManagerRefreshCachedStatus(manager);
     pthread_mutex_unlock(&manager->lock);
 }
 
@@ -2864,79 +2967,63 @@ void BRPeerManagerRescan(BRPeerManager *manager)
 // the (unverified) best block height reported by connected peers
 uint32_t BRPeerManagerEstimatedBlockHeight(BRPeerManager *manager)
 {
-    uint32_t height;
-    
     assert(manager != NULL);
-    pthread_mutex_lock(&manager->lock);
-    height = (manager->lastBlock->height < manager->estimatedHeight) ? manager->estimatedHeight :
-             manager->lastBlock->height;
-    pthread_mutex_unlock(&manager->lock);
-    return height;
+    // Lock-free read of the cached mirrors (_BRPeerManagerRefreshCachedStatus keeps
+    // them current under the lock). Avoids blocking the UI thread behind a heavy sync.
+    uint32_t last = atomic_load_explicit(&manager->cachedLastHeight, memory_order_relaxed);
+    uint32_t est  = atomic_load_explicit(&manager->cachedEstimatedHeight, memory_order_relaxed);
+    return (last < est) ? est : last;
 }
 
 // current proof-of-work verified best block height
 uint32_t BRPeerManagerLastBlockHeight(BRPeerManager *manager)
 {
-    uint32_t height;
-    
     assert(manager != NULL);
-    pthread_mutex_lock(&manager->lock);
-    height = manager->lastBlock->height;
-    pthread_mutex_unlock(&manager->lock);
-    return height;
+    return atomic_load_explicit(&manager->cachedLastHeight, memory_order_relaxed);
 }
 
 // current proof-of-work verified best block timestamp (time interval since unix epoch)
 uint32_t BRPeerManagerLastBlockTimestamp(BRPeerManager *manager)
 {
-    uint32_t timestamp;
-    
     assert(manager != NULL);
-    pthread_mutex_lock(&manager->lock);
-    timestamp = manager->lastBlock->timestamp;
-    pthread_mutex_unlock(&manager->lock);
-    return timestamp;
+    return atomic_load_explicit(&manager->cachedLastTimestamp, memory_order_relaxed);
 }
 
 // current network sync progress from 0 to 1
 // startHeight is the block height of the most recent fully completed sync
 double  BRPeerManagerSyncProgress(BRPeerManager *manager, uint32_t startHeight)
 {
-    double progress;
-    
     assert(manager != NULL);
-    pthread_mutex_lock(&manager->lock);
-    if (startHeight == 0) startHeight = manager->syncStartHeight;
-    
-    if (! manager->downloadPeer && manager->syncStartHeight == 0) {
+    // Lock-free: recompute from the cached mirrors so the overlay poll can't block
+    // behind a heavy compact-filter sync holding manager->lock.
+    uint32_t last      = atomic_load_explicit(&manager->cachedLastHeight, memory_order_relaxed);
+    uint32_t est       = atomic_load_explicit(&manager->cachedEstimatedHeight, memory_order_relaxed);
+    uint32_t syncStart = atomic_load_explicit(&manager->cachedSyncStartHeight, memory_order_relaxed);
+    int hasDownloadPeer = atomic_load_explicit(&manager->cachedHasDownloadPeer, memory_order_relaxed);
+    double progress;
+
+    if (startHeight == 0) startHeight = syncStart;
+
+    if (! hasDownloadPeer && syncStart == 0) {
         progress = 0.0;
     }
-    else if (! manager->downloadPeer || manager->lastBlock->height < manager->estimatedHeight) {
-        if (manager->lastBlock->height > startHeight && manager->estimatedHeight > startHeight) {
-            progress = 0.001 + 0.999 * (manager->lastBlock->height - startHeight)/(manager->estimatedHeight - startHeight);
+    else if (! hasDownloadPeer || last < est) {
+        if (last > startHeight && est > startHeight) {
+            progress = 0.001 + 0.999 * (last - startHeight)/(double)(est - startHeight);
         }
         else progress = 0.001;
     }
     else progress = 1.0;
 
-    pthread_mutex_unlock(&manager->lock);
     return progress;
 }
 
 // returns the number of currently connected peers
 size_t BRPeerManagerPeerCount(BRPeerManager *manager)
 {
-    size_t count = 0;
-    
     assert(manager != NULL);
-    pthread_mutex_lock(&manager->lock);
-    
-    for (size_t i = array_count(manager->connectedPeers); i > 0; i--) {
-        if (BRPeerConnectStatus(manager->connectedPeers[i - 1]) != BRPeerStatusDisconnected) count++;
-    }
-    
-    pthread_mutex_unlock(&manager->lock);
-    return count;
+    int c = atomic_load_explicit(&manager->cachedPeerCount, memory_order_relaxed);
+    return (c > 0) ? (size_t)c : 0;
 }
 
 // description of the peer most recently used to sync blockchain data
@@ -3185,16 +3272,14 @@ void BRPeerManagerSetSyncMode(BRPeerManager *manager, BRSyncMode mode)
     assert(manager != NULL);
     pthread_mutex_lock(&manager->lock);
     manager->syncMode = mode;
+    _BRPeerManagerRefreshCachedStatus(manager);
     pthread_mutex_unlock(&manager->lock);
 }
 
 BRSyncMode BRPeerManagerGetSyncMode(BRPeerManager *manager)
 {
     if (!manager) return BR_SYNC_MODE_BLOOM_ONLY;
-    pthread_mutex_lock(&manager->lock);
-    BRSyncMode m = manager->syncMode;
-    pthread_mutex_unlock(&manager->lock);
-    return m;
+    return (BRSyncMode)atomic_load_explicit(&manager->cachedSyncMode, memory_order_relaxed);
 }
 
 // Mid-run fallback: flip syncMode to BLOOM_ONLY AND push a freshly-built
@@ -3222,17 +3307,10 @@ void BRPeerManagerFallbackToBloom(BRPeerManager *manager)
 uint32_t BRPeerManagerCFChainTipHeight(BRPeerManager *manager)
 {
     if (!manager) return 0;
-    pthread_mutex_lock(&manager->lock);
-    uint32_t h = 0;
-    if (manager->compactFilterChain) {
-        // NextHeight is start + count; tip is one below, but if count==0
-        // there's no tip yet — return start-1 as "anchor seen, no headers"
-        // marker, or 0 if no chain at all.
-        uint32_t next = BRCompactFilterChainNextHeight(manager->compactFilterChain);
-        h = next > 0 ? next - 1 : 0;
-    }
-    pthread_mutex_unlock(&manager->lock);
-    return h;
+    // Lock-free: cachedCFTip mirrors BRCompactFilterChainNextHeight (start+count);
+    // the tip is one below that. 0 means no chain yet.
+    uint32_t next = atomic_load_explicit(&manager->cachedCFTip, memory_order_relaxed);
+    return next > 0 ? next - 1 : 0;
 }
 
 // Lowest contiguous block height reachable by walking prevBlock links from

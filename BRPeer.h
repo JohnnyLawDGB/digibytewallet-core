@@ -200,6 +200,10 @@ void BRPeerSetCurrentBlockHeight(BRPeer *peer, uint32_t currentBlockHeight);
 // current connection status
 BRPeerStatus BRPeerConnectStatus(BRPeer *peer);
 
+// nonzero if the peer's socket fd is still open (distinguishes a live Connected peer from a
+// dead-socket zombie whose status is still Connected but whose fd is already -1)
+int BRPeerIsSocketOpen(BRPeer *peer);
+
 // open connection to peer and perform handshake
 void BRPeerConnect(BRPeer *peer);
 

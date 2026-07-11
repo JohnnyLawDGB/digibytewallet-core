@@ -154,6 +154,10 @@ void BRPeerManagerConnect(BRPeerManager *manager);
 // disconnect from bitcoin peer-to-peer network (may cause syncFailed(), saveBlocks() or savePeers() callbacks to fire)
 void BRPeerManagerDisconnect(BRPeerManager *manager);
 
+// send a keepalive ping to every connected peer so idle CF filter-peer connections don't get
+// dropped by the remote node / NAT inactivity timeout (call periodically, e.g. every ~10-20s)
+void BRPeerManagerKeepAlive(BRPeerManager *manager);
+
 // rescans blocks and transactions after earliestKeyTime (a new random download peer is also selected due to the
 // possibility that a malicious node might lie by omitting transactions that match the bloom filter)
 void BRPeerManagerRescan(BRPeerManager *manager);

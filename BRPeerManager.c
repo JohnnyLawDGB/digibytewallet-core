@@ -1033,6 +1033,9 @@ static void _peerConnected(void *info)
         // COMPACT_FILTERS_ONLY. Gossip retention (BRPeerManager.c:1086-1096) is left
         // testnet-only here; its mainnet generalization ships with oracle-bootstrap.
         peer_log(peer, "node doesn't support SPV mode");
+        // Penalize so the CF-first dial loop AND the shotgun fallback skip this bloom-off node for
+        // PEER_PENALTY_SECONDS instead of re-dialing it (mirrors the "node isn't synced" penalty).
+        _penalize(manager, peer->address, peer->port, now);
         BRPeerDisconnect(peer);
     }
     else if (manager->downloadPeer && // check if we should stick with the existing download peer
@@ -2156,6 +2159,7 @@ static BRPeer *_BRPeerManagerAnyFilterCapablePeer(BRPeerManager *manager)
     for (size_t i = array_count(manager->connectedPeers); i > 0; i--) {
         BRPeer *p = manager->connectedPeers[i - 1];
         if (BRPeerConnectStatus(p) != BRPeerStatusConnected) continue;
+        if (! BRPeerIsSocketOpen(p)) continue; // skip dead-socket zombie — don't hand the driver a dead peer
         if (_BRPeerManagerPeerSupportsCompactFilters(manager, p)) return p;
     }
     return NULL;
@@ -2171,6 +2175,7 @@ static BRPeer *_BRPeerManagerNextUntriedFilterPeer(BRPeerManager *manager)
     for (size_t i = array_count(manager->connectedPeers); i > 0; i--) {
         BRPeer *p = manager->connectedPeers[i - 1];
         if (BRPeerConnectStatus(p) != BRPeerStatusConnected) continue;
+        if (! BRPeerIsSocketOpen(p)) continue; // skip dead-socket zombie — rotate onto a live filter peer
         if (!_BRPeerManagerPeerSupportsCompactFilters(manager, p)) continue;
         int tried = 0;
         for (uint8_t k = 0; k < manager->cfTriedCount; k++) {
@@ -2765,6 +2770,45 @@ static void _BRPeerManagerBeginConnect(BRPeerManager *manager, const BRPeer *tmp
     }
 }
 
+// Count peers in the candidate pool (manager->peers) that are compact-filter capable, NOT already
+// connected, and NOT penalized — exactly the set the filter-first pre-pass will dial. Read-only;
+// caller holds manager->lock. Never peer_log's a bare manager->peers element.
+static size_t _BRPeerManagerCountDialableFilterPeers(BRPeerManager *manager, time_t now)
+{
+    size_t n = 0;
+    for (size_t k = 0; k < array_count(manager->peers); k++) {
+        if ((manager->peers[k].services & SERVICES_NODE_COMPACT_FILTERS) != SERVICES_NODE_COMPACT_FILTERS)
+            continue;
+        int already = 0;
+        for (size_t j = array_count(manager->connectedPeers); j > 0; j--) {
+            if (BRPeerEq(&manager->peers[k], manager->connectedPeers[j - 1])) { already = 1; break; }
+        }
+        if (already) continue;
+        if (BRPeerPenaltyContains(manager->penaltyAddr, manager->penaltyPort, manager->penaltyUntil,
+                                  manager->penaltyCount < PEER_PENALTY_MAX ? manager->penaltyCount : PEER_PENALTY_MAX,
+                                  manager->peers[k].address, manager->peers[k].port, now))
+            continue;
+        n++;
+    }
+    return n;
+}
+
+// Count connected filter peers whose socket is still LIVE (excludes dead-socket zombies). Combined
+// with the dialable count this answers "do we have any real filter peer to work with" — so the
+// wallet only falls back to the discovery/own-node path when the known filter set is truly
+// exhausted. Read-only; caller holds manager->lock.
+static size_t _BRPeerManagerCountLiveFilterPeers(BRPeerManager *manager)
+{
+    size_t n = 0;
+    for (size_t i = array_count(manager->connectedPeers); i > 0; i--) {
+        BRPeer *p = manager->connectedPeers[i - 1];
+        if (BRPeerConnectStatus(p) == BRPeerStatusDisconnected) continue;
+        if (! BRPeerIsSocketOpen(p)) continue; // dead-socket zombie is not a live filter peer
+        if ((p->services & SERVICES_NODE_COMPACT_FILTERS) == SERVICES_NODE_COMPACT_FILTERS) n++;
+    }
+    return n;
+}
+
 // connect to bitcoin peer-to-peer network (also call this whenever networkIsReachable() status changes)
 void BRPeerManagerConnect(BRPeerManager *manager)
 {
@@ -2790,8 +2834,23 @@ void BRPeerManagerConnect(BRPeerManager *manager)
         time_t now = time(NULL);
         BRPeer *peers;
 
-		if ((array_count(manager->peers) < (4 * manager->maxConnectCount)) ||
-			((manager->peers[manager->maxConnectCount - 1].timestamp + 3*24*60*60) < now)) {
+        // CF-first (COMPACT_FILTERS_ONLY): dial the KNOWN validated filter peers as the primary
+        // set and SUPPRESS the random DNS/bloom shotgun while we have any filter peer to work with
+        // (a dialable candidate OR one already connected/connecting). The keepalive ping keeps
+        // those known peers up, so this rarely trips to exhaustion. Only when the known filter set
+        // is TRULY exhausted (all down) do we fall back to discovery — which is the point at which
+        // the app should nudge the user toward their own-node option (the sovereignty upgrade)
+        // rather than shotgunning bloom-off nodes. Never wedges at 0 peers (fallback still runs).
+        int cfOnly = (manager->syncMode == BR_SYNC_MODE_COMPACT_FILTERS_ONLY);
+        int cfExhausted = 1;
+        if (cfOnly) {
+            cfExhausted = (_BRPeerManagerCountDialableFilterPeers(manager, now) == 0 &&
+                           _BRPeerManagerCountLiveFilterPeers(manager) == 0);
+        }
+
+		if (cfExhausted &&
+		    ((array_count(manager->peers) < (4 * manager->maxConnectCount)) ||
+			((manager->peers[manager->maxConnectCount - 1].timestamp + 3*24*60*60) < now))) {
             _BRPeerManagerFindPeers(manager);
         }
 
@@ -2840,6 +2899,11 @@ void BRPeerManagerConnect(BRPeerManager *manager)
             }
         }
 
+        // Shotgun fallback: the random-peer / bloom dial pass. In COMPACT_FILTERS_ONLY this runs
+        // ONLY when the known filter set is exhausted (cfExhausted) — otherwise the filter-first
+        // pre-pass above is the sole dialer, so no bloom-off nodes are contacted. Verbatim
+        // otherwise (BLOOM_ONLY path + CF exhaustion fallback).
+        if (cfExhausted) {
         array_new(peers, 100);
 
         // Prioritize bloom-capable peers: add them to the candidate list first,
@@ -2916,15 +2980,36 @@ void BRPeerManagerConnect(BRPeerManager *manager)
         }
 
         array_free(peers);
+        } // end cfExhausted shotgun-fallback gate
     }
-    
+
     if (array_count(manager->connectedPeers) == 0) {
-        peer_log(&BR_PEER_NONE, "sync failed");
+        // Was peer_log(&BR_PEER_NONE, ...) — peer_log casts to BRPeerContext* and writes the host
+        // past the bare sentinel (OOB). Use the peer-less _peer_log.
+        _peer_log("sync failed — no peers connected\n");
         _BRPeerManagerSyncStopped(manager);
         pthread_mutex_unlock(&manager->lock);
         if (manager->syncStopped) manager->syncStopped(manager->info, ENETUNREACH);
     }
     else pthread_mutex_unlock(&manager->lock);
+}
+
+// Send a keepalive PING to every connected peer. Bloom sync keeps its single download peer hot
+// via continuous merkleblock traffic; CF sync juggles multiple filter peers, only one of which is
+// actively serving cfheaders at a time, so the others go idle and the remote node (or a NAT) drops
+// them ("Connection reset" / dead-socket zombies) — then the cfheaders driver rotates onto those
+// dead sockets. A periodic ping keeps every connection active so filter peers stay available.
+// Fire-and-forget (NULL pong callback — the pong just refreshes pingTime). Call periodically
+// (the app's ~10s keepalive tick). Safe anytime; no-op if not connected.
+void BRPeerManagerKeepAlive(BRPeerManager *manager)
+{
+    assert(manager != NULL);
+    pthread_mutex_lock(&manager->lock);
+    for (size_t i = array_count(manager->connectedPeers); i > 0; i--) {
+        BRPeer *p = manager->connectedPeers[i - 1];
+        if (BRPeerConnectStatus(p) == BRPeerStatusConnected) BRPeerSendPing(p, NULL, NULL);
+    }
+    pthread_mutex_unlock(&manager->lock);
 }
 
 void BRPeerManagerDisconnect(BRPeerManager *manager)

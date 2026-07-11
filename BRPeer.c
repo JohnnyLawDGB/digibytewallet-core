@@ -1616,6 +1616,14 @@ BRPeerStatus BRPeerConnectStatus(BRPeer *peer)
     return ((BRPeerContext *)peer)->status;
 }
 
+// nonzero if the peer's socket fd is still open. A live Connected peer always has socket>=0, so
+// socket<0 && status==Connected uniquely identifies a "dead-socket zombie". Lets the CF-first
+// counters/selectors ignore zombies so the wallet doesn't count a dead peer as a live filter peer.
+int BRPeerIsSocketOpen(BRPeer *peer)
+{
+    return ((BRPeerContext *)peer)->socket >= 0;
+}
+
 // open connection to peer and perform handshake
 void BRPeerConnect(BRPeer *peer)
 {

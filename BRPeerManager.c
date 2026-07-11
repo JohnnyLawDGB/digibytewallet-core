@@ -974,6 +974,8 @@ static uint32_t _BRPeerManagerBlockFloor(BRPeerManager *manager);
 static void _BRPeerManagerProbeOtherFilterPeersForCFHeaders(BRPeerManager *manager, BRPeer *current,
                                                             uint8_t filterType, uint32_t startHeight,
                                                             UInt256 stopHash);
+static void _BRPeerManagerBeginConnect(BRPeerManager *manager, const BRPeer *tmpl);
+static void _BRPeerManagerEnsureFilterPeerFloor(BRPeerManager *manager);
 
 // Ring-buffer insert/refresh for the churn-fix penalty set (see PEER_PENALTY_*
 // above). If (addr, port) is already on the list its window is refreshed;
@@ -1033,6 +1035,14 @@ static void _peerConnected(void *info)
         // COMPACT_FILTERS_ONLY. Gossip retention (BRPeerManager.c:1086-1096) is left
         // testnet-only here; its mainnet generalization ships with oracle-bootstrap.
         peer_log(peer, "node doesn't support SPV mode");
+        // Churn fix (mirror of the "node isn't synced" penalty above): a peer that is
+        // tagged/relayed with the compact-filter bit in our candidate pool but advertises
+        // neither bloom nor 0x40 in its own version message (a "phantom filter peer") would
+        // otherwise be re-dialed on every filter-first pre-pass AND every filter-floor kick —
+        // observed on-device as one phantom peer re-dialed 36x while real filter peers went
+        // unused. Penalize it so both dial loops skip it for PEER_PENALTY_SECONDS and rotate
+        // onto genuine filter peers instead.
+        _penalize(manager, peer->address, peer->port, now);
         BRPeerDisconnect(peer);
     }
     else if (manager->downloadPeer && // check if we should stick with the existing download peer
@@ -1657,6 +1667,10 @@ static void _peerRelayedBlock(void *info, BRMerkleBlock *block)
         // the driver another chance; it self-no-ops once caught up.
         if (manager->autoFetchCFiltersEnabled &&
             manager->syncMode != BR_SYNC_MODE_BLOOM_ONLY) {
+            // Top up live filter peers FIRST so a pool starved to dead-socket zombies dials
+            // fresh ones, then re-derive fp AFTER the floor (no stale pointer across its
+            // possible BeginConnect unlock window).
+            _BRPeerManagerEnsureFilterPeerFloor(manager);
             BRPeer *fp = _BRPeerManagerAnyFilterCapablePeer(manager);
             if (fp) _BRPeerManagerRequestNextCFHeaders(manager, fp);
         }
@@ -2172,6 +2186,7 @@ static BRPeer *_BRPeerManagerNextUntriedFilterPeer(BRPeerManager *manager)
         BRPeer *p = manager->connectedPeers[i - 1];
         if (BRPeerConnectStatus(p) != BRPeerStatusConnected) continue;
         if (!_BRPeerManagerPeerSupportsCompactFilters(manager, p)) continue;
+        if (!BRPeerIsSocketOpen(p)) continue; // skip dead-socket zombie — rotate onto a live filter peer
         int tried = 0;
         for (uint8_t k = 0; k < manager->cfTriedCount; k++) {
             if (UInt128Eq(manager->cfTriedPeers[k], p->address)) { tried = 1; break; }
@@ -2320,6 +2335,19 @@ static void _BRPeerManagerRequestNextCFHeaders(BRPeerManager *manager, BRPeer *p
     }
 
     if (!_BRPeerManagerPeerSupportsCompactFilters(manager, reqPeer)) return; // no usable filter peer this pass
+    // Don't ENOTCONN-hammer a dead-socket zombie: if the chosen peer's fd is already closed,
+    // skip the wasted send. But ARM THE REQUEST THROTTLE before bailing — a bare early return
+    // here leaves cfHeadersRequestTime stale, so the block-extend kick (which fires on EVERY
+    // block during header catch-up, ~25/s) re-enters, the timeout-retry path runs, and
+    // DropStalledFilterPeer busy-loops (observed on-device: 14838 "whole filter set stalled" in
+    // minutes). Re-arming makes the serialize guard hold off CF_HEADERS_REQUEST_TIMEOUT_SECS,
+    // by which time the filter floor should have dialed a fresh live filter peer that
+    // NextUntriedFilterPeer will rotate onto. Safe deref — this function never unlocks.
+    if (!BRPeerIsSocketOpen(reqPeer)) {
+        manager->cfHeadersRequestedThrough = batchEnd;
+        manager->cfHeadersRequestTime = time(NULL);
+        return;
+    }
 
     peer_log(reqPeer, "cfheaders: requesting [%u..%u] (%u headers)",
              next, batchEnd, batchEnd - next + 1);
@@ -2349,6 +2377,7 @@ static void _BRPeerManagerProbeOtherFilterPeersForCFHeaders(BRPeerManager *manag
         if (BRPeerEq(p, current)) continue;
         if (BRPeerConnectStatus(p) != BRPeerStatusConnected) continue;
         if (! _BRPeerManagerPeerSupportsCompactFilters(manager, p)) continue;
+        if (! BRPeerIsSocketOpen(p)) continue; // don't probe a dead-socket zombie (wasted ENOTCONN)
 
         int known = 0;
         for (uint8_t k = 0; k < manager->cfDisagreedCount; k++) {
@@ -2379,9 +2408,107 @@ static int _BRPeerManagerConnectedFilterPeerCount(BRPeerManager *manager)
         BRPeer *p = manager->connectedPeers[i - 1];
         if (BRPeerConnectStatus(p) != BRPeerStatusConnected) continue;
         if (! _BRPeerManagerPeerSupportsCompactFilters(manager, p)) continue;
+        if (! BRPeerIsSocketOpen(p)) continue; // a dead-socket zombie can't serve BIP158 — don't count it
         n++;
     }
     return n;
+}
+
+// Minimum number of LIVE (open-socket) filter-capable peers to keep connected.
+#define FILTER_PEER_FLOOR 3
+
+// Count connection slots occupied by USABLE peers: in-flight Connecting dials (fd may not be
+// open yet) plus live-open Connected peers. EXCLUDES dead-socket zombies (status==Connected but
+// socket<0) — the whole point, so a stuck zombie doesn't make an occupied-looking slot that
+// blocks a replacement dial. Caller must hold manager->lock.
+static int _BRPeerManagerOpenSlotOccupancy(BRPeerManager *manager)
+{
+    int n = 0;
+    for (size_t i = array_count(manager->connectedPeers); i > 0; i--) {
+        BRPeer *p = manager->connectedPeers[i - 1];
+        BRPeerStatus st = BRPeerConnectStatus(p);
+        if (st == BRPeerStatusDisconnected) continue;
+        if (st == BRPeerStatusConnected && ! BRPeerIsSocketOpen(p)) continue; // dead-socket zombie
+        n++;
+    }
+    return n;
+}
+
+// Maintain a floor of LIVE filter-capable peer connections. The filter-first pre-pass in
+// BRPeerManagerConnect only dials fresh filter peers when array_count(connectedPeers) <
+// maxConnectCount — but a dead-socket zombie (BRPeerDisconnect no-ops once socket<0, so it is
+// never evicted) pins that total at maxConnectCount forever, gating the pre-pass out and
+// stranding the cfheaders driver on the two dead sockets while healthy filter peers in
+// manager->peers are never dialed. This maintainer breaks that wedge: it dials fresh UNTRIED
+// filter peers gated on OPEN-SOCKET occupancy (which excludes zombies) instead of total count,
+// so zombies can no longer block replacement dials. Real open sockets still never exceed
+// maxConnectCount (occupancy cap), so PEER_MAX_CONNECTIONS stays 8. Caller must hold manager->lock.
+static void _BRPeerManagerEnsureFilterPeerFloor(BRPeerManager *manager)
+{
+    // Inert in bloom-only; skip when a single fixed peer is pinned (rescan / own-node lock via
+    // BRPeerManagerSetFixedPeer) or connections are effectively disabled.
+    if (manager->syncMode == BR_SYNC_MODE_BLOOM_ONLY) return;
+    if (manager->maxConnectCount <= 1) return;
+    if (! UInt128IsZero(manager->fixedPeer.address)) return;
+
+    int live = _BRPeerManagerConnectedFilterPeerCount(manager); // already excludes zombies
+    if (live >= FILTER_PEER_FLOOR) return;
+
+    // Anti-pileup ceiling: cap total live peer threads at maxConnectCount + FILTER_PEER_FLOOR even
+    // when stuck zombie read-threads keep peerThreadCount elevated. Bounds pthread_create pressure
+    // so the -fstack-protector reconnect re-entrancy class (seen at raised PEER_MAX) stays unreachable.
+    if (manager->peerThreadCount >= manager->maxConnectCount + FILTER_PEER_FLOOR) return;
+
+    time_t now = time(NULL);
+
+    // Snapshot up to (FLOOR - live) fresh filter candidates BY VALUE into a fixed local array,
+    // taking NO unlock during the scan. The later dial loop unlocks inside BeginConnect's
+    // immediate-fail path; iterating local copies means concurrent manager->peers mutation cannot
+    // corrupt the walk.
+    BRPeer picks[FILTER_PEER_FLOOR];
+    int nPicks = 0;
+    int want = FILTER_PEER_FLOOR - live;
+    for (size_t k = 0; k < array_count(manager->peers) && nPicks < want; k++) {
+        if ((manager->peers[k].services & SERVICES_NODE_COMPACT_FILTERS) != SERVICES_NODE_COMPACT_FILTERS)
+            continue;
+        int already = 0; // skip peers already connected
+        for (size_t j = array_count(manager->connectedPeers); j > 0; j--) {
+            if (BRPeerEq(&manager->peers[k], manager->connectedPeers[j - 1])) { already = 1; break; }
+        }
+        if (already) continue;
+        if (BRPeerPenaltyContains(manager->penaltyAddr, manager->penaltyPort, manager->penaltyUntil,
+                                  manager->penaltyCount < PEER_PENALTY_MAX ? manager->penaltyCount : PEER_PENALTY_MAX,
+                                  manager->peers[k].address, manager->peers[k].port, now))
+            continue; // recently penalized (same list the pre-pass uses)
+        int dup = 0; // skip peers already picked this pass
+        for (int q = 0; q < nPicks; q++) {
+            if (BRPeerEq(&picks[q], &manager->peers[k])) { dup = 1; break; }
+        }
+        if (dup) continue;
+        picks[nPicks++] = manager->peers[k]; // copy by value
+    }
+
+    // Dial the local picks. Re-check occupancy AND the thread ceiling every iteration because
+    // BeginConnect can unlock (immediate-fail path) and change both. Never dial past the
+    // open-socket cap — keeps real open sockets <= maxConnectCount so PEER_MAX stays 8.
+    for (int i = 0; i < nPicks; i++) {
+        if (_BRPeerManagerOpenSlotOccupancy(manager) >= manager->maxConnectCount) break;
+        if (manager->peerThreadCount >= manager->maxConnectCount + FILTER_PEER_FLOOR) break;
+        int already = 0; // a nested pre-pass during an earlier BeginConnect unlock may have dialed this IP
+        for (size_t j = array_count(manager->connectedPeers); j > 0; j--) {
+            if (BRPeerEq(&picks[i], manager->connectedPeers[j - 1])) { already = 1; break; }
+        }
+        if (already) continue;
+        // Log via a LOCAL octet copy — NEVER peer_log on picks[i] (a bare BRPeer: peer_log would
+        // write the host string past the struct end, corrupting the next slot). Mirrors the pre-pass.
+        {
+            const uint8_t *ip = (const uint8_t *)&picks[i].address.u32[3];
+            _peer_log("%u.%u.%u.%u:%"PRIu16" BIP158: filter floor low (%d/%d) — dialing fresh filter peer\n",
+                      ip[0], ip[1], ip[2], ip[3], picks[i].port, live, FILTER_PEER_FLOOR);
+        }
+        _BRPeerManagerBeginConnect(manager, &picks[i]);
+        live++;
+    }
 }
 
 // --- BIP 158 peer callbacks -----------------------------------------------
@@ -2919,7 +3046,11 @@ void BRPeerManagerConnect(BRPeerManager *manager)
     }
     
     if (array_count(manager->connectedPeers) == 0) {
-        peer_log(&BR_PEER_NONE, "sync failed");
+        // Was peer_log(&BR_PEER_NONE, ...): peer_log expands to BRPeerHost(peer), which casts the
+        // arg to BRPeerContext* and writes the formatted host PAST the end of the bare BR_PEER_NONE
+        // sentinel — a latent OOB write that surfaced as a garbled "l\xef\xbf\xbd...:0 sync failed"
+        // host in the log. Use the peer-less _peer_log (no host cast).
+        _peer_log("sync failed — no peers connected\n");
         _BRPeerManagerSyncStopped(manager);
         pthread_mutex_unlock(&manager->lock);
         if (manager->syncStopped) manager->syncStopped(manager->info, ENETUNREACH);
@@ -3413,7 +3544,10 @@ static int _BRPeerManagerReanchorAtFloorLocked(BRPeerManager *manager, int force
     manager->cfSingleDisagreeRounds    = 0;   // fresh single-peer diverged-round window
 
     // Kick recovery immediately if a filter peer is connected; otherwise the
-    // next block-extend kick handles it once filter-first connects one.
+    // next block-extend kick handles it once filter-first connects one. Top up
+    // the live-filter floor first (same re-derive-fp-after ordering as the
+    // block-extend kick) so recovery isn't stuck on dead-socket zombies.
+    _BRPeerManagerEnsureFilterPeerFloor(manager);
     BRPeer *fp = _BRPeerManagerAnyFilterCapablePeer(manager);
     if (fp) _BRPeerManagerRequestNextCFHeaders(manager, fp);
     return 1;

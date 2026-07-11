@@ -1616,6 +1616,16 @@ BRPeerStatus BRPeerConnectStatus(BRPeer *peer)
     return ((BRPeerContext *)peer)->status;
 }
 
+// nonzero if the peer's socket fd is still open. A live Connected peer always has socket>=0
+// (status only flips to Connected after the fd is assigned and the handshake completes), so
+// socket<0 && status==Connected uniquely identifies a "dead-socket zombie" — a peer whose send
+// path already hit ENOTCONN and self-closed (socket=-1) but whose read thread hasn't yet run
+// cleanup to flip status/remove it. Lets the filter-peer selectors skip such zombies.
+int BRPeerIsSocketOpen(BRPeer *peer)
+{
+    return ((BRPeerContext *)peer)->socket >= 0;
+}
+
 // open connection to peer and perform handshake
 void BRPeerConnect(BRPeer *peer)
 {

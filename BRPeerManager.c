@@ -28,6 +28,7 @@
 #include "BRArray.h"
 #include "BRInt.h"
 #include "BRCompactFilterChain.h"
+#include "BRCompactFilterCheckpoints.h"
 #include "BRGCSFilter.h"
 #include "BRWalletFilterElements.h"
 #include "BRNetwork.h"
@@ -2452,6 +2453,35 @@ static void _peerRelayedCFHeaders(void *info, uint8_t filterType, UInt256 stopHa
     }
 
     int ok = BRCompactFilterChainAppend(manager->compactFilterChain, prevFilterHeader, filterHashes, count);
+
+    // R1 (Neutrino review) — OBSERVE-MODE filter-header checkpoint cross-check.
+    // The chain now covers the freshly-appended batch; compare any hardcoded
+    // filter-header checkpoint that falls inside this batch against the wallet's
+    // own computed header. OBSERVE ONLY: log MATCH/MISMATCH, never reject or ban.
+    // This proves the compiled checkpoint data + byte order against honest chains
+    // in the wild before Phase 2 turns it into enforced trust (reject+ban on
+    // mismatch, gate single-peer re-anchor). Mainnet-only — the table is DGB
+    // mainnet filter-headers; applying it on testnet would falsely mismatch.
+    if (ok && manager->params->standardPort == BRMainNetParams.standardPort) {
+        uint32_t newTip = BRCompactFilterChainStartHeight(manager->compactFilterChain) +
+                          (uint32_t)BRCompactFilterChainCount(manager->compactFilterChain) - 1;
+        uint32_t batchStart = ((uint32_t)count <= newTip) ? (newTip - (uint32_t)count + 1) : 0;
+        for (size_t ci = 0; ci < BRMainNetCFCheckpointsCount; ci++) {
+            uint32_t h = BRMainNetCFCheckpoints[ci].height;
+            if (h < batchStart || h > newTip) continue;
+            UInt256 computed = BRCompactFilterChainHeader(manager->compactFilterChain, h);
+            if (UInt256Eq(computed, BRMainNetCFCheckpoints[ci].filterHeader)) {
+                peer_log(peer, "cf-checkpoint: height %u MATCH (observe)", h);
+            } else {
+                // Separate calls: log_u256_hex_encode may reuse a static buffer.
+                peer_log(peer, "cf-checkpoint: height %u *** MISMATCH (observe) *** computed=%s",
+                         h, log_u256_hex_encode(computed));
+                peer_log(peer, "cf-checkpoint: height %u *** MISMATCH (observe) *** pinned=%s",
+                         h, log_u256_hex_encode(BRMainNetCFCheckpoints[ci].filterHeader));
+            }
+        }
+    }
+
     if (!ok) {
         // Record this peer as one that disagrees with our tip (dedup by address).
         // Do NOT mark it misbehavin'/disconnect — if the majority disagrees, the

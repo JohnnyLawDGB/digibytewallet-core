@@ -966,7 +966,8 @@ static void _BRPeerManagerFindPeers(BRPeerManager *manager)
 // alongside the rest of the compact-filter helpers.
 static void _BRPeerManagerOnFilterCapablePeerConnected(BRPeerManager *manager, void *peerCbInfo, BRPeer *peer);
 static size_t _BRPeerManagerRequestCFiltersLocked(BRPeerManager *manager,
-                                                  uint32_t startHeight, uint32_t stopHeight);
+                                                  uint32_t startHeight, uint32_t stopHeight,
+                                                  BRPeer *preferred);
 static BRPeer *_BRPeerManagerAnyFilterCapablePeer(BRPeerManager *manager);
 static void _BRPeerManagerRequestNextCFHeaders(BRPeerManager *manager, BRPeer *peer);
 static int _BRPeerManagerReanchorAtFloorLocked(BRPeerManager *manager, int force);
@@ -2215,6 +2216,12 @@ static void _BRPeerManagerDropStalledFilterPeer(BRPeerManager *manager)
 // (peer dropped, slow link), the serialization guard releases so another peer
 // can retry the same batch.
 #define CF_HEADERS_REQUEST_TIMEOUT_SECS 5
+// Tor circuits are slow to establish and high-latency; a 5s timeout mis-punishes
+// a good-but-slow filter peer, churning peer rotation and forcing expensive
+// circuit re-dials that push our thin fleet toward a 0-peer wedge. Widen the CF
+// request timeout while a SOCKS proxy (Tor) is active. (R4, Neutrino review.)
+#define CF_HEADERS_REQUEST_TIMEOUT_TOR_SECS 20
+#define CF_REQUEST_TIMEOUT_SECS() (BRPeerHasSocksProxy() ? CF_HEADERS_REQUEST_TIMEOUT_TOR_SECS : CF_HEADERS_REQUEST_TIMEOUT_SECS)
 
 static void _BRPeerManagerRequestNextCFHeaders(BRPeerManager *manager, BRPeer *peer)
 {
@@ -2244,7 +2251,7 @@ static void _BRPeerManagerRequestNextCFHeaders(BRPeerManager *manager, BRPeer *p
     // responses fail the continuity check (chain already moved) and get those
     // peers marked misbehavin' and disconnected — stalling cfheaders entirely.
     if (manager->cfHeadersRequestedThrough >= next &&
-        (time(NULL) - manager->cfHeadersRequestTime) < CF_HEADERS_REQUEST_TIMEOUT_SECS) {
+        (time(NULL) - manager->cfHeadersRequestTime) < CF_REQUEST_TIMEOUT_SECS()) {
         return;
     }
 
@@ -2551,7 +2558,7 @@ static void _peerRelayedCFHeaders(void *info, uint8_t filterType, UInt256 stopHa
             if (reqStop > reqStart + (MAX_CFILTERS_RESULTS - 1)) {
                 reqStop = reqStart + (MAX_CFILTERS_RESULTS - 1);
             }
-            size_t n = _BRPeerManagerRequestCFiltersLocked(manager, reqStart, reqStop);
+            size_t n = _BRPeerManagerRequestCFiltersLocked(manager, reqStart, reqStop, peer);
             if (n > 0) {
                 manager->autoFetchCFiltersThrough = reqStop;
                 peer_log(peer, "cfilters: auto-requested [%u..%u] (%zu blocks)",
@@ -3546,8 +3553,16 @@ void BRPeerManagerSetSaveFilterHeaders(BRPeerManager *manager, void *info,
 
 // Lock-held internal helper. Caller must hold manager->lock. Returns the
 // number of blocks actually requested or 0 if no eligible peer was found.
+static int _BRPeerManagerPeerCanServeFilters(BRPeer *p)
+{
+    return p && BRPeerConnectStatus(p) == BRPeerStatusConnected &&
+           BRPeerIsSocketOpen(p) &&
+           (p->services & SERVICES_NODE_COMPACT_FILTERS) == SERVICES_NODE_COMPACT_FILTERS;
+}
+
 static size_t _BRPeerManagerRequestCFiltersLocked(BRPeerManager *manager,
-                                                  uint32_t startHeight, uint32_t stopHeight)
+                                                  uint32_t startHeight, uint32_t stopHeight,
+                                                  BRPeer *preferred)
 {
     if (stopHeight < startHeight) return 0;
     if (manager->syncMode == BR_SYNC_MODE_BLOOM_ONLY) return 0;
@@ -3562,13 +3577,20 @@ static size_t _BRPeerManagerRequestCFiltersLocked(BRPeerManager *manager,
                          ? BRCompactFilterChainType(manager->compactFilterChain)
                          : FILTER_TYPE_BASIC;
 
-    BRPeer *target = NULL;
-    for (size_t i = array_count(manager->connectedPeers); i > 0; i--) {
-        BRPeer *p = manager->connectedPeers[i - 1];
-        if (BRPeerConnectStatus(p) != BRPeerStatusConnected) continue;
-        if ((p->services & SERVICES_NODE_COMPACT_FILTERS) != SERVICES_NODE_COMPACT_FILTERS) continue;
-        target = p;
-        break;
+    // R3 (Neutrino review): prefer the peer that just delivered these cfheaders.
+    // It's a proven-responsive filter peer, and because the cfheaders driver
+    // rotates that peer off on stall, cfilters follow the rotation (implicit
+    // failover) instead of pinning the FIRST connected peer — which may be slow
+    // or a dead-socket zombie, stranding the tail of the sync ("stuck at 99%").
+    // Fall back to the first LIVE (socket-open) filter peer, skipping zombies.
+    BRPeer *target = _BRPeerManagerPeerCanServeFilters(preferred) ? preferred : NULL;
+    if (!target) {
+        for (size_t i = array_count(manager->connectedPeers); i > 0; i--) {
+            BRPeer *p = manager->connectedPeers[i - 1];
+            if (! _BRPeerManagerPeerCanServeFilters(p)) continue;
+            target = p;
+            break;
+        }
     }
     if (!target) return 0;
 
@@ -3581,7 +3603,7 @@ size_t BRPeerManagerRequestCompactFilters(BRPeerManager *manager,
 {
     if (!manager) return 0;
     pthread_mutex_lock(&manager->lock);
-    size_t n = _BRPeerManagerRequestCFiltersLocked(manager, startHeight, stopHeight);
+    size_t n = _BRPeerManagerRequestCFiltersLocked(manager, startHeight, stopHeight, NULL);
     pthread_mutex_unlock(&manager->lock);
     return n;
 }

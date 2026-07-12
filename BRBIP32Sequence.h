@@ -98,6 +98,22 @@ void BRBIP32PrivKeyBIP86(BRKey *key, const void *seed, size_t seedLen, uint32_t 
 void BRBIP32PrivKeyListBIP86(BRKey keys[], size_t keysCount, const void *seed, size_t seedLen,
                              uint32_t chain, const uint32_t indexes[]);
 
+// ── Account-parameterized derivation (duress decoy = account 1') ──────────────
+// Byte-identical to the account-0 functions above when account == BIP84_ACCOUNT (0).
+// `account` sits right after seedLen to mirror the path order m/purpose'/coin'/ACCOUNT'/chain/index.
+
+BRMasterPubKey BRBIP32MasterPubKeyBIP84ForAccount(const void *seed, size_t seedLen, uint32_t account);
+BRMasterPubKey BRBIP32MasterPubKeyBIP86ForAccount(const void *seed, size_t seedLen, uint32_t account);
+
+void BRBIP32PrivKeyBIP84ForAccount(BRKey *key, const void *seed, size_t seedLen, uint32_t account,
+                                   uint32_t chain, uint32_t index);
+void BRBIP32PrivKeyListBIP84ForAccount(BRKey keys[], size_t keysCount, const void *seed, size_t seedLen,
+                                       uint32_t account, uint32_t chain, const uint32_t indexes[]);
+void BRBIP32PrivKeyBIP86ForAccount(BRKey *key, const void *seed, size_t seedLen, uint32_t account,
+                                   uint32_t chain, uint32_t index);
+void BRBIP32PrivKeyListBIP86ForAccount(BRKey keys[], size_t keysCount, const void *seed, size_t seedLen,
+                                       uint32_t account, uint32_t chain, const uint32_t indexes[]);
+
 // writes the public key for path N(m/0H/chain/index) to pubKey
 // returns number of bytes written, or pubKeyLen needed if pubKey is NULL
 size_t BRBIP32PubKey(uint8_t *pubKey, size_t pubKeyLen, BRMasterPubKey mpk, uint32_t chain, uint32_t index);

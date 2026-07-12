@@ -136,8 +136,8 @@ BRMasterPubKey BRBIP32MasterPubKey(const void *seed, size_t seedLen)
     return mpk;
 }
 
-// BIP84 master pub key: m/84'/20'/0' with standard "Bitcoin seed" HMAC
-BRMasterPubKey BRBIP32MasterPubKeyBIP84(const void *seed, size_t seedLen)
+// BIP84 master pub key at an arbitrary hardened account: m/84'/20'/account'
+BRMasterPubKey BRBIP32MasterPubKeyBIP84ForAccount(const void *seed, size_t seedLen, uint32_t account)
 {
     BRMasterPubKey mpk = BR_MASTER_PUBKEY_NONE;
     UInt512 I;
@@ -158,7 +158,7 @@ BRMasterPubKey BRBIP32MasterPubKeyBIP84(const void *seed, size_t seedLen)
 
         _CKDpriv(&secret, &chain, BIP84_PURPOSE | BIP32_HARD); // m/84'
         _CKDpriv(&secret, &chain, DGB_COIN_TYPE | BIP32_HARD);  // m/84'/20'
-        _CKDpriv(&secret, &chain, BIP84_ACCOUNT | BIP32_HARD);  // m/84'/20'/0'
+        _CKDpriv(&secret, &chain, account | BIP32_HARD);        // m/84'/20'/account'
 
         mpk.chainCode = chain;
         BRKeySetSecret(&key, &secret, 1);
@@ -170,10 +170,14 @@ BRMasterPubKey BRBIP32MasterPubKeyBIP84(const void *seed, size_t seedLen)
     return mpk;
 }
 
-// BIP86 master pub key: m/86'/20'/0' with standard "Bitcoin seed" HMAC
-// Verbatim clone of BRBIP32MasterPubKeyBIP84 -- only the hardened purpose
-// level differs (84 -> 86); same HMAC key, same DGB_COIN_TYPE, same account 0.
-BRMasterPubKey BRBIP32MasterPubKeyBIP86(const void *seed, size_t seedLen)
+// BIP84 master pub key: m/84'/20'/0' with standard "Bitcoin seed" HMAC
+BRMasterPubKey BRBIP32MasterPubKeyBIP84(const void *seed, size_t seedLen)
+{
+    return BRBIP32MasterPubKeyBIP84ForAccount(seed, seedLen, BIP84_ACCOUNT);
+}
+
+// BIP86 master pub key at an arbitrary hardened account: m/86'/20'/account'
+BRMasterPubKey BRBIP32MasterPubKeyBIP86ForAccount(const void *seed, size_t seedLen, uint32_t account)
 {
     BRMasterPubKey mpk = BR_MASTER_PUBKEY_NONE;
     UInt512 I;
@@ -194,7 +198,7 @@ BRMasterPubKey BRBIP32MasterPubKeyBIP86(const void *seed, size_t seedLen)
 
         _CKDpriv(&secret, &chain, BIP86_PURPOSE | BIP32_HARD); // m/86'
         _CKDpriv(&secret, &chain, DGB_COIN_TYPE | BIP32_HARD);  // m/86'/20'
-        _CKDpriv(&secret, &chain, BIP84_ACCOUNT | BIP32_HARD);  // m/86'/20'/0'
+        _CKDpriv(&secret, &chain, account | BIP32_HARD);        // m/86'/20'/account'
 
         mpk.chainCode = chain;
         BRKeySetSecret(&key, &secret, 1);
@@ -204,6 +208,12 @@ BRMasterPubKey BRBIP32MasterPubKeyBIP86(const void *seed, size_t seedLen)
     }
 
     return mpk;
+}
+
+// BIP86 master pub key: m/86'/20'/0' with standard "Bitcoin seed" HMAC
+BRMasterPubKey BRBIP32MasterPubKeyBIP86(const void *seed, size_t seedLen)
+{
+    return BRBIP32MasterPubKeyBIP86ForAccount(seed, seedLen, BIP84_ACCOUNT);
 }
 
 // Legacy master pub key — explicit name for the old m/0H path with "DigiByte seed"
@@ -293,8 +303,9 @@ void BRBIP32PrivKeyList(BRKey keys[], size_t keysCount, const void *seed, size_t
     }
 }
 
-// BIP84 private key: m/84'/20'/0'/chain/index with "Bitcoin seed"
-void BRBIP32PrivKeyBIP84(BRKey *key, const void *seed, size_t seedLen, uint32_t chain, uint32_t index)
+// BIP84 private key at an arbitrary hardened account: m/84'/20'/account'/chain/index
+void BRBIP32PrivKeyBIP84ForAccount(BRKey *key, const void *seed, size_t seedLen, uint32_t account,
+                                   uint32_t chain, uint32_t index)
 {
     UInt512 I;
     UInt256 secret, chainCode;
@@ -311,7 +322,7 @@ void BRBIP32PrivKeyBIP84(BRKey *key, const void *seed, size_t seedLen, uint32_t 
 
         _CKDpriv(&secret, &chainCode, BIP84_PURPOSE | BIP32_HARD); // 84'
         _CKDpriv(&secret, &chainCode, DGB_COIN_TYPE | BIP32_HARD);  // 20'
-        _CKDpriv(&secret, &chainCode, BIP84_ACCOUNT | BIP32_HARD);  // 0'
+        _CKDpriv(&secret, &chainCode, account | BIP32_HARD);        // account'
         _CKDpriv(&secret, &chainCode, chain);                        // chain
         _CKDpriv(&secret, &chainCode, index);                        // index
 
@@ -320,9 +331,15 @@ void BRBIP32PrivKeyBIP84(BRKey *key, const void *seed, size_t seedLen, uint32_t 
     }
 }
 
-// BIP84 batch private key derivation for transaction signing
-void BRBIP32PrivKeyListBIP84(BRKey keys[], size_t keysCount, const void *seed, size_t seedLen,
-                             uint32_t chain, const uint32_t indexes[])
+// BIP84 private key: m/84'/20'/0'/chain/index with "Bitcoin seed"
+void BRBIP32PrivKeyBIP84(BRKey *key, const void *seed, size_t seedLen, uint32_t chain, uint32_t index)
+{
+    BRBIP32PrivKeyBIP84ForAccount(key, seed, seedLen, BIP84_ACCOUNT, chain, index);
+}
+
+// BIP84 batch private key derivation at an arbitrary hardened account
+void BRBIP32PrivKeyListBIP84ForAccount(BRKey keys[], size_t keysCount, const void *seed, size_t seedLen,
+                                       uint32_t account, uint32_t chain, const uint32_t indexes[])
 {
     UInt512 I;
     UInt256 secret, chainCode, s, c;
@@ -340,7 +357,7 @@ void BRBIP32PrivKeyListBIP84(BRKey keys[], size_t keysCount, const void *seed, s
 
         _CKDpriv(&secret, &chainCode, BIP84_PURPOSE | BIP32_HARD); // 84'
         _CKDpriv(&secret, &chainCode, DGB_COIN_TYPE | BIP32_HARD);  // 20'
-        _CKDpriv(&secret, &chainCode, BIP84_ACCOUNT | BIP32_HARD);  // 0'
+        _CKDpriv(&secret, &chainCode, account | BIP32_HARD);        // account'
         _CKDpriv(&secret, &chainCode, chain);                        // chain
 
         for (size_t i = 0; i < keysCount; i++) {
@@ -351,39 +368,53 @@ void BRBIP32PrivKeyListBIP84(BRKey keys[], size_t keysCount, const void *seed, s
         }
 
         var_clean(&secret, &chainCode, &c, &s);
+    }
+}
+
+// BIP84 batch private key derivation for transaction signing (account 0)
+void BRBIP32PrivKeyListBIP84(BRKey keys[], size_t keysCount, const void *seed, size_t seedLen,
+                             uint32_t chain, const uint32_t indexes[])
+{
+    BRBIP32PrivKeyListBIP84ForAccount(keys, keysCount, seed, seedLen, BIP84_ACCOUNT, chain, indexes);
+}
+
+// BIP86 (Taproot) private key at an arbitrary hardened account: m/86'/20'/account'/chain/index
+void BRBIP32PrivKeyBIP86ForAccount(BRKey *key, const void *seed, size_t seedLen, uint32_t account,
+                                   uint32_t chain, uint32_t index)
+{
+    UInt512 I;
+    UInt256 secret, chainCode;
+
+    assert(key != NULL);
+    assert(seed != NULL || seedLen == 0);
+
+    if (key && (seed || seedLen == 0)) {
+        BRHMAC(&I, BRSHA512, sizeof(UInt512), BIP32_SEED_KEY_STANDARD,
+               strlen(BIP32_SEED_KEY_STANDARD), seed, seedLen);
+        secret = *(UInt256 *)&I;
+        chainCode = *(UInt256 *)&I.u8[sizeof(UInt256)];
+        var_clean(&I);
+
+        _CKDpriv(&secret, &chainCode, BIP86_PURPOSE | BIP32_HARD); // 86'
+        _CKDpriv(&secret, &chainCode, DGB_COIN_TYPE | BIP32_HARD);  // 20'
+        _CKDpriv(&secret, &chainCode, account | BIP32_HARD);        // account'
+        _CKDpriv(&secret, &chainCode, chain);                        // chain
+        _CKDpriv(&secret, &chainCode, index);                        // index
+
+        BRKeySetSecret(key, &secret, 1);
+        var_clean(&secret, &chainCode);
     }
 }
 
 // BIP86 (Taproot) private key: m/86'/20'/0'/chain/index with "Bitcoin seed"
 void BRBIP32PrivKeyBIP86(BRKey *key, const void *seed, size_t seedLen, uint32_t chain, uint32_t index)
 {
-    UInt512 I;
-    UInt256 secret, chainCode;
-
-    assert(key != NULL);
-    assert(seed != NULL || seedLen == 0);
-
-    if (key && (seed || seedLen == 0)) {
-        BRHMAC(&I, BRSHA512, sizeof(UInt512), BIP32_SEED_KEY_STANDARD,
-               strlen(BIP32_SEED_KEY_STANDARD), seed, seedLen);
-        secret = *(UInt256 *)&I;
-        chainCode = *(UInt256 *)&I.u8[sizeof(UInt256)];
-        var_clean(&I);
-
-        _CKDpriv(&secret, &chainCode, BIP86_PURPOSE | BIP32_HARD); // 86'
-        _CKDpriv(&secret, &chainCode, DGB_COIN_TYPE | BIP32_HARD);  // 20'
-        _CKDpriv(&secret, &chainCode, BIP84_ACCOUNT | BIP32_HARD);  // 0'
-        _CKDpriv(&secret, &chainCode, chain);                        // chain
-        _CKDpriv(&secret, &chainCode, index);                        // index
-
-        BRKeySetSecret(key, &secret, 1);
-        var_clean(&secret, &chainCode);
-    }
+    BRBIP32PrivKeyBIP86ForAccount(key, seed, seedLen, BIP84_ACCOUNT, chain, index);
 }
 
-// BIP86 batch private key derivation for transaction signing
-void BRBIP32PrivKeyListBIP86(BRKey keys[], size_t keysCount, const void *seed, size_t seedLen,
-                             uint32_t chain, const uint32_t indexes[])
+// BIP86 batch private key derivation at an arbitrary hardened account
+void BRBIP32PrivKeyListBIP86ForAccount(BRKey keys[], size_t keysCount, const void *seed, size_t seedLen,
+                                       uint32_t account, uint32_t chain, const uint32_t indexes[])
 {
     UInt512 I;
     UInt256 secret, chainCode, s, c;
@@ -401,7 +432,7 @@ void BRBIP32PrivKeyListBIP86(BRKey keys[], size_t keysCount, const void *seed, s
 
         _CKDpriv(&secret, &chainCode, BIP86_PURPOSE | BIP32_HARD); // 86'
         _CKDpriv(&secret, &chainCode, DGB_COIN_TYPE | BIP32_HARD);  // 20'
-        _CKDpriv(&secret, &chainCode, BIP84_ACCOUNT | BIP32_HARD);  // 0'
+        _CKDpriv(&secret, &chainCode, account | BIP32_HARD);        // account'
         _CKDpriv(&secret, &chainCode, chain);                        // chain
 
         for (size_t i = 0; i < keysCount; i++) {
@@ -413,6 +444,13 @@ void BRBIP32PrivKeyListBIP86(BRKey keys[], size_t keysCount, const void *seed, s
 
         var_clean(&secret, &chainCode, &c, &s);
     }
+}
+
+// BIP86 batch private key derivation for transaction signing (account 0)
+void BRBIP32PrivKeyListBIP86(BRKey keys[], size_t keysCount, const void *seed, size_t seedLen,
+                             uint32_t chain, const uint32_t indexes[])
+{
+    BRBIP32PrivKeyListBIP86ForAccount(keys, keysCount, seed, seedLen, BIP84_ACCOUNT, chain, indexes);
 }
 
 // sets the private key for the specified path to key

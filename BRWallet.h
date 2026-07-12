@@ -115,6 +115,9 @@ int BRWalletHasLegacyFunds(BRWallet *wallet);
 // BIP84 masterPubKey — deriving P2TR over the m/84' key would produce unrecoverable addresses.
 void BRWalletSetTaprootKey(BRWallet *wallet, BRMasterPubKey taprootMpk);
 
+// sets the hardened BIP44 account (0 = real, 1 = duress decoy) used by BRWalletSignTransaction
+void BRWalletSetAccount(BRWallet *wallet, uint32_t account);
+
 // not thread-safe, set callbacks once after BRWalletNew(), before calling other BRWallet functions
 // info is a void pointer that will be passed along with each callback call
 // void balanceChanged(void *, uint64_t) - called when the wallet balance changes

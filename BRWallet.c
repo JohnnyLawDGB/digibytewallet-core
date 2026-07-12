@@ -59,6 +59,9 @@ struct BRWalletStruct {
     int hasTaprootKey;
     BRAddress *taprootExternalChain;
     BRAddress *taprootInternalChain;
+    // Hardened BIP44 account level the wallet's keys derive at (0 = real, 1 = duress decoy).
+    // Signing re-derivation reads this so an account-1' wallet signs with account-1' keys.
+    uint32_t account;
     // Explicitly-watched addresses persisted independently of the derived chains
     // (every address ever shown on the Receive screen). Always included in the
     // BIP158 match set (BRWalletAllAddrs) and containment checks, so a receive to an
@@ -343,6 +346,7 @@ BRWallet *BRWalletNew(BRTransaction *transactions[], size_t txCount, BRMasterPub
     array_new(wallet->taprootInternalChain, 50);
     array_new(wallet->watchedAddrs, 16);
     wallet->hasTaprootKey = 0;
+    wallet->account = BIP84_ACCOUNT; // 0 — default real account; BRWalletSetAccount overrides for the decoy
     array_new(wallet->balanceHist, txCount + 100);
     wallet->allTx = BRSetNew(BRTransactionHash, BRTransactionEq, txCount + 100);
     wallet->invalidTx = BRSetNew(BRTransactionHash, BRTransactionEq, 10);
@@ -535,6 +539,16 @@ void BRWalletSetTaprootKey(BRWallet *wallet, BRMasterPubKey taprootMpk)
     pthread_mutex_lock(&wallet->lock);
     _BRWalletUpdateBalance(wallet);
     pthread_mutex_unlock(&wallet->lock);
+}
+
+// Set the hardened BIP44 account the wallet's signing keys derive at. Must be called
+// immediately after BRWalletNew/BRWalletNewDual (before signing). Address generation
+// already flows from the account-N master pub key installed at construction; this makes
+// BRWalletSignTransaction re-derive private keys at the SAME account.
+void BRWalletSetAccount(BRWallet *wallet, uint32_t account)
+{
+    assert(wallet != NULL);
+    if (wallet) wallet->account = account;
 }
 
 // returns non-zero if any UTXO in the wallet belongs to the legacy key chains (old m/0H addresses)
@@ -1431,27 +1445,27 @@ int BRWalletSignTransaction(BRWallet *wallet, BRTransaction *tx, int forkId, con
 
     if (seed) {
         size_t keyOff = 0;
-        // BIP84 keys: use "Bitcoin seed" + m/84'/20'/0'
-        BRBIP32PrivKeyListBIP84(keys + keyOff, bip84InternalCount, seed, seedLen,
-                                SEQUENCE_INTERNAL_CHAIN, bip84InternalIdx);
+        // BIP84 keys: use "Bitcoin seed" + m/84'/20'/account'
+        BRBIP32PrivKeyListBIP84ForAccount(keys + keyOff, bip84InternalCount, seed, seedLen,
+                                          wallet->account, SEQUENCE_INTERNAL_CHAIN, bip84InternalIdx);
         keyOff += bip84InternalCount;
-        BRBIP32PrivKeyListBIP84(keys + keyOff, bip84ExternalCount, seed, seedLen,
-                                SEQUENCE_EXTERNAL_CHAIN, bip84ExternalIdx);
+        BRBIP32PrivKeyListBIP84ForAccount(keys + keyOff, bip84ExternalCount, seed, seedLen,
+                                          wallet->account, SEQUENCE_EXTERNAL_CHAIN, bip84ExternalIdx);
         keyOff += bip84ExternalCount;
-        // Legacy keys: use "DigiByte seed" + m/0H
+        // Legacy keys: use "DigiByte seed" + m/0H (account-less — unchanged)
         BRBIP32PrivKeyList(keys + keyOff, legacyInternalCount, seed, seedLen,
                            SEQUENCE_INTERNAL_CHAIN, legacyInternalIdx);
         keyOff += legacyInternalCount;
         BRBIP32PrivKeyList(keys + keyOff, legacyExternalCount, seed, seedLen,
                            SEQUENCE_EXTERNAL_CHAIN, legacyExternalIdx);
         keyOff += legacyExternalCount;
-        // Taproot keys: use "Bitcoin seed" + m/86'/20'/0' (BIP86). The child privkey
+        // Taproot keys: use "Bitcoin seed" + m/86'/20'/account' (BIP86). The child privkey
         // here is the INTERNAL key d; BRKeyTaprootSchnorrSign applies the BIP86 taptweak.
-        BRBIP32PrivKeyListBIP86(keys + keyOff, taprootInternalCount, seed, seedLen,
-                                SEQUENCE_INTERNAL_CHAIN, taprootInternalIdx);
+        BRBIP32PrivKeyListBIP86ForAccount(keys + keyOff, taprootInternalCount, seed, seedLen,
+                                          wallet->account, SEQUENCE_INTERNAL_CHAIN, taprootInternalIdx);
         keyOff += taprootInternalCount;
-        BRBIP32PrivKeyListBIP86(keys + keyOff, taprootExternalCount, seed, seedLen,
-                                SEQUENCE_EXTERNAL_CHAIN, taprootExternalIdx);
+        BRBIP32PrivKeyListBIP86ForAccount(keys + keyOff, taprootExternalCount, seed, seedLen,
+                                          wallet->account, SEQUENCE_EXTERNAL_CHAIN, taprootExternalIdx);
         // TODO: XXX wipe seed callback
         seed = NULL;
         if (tx) r = BRTransactionSign(tx, forkId, keys, totalKeys);

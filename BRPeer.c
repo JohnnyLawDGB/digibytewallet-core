@@ -1783,12 +1783,30 @@ void BRPeerSendMessage(BRPeer *peer, const uint8_t *msg, size_t msgLen, const ch
         socket = ctx->socket;
         if (socket < 0) error = ENOTCONN;
 
+        // Independent send deadline. ctx->disconnectTime is DBL_MAX for idle /
+        // fully-synced peers, so it cannot bound this loop: on a half-dead or
+        // zero-window socket, send() returns EWOULDBLOCK indefinitely (correctly
+        // not treated as an error), so without this cap the loop spins forever.
+        // When that send is issued while holding manager->lock / PEER_GUARD
+        // (e.g. the keepalive ping), it pins those locks and wedges the entire
+        // sync layer until the process is killed (v3.10.21 keepalive regression:
+        // a half-dead peer socket after hours on mobile froze all peer ops and
+        // made pull-to-refresh a no-op). MESSAGE_TIMEOUT caps the whole send
+        // regardless of disconnectTime; on timeout the peer is disconnected
+        // below (the same BRPeerDisconnect the error path already calls under
+        // the lock), which releases the locks and frees the slot for a fresh peer.
+        gettimeofday(&tv, NULL);
+        double sendDeadline = tv.tv_sec + (double)tv.tv_usec/1000000 + MESSAGE_TIMEOUT;
+
         while (socket >= 0 && ! error && msgLen < bufLen) {
+            double now;
             n = send(socket, &buf[msgLen], bufLen - msgLen, MSG_NOSIGNAL);
             if (n >= 0) msgLen += n;
             if (n < 0 && errno != EWOULDBLOCK) error = errno;
             gettimeofday(&tv, NULL);
-            if (! error && tv.tv_sec + (double)tv.tv_usec/1000000 >= ctx->disconnectTime) error = ETIMEDOUT;
+            now = tv.tv_sec + (double)tv.tv_usec/1000000;
+            if (! error && now >= ctx->disconnectTime) error = ETIMEDOUT;
+            if (! error && now >= sendDeadline) error = ETIMEDOUT; // hard cap; disconnectTime is DBL_MAX for idle peers
             socket = ctx->socket;
         }
 

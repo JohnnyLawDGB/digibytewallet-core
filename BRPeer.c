@@ -205,6 +205,14 @@ typedef struct {
     uint32_t version, lastblock, earliestKeyTime, currentBlockHeight;
     double startTime, pingTime;
     volatile double disconnectTime, mempoolTime;
+    // Wall-clock timestamp of the last successful (n > 0) socket read. Set on connect
+    // and on every inbound read (below). Read by BRPeerManagerKeepAlive (via the
+    // BRPeerLastRecvTime getter) to evict peers that have gone silent for
+    // PEER_INBOUND_IDLE_LIMIT even though disconnectTime is still the DBL_MAX idle
+    // sentinel (ANR fix #2). volatile: written by this peer's own read thread, read
+    // by the manager thread under manager->lock; worst case is a torn read that
+    // mis-times the 90s threshold by a hair -- harmless.
+    volatile double lastRecvTime;
     int sentVerack, gotVerack, sentGetaddr, sentFilter, sentGetdata, sentMempool, sentGetblocks;
     int compactFiltersOnly; // BR_SYNC_MODE_COMPACT_FILTERS_ONLY: pull headers to tip, never getblocks
     UInt256 lastBlockHash;
@@ -1405,6 +1413,7 @@ static void *_peerThreadRoutine(void *arg)
         assert(payload != NULL);
         gettimeofday(&tv, NULL);
         ctx->startTime = tv.tv_sec + (double)tv.tv_usec/1000000;
+        ctx->lastRecvTime = ctx->startTime; // baseline so a peer isn't "idle" before its first read
         BRPeerSendVersionMessage(peer);
         
         while (ctx->socket >= 0 && ! error) {
@@ -1418,6 +1427,7 @@ static void *_peerThreadRoutine(void *arg)
                 if (n < 0 && errno != EWOULDBLOCK) error = errno;
                 gettimeofday(&tv, NULL);
                 time = tv.tv_sec + (double)tv.tv_usec/1000000;
+                if (n > 0) ctx->lastRecvTime = time;
                 if (! error && time >= ctx->disconnectTime) error = ETIMEDOUT;
 
                 if (! error && time >= ctx->mempoolTime) {
@@ -1465,6 +1475,7 @@ static void *_peerThreadRoutine(void *arg)
                         if (n < 0 && errno != EWOULDBLOCK) error = errno;
                         gettimeofday(&tv, NULL);
                         time = tv.tv_sec + (double)tv.tv_usec/1000000;
+                        if (n > 0) ctx->lastRecvTime = time;
                         if (n > 0) msgTimeout = time + MESSAGE_TIMEOUT;
                         if (! error && time >= msgTimeout) error = ETIMEDOUT;
                         socket = ctx->socket;
@@ -1731,6 +1742,13 @@ double BRPeerPingTime(BRPeer *peer)
     return ((BRPeerContext *)peer)->pingTime;
 }
 
+// wall-clock timestamp of the last successful (n > 0) socket read from this peer. See
+// the field comment on BRPeerContext.lastRecvTime and the declaration in BRPeer.h.
+double BRPeerLastRecvTime(BRPeer *peer)
+{
+    return ((BRPeerContext *)peer)->lastRecvTime;
+}
+
 // minimum tx fee rate peer will accept
 uint64_t BRPeerFeePerKb(BRPeer *peer)
 {
@@ -1741,8 +1759,17 @@ uint64_t BRPeerFeePerKb(BRPeer *peer)
 #define MSG_NOSIGNAL 0 // set to 0 if undefined (BSD has the SO_NOSIGPIPE sockopt, and windows has no signals at all)
 #endif
 
-// sends a bitcoin protocol message to peer
-void BRPeerSendMessage(BRPeer *peer, const uint8_t *msg, size_t msgLen, const char *type)
+// Shared implementation behind BRPeerSendMessage and BRPeerSendPingProbe. Identical to
+// the former inline body of BRPeerSendMessage except the send deadline is a parameter
+// (timeoutSecs) instead of the hardcoded MESSAGE_TIMEOUT constant -- BRPeerSendMessage
+// below is now a thin wrapper passing MESSAGE_TIMEOUT, so behavior for every existing
+// caller is unchanged. BRPeerSendPingProbe passes the much shorter
+// KEEPALIVE_SEND_TIMEOUT so BRPeerManagerKeepAlive can't be pinned on a wedged socket
+// (ANR fix #2, .superpowers/sdd/anr-fix2-native-design.md). The `if (error)
+// BRPeerDisconnect(peer)` tail is unchanged -- it's what evicts a socket that hits
+// either deadline, same as before this refactor.
+static void _BRPeerSendMessageTimeout(BRPeer *peer, const uint8_t *msg, size_t msgLen, const char *type,
+                                      double timeoutSecs)
 {
     if (msgLen > MAX_MSG_LENGTH) {
         peer_log(peer, "failed to send %s, length %zu is too long", type, msgLen);
@@ -1796,7 +1823,7 @@ void BRPeerSendMessage(BRPeer *peer, const uint8_t *msg, size_t msgLen, const ch
         // below (the same BRPeerDisconnect the error path already calls under
         // the lock), which releases the locks and frees the slot for a fresh peer.
         gettimeofday(&tv, NULL);
-        double sendDeadline = tv.tv_sec + (double)tv.tv_usec/1000000 + MESSAGE_TIMEOUT;
+        double sendDeadline = tv.tv_sec + (double)tv.tv_usec/1000000 + timeoutSecs;
 
         while (socket >= 0 && ! error && msgLen < bufLen) {
             double now;
@@ -1817,6 +1844,12 @@ void BRPeerSendMessage(BRPeer *peer, const uint8_t *msg, size_t msgLen, const ch
             BRPeerDisconnect(peer);
         }
     }
+}
+
+// sends a bitcoin protocol message to peer
+void BRPeerSendMessage(BRPeer *peer, const uint8_t *msg, size_t msgLen, const char *type)
+{
+    _BRPeerSendMessageTimeout(peer, msg, msgLen, type, MESSAGE_TIMEOUT);
 }
 
 void BRPeerSendVersionMessage(BRPeer *peer)
@@ -2075,6 +2108,24 @@ void BRPeerSendPing(BRPeer *peer, void *info, void (*pongCallback)(void *info, i
     array_add(ctx->pongCallback, pongCallback);
     UInt64SetLE(msg, ctx->nonce);
     BRPeerSendMessage(peer, msg, sizeof(msg), MSG_PING);
+}
+
+// Identical to BRPeerSendPing except the send is bounded by KEEPALIVE_SEND_TIMEOUT
+// instead of MESSAGE_TIMEOUT. Used exclusively by BRPeerManagerKeepAlive (ANR fix #2)
+// so a wedged / half-dead socket can't pin manager->lock/PEER_GUARD for up to
+// MESSAGE_TIMEOUT per peer -- see .superpowers/sdd/anr-fix2-native-design.md.
+void BRPeerSendPingProbe(BRPeer *peer, void *info, void (*pongCallback)(void *info, int success))
+{
+    BRPeerContext *ctx = (BRPeerContext *)peer;
+    uint8_t msg[sizeof(uint64_t)];
+    struct timeval tv;
+
+    gettimeofday(&tv, NULL);
+    ctx->startTime = tv.tv_sec + (double)tv.tv_usec/1000000;
+    array_add(ctx->pongInfo, info);
+    array_add(ctx->pongCallback, pongCallback);
+    UInt64SetLE(msg, ctx->nonce);
+    _BRPeerSendMessageTimeout(peer, msg, sizeof(msg), MSG_PING, KEEPALIVE_SEND_TIMEOUT);
 }
 
 // BIP 157 getcfheaders / getcfilters share an identical wire layout:

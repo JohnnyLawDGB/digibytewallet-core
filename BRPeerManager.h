@@ -45,6 +45,17 @@ extern "C" {
 // population grows (oracle-bootstrap). Bloom-mode sync is unaffected.
 #define PEER_MAX_CONNECTIONS 8
 
+// ANR fix #2 (native peer-manager keepalive lock-starvation,
+// .superpowers/sdd/anr-fix2-native-design.md). Robustness eviction for peers that are
+// dead but not currently being pinged (e.g. NAT silently dropped the return path, no
+// outbound stall yet to trip the send-path eviction). BRPeerManagerKeepAlive schedules
+// a real disconnect for any connected peer whose last inbound read
+// (BRPeerLastRecvTime) is older than this, replacing the DBL_MAX idle sentinel
+// _BRPeerDidConnect sets. Safely longer than the ~10s keepalive tick interval so a
+// responsive peer -- which gets pinged, and thus reads a pong, every tick -- never
+// trips it.
+#define PEER_INBOUND_IDLE_LIMIT 90.0
+
 /* defines, how many blocks to be held in sqlite DB */
 #define SAVE_BLOCK_COUNT 300
 #define SAVE_BLOCK_INTERVAL 4000

@@ -40,6 +40,7 @@
 #include <inttypes.h>
 #include <limits.h>
 #include <time.h>
+#include <sys/time.h>
 #include <assert.h>
 #include <pthread.h>
 #include <errno.h>
@@ -3038,14 +3039,58 @@ void BRPeerManagerConnect(BRPeerManager *manager)
 // dead sockets. A periodic ping keeps every connection active so filter peers stay available.
 // Fire-and-forget (NULL pong callback — the pong just refreshes pingTime). Call periodically
 // (the app's ~10s keepalive tick). Safe anytime; no-op if not connected.
+//
+// ANR fix #2 (.superpowers/sdd/anr-fix2-native-design.md): this runs under
+// manager->lock, which is nested inside the JNI PEER_GUARD, and manager->lock is NOT
+// released between peers (releasing it would let a peer's own read thread free it out
+// from under this loop -- BRPeer has no refcount, see the design doc's UAF analysis).
+// Previously each BRPeerSendPing could block up to MESSAGE_TIMEOUT (10s) on a
+// half-dead socket, so K wedged peers could pin manager->lock/PEER_GUARD for up to
+// K*10s -- long enough to ANR any other PEER_GUARD-taking JNI entry point. Two bounds
+// now cap that instead of touching lock order or duration-vs-safety tradeoffs:
+//   1. BRPeerSendPingProbe caps the send itself at KEEPALIVE_SEND_TIMEOUT (~1.5s) --
+//      a wedged socket hits BRPeerDisconnect (existing error path, unchanged) fast
+//      instead of after 10s.
+//   2. A per-tick wall-clock budget bounds the WHOLE sweep at KEEPALIVE_TICK_BUDGET
+//      regardless of connectedPeers count; any peers not reached this tick are picked
+//      up on the next ~10s tick.
+// Dead-socket zombies (BRPeerIsSocketOpen false) are skipped so budget isn't burned on
+// already-dead sockets, matching the existing zombie-skip selectors elsewhere in this
+// file. Idle-but-not-currently-wedged peers (e.g. a dropped NAT mapping with no
+// outbound stall to trigger #1) get a real disconnectTime via BRPeerScheduleDisconnect
+// once BRPeerLastRecvTime shows no inbound read in PEER_INBOUND_IDLE_LIMIT -- this
+// replaces the DBL_MAX idle sentinel with the real deadline the read loop's existing
+// `time >= ctx->disconnectTime` check was already built to honor, reaping the peer
+// within ~1s via the single existing _peerDisconnected free path. Neither mechanism
+// frees or array_rm's anything itself; both are idempotent no-ops on an
+// already-evicted peer.
 void BRPeerManagerKeepAlive(BRPeerManager *manager)
 {
     assert(manager != NULL);
     pthread_mutex_lock(&manager->lock);
+
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    double t0 = tv.tv_sec + (double)tv.tv_usec/1000000;
+
     for (size_t i = array_count(manager->connectedPeers); i > 0; i--) {
         BRPeer *p = manager->connectedPeers[i - 1];
-        if (BRPeerConnectStatus(p) == BRPeerStatusConnected) BRPeerSendPing(p, NULL, NULL);
+        if (BRPeerConnectStatus(p) != BRPeerStatusConnected) continue;
+        if (! BRPeerIsSocketOpen(p)) continue; // dead-socket zombie -- don't burn tick budget pinging it
+
+        gettimeofday(&tv, NULL);
+        double now = tv.tv_sec + (double)tv.tv_usec/1000000;
+        if (now - t0 > KEEPALIVE_TICK_BUDGET) break; // bounded hold; remaining peers get the next tick
+
+        BRPeerSendPingProbe(p, NULL, NULL);
+
+        gettimeofday(&tv, NULL);
+        now = tv.tv_sec + (double)tv.tv_usec/1000000;
+        if (now - BRPeerLastRecvTime(p) > PEER_INBOUND_IDLE_LIMIT) {
+            BRPeerScheduleDisconnect(p, 0); // real deadline instead of the DBL_MAX idle sentinel
+        }
     }
+
     pthread_mutex_unlock(&manager->lock);
 }
 

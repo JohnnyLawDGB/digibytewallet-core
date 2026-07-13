@@ -234,6 +234,30 @@ uint64_t BRPeerFeePerKb(BRPeer *peer);
 // average ping time for connected peer
 double BRPeerPingTime(BRPeer *peer);
 
+// monotonic wall-clock timestamp (gettimeofday-based) of the last successful (n > 0)
+// socket read from this peer, updated on connect and on every inbound read. Used by
+// BRPeerManagerKeepAlive's inbound-idle eviction (PEER_INBOUND_IDLE_LIMIT,
+// BRPeerManager.h) -- BRPeerContext is private to BRPeer.c so this getter is the only
+// way BRPeerManager.c can read it, mirroring BRPeerPingTime/BRPeerLastBlock.
+double BRPeerLastRecvTime(BRPeer *peer);
+
+// ANR fix #2 (native peer-manager keepalive lock-starvation, see
+// .superpowers/sdd/anr-fix2-native-design.md). BRPeerManagerKeepAlive holds
+// manager->lock/PEER_GUARD across the ping; on a half-dead socket the plain
+// MESSAGE_TIMEOUT (10s) send deadline lets one wedged peer pin those locks for up
+// to 10s, and K wedged peers for up to K*10s -- long enough to ANR any other
+// PEER_GUARD-taking JNI entry point. KEEPALIVE_SEND_TIMEOUT bounds the keepalive
+// ping specifically (one SO_SNDTIMEO cycle + slack); a healthy socket absorbs the
+// 32-byte ping on the first cycle, only a wedged one hits the cap.
+#define KEEPALIVE_SEND_TIMEOUT 1.5
+
+// Per-tick wall-clock budget for BRPeerManagerKeepAlive's sweep over connectedPeers
+// (BRPeerManager.c). Once elapsed time in the sweep exceeds this, the loop breaks and
+// defers the rest to the next ~10s keepalive tick, so manager->lock/PEER_GUARD is held
+// for O(KEEPALIVE_TICK_BUDGET) regardless of how many peers are connected, instead of
+// O(peerCount * sendTimeout).
+#define KEEPALIVE_TICK_BUDGET 1.5
+
 // sends a bitcoin protocol message to peer
 void BRPeerSendMessage(BRPeer *peer, const uint8_t *msg, size_t msgLen, const char *type);
 void BRPeerSendFilterload(BRPeer *peer, const uint8_t *filter, size_t filterLen);
@@ -246,6 +270,13 @@ void BRPeerSendGetdata(BRPeer *peer, const UInt256 txHashes[], size_t txCount, c
                        size_t blockCount);
 void BRPeerSendGetaddr(BRPeer *peer);
 void BRPeerSendPing(BRPeer *peer, void *info, void (*pongCallback)(void *info, int success));
+
+// Same as BRPeerSendPing, but the send is bounded by KEEPALIVE_SEND_TIMEOUT instead of
+// the normal MESSAGE_TIMEOUT. Used exclusively by BRPeerManagerKeepAlive so a wedged /
+// half-dead socket can't pin manager->lock/PEER_GUARD for up to MESSAGE_TIMEOUT per
+// peer (ANR fix #2). Every other caller of BRPeerSendPing / BRPeerSendMessage is
+// unaffected -- see .superpowers/sdd/anr-fix2-native-design.md.
+void BRPeerSendPingProbe(BRPeer *peer, void *info, void (*pongCallback)(void *info, int success));
 
 // BIP 157 send helpers. May be called only after a successful handshake.
 // startHeight is inclusive; stopHash bounds the range. For getcfheaders the

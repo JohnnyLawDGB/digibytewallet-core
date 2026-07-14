@@ -34,6 +34,8 @@
 #include "BRNetwork.h"
 #include "BRPeerServices.h"
 #include "BRPeerPenalty.h"
+#include "BRPeerPin.h"
+#include "BRPeerCFStatus.h"
 #include <stdlib.h>
 #include <stdatomic.h>
 #include <stdio.h>
@@ -279,6 +281,17 @@ struct BRPeerManagerStruct {
     uint16_t penaltyPort[PEER_PENALTY_MAX];
     time_t   penaltyUntil[PEER_PENALTY_MAX];
     size_t   penaltyCount;
+    // Pinned own-node: a user-paired node kept as a reserved, never-churn-evicted
+    // CF peer. pinnedPort == 0 means no pin. pinnedExclusive: dial ONLY this node.
+    // Zero-initialized by BRPeerManagerNewEx's calloc (matching the penalty arrays).
+    UInt128  pinnedAddr;
+    uint16_t pinnedPort;
+    int      pinnedExclusive;
+    // Per-peer "answered cfheaders/cfilter this session" set (positive CF-served
+    // signal; mirrors cfDisagreedPeers). Ring buffer, calloc-zeroed.
+    UInt128  cfServedAddr[16];
+    uint16_t cfServedPort[16];
+    size_t   cfServedCount;
     pthread_mutex_t lock;
 };
 
@@ -998,6 +1011,33 @@ static void _penalize(BRPeerManager *manager, UInt128 addr, uint16_t port, time_
     manager->penaltyCount++;
 }
 
+// Record that `peer` answered a compact-filter request (positive served signal).
+// Ring buffer of the last 16 distinct filter-serving peers; feeds the pinned
+// own-node CF status accessor (SERVING vs CONNECTED_NOT_SERVING). Caller holds
+// manager->lock (both call sites — _peerRelayedCFHeaders/_peerRelayedCFilter —
+// already hold it); this must NOT lock (no double-lock). BRPeer stores addr/port
+// as plain fields (no BRPeerAddress accessor exists), matching _penalize above.
+static void _recordCFServed(BRPeerManager *manager, BRPeer *peer)
+{
+    UInt128 a = peer->address; uint16_t p = peer->port;
+    for (size_t i = 0; i < manager->cfServedCount && i < 16; i++) {
+        if (UInt128Eq(manager->cfServedAddr[i], a) && manager->cfServedPort[i] == p) return;
+    }
+    size_t idx = manager->cfServedCount % 16;
+    manager->cfServedAddr[idx] = a; manager->cfServedPort[idx] = p;
+    manager->cfServedCount++;
+}
+
+// Has (a, p) answered a cfheaders/cfilter this session? Read-only; caller holds
+// manager->lock (only called from the locked status accessor). Must NOT lock.
+static int _cfServedContains(const BRPeerManager *manager, UInt128 a, uint16_t p)
+{
+    size_t n = manager->cfServedCount < 16 ? manager->cfServedCount : 16;
+    for (size_t i = 0; i < n; i++)
+        if (UInt128Eq(manager->cfServedAddr[i], a) && manager->cfServedPort[i] == p) return 1;
+    return 0;
+}
+
 static void _peerConnected(void *info)
 {
     BRPeer *peer = ((BRPeerCallbackInfo *)info)->peer;
@@ -1022,8 +1062,11 @@ static void _peerConnected(void *info)
         // Churn fix: remember this (addr, port) for PEER_PENALTY_SECONDS so
         // the filter-first dial loop (BRPeerManagerConnect) doesn't
         // immediately re-dial the same still-behind peer on the very next
-        // connect pass. See BRPeerPenalty.h.
-        _penalize(manager, peer->address, peer->port, now);
+        // connect pass. See BRPeerPenalty.h. Never penalize the pinned own-node:
+        // a transient reject must not park the user's paired node (Step 6 re-dials
+        // it next Connect; a genuinely dead socket is still reaped by _peerDisconnected).
+        if (! BRPeerIsPinned(manager->pinnedAddr, manager->pinnedPort, peer->address, peer->port))
+            _penalize(manager, peer->address, peer->port, now);
         BRPeerDisconnect(peer);
     }
     else if (BRPeerVersion(peer) >= 70011 &&
@@ -1038,7 +1081,9 @@ static void _peerConnected(void *info)
         peer_log(peer, "node doesn't support SPV mode");
         // Penalize so the CF-first dial loop AND the shotgun fallback skip this bloom-off node for
         // PEER_PENALTY_SECONDS instead of re-dialing it (mirrors the "node isn't synced" penalty).
-        _penalize(manager, peer->address, peer->port, now);
+        // Exempt the pinned own-node (see the "node isn't synced" branch above).
+        if (! BRPeerIsPinned(manager->pinnedAddr, manager->pinnedPort, peer->address, peer->port))
+            _penalize(manager, peer->address, peer->port, now);
         BRPeerDisconnect(peer);
     }
     else if (manager->downloadPeer && // check if we should stick with the existing download peer
@@ -2570,6 +2615,7 @@ static void _peerRelayedCFHeaders(void *info, uint8_t filterType, UInt256 stopHa
     manager->cfDisagreedCount = 0;   // appended cleanly — clear the disagreement window
     manager->cfSingleDisagreeRounds = 0;   // ...and the single-peer diverged-round counter
     manager->cfTriedCount = 0;       // batch advanced — fresh rotation round for the next one
+    _recordCFServed(manager, peer);  // this peer answered cfheaders (positive CF-served signal)
     peer_log(peer, "cfheaders: chain extended to height %u (added %zu, stop %s)",
              chainTip, count, log_u256_hex_encode(stopHash));
 
@@ -2640,6 +2686,10 @@ static void _peerRelayedCFilter(void *info, uint8_t filterType, UInt256 blockHas
         pthread_mutex_unlock(&manager->lock);
         return;
     }
+
+    // The filter verified against the chain — this peer served a valid cfilter
+    // (positive CF-served signal), independent of whether it hits our wallet.
+    _recordCFServed(manager, peer);
 
     BRGCSFilter *gcs = BRGCSFilterBasicParse(encoded, encodedLen, blockHash);
     if (!gcs) {
@@ -2779,6 +2829,56 @@ BRPeerStatus BRPeerManagerConnectStatus(BRPeerManager *manager)
     return status;
 }
 
+// Pin a user-paired own-node as a reserved, never-churn-evicted CF peer. exclusive
+// != 0 makes the dialer contact ONLY this node. Takes manager->lock itself (the JNI
+// caller holds the separate PEER_GUARD, not this lock). port == 0 clears the pin.
+void BRPeerManagerSetPinnedPeer(BRPeerManager *manager, UInt128 addr, uint16_t port, int exclusive)
+{
+    assert(manager != NULL);
+    pthread_mutex_lock(&manager->lock);
+    manager->pinnedAddr = addr;
+    manager->pinnedPort = port;
+    manager->pinnedExclusive = exclusive ? 1 : 0;
+    pthread_mutex_unlock(&manager->lock);
+}
+
+// Clear any pinned own-node (reverts to normal dial/eviction behavior). Takes
+// manager->lock itself.
+void BRPeerManagerClearPinnedPeer(BRPeerManager *manager)
+{
+    assert(manager != NULL);
+    pthread_mutex_lock(&manager->lock);
+    manager->pinnedAddr = UINT128_ZERO;
+    manager->pinnedPort = 0;
+    manager->pinnedExclusive = 0;
+    pthread_mutex_unlock(&manager->lock);
+}
+
+// Compact-filter status of the peer at addr:port for the own-node connectivity UI:
+// UNKNOWN (not in pool) / CONNECTING (in pool, not connected) / CONNECTED_NOT_SERVING
+// / SERVING (has answered a cfheaders/cfilter this session). Takes manager->lock
+// itself. manager->peers is a BRPeer value array; connectedPeers a BRPeer* array —
+// both store addr/port as plain fields (no BRPeerAddress accessor exists).
+int BRPeerManagerCompactFilterPeerStatus(BRPeerManager *manager, UInt128 addr, uint16_t port)
+{
+    assert(manager != NULL);
+    int inPool = 0, connected = 0, served = 0;
+    pthread_mutex_lock(&manager->lock);
+    for (size_t i = 0; i < array_count(manager->peers); i++) {
+        if (! UInt128Eq(manager->peers[i].address, addr) || manager->peers[i].port != port) continue;
+        inPool = 1; break;
+    }
+    for (size_t i = 0; inPool && i < array_count(manager->connectedPeers); i++) {
+        BRPeer *p = manager->connectedPeers[i];
+        if (! UInt128Eq(p->address, addr) || p->port != port) continue;
+        connected = (BRPeerConnectStatus(p) == BRPeerStatusConnected && BRPeerIsSocketOpen(p)) ? 1 : 0;
+        break;
+    }
+    served = _cfServedContains(manager, addr, port);
+    pthread_mutex_unlock(&manager->lock);
+    return BRComputeCFPeerStatus(inPool, connected, served);
+}
+
 // Begin an async connect to a copy of `tmpl`, wiring all manager callbacks and
 // adding it to connectedPeers. Caller must hold manager->lock. Mirrors the inline
 // connect block in BRPeerManagerConnect so the BIP158 filter-first pre-pass and the
@@ -2892,6 +2992,29 @@ void BRPeerManagerConnect(BRPeerManager *manager)
             _BRPeerManagerFindPeers(manager);
         }
 
+        // Reserved slot: always dial the pinned own-node first if it's set, not
+        // already connected, and a slot is free. Timestamp-ordered qsort/dial cutoffs
+        // in the loops below can otherwise bury it past the cutoff. _BRPeerManagerBeginConnect
+        // array_add's it to connectedPeers, so the count checks below see it filled.
+        // No penalty check: the pinned node is the never-churn reserved slot (it is
+        // also exempt from _penalize, see _peerConnected).
+        if (manager->pinnedPort != 0 &&
+            array_count(manager->connectedPeers) < manager->maxConnectCount) {
+            int already = 0;
+            for (size_t i = 0; i < array_count(manager->connectedPeers); i++) {
+                if (UInt128Eq(manager->connectedPeers[i]->address, manager->pinnedAddr) &&
+                    manager->connectedPeers[i]->port == manager->pinnedPort) { already = 1; break; }
+            }
+            if (! already) {
+                for (size_t k = 0; k < array_count(manager->peers); k++) {
+                    if (! UInt128Eq(manager->peers[k].address, manager->pinnedAddr) ||
+                        manager->peers[k].port != manager->pinnedPort) continue;
+                    _BRPeerManagerBeginConnect(manager, &manager->peers[k]);
+                    break;
+                }
+            }
+        }
+
         // BIP 158: filter-first. The cfheaders driver only runs once a
         // NODE_COMPACT_FILTERS peer is connected, but those are a tiny minority
         // of the candidate pool (a few seeder nodes among hundreds of random
@@ -2903,6 +3026,11 @@ void BRPeerManagerConnect(BRPeerManager *manager)
         if (manager->syncMode != BR_SYNC_MODE_BLOOM_ONLY) {
             for (size_t k = 0; k < array_count(manager->peers) &&
                                array_count(manager->connectedPeers) < manager->maxConnectCount; k++) {
+                // Exclusive-pin mode: contact ONLY the pinned own-node (it is dialed
+                // by the reserved-slot block above); skip every other candidate.
+                if (manager->pinnedExclusive &&
+                    ! BRPeerIsPinned(manager->pinnedAddr, manager->pinnedPort,
+                                     manager->peers[k].address, manager->peers[k].port)) continue;
                 if ((manager->peers[k].services & SERVICES_NODE_COMPACT_FILTERS) != SERVICES_NODE_COMPACT_FILTERS)
                     continue;
 
@@ -2953,6 +3081,10 @@ void BRPeerManagerConnect(BRPeerManager *manager)
 
             // First pass: bloom-capable peers only
             for (size_t k = 0; k < totalAvail && added < 100; k++) {
+                // Exclusive-pin mode: only the pinned own-node may enter the shotgun list.
+                if (manager->pinnedExclusive &&
+                    ! BRPeerIsPinned(manager->pinnedAddr, manager->pinnedPort,
+                                     manager->peers[k].address, manager->peers[k].port)) continue;
                 if ((manager->peers[k].services & SERVICES_NODE_BLOOM) == SERVICES_NODE_BLOOM) {
                     array_add(peers, manager->peers[k]);
                     added++;
@@ -2960,6 +3092,9 @@ void BRPeerManagerConnect(BRPeerManager *manager)
             }
             // Second pass: fill remaining slots with any peer
             for (size_t k = 0; k < totalAvail && added < 100; k++) {
+                if (manager->pinnedExclusive &&
+                    ! BRPeerIsPinned(manager->pinnedAddr, manager->pinnedPort,
+                                     manager->peers[k].address, manager->peers[k].port)) continue;
                 if ((manager->peers[k].services & SERVICES_NODE_BLOOM) != SERVICES_NODE_BLOOM) {
                     array_add(peers, manager->peers[k]);
                     added++;
@@ -3086,7 +3221,11 @@ void BRPeerManagerKeepAlive(BRPeerManager *manager)
 
         gettimeofday(&tv, NULL);
         now = tv.tv_sec + (double)tv.tv_usec/1000000;
-        if (now - BRPeerLastRecvTime(p) > PEER_INBOUND_IDLE_LIMIT) {
+        // Never idle-evict the pinned own-node (it still got pinged above to stay hot).
+        // A genuinely dead pinned socket is reaped by the read loop / _peerDisconnected
+        // and re-dialed by BRPeerManagerConnect's reserved slot — the intended dark→recover.
+        if (now - BRPeerLastRecvTime(p) > PEER_INBOUND_IDLE_LIMIT &&
+            ! BRPeerIsPinned(manager->pinnedAddr, manager->pinnedPort, p->address, p->port)) {
             BRPeerScheduleDisconnect(p, 0); // real deadline instead of the DBL_MAX idle sentinel
         }
     }

@@ -159,6 +159,20 @@ void BRPeerManagerSetStartBlock(BRPeerManager* manager, BRMerkleBlock* start);
 // current connect status
 BRPeerStatus BRPeerManagerConnectStatus(BRPeerManager *manager);
 
+// Own-node first-class pairing. Pin a user-paired node (addr:port) as a reserved,
+// never-churn-evicted compact-filter peer that BRPeerManagerConnect always dials
+// first. exclusive != 0 makes the dialer contact ONLY the pinned node. These take
+// manager->lock internally; call them from the JNI layer (which holds PEER_GUARD).
+void BRPeerManagerSetPinnedPeer(BRPeerManager *manager, UInt128 addr, uint16_t port, int exclusive);
+
+// Clear any pinned own-node, reverting to normal dial/eviction behavior.
+void BRPeerManagerClearPinnedPeer(BRPeerManager *manager);
+
+// Compact-filter status of the peer at addr:port, for the own-node connectivity UI:
+// one of BR_CF_PEER_{UNKNOWN,CONNECTING,CONNECTED_NOT_SERVING,SERVING} (see
+// BRPeerCFStatus.h). SERVING means it has answered a cfheaders/cfilter this session.
+int BRPeerManagerCompactFilterPeerStatus(BRPeerManager *manager, UInt128 addr, uint16_t port);
+
 // connect to bitcoin peer-to-peer network (also call this whenever networkIsReachable() status changes)
 void BRPeerManagerConnect(BRPeerManager *manager);
 

@@ -3505,7 +3505,11 @@ void BRPeerManagerFluffTx(BRPeerManager *manager, UInt256 txHash)
         peerInfo->manager = manager;
         BRPeerSendPing(peer, peerInfo, _publishTxInvDone);
     }
-    peer_log(&BR_PEER_NONE, "dandelion: embargo fluff — flooded tx %s to all peers", u256hex(txHash));
+    // Peer-less log (see the _peer_log note at the "sync failed" site above): passing
+    // the bare BR_PEER_NONE sentinel to peer_log casts it to BRPeerContext* and writes
+    // inet_ntop's host string past the end of the ~40-byte stack temporary — a stack
+    // buffer overflow (-fstack-protector abort). Use the peer-less _peer_log.
+    _peer_log("dandelion: embargo fluff — flooded tx %s to all peers\n", u256hex(txHash));
     pthread_mutex_unlock(&manager->lock);
 }
 
@@ -3704,8 +3708,14 @@ static int _BRPeerManagerReanchorAtFloorLocked(BRPeerManager *manager, int force
     if (floor == 0) return 0;
     if (!force && next >= floor) return 0;   // watchdog path keeps the cfTip<floor guard
 
-    peer_log(&BR_PEER_NONE, "cfheaders: re-anchoring filter chain (force=%d) from tip %u to block floor %u",
-             force, next > 0 ? next - 1 : 0, floor);
+    // Peer-less log (see the _peer_log note at the "sync failed" site above): passing the
+    // bare BR_PEER_NONE sentinel to peer_log casts it to BRPeerContext* and writes
+    // inet_ntop's host string past the end of the ~40-byte stack temporary — a stack
+    // buffer overflow (-fstack-protector abort). This re-anchor line is the CONFIRMED
+    // crash site (tombstone: SIGABRT "stack corruption detected", Galaxy S25 Ultra,
+    // v3.10.29). Use the peer-less _peer_log.
+    _peer_log("cfheaders: re-anchoring filter chain (force=%d) from tip %u to block floor %u\n",
+              force, next > 0 ? next - 1 : 0, floor);
 
     BRCompactFilterChainFree(manager->compactFilterChain);
     manager->compactFilterChain = NULL;

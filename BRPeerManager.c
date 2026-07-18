@@ -623,21 +623,23 @@ static void _updateFilterPingDone(void *info, int success)
 
         if (manager->lastBlock->height < manager->estimatedHeight) { // if we're syncing, only update download peer
             if (manager->downloadPeer) {
-                _BRPeerManagerLoadBloomFilter(manager, manager->downloadPeer);
+                // Bloom filter load removed (CF-only: _BRPeerManagerLoadBloomFilter
+                // is now uncalled here; it early-returned for CF-only anyway).
                 BRPeerSendPing(manager->downloadPeer, info, _updateFilterLoadDone); // wait for pong so filter is loaded
             }
             else free(info);
         }
         else {
             free(info);
-            
+
             for (size_t i = array_count(manager->connectedPeers); i > 0; i--) {
                 if (BRPeerConnectStatus(manager->connectedPeers[i - 1]) != BRPeerStatusConnected) continue;
                 peerInfo = calloc(1, sizeof(*peerInfo));
                 assert(peerInfo != NULL);
                 peerInfo->peer = manager->connectedPeers[i - 1];
                 peerInfo->manager = manager;
-                _BRPeerManagerLoadBloomFilter(manager, peerInfo->peer);
+                // Bloom filter load removed (CF-only: _BRPeerManagerLoadBloomFilter
+                // is now uncalled here; it early-returned for CF-only anyway).
                 BRPeerSendPing(peerInfo->peer, peerInfo, _updateFilterLoadDone); // wait for pong so filter is loaded
             }
         }
@@ -866,7 +868,8 @@ static void _BRPeerManagerLoadMempools(BRPeerManager *manager)
         info->manager = manager;
         
         if (peer != manager->downloadPeer || manager->fpRate > BLOOM_REDUCED_FALSEPOSITIVE_RATE*5.0) {
-            _BRPeerManagerLoadBloomFilter(manager, peer);
+            // Bloom filter load removed (CF-only: _BRPeerManagerLoadBloomFilter
+            // is now uncalled here; it early-returned for CF-only anyway).
             _BRPeerManagerPublishPendingTx(manager, peer);
             BRPeerSendPing(peer, info, _loadBloomFilterDone); // load mempool after updating bloomfilter
         }
@@ -1091,7 +1094,8 @@ static void _peerConnected(void *info)
               manager->lastBlock->height >= BRPeerLastBlock(peer))) {
         if (manager->lastBlock->height >= BRPeerLastBlock(peer)) { // only load bloom filter if we're done syncing
             manager->connectFailureCount = 0; // also reset connect failure count if we're already synced
-            _BRPeerManagerLoadBloomFilter(manager, peer);
+            // Bloom filter load removed (CF-only: _BRPeerManagerLoadBloomFilter
+            // is now uncalled here; it early-returned for CF-only anyway).
             _BRPeerManagerPublishPendingTx(manager, peer);
             peerInfo = calloc(1, sizeof(*peerInfo));
             assert(peerInfo != NULL);
@@ -1115,7 +1119,8 @@ static void _peerConnected(void *info)
         manager->downloadPeer = peer;
         manager->isConnected = 1;
         manager->estimatedHeight = BRPeerLastBlock(peer);
-        _BRPeerManagerLoadBloomFilter(manager, peer);
+        // Bloom filter load removed (CF-only: _BRPeerManagerLoadBloomFilter
+        // is now uncalled here; it early-returned for CF-only anyway).
         BRPeerSetCurrentBlockHeight(peer, manager->lastBlock->height);
         _BRPeerManagerPublishPendingTx(manager, peer);
             
@@ -1622,31 +1627,11 @@ static void _peerRelayedBlock(void *info, BRMerkleBlock *block)
         block->height = prev->height + 1;
     }
     
-    // track the observed bloom filter false positive rate using a low pass filter to smooth out variance
-    if (peer == manager->downloadPeer && block->totalTx > 0) {
-        for (i = 0; i < txCount; i++) { // wallet tx are not false-positives
-            if (! BRWalletTransactionForHash(manager->wallet, txHashes[i])) fpCount++;
-        }
-        
-        // moving average number of tx-per-block
-        manager->averageTxPerBlock = manager->averageTxPerBlock*0.999 + block->totalTx*0.001;
-        
-        // 1% low pass filter, also weights each block by total transactions, compared to the avarage
-        manager->fpRate = manager->fpRate*(1.0 - 0.01*block->totalTx/manager->averageTxPerBlock) +
-                          0.01*fpCount/manager->averageTxPerBlock;
-        
-        // false positive rate sanity check
-        if (BRPeerConnectStatus(peer) == BRPeerStatusConnected &&
-            manager->fpRate > BLOOM_DEFAULT_FALSEPOSITIVE_RATE*10.0) {
-            peer_log(peer, "bloom filter false positive rate %f too high after %"PRIu32" blocks, disconnecting...",
-                     manager->fpRate, manager->lastBlock->height + 1 - manager->filterUpdateHeight);
-            BRPeerDisconnect(peer);
-        }
-        else if (manager->lastBlock->height + 500 < BRPeerLastBlock(peer) &&
-                 manager->fpRate > BLOOM_REDUCED_FALSEPOSITIVE_RATE*10.0) {
-            _BRPeerManagerUpdateFilter(manager); // rebuild bloom filter when it starts to degrade
-        }
-    }
+    // Bloom filter false-positive-rate tracking removed (CF-only: no bloom
+    // filter is ever loaded, so fpCount/averageTxPerBlock/fpRate never had a
+    // signal to track in this mode — this block was already a no-op degrade/
+    // disconnect heuristic here). fpCount/i stay declared above; i is reused
+    // by the save-blocks loop further down in this function.
 
     // ignore block headers that are newer than one week before earliestKeyTime (it's a header if it has 0 totalTx)
     if (manager->syncMode != BR_SYNC_MODE_COMPACT_FILTERS_ONLY &&
@@ -1654,15 +1639,9 @@ static void _peerRelayedBlock(void *info, BRMerkleBlock *block)
         BRMerkleBlockFree(block);
         block = NULL;
     }
-    else if (manager->syncMode != BR_SYNC_MODE_COMPACT_FILTERS_ONLY && manager->bloomFilter == NULL) { // bloom/BOTH only; compact-only keeps bloomFilter==NULL by design so this must not fire
-        BRMerkleBlockFree(block);
-        block = NULL;
-
-        if (peer == manager->downloadPeer && manager->lastBlock->height < manager->estimatedHeight) {
-            BRPeerScheduleDisconnect(peer, PROTOCOL_TIMEOUT); // reschedule sync timeout
-            manager->connectFailureCount = 0; // reset failure count once we know our initial request didn't timeout
-        }
-    }
+    // Bloom bailout branch removed (CF-only: compact-only keeps bloomFilter==NULL
+    // by design, so `manager->syncMode != COMPACT_FILTERS_ONLY && bloomFilter==NULL`
+    // never fires in this mode; it guarded a bloom-mode-only re-request path).
     else if (! prev) { // block is an orphan
         peer_log(peer, "relayed orphan block %s, previous %s, last block is %s, height %"PRIu32,
                  log_u256_hex_encode(block->blockHash), log_u256_hex_encode(block->prevBlock), log_u256_hex_encode(manager->lastBlock->blockHash),
@@ -3633,7 +3612,11 @@ void BRPeerManagerSetSyncMode(BRPeerManager *manager, BRSyncMode mode)
 
 BRSyncMode BRPeerManagerGetSyncMode(BRPeerManager *manager)
 {
-    if (!manager) return BR_SYNC_MODE_BLOOM_ONLY;
+    // Defense-in-depth: a NULL manager (no wallet loaded yet) defaults to
+    // compact-filters-only. The wallet always runs CF-only (bloom is never
+    // selected — see syncModeFor in CustomNode.kt); the old BLOOM_ONLY
+    // null-default predated that decision.
+    if (!manager) return BR_SYNC_MODE_COMPACT_FILTERS_ONLY;
     return (BRSyncMode)atomic_load_explicit(&manager->cachedSyncMode, memory_order_relaxed);
 }
 
@@ -3648,12 +3631,12 @@ void BRPeerManagerFallbackToBloom(BRPeerManager *manager)
     assert(manager != NULL);
     pthread_mutex_lock(&manager->lock);
     manager->syncMode = BR_SYNC_MODE_BLOOM_ONLY;
-    for (size_t i = array_count(manager->connectedPeers); i > 0; i--) {
-        BRPeer *p = manager->connectedPeers[i - 1];
-        if (BRPeerConnectStatus(p) == BRPeerStatusConnected) {
-            _BRPeerManagerLoadBloomFilter(manager, p);
-        }
-    }
+    // Per-peer bloom filter reload removed (CF-only: _BRPeerManagerLoadBloomFilter
+    // is now uncalled here — the loop's sole purpose was pushing a fresh
+    // filterload to each connected peer). This function has no live caller
+    // (the Kotlin watchdog never invokes fallbackToBloom(); every former
+    // bloom-fallback branch now stays on filters), kept for Stage 3 symbol
+    // removal rather than deleted this stage.
     pthread_mutex_unlock(&manager->lock);
 }
 

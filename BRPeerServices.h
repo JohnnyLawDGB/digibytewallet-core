@@ -2,23 +2,19 @@
 #define BRPeerServices_h
 
 #include <stdint.h>
-#include "BRPeer.h"         // SERVICES_NODE_BLOOM / _NETWORK / _COMPACT_FILTERS
-#include "BRPeerManager.h"  // BRSyncMode (BR_SYNC_MODE_BLOOM_ONLY)
+#include "BRPeer.h"         // SERVICES_NODE_COMPACT_FILTERS / _NETWORK
 
-// Is a peer's advertised service set usable for the current sync mode?
-// A peer is usable if it serves bloom, OR — when the wallet is running
-// BIP157/158 (any mode other than BLOOM_ONLY) — if it serves compact filters.
+// Is a peer's advertised service set usable for the current sync mode? The
+// wallet is CF-only (bloom excised, 4.0.0) — a peer is usable iff it serves
+// compact filters.
 //
-// This is the sync-mode-gated generalization of the former testnet-only
-// compact-filter exception at the connect accept gate. It lets compact-filter-only
-// nodes — modern DigiByte Core ships bloom OFF by default — be accepted on mainnet
-// whenever the wallet is not in the legacy bloom-only mode.
+// `syncMode` is unused now that bloom is gone; kept as a parameter (rather than
+// changing the signature) so callers don't need a lockstep edit — the enum
+// itself still has 3 values for ABI reasons (see BRSyncMode).
 static inline int BRPeerServicesAllowedForSyncMode(uint64_t services, int syncMode)
 {
-    if ((services & SERVICES_NODE_BLOOM) == SERVICES_NODE_BLOOM) return 1;
-    if (syncMode != BR_SYNC_MODE_BLOOM_ONLY &&
-        (services & SERVICES_NODE_COMPACT_FILTERS) == SERVICES_NODE_COMPACT_FILTERS) return 1;
-    return 0;
+    (void)syncMode;
+    return (services & SERVICES_NODE_COMPACT_FILTERS) == SERVICES_NODE_COMPACT_FILTERS ? 1 : 0;
 }
 
 #endif // BRPeerServices_h

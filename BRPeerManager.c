@@ -23,7 +23,6 @@
 //  THE SOFTWARE.
 
 #include "BRPeerManager.h"
-#include "BRBloomFilter.h"
 #include "BRSet.h"
 #include "BRArray.h"
 #include "BRInt.h"
@@ -204,9 +203,7 @@ struct BRPeerManagerStruct {
     int isConnected, connectFailureCount, misbehavinCount, dnsThreadCount, maxConnectCount, peerThreadCount;
     BRPeer *peers, *downloadPeer, fixedPeer, **connectedPeers;
     char downloadPeerName[INET6_ADDRSTRLEN + 6];
-    uint32_t earliestKeyTime, syncStartHeight, filterUpdateHeight, estimatedHeight;
-    BRBloomFilter *bloomFilter;
-    double fpRate, averageTxPerBlock;
+    uint32_t earliestKeyTime, syncStartHeight, estimatedHeight;
     BRSet *blocks, *orphans, *checkpoints;
     BRMerkleBlock *lastBlock, *lastOrphan;
     BRMerkleBlock *startSyncFrom;
@@ -446,225 +443,14 @@ static void _BRPeerManagerPregenAddrWindow(BRPeerManager *manager)
     BRWalletUnusedAddrs(manager->wallet, NULL, SEQUENCE_GAP_LIMIT_INTERNAL + 100, 1, 2);
 }
 
-static void _BRPeerManagerLoadBloomFilter(BRPeerManager *manager, BRPeer *peer)
-{
-    // Privacy-first: skip bloom filterload entirely when the wallet is
-    // running compact-filters-only. The wallet still receives merkleblock
-    // headers without a filterload (peer assumes empty filter == match-all),
-    // but the address set never leaves the device. The Kotlin watchdog
-    // flips syncMode to BLOOM_ONLY if filter peers don't progress within
-    // 120s, after which this function runs normally on the next call.
-    if (manager->syncMode == BR_SYNC_MODE_COMPACT_FILTERS_ONLY) return;
-
-    // every time a new wallet address is added, the bloom filter has to be rebuilt, and each address is only used
-    // for one transaction, so here we generate some spare addresses to avoid rebuilding the filter each time a
-    // wallet transaction is encountered during the chain sync. Same +100 window is
-    // maintained on the compact-filter path via _BRPeerManagerPregenAddrWindow.
-    _BRPeerManagerPregenAddrWindow(manager);
-
-    BRSetApply(manager->orphans, NULL, _setApplyFreeBlock);
-    BRSetClear(manager->orphans); // clear out orphans that may have been received on an old filter
-    manager->lastOrphan = NULL;
-    manager->filterUpdateHeight = manager->lastBlock->height;
-    manager->fpRate = BLOOM_REDUCED_FALSEPOSITIVE_RATE;
-    
-    size_t addrsCount = BRWalletAllAddrs(manager->wallet, NULL, 0);
-    BRAddress *addrs = malloc(addrsCount * sizeof(*addrs));
-    size_t utxosCount = BRWalletUTXOs(manager->wallet, NULL, 0);
-    BRUTXO *utxos = malloc(utxosCount * sizeof(*utxos));
-    uint32_t blockHeight = (manager->lastBlock->height > 100) ? manager->lastBlock->height - 100 : 0;
-    size_t txCount = BRWalletTxUnconfirmedBefore(manager->wallet, NULL, 0, blockHeight);
-    BRTransaction **transactions = malloc(txCount*sizeof(*transactions));
-    BRBloomFilter *filter;
-    
-    assert(addrs != NULL);
-    assert(utxos != NULL);
-    assert(transactions != NULL);
-    addrsCount = BRWalletAllAddrs(manager->wallet, addrs, addrsCount);
-    utxosCount = BRWalletUTXOs(manager->wallet, utxos, utxosCount);
-    txCount = BRWalletTxUnconfirmedBefore(manager->wallet, transactions, txCount, blockHeight);
-
-    peer_log(peer, "bloom filter: %zu addrs, %zu utxos, %zu txs, fpRate=%.6f",
-             addrsCount, utxosCount, txCount, manager->fpRate);
-
-    filter = BRBloomFilterNew(manager->fpRate, addrsCount + utxosCount + txCount + 100, (uint32_t) BRPeerHash(peer),
-                              BLOOM_UPDATE_ALL); // BUG: XXX txCount not the same as number of spent wallet outputs
-
-    size_t insertedCount = 0;
-    size_t failedCount = 0;
-    for (size_t i = 0; i < addrsCount; i++) { // add addresses to watch for tx receiving money to the wallet
-        UInt160 hash = UINT160_ZERO;
-
-        BRAddressHash160(&hash, addrs[i].s);
-
-        if (! UInt160IsZero(hash) && ! BRBloomFilterContainsData(filter, hash.u8, sizeof(hash))) {
-            BRBloomFilterInsertData(filter, hash.u8, sizeof(hash));
-            insertedCount++;
-
-            /* Also insert the full P2WPKH witness program (OP_0 + push20 + hash160)
-             * so peers that match against the serialized scriptPubKey (not just data
-             * elements) will find segwit transactions. Without this, BIP37 bloom
-             * filter matching fails for segwit outputs on some node implementations. */
-            uint8_t witnessProgram[22];
-            witnessProgram[0] = 0x00;  /* OP_0 (witness version 0) */
-            witnessProgram[1] = 0x14;  /* push 20 bytes */
-            memcpy(&witnessProgram[2], hash.u8, 20);
-            if (! BRBloomFilterContainsData(filter, witnessProgram, sizeof(witnessProgram))) {
-                BRBloomFilterInsertData(filter, witnessProgram, sizeof(witnessProgram));
-            }
-        } else if (UInt160IsZero(hash)) {
-            peer_log(peer, "bloom filter: FAILED to hash addr[%zu] = '%.10s...'", i, addrs[i].s);
-            failedCount++;
-        }
-    }
-
-    peer_log(peer, "bloom filter: inserted %zu address hashes, %zu failed", insertedCount, failedCount);
-    if (addrsCount > 0) {
-        peer_log(peer, "bloom filter: first addr = '%s'", addrs[0].s);
-    }
-
-    free(addrs);
-        
-    for (size_t i = 0; i < utxosCount; i++) { // add UTXOs to watch for tx sending money from the wallet
-        uint8_t o[sizeof(UInt256) + sizeof(uint32_t)];
-        
-        UInt256Set(o, utxos[i].hash);
-        UInt32SetLE(&o[sizeof(UInt256)], utxos[i].n);
-        if (! BRBloomFilterContainsData(filter, o, sizeof(o))) BRBloomFilterInsertData(filter, o, sizeof(o));
-    }
-    
-    free(utxos);
-        
-    for (size_t i = 0; i < txCount; i++) { // also add TXOs spent within the last 100 blocks
-        for (size_t j = 0; j < transactions[i]->inCount; j++) {
-            BRTxInput *input = &transactions[i]->inputs[j];
-            BRTransaction *tx = BRWalletTransactionForHash(manager->wallet, input->txHash);
-            uint8_t o[sizeof(UInt256) + sizeof(uint32_t)];
-            
-            if (tx && input->index < tx->outCount &&
-                BRWalletContainsAddress(manager->wallet, tx->outputs[input->index].address)) {
-                UInt256Set(o, input->txHash);
-                UInt32SetLE(&o[sizeof(UInt256)], input->index);
-                if (! BRBloomFilterContainsData(filter, o, sizeof(o))) BRBloomFilterInsertData(filter, o,sizeof(o));
-            }
-        }
-    }
-    
-    free(transactions);
-    if (manager->bloomFilter) BRBloomFilterFree(manager->bloomFilter);
-    manager->bloomFilter = filter;
-    // TODO: XXX if already synced, recursively add inputs of unconfirmed receives
-
-    uint8_t data[BRBloomFilterSerialize(filter, NULL, 0)];
-    size_t len = BRBloomFilterSerialize(filter, data, sizeof(data));
-    
-    BRPeerSendFilterload(peer, data, len);
-}
-
-static void _updateFilterRerequestDone(void *info, int success)
-{
-    BRPeer *peer = ((BRPeerCallbackInfo *)info)->peer;
-    BRPeerManager *manager = ((BRPeerCallbackInfo *)info)->manager;
-    
-    free(info);
-    
-    if (success) {
-        pthread_mutex_lock(&manager->lock);
-
-        if ((peer->flags & PEER_FLAG_NEEDSUPDATE) == 0) {
-            UInt256 locators[_BRPeerManagerBlockLocators(manager, NULL, 0)];
-            size_t count = _BRPeerManagerBlockLocators(manager, locators, sizeof(locators)/sizeof(*locators));
-            
-            BRPeerSendGetblocks(peer, locators, count, UINT256_ZERO);
-        }
-
-        pthread_mutex_unlock(&manager->lock);
-    }
-}
-
-static void _updateFilterLoadDone(void *info, int success)
-{
-    BRPeer *peer = ((BRPeerCallbackInfo *)info)->peer;
-    BRPeerManager *manager = ((BRPeerCallbackInfo *)info)->manager;
-    BRPeerCallbackInfo *peerInfo;
-
-    free(info);
-    
-    if (success) {
-        pthread_mutex_lock(&manager->lock);
-        BRPeerSetNeedsFilterUpdate(peer, 0);
-        peer->flags &= ~PEER_FLAG_NEEDSUPDATE;
-        
-        if (manager->lastBlock->height < manager->estimatedHeight) { // if syncing, rerequest blocks
-            peerInfo = calloc(1, sizeof(*peerInfo));
-            assert(peerInfo != NULL);
-            peerInfo->peer = peer;
-            peerInfo->manager = manager;
-            BRPeerRerequestBlocks(manager->downloadPeer, manager->lastBlock->blockHash);
-            BRPeerSendPing(manager->downloadPeer, peerInfo, _updateFilterRerequestDone);
-        }
-        else BRPeerSendMempool(peer, NULL, 0, NULL, NULL); // if not syncing, request mempool
-        
-        pthread_mutex_unlock(&manager->lock);
-    }
-}
-
-static void _updateFilterPingDone(void *info, int success)
-{
-    BRPeer *peer = ((BRPeerCallbackInfo *)info)->peer;
-    BRPeerManager *manager = ((BRPeerCallbackInfo *)info)->manager;
-    BRPeerCallbackInfo *peerInfo;
-    
-    if (success) {
-        pthread_mutex_lock(&manager->lock);
-        peer_log(peer, "updating filter with newly created wallet addresses");
-        if (manager->bloomFilter) BRBloomFilterFree(manager->bloomFilter);
-        manager->bloomFilter = NULL;
-
-        if (manager->lastBlock->height < manager->estimatedHeight) { // if we're syncing, only update download peer
-            if (manager->downloadPeer) {
-                // Bloom filter load removed (CF-only: _BRPeerManagerLoadBloomFilter
-                // is now uncalled here; it early-returned for CF-only anyway).
-                BRPeerSendPing(manager->downloadPeer, info, _updateFilterLoadDone); // wait for pong so filter is loaded
-            }
-            else free(info);
-        }
-        else {
-            free(info);
-
-            for (size_t i = array_count(manager->connectedPeers); i > 0; i--) {
-                if (BRPeerConnectStatus(manager->connectedPeers[i - 1]) != BRPeerStatusConnected) continue;
-                peerInfo = calloc(1, sizeof(*peerInfo));
-                assert(peerInfo != NULL);
-                peerInfo->peer = manager->connectedPeers[i - 1];
-                peerInfo->manager = manager;
-                // Bloom filter load removed (CF-only: _BRPeerManagerLoadBloomFilter
-                // is now uncalled here; it early-returned for CF-only anyway).
-                BRPeerSendPing(peerInfo->peer, peerInfo, _updateFilterLoadDone); // wait for pong so filter is loaded
-            }
-        }
-
-         pthread_mutex_unlock(&manager->lock);
-    }
-    else free(info);
-}
-
-static void _BRPeerManagerUpdateFilter(BRPeerManager *manager)
-{
-    BRPeerCallbackInfo *info;
-
-    if (manager->downloadPeer && (manager->downloadPeer->flags & PEER_FLAG_NEEDSUPDATE) == 0) {
-        BRPeerSetNeedsFilterUpdate(manager->downloadPeer, 1);
-        manager->downloadPeer->flags |= PEER_FLAG_NEEDSUPDATE;
-        peer_log(manager->downloadPeer, "filter update needed, waiting for pong");
-        info = calloc(1, sizeof(*info));
-        assert(info != NULL);
-        info->peer = manager->downloadPeer;
-        info->manager = manager;
-        // wait for pong so we're sure to include any tx already sent by the peer in the updated filter
-        BRPeerSendPing(manager->downloadPeer, info, _updateFilterPingDone);
-    }
-}
+// Bloom filter loader + reload cluster (_BRPeerManagerLoadBloomFilter,
+// _updateFilterRerequestDone/_updateFilterLoadDone/_updateFilterPingDone,
+// _BRPeerManagerUpdateFilter) removed — CF-only mode never loaded a bloom
+// filter (the loader early-returned for COMPACT_FILTERS_ONLY), so this was
+// already dead weight. The gap+100 look-ahead these functions maintained is
+// still generated by _BRPeerManagerPregenAddrWindow above, called directly
+// from the CF path (_BRPeerManagerOnFilterCapablePeerConnected) and from
+// _peerRelayedTx below.
 
 static void _BRPeerManagerUpdateTx(BRPeerManager *manager, const UInt256 txHashes[], size_t txCount,
                                    uint32_t blockHeight, uint32_t timestamp)
@@ -829,34 +615,13 @@ static void _mempoolDone(void *info, int success)
     else peer_log(peer, "mempool request failed");
 }
 
-static void _loadBloomFilterDone(void *info, int success)
-{
-    BRPeer *peer = ((BRPeerCallbackInfo *)info)->peer;
-    BRPeerManager *manager = ((BRPeerCallbackInfo *)info)->manager;
-
-    pthread_mutex_lock(&manager->lock);
-    
-    if (success) {
-        BRPeerSendMempool(peer, manager->publishedTxHashes, array_count(manager->publishedTxHashes), info,
-                          _mempoolDone);
-        pthread_mutex_unlock(&manager->lock);
-    }
-    else {
-        free(info);
-        
-        if (peer == manager->downloadPeer) {
-            peer_log(peer, "sync succeeded");
-            _BRPeerManagerSyncStopped(manager);
-            pthread_mutex_unlock(&manager->lock);
-            if (manager->syncStopped) manager->syncStopped(manager->info, 0);
-        }
-        else pthread_mutex_unlock(&manager->lock);
-    }
-}
-
 static void _BRPeerManagerLoadMempools(BRPeerManager *manager)
 {
-    // after syncing, load filters and get mempools from other peers
+    // after syncing, request mempools from connected peers. Formerly gated on
+    // whether each peer's bloom filter was already fresh enough (fpRate check) to
+    // skip a pre-mempool filter-reload ping; with bloom gone there is nothing to
+    // wait on, so every peer goes straight to the same publish+mempool path the
+    // "fresh filter" branch already used.
     for (size_t i = array_count(manager->connectedPeers); i > 0; i--) {
         BRPeer *peer = manager->connectedPeers[i - 1];
         BRPeerCallbackInfo *info;
@@ -866,15 +631,10 @@ static void _BRPeerManagerLoadMempools(BRPeerManager *manager)
         assert(info != NULL);
         info->peer = peer;
         info->manager = manager;
-        
-        if (peer != manager->downloadPeer || manager->fpRate > BLOOM_REDUCED_FALSEPOSITIVE_RATE*5.0) {
-            // Bloom filter load removed (CF-only: _BRPeerManagerLoadBloomFilter
-            // is now uncalled here; it early-returned for CF-only anyway).
-            _BRPeerManagerPublishPendingTx(manager, peer);
-            BRPeerSendPing(peer, info, _loadBloomFilterDone); // load mempool after updating bloomfilter
-        }
-        else BRPeerSendMempool(peer, manager->publishedTxHashes, array_count(manager->publishedTxHashes), info,
-                               _mempoolDone);
+
+        _BRPeerManagerPublishPendingTx(manager, peer);
+        BRPeerSendMempool(peer, manager->publishedTxHashes, array_count(manager->publishedTxHashes), info,
+                          _mempoolDone);
     }
 }
 
@@ -935,7 +695,7 @@ static void *_findPeersThreadRoutine(void *arg)
 // DNS peer discovery
 static void _BRPeerManagerFindPeers(BRPeerManager *manager)
 {
-    uint64_t services = SERVICES_NODE_NETWORK | SERVICES_NODE_BLOOM | manager->params->services;
+    uint64_t services = SERVICES_NODE_NETWORK | SERVICES_NODE_COMPACT_FILTERS | manager->params->services;
     time_t now = time(NULL);
     struct timespec ts;
     pthread_t thread;
@@ -1092,16 +852,15 @@ static void _peerConnected(void *info)
     else if (manager->downloadPeer && // check if we should stick with the existing download peer
              (BRPeerLastBlock(manager->downloadPeer) >= BRPeerLastBlock(peer) ||
               manager->lastBlock->height >= BRPeerLastBlock(peer))) {
-        if (manager->lastBlock->height >= BRPeerLastBlock(peer)) { // only load bloom filter if we're done syncing
+        if (manager->lastBlock->height >= BRPeerLastBlock(peer)) { // already synced: request this peer's mempool too
             manager->connectFailureCount = 0; // also reset connect failure count if we're already synced
-            // Bloom filter load removed (CF-only: _BRPeerManagerLoadBloomFilter
-            // is now uncalled here; it early-returned for CF-only anyway).
             _BRPeerManagerPublishPendingTx(manager, peer);
             peerInfo = calloc(1, sizeof(*peerInfo));
             assert(peerInfo != NULL);
             peerInfo->peer = peer;
             peerInfo->manager = manager;
-            BRPeerSendPing(peer, peerInfo, _loadBloomFilterDone);
+            BRPeerSendMempool(peer, manager->publishedTxHashes, array_count(manager->publishedTxHashes), peerInfo,
+                              _mempoolDone);
         }
     }
     else { // select the peer with the lowest ping time to download the chain from if we're behind
@@ -1119,8 +878,6 @@ static void _peerConnected(void *info)
         manager->downloadPeer = peer;
         manager->isConnected = 1;
         manager->estimatedHeight = BRPeerLastBlock(peer);
-        // Bloom filter load removed (CF-only: _BRPeerManagerLoadBloomFilter
-        // is now uncalled here; it early-returned for CF-only anyway).
         BRPeerSetCurrentBlockHeight(peer, manager->lastBlock->height);
         _BRPeerManagerPublishPendingTx(manager, peer);
             
@@ -1342,46 +1099,17 @@ static void _peerRelayedTx(void *info, BRTransaction *tx)
         
         _BRTxPeerListRemovePeer(manager->txRequests, tx->txHash, peer);
         
-        if (manager->bloomFilter != NULL) { // check if bloom filter is already being updated
-            BRAddress addrs[SEQUENCE_GAP_LIMIT_EXTERNAL + SEQUENCE_GAP_LIMIT_INTERNAL];
-            UInt160 hash;
-            
-            // the transaction likely consumed one or more wallet addresses, so check that at least the next <gap limit>
-            // unused addresses are still matched by the bloom filter
-            BRWalletUnusedAddrs(manager->wallet, addrs, SEQUENCE_GAP_LIMIT_EXTERNAL, 0, 0);
-            BRWalletUnusedAddrs(manager->wallet, addrs + SEQUENCE_GAP_LIMIT_EXTERNAL, SEQUENCE_GAP_LIMIT_INTERNAL, 1, 0);
-
-            for (size_t i = 0; i < SEQUENCE_GAP_LIMIT_EXTERNAL + SEQUENCE_GAP_LIMIT_INTERNAL; i++) {
-                if (! BRAddressHash160(&hash, addrs[i].s) ||
-                    BRBloomFilterContainsData(manager->bloomFilter, hash.u8, sizeof(hash))) continue;
-                if (manager->bloomFilter) BRBloomFilterFree(manager->bloomFilter);
-                manager->bloomFilter = NULL; // reset bloom filter so it's recreated with new wallet addresses
-                _BRPeerManagerUpdateFilter(manager);
-                break;
-            }
-            
-            // Do the same for segwit addresses again
-            BRWalletUnusedAddrs(manager->wallet, addrs, SEQUENCE_GAP_LIMIT_EXTERNAL, 0, 1);
-            BRWalletUnusedAddrs(manager->wallet, addrs + SEQUENCE_GAP_LIMIT_EXTERNAL, SEQUENCE_GAP_LIMIT_INTERNAL, 1, 1);
-
-            for (size_t i = 0; i < SEQUENCE_GAP_LIMIT_EXTERNAL + SEQUENCE_GAP_LIMIT_INTERNAL; i++) {
-                if (! BRAddressHash160(&hash, addrs[i].s) ||
-                    BRBloomFilterContainsData(manager->bloomFilter, hash.u8, sizeof(hash))) continue;
-                if (manager->bloomFilter) BRBloomFilterFree(manager->bloomFilter);
-                manager->bloomFilter = NULL; // reset bloom filter so it's recreated with new wallet addresses
-                _BRPeerManagerUpdateFilter(manager);
-                break;
-            }
-
-            // Extend the taproot (P2TR / BIP86) gap so the next taproot window stays
-            // watched. Taproot outputs are matched via BIP158 (which reads allAddrs
-            // through BRWalletGetFilterElements), not the BIP37 bloom filter — P2TR
-            // has no hash160 to test against manager->bloomFilter — so there is no
-            // hash160 recheck here; the pregen alone advances the watched window.
-            if (manager->wallet) {
-                BRWalletUnusedAddrs(manager->wallet, NULL, SEQUENCE_GAP_LIMIT_EXTERNAL, 0, 2);
-                BRWalletUnusedAddrs(manager->wallet, NULL, SEQUENCE_GAP_LIMIT_INTERNAL, 1, 2);
-            }
+        // The transaction likely consumed one or more wallet addresses. Extend the
+        // taproot (P2TR / BIP86) gap so the next taproot window stays watched.
+        // Taproot outputs are matched via BIP158 (BRWalletGetFilterElements reading
+        // allAddrs), not a bloom filter, so there is no hash160 recheck here — the
+        // pregen alone advances the watched window. Legacy/segwit gap extension is
+        // covered by _BRPeerManagerPregenAddrWindow on filter-capable peer connect
+        // (the former bloom-filter recheck-and-reset for those types is gone along
+        // with the bloom filter it rebuilt).
+        if (manager->wallet) {
+            BRWalletUnusedAddrs(manager->wallet, NULL, SEQUENCE_GAP_LIMIT_EXTERNAL, 0, 2);
+            BRWalletUnusedAddrs(manager->wallet, NULL, SEQUENCE_GAP_LIMIT_INTERNAL, 1, 2);
         }
     }
     
@@ -1612,7 +1340,7 @@ static void _peerRelayedBlock(void *info, BRMerkleBlock *block)
     size_t txCount = BRMerkleBlockTxHashes(block, NULL, 0);
     UInt256 _txHashes[(sizeof(UInt256)*txCount <= 0x1000) ? txCount : 0],
             *txHashes = (sizeof(UInt256)*txCount <= 0x1000) ? _txHashes : malloc(txCount*sizeof(*txHashes));
-    size_t i, fpCount = 0, saveCount = 0;
+    size_t i, saveCount = 0;
     BRMerkleBlock orphan, *b, *b2, *prev, *next = NULL;
     uint32_t txTime = 0;
     
@@ -1627,11 +1355,9 @@ static void _peerRelayedBlock(void *info, BRMerkleBlock *block)
         block->height = prev->height + 1;
     }
     
-    // Bloom filter false-positive-rate tracking removed (CF-only: no bloom
-    // filter is ever loaded, so fpCount/averageTxPerBlock/fpRate never had a
-    // signal to track in this mode — this block was already a no-op degrade/
-    // disconnect heuristic here). fpCount/i stay declared above; i is reused
-    // by the save-blocks loop further down in this function.
+    // Bloom filter false-positive-rate tracking (fpCount/averageTxPerBlock/fpRate)
+    // removed along with the bloom filter fields themselves. `i` stays declared
+    // above; it is reused by the save-blocks loop further down in this function.
 
     // ignore block headers that are newer than one week before earliestKeyTime (it's a header if it has 0 totalTx)
     if (manager->syncMode != BR_SYNC_MODE_COMPACT_FILTERS_ONLY &&
@@ -1675,7 +1401,7 @@ static void _peerRelayedBlock(void *info, BRMerkleBlock *block)
     }
     else if (UInt256Eq(block->prevBlock, manager->lastBlock->blockHash)) { // new block extends main chain
         if ((block->height % 500) == 0 || txCount > 0 || block->height >= BRPeerLastBlock(peer)) {
-            peer_log(peer, "adding block #%"PRIu32", false positive rate: %f", block->height, manager->fpRate);
+            peer_log(peer, "adding block #%"PRIu32, block->height);
         }
         
         BRSetAdd(manager->blocks, block);
@@ -2067,7 +1793,6 @@ BRPeerManager *BRPeerManagerNewEx(const BRChainParams *params, BRWallet *wallet,
     manager->params = params;
     manager->wallet = wallet;
     manager->earliestKeyTime = earliestKeyTime;
-    manager->averageTxPerBlock = 1400;
     manager->maxConnectCount = PEER_MAX_CONNECTIONS;
     array_new(manager->peers, peersCount);
     if (peers)
@@ -3044,27 +2769,29 @@ void BRPeerManagerConnect(BRPeerManager *manager)
             }
         }
 
-        // Shotgun fallback: the random-peer / bloom dial pass. In COMPACT_FILTERS_ONLY this runs
+        // Shotgun fallback: the random-peer dial pass. In COMPACT_FILTERS_ONLY this runs
         // ONLY when the known filter set is exhausted (cfExhausted) — otherwise the filter-first
-        // pre-pass above is the sole dialer, so no bloom-off nodes are contacted. Verbatim
-        // otherwise (BLOOM_ONLY path + CF exhaustion fallback).
+        // pre-pass above is the sole dialer. Prioritizes CF-capable candidates so filter peers
+        // aren't sorted to the back of a shotgun pass full of non-CF nodes (risk: modern nodes
+        // ship bloom OFF by default, so a bloom-keyed prioritization here would starve the exact
+        // peers CF-only needs).
         if (cfExhausted) {
         array_new(peers, 100);
 
-        // Prioritize bloom-capable peers: add them to the candidate list first,
+        // Prioritize CF-capable peers: add them to the candidate list first,
         // then fill remaining slots with other peers. This ensures all 5
-        // connection slots go to bloom peers when enough are available.
+        // connection slots go to filter-capable peers when enough are available.
         {
             size_t totalAvail = array_count(manager->peers);
             size_t added = 0;
 
-            // First pass: bloom-capable peers only
+            // First pass: CF-capable peers only
             for (size_t k = 0; k < totalAvail && added < 100; k++) {
                 // Exclusive-pin mode: only the pinned own-node may enter the shotgun list.
                 if (manager->pinnedExclusive &&
                     ! BRPeerIsPinned(manager->pinnedAddr, manager->pinnedPort,
                                      manager->peers[k].address, manager->peers[k].port)) continue;
-                if ((manager->peers[k].services & SERVICES_NODE_BLOOM) == SERVICES_NODE_BLOOM) {
+                if ((manager->peers[k].services & SERVICES_NODE_COMPACT_FILTERS) == SERVICES_NODE_COMPACT_FILTERS) {
                     array_add(peers, manager->peers[k]);
                     added++;
                 }
@@ -3074,7 +2801,7 @@ void BRPeerManagerConnect(BRPeerManager *manager)
                 if (manager->pinnedExclusive &&
                     ! BRPeerIsPinned(manager->pinnedAddr, manager->pinnedPort,
                                      manager->peers[k].address, manager->peers[k].port)) continue;
-                if ((manager->peers[k].services & SERVICES_NODE_BLOOM) != SERVICES_NODE_BLOOM) {
+                if ((manager->peers[k].services & SERVICES_NODE_COMPACT_FILTERS) != SERVICES_NODE_COMPACT_FILTERS) {
                     array_add(peers, manager->peers[k]);
                     added++;
                 }
@@ -3082,19 +2809,19 @@ void BRPeerManagerConnect(BRPeerManager *manager)
         }
 
         while ((array_count(peers) > 0) && (array_count(manager->connectedPeers) < manager->maxConnectCount)) {
-            size_t bloomCount = 0;
+            size_t filterCount = 0;
             for (size_t bc = 0; bc < array_count(peers); bc++) {
-                if ((peers[bc].services & SERVICES_NODE_BLOOM) == SERVICES_NODE_BLOOM) bloomCount++;
+                if ((peers[bc].services & SERVICES_NODE_COMPACT_FILTERS) == SERVICES_NODE_COMPACT_FILTERS) filterCount++;
             }
 
             size_t i;
             BRPeerCallbackInfo *info;
 
-            if (bloomCount > 0) {
-                // Pick randomly from bloom peers only (they're at the front)
-                i = BRRand((uint32_t)bloomCount);
+            if (filterCount > 0) {
+                // Pick randomly from CF-capable peers only (they're at the front)
+                i = BRRand((uint32_t)filterCount);
             } else {
-                // No bloom peers left, fall back to random from full list
+                // No CF-capable peers left, fall back to random from full list
                 i = BRRand((uint32_t)array_count(peers));
                 i = i*i/array_count(peers); // bias toward recent timestamp
             }
@@ -3620,25 +3347,9 @@ BRSyncMode BRPeerManagerGetSyncMode(BRPeerManager *manager)
     return (BRSyncMode)atomic_load_explicit(&manager->cachedSyncMode, memory_order_relaxed);
 }
 
-// Mid-run fallback: flip syncMode to BLOOM_ONLY AND push a freshly-built
-// bloom filterload to every currently-connected peer. Required because
-// _peerConnected only fires on new connections — peers that handshook
-// while syncMode==COMPACT_FILTERS_ONLY never received our filter, so they
-// won't relay matching txs after the mode change without an explicit
-// reload. Called from JNI when the Kotlin watchdog times out.
-void BRPeerManagerFallbackToBloom(BRPeerManager *manager)
-{
-    assert(manager != NULL);
-    pthread_mutex_lock(&manager->lock);
-    manager->syncMode = BR_SYNC_MODE_BLOOM_ONLY;
-    // Per-peer bloom filter reload removed (CF-only: _BRPeerManagerLoadBloomFilter
-    // is now uncalled here — the loop's sole purpose was pushing a fresh
-    // filterload to each connected peer). This function has no live caller
-    // (the Kotlin watchdog never invokes fallbackToBloom(); every former
-    // bloom-fallback branch now stays on filters), kept for Stage 3 symbol
-    // removal rather than deleted this stage.
-    pthread_mutex_unlock(&manager->lock);
-}
+// BRPeerManagerFallbackToBloom removed — no live caller (the Kotlin watchdog
+// never invoked fallbackToBloom(); every former bloom-fallback branch stays on
+// filters). Its JNI wrapper (Java_..._fallbackToBloom) is removed alongside it.
 
 // Current cfheaders tip height (height of the last header we've stored).
 // 0 if no chain yet. Used by the watchdog to detect "no progress."

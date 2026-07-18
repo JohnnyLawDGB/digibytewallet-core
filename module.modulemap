@@ -8,7 +8,6 @@ module BRCore [system] [extern_c] {
     header "BRInt.h"
     header "BRArray.h"
     header "BRSet.h"
-    header "BRBloomFilter.h"
     header "BRMerkleBlock.h"
     header "BRPeer.h"
     header "BRCrypto.h"

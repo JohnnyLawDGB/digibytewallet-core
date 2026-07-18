@@ -96,10 +96,6 @@ extern "C" {
 #define MSG_MEMPOOL      "mempool"
 #define MSG_PING         "ping"
 #define MSG_PONG         "pong"
-#define MSG_FILTERLOAD   "filterload"
-#define MSG_FILTERADD    "filteradd"
-#define MSG_FILTERCLEAR  "filterclear"
-#define MSG_MERKLEBLOCK  "merkleblock"
 #define MSG_ALERT        "alert"
 #define MSG_REJECT       "reject"   // described in BIP61: https://github.com/bitcoin/bips/blob/master/bip-0061.mediawiki
 #define MSG_FEEFILTER    "feefilter"// described in BIP133 https://github.com/bitcoin/bips/blob/master/bip-0133.mediawiki
@@ -213,9 +209,6 @@ void BRPeerDisconnect(BRPeer *peer);
 // call this to (re)schedule a disconnect in the given number of seconds, or < 0 to cancel (useful for sync timeout)
 void BRPeerScheduleDisconnect(BRPeer *peer, double seconds);
 
-// set this to true when wallet addresses need to be added to bloom filter
-void BRPeerSetNeedsFilterUpdate(BRPeer *peer, int needsFilterUpdate);
-
 // display name of peer address
 const char *BRPeerHost(BRPeer *peer);
 
@@ -260,7 +253,6 @@ double BRPeerLastRecvTime(BRPeer *peer);
 
 // sends a bitcoin protocol message to peer
 void BRPeerSendMessage(BRPeer *peer, const uint8_t *msg, size_t msgLen, const char *type);
-void BRPeerSendFilterload(BRPeer *peer, const uint8_t *filter, size_t filterLen);
 void BRPeerSendMempool(BRPeer *peer, const UInt256 knownTxHashes[], size_t knownTxCount, void *info,
                        void (*completionCallback)(void *info, int success));
 void BRPeerSendGetheaders(BRPeer *peer, const UInt256 locators[], size_t locatorsCount, UInt256 hashStop);

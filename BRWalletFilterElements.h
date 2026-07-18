@@ -36,7 +36,8 @@ typedef struct {
  * Snapshot the wallet's current address set into a BIP 158 element list.
  *
  * Caller is responsible for any gap-limit pre-derivation it needs
- * (mirrors BRBloomFilter usage — see _BRPeerManagerLoadBloomFilter).
+ * (see _BRPeerManagerPregenAddrWindow, which maintains this gap+100
+ * look-ahead window on the compact-filter path).
  *
  * Returns NULL on allocation failure or if the wallet has no addresses.
  * Free with BRWalletFilterElementsFree.

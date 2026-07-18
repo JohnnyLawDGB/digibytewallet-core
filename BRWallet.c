@@ -800,6 +800,21 @@ size_t BRWalletDigiDollarUTXOs(BRWallet *wallet, BRUTXO *utxos, size_t utxosCoun
     return utxosCount;
 }
 
+// true if the outpoint (txHash, n) is in the spentOutputs set. spentOutputs is
+// cleared and rebuilt on every _BRWalletUpdateBalance from every registered
+// tx's inputs (see BRSetAdd(wallet->spentOutputs, &tx->inputs[j])), so it is
+// authoritative for spends of ALL output kinds including DigiAsset markers —
+// unlike wallet->assetUtxos, which is never pruned of spends.
+int BRWalletOutpointSpent(BRWallet *wallet, UInt256 txHash, uint32_t n)
+{
+    assert(wallet != NULL);
+    BRUTXO o = { txHash, n };
+    pthread_mutex_lock(&wallet->lock);
+    int spent = BRSetContains(wallet->spentOutputs, &o) ? 1 : 0;
+    pthread_mutex_unlock(&wallet->lock);
+    return spent;
+}
+
 // writes transactions registered in the wallet, sorted by date, oldest first, to the given transactions array
 // returns the number of transactions written, or total number available if transactions is NULL
 size_t BRWalletTransactions(BRWallet *wallet, BRTransaction *transactions[], size_t txCount)

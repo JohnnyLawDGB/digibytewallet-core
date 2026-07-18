@@ -187,6 +187,13 @@ size_t BRWalletUTXOs(BRWallet *wallet, BRUTXO utxos[], size_t utxosCount);
 // wallet's unspent DigiDollar token UTXOs (SEND coin-selection input)
 size_t BRWalletDigiDollarUTXOs(BRWallet *wallet, BRUTXO utxos[], size_t utxosCount);
 
+// true if the outpoint (txHash, n) has been spent by a registered tx. Reads the
+// authoritative spentOutputs set (rebuilt every balance update from every
+// registered tx's inputs — DGB, DigiAsset and DigiDollar alike), so it is the
+// correct sovereign source of asset-marker spent-ness (assetUtxos is not pruned
+// of spends and must not be used for this).
+int BRWalletOutpointSpent(BRWallet *wallet, UInt256 txHash, uint32_t n);
+
 // fee-per-kb of transaction size to use when creating a transaction
 uint64_t BRWalletFeePerKb(BRWallet *wallet);
 void BRWalletSetFeePerKb(BRWallet *wallet, uint64_t feePerKb);

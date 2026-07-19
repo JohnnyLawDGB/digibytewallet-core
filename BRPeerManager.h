@@ -274,6 +274,11 @@ uint32_t BRPeerManagerCFChainTipHeight(BRPeerManager *manager);
 // below the downloaded chain (legacy deficit). Returns 1 if re-anchored.
 int BRPeerManagerReanchorCompactFilterChainAtFloor(BRPeerManager *manager);
 
+// Proactively re-issue a full-locator getheaders to all connected peers to un-stick
+// a frozen block-header tip (all other getheaders senders are reactive). Called by
+// the Kotlin tip-stall watchdog. Returns the peer count the request was sent to.
+int BRPeerManagerRerequestHeadersFromTip(BRPeerManager *manager);
+
 // Provide a previously persisted filter-header chain. The manager takes
 // ownership of the chain pointer; do not free it. Passing NULL clears any
 // existing chain. Must be called before BRPeerManagerConnect.

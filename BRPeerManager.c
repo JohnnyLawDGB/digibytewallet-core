@@ -3470,6 +3470,40 @@ int BRPeerManagerReanchorCompactFilterChainAtFloor(BRPeerManager *manager)
     return r;
 }
 
+// Proactively re-issue a FULL-LOCATOR getheaders to every connected peer. All
+// getheaders senders are otherwise reactive (sync-start, relayed inv/orphan,
+// headers-continuation), so once the wallet reaches its stale estimatedHeight it
+// goes idle — a tip with live-but-silent peers (half-dead socket answering pings,
+// non-announcing/lagging download peer) then freezes forever and stops confirming
+// txs. The Kotlin tip-stall watchdog calls this on a clock (peers>0 AND blockTip
+// frozen N min) to un-stick BOTH modes: behind-and-stopped resumes; a connectable
+// dead-branch walks back via the shared ancestors in the full locators (same
+// _BRPeerManagerBlockLocators + BRPeerSendGetheaders the orphan re-anchor uses).
+// Benign no-op on a healthy at-tip wallet: peers reply 0 headers ("reached tip"),
+// no reorg, no disconnect. Returns the number of peers the request was sent to.
+int BRPeerManagerRerequestHeadersFromTip(BRPeerManager *manager)
+{
+    assert(manager != NULL);
+    pthread_mutex_lock(&manager->lock);
+    int sent = 0;
+    if (manager->isConnected && array_count(manager->connectedPeers) > 0) {
+        UInt256 locators[_BRPeerManagerBlockLocators(manager, NULL, 0)];
+        size_t locatorsCount = _BRPeerManagerBlockLocators(manager, locators,
+                                                           sizeof(locators) / sizeof(*locators));
+        for (size_t i = array_count(manager->connectedPeers); i > 0; i--) {
+            BRPeer *peer = manager->connectedPeers[i - 1];
+            if (BRPeerConnectStatus(peer) != BRPeerStatusConnected) continue;
+            BRPeerSendGetheaders(peer, locators, locatorsCount, UINT256_ZERO);
+            sent++;
+        }
+        if (sent > 0) {
+            _peer_log("tip-stall: re-requested headers (full locator) from %d peer(s)\n", sent);
+        }
+    }
+    pthread_mutex_unlock(&manager->lock);
+    return sent;
+}
+
 void BRPeerManagerSetCompactFilterChain(BRPeerManager *manager, BRCompactFilterChain *chain)
 {
     assert(manager != NULL);

@@ -1378,17 +1378,34 @@ static void _peerRelayedBlock(void *info, BRMerkleBlock *block)
             block = NULL;
         }
         else {
-            // call getblocks, unless we already did with the previous block, or we're still syncing
-            if (manager->lastBlock->height >= BRPeerLastBlock(peer) &&
-                (! manager->lastOrphan || ! UInt256Eq(manager->lastOrphan->blockHash, block->prevBlock))) {
+            // Re-anchor to recover from a stale/minority (orphaned) tip. An orphan
+            // whose parent isn't in our chain means our tip may be on a fork the
+            // network abandoned; the connecting header sits BELOW the fork point, so
+            // re-request with the FULL exponential block locators (which include shared
+            // ancestors below the fork). A correct peer answers with the connecting
+            // header, the stored orphans cascade-connect, and the reorg promotes the
+            // main chain.
+            //
+            // This was previously gated on `lastBlock->height >= BRPeerLastBlock(peer)`,
+            // which is FALSE exactly when we're BEHIND — i.e. the reorg case — so a
+            // wallet stranded on an orphaned tip while behind the network NEVER
+            // re-anchored and wedged forever (the CF-only forward-only getheaders
+            // continuation in BRPeer.c only ever walks toward the tip, never back to the
+            // fork). The bloom path used to self-heal forks via its inv/getblocks/
+            // merkleblock machinery, excised in v4.0.0 — this restores the equivalent
+            // for CF-only. Drop the precondition; keep the lastOrphan/prevBlock dedup as
+            // the throttle so only the FIRST orphan of each new orphan-chain triggers a
+            // request (no storm). Use getheaders, not the dead getblocks/inv detour —
+            // CF-only pulls plain headers (mirrors the sync-start path above).
+            if (! manager->lastOrphan || ! UInt256Eq(manager->lastOrphan->blockHash, block->prevBlock)) {
                 UInt256 locators[_BRPeerManagerBlockLocators(manager, NULL, 0)];
                 size_t locatorsCount = _BRPeerManagerBlockLocators(manager, locators,
                                                                    sizeof(locators)/sizeof(*locators));
-                
-                peer_log(peer, "calling getblocks");
-                BRPeerSendGetblocks(peer, locators, locatorsCount, UINT256_ZERO);
+
+                peer_log(peer, "orphan re-anchor: getheaders with %zu locators (walk back to reorg)", locatorsCount);
+                BRPeerSendGetheaders(peer, locators, locatorsCount, UINT256_ZERO);
             }
-            
+
             BRSetAdd(manager->orphans, block); // BUG: limit total orphans to avoid memory exhaustion attack
             manager->lastOrphan = block;
         }

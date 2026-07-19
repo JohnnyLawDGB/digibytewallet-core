@@ -750,6 +750,7 @@ static BRPeer *_BRPeerManagerAnyFilterCapablePeer(BRPeerManager *manager);
 static void _BRPeerManagerRequestNextCFHeaders(BRPeerManager *manager, BRPeer *peer);
 static int _BRPeerManagerReanchorAtFloorLocked(BRPeerManager *manager, int force);
 static uint32_t _BRPeerManagerBlockFloor(BRPeerManager *manager);
+static int _BRPeerManagerConnectedFilterPeerCount(BRPeerManager *manager); // defined below; used by the cfheaders stall-drop floor guard
 static void _BRPeerManagerProbeOtherFilterPeersForCFHeaders(BRPeerManager *manager, BRPeer *current,
                                                             uint8_t filterType, uint32_t startHeight,
                                                             UInt256 stopHash);
@@ -2087,11 +2088,19 @@ static void _BRPeerManagerRequestNextCFHeaders(BRPeerManager *manager, BRPeer *p
 
         BRPeer *alt = _BRPeerManagerNextUntriedFilterPeer(manager);
         if (!alt) {
-            // Every connected filter peer tried, all stalled → drop one for a fresh peer
-            // and start a fresh round on the remaining/new set.
-            _BRPeerManagerDropStalledFilterPeer(manager);
-            manager->cfTriedCount = 0;
-            alt = _BRPeerManagerNextUntriedFilterPeer(manager);
+            // Every connected filter peer tried, all stalled. Drop one for a fresh
+            // peer ONLY while we'd keep a safe floor of filter peers — otherwise a
+            // batch that NO peer can serve (e.g. a contested cfheaders range during a
+            // rescan) turns a batch-level stall into a fleet-wipe: the drop primitive
+            // has no min-peer guard, so it shreds one filter peer per full rotation
+            // and drains the pool to 0, then oscillates 0↔few against the keepalive
+            // forever. Below the floor, keep retrying on the survivors and let the
+            // keepalive grow the pool back instead of racing a shredder.
+            if (_BRPeerManagerConnectedFilterPeerCount(manager) > CF_MIN_FILTER_PEERS) {
+                _BRPeerManagerDropStalledFilterPeer(manager);
+                manager->cfTriedCount = 0;
+                alt = _BRPeerManagerNextUntriedFilterPeer(manager);
+            }
         }
         if (alt) {
             peer_log(alt, "cfheaders: rotating to untried filter peer for batch [%u..%u]", next, batchEnd);
@@ -2195,6 +2204,12 @@ static void _peerRelayedCFHeaders(void *info, uint8_t filterType, UInt256 stopHa
             if (batchStart != expectedStart) {
                 peer_log(peer, "cfheaders: batch start %u != expected %u — stale/misaligned, ignoring",
                          batchStart, expectedStart);
+                // Clear the in-flight marker (as the continuity-mismatch path below
+                // does) so the next driver tick issues a FRESH request for the
+                // expected height instead of seeing cfHeadersRequestedThrough still
+                // set, treating it as a timeout-retry, and rotating the SAME
+                // (unservable) batch forever.
+                manager->cfHeadersRequestedThrough = 0;
                 pthread_mutex_unlock(&manager->lock);
                 return;
             }

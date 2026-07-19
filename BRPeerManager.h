@@ -96,6 +96,13 @@ Remarks:
    persistently-divergent peer can't loop forever. */
 #define CF_CONTINUITY_REANCHOR_K   2
 #define CF_CONTINUITY_REANCHOR_MAX 3
+
+/* Floor of connected filter peers below which the cfheaders stall-recovery must
+   NOT disconnect a peer. A batch no peer can serve (e.g. a contested range during
+   a rescan) would otherwise shred the whole filter-peer pool to 0 one peer per
+   rotation; keep at least this many so the keepalive can grow the pool instead of
+   racing the shredder. */
+#define CF_MIN_FILTER_PEERS 2
     
 /* Readability constants */
 #define ADD_TO_SAVED_BLOCKS 0

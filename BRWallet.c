@@ -914,113 +914,121 @@ BRAddress BRWalletInternalChangeAddress(BRWallet *wallet)
     return addr;
 }
 
+// Enumerate every address chain in the canonical emission order:
+//   primary BIP84 (internal segwit, internal legacy, external segwit, external legacy),
+//   then the legacy m/0H chains, then the BIP86 taproot chains, then the explicitly-watched
+//   tail. The taproot chains are the SOLE source of P2TR (and therefore DigiDollar) filter
+//   elements, so they MUST be enumerated or a received P2TR is never watched/credited.
+//
+// CALLER MUST HOLD wallet->lock.
+//
+// out == NULL : returns the TOTAL available, unclamped (outCount ignored).
+// out != NULL : writes at most outCount entries — every write bounds-checked against
+//               outCount, so a set larger than the caller's buffer TRUNCATES rather than
+//               overrunning it — and returns the number actually written.
+// origins, if non-NULL, receives the derived/watched split of whatever was counted or written.
+static size_t _BRWalletCollectAddrsLocked(BRWallet *wallet, BRAddress *out, size_t outCount,
+                                          BRWalletAddrOrigins *origins)
+{
+    BRAddress *chains[11];
+    size_t counts[11];
+    size_t nchains = 0, derivedChains, total = 0, derivedTotal = 0, c, i;
+
+    chains[nchains] = wallet->internalChainSegwit;
+    counts[nchains++] = array_count(wallet->internalChainSegwit);
+    chains[nchains] = wallet->internalChain;
+    counts[nchains++] = array_count(wallet->internalChain);
+    chains[nchains] = wallet->externalChainSegwit;
+    counts[nchains++] = array_count(wallet->externalChainSegwit);
+    chains[nchains] = wallet->externalChain;
+    counts[nchains++] = array_count(wallet->externalChain);
+
+    if (wallet->hasLegacyKey) { // populated only by BRWalletNewDual
+        chains[nchains] = wallet->legacyInternalChainSegwit;
+        counts[nchains++] = array_count(wallet->legacyInternalChainSegwit);
+        chains[nchains] = wallet->legacyInternalChain;
+        counts[nchains++] = array_count(wallet->legacyInternalChain);
+        chains[nchains] = wallet->legacyExternalChainSegwit;
+        counts[nchains++] = array_count(wallet->legacyExternalChainSegwit);
+        chains[nchains] = wallet->legacyExternalChain;
+        counts[nchains++] = array_count(wallet->legacyExternalChain);
+    }
+
+    if (wallet->hasTaprootKey) { // populated only by BRWalletSetTaprootKey
+        chains[nchains] = wallet->taprootInternalChain;
+        counts[nchains++] = array_count(wallet->taprootInternalChain);
+        chains[nchains] = wallet->taprootExternalChain;
+        counts[nchains++] = array_count(wallet->taprootExternalChain);
+    }
+
+    derivedChains = nchains; // everything enumerated so far is derived (and signable)
+
+    chains[nchains] = wallet->watchedAddrs;
+    counts[nchains++] = array_count(wallet->watchedAddrs);
+
+    for (c = 0; c < nchains; c++) {
+        total += counts[c];
+        if (c < derivedChains) derivedTotal += counts[c];
+    }
+
+    if (! out) {
+        if (origins) { origins->derived = derivedTotal; origins->watched = total - derivedTotal; }
+        return total;
+    }
+
+    size_t written = 0, writtenDerived = 0;
+    for (c = 0; c < nchains && written < outCount; c++) {
+        for (i = 0; i < counts[c] && written < outCount; i++) {
+            out[written++] = chains[c][i];
+            if (c < derivedChains) writtenDerived++;
+        }
+    }
+
+    if (origins) { origins->derived = writtenDerived; origins->watched = written - writtenDerived; }
+    return written;
+}
+
 // writes all addresses previously genereated with BRWalletUnusedAddrs() to addrs
-// returns the number addresses written, or total number available if addrs is NULL
+// see BRWallet.h for the two-branch return contract (addrs==NULL sizes, addrs!=NULL fills)
 size_t BRWalletAllAddrs(BRWallet *wallet, BRAddress addrs[], size_t addrsCount)
 {
-    size_t i, internalCount = 0, externalCount = 0;
-    size_t internalCountSegwit, externalCountSegwit = 0;
-    // Legacy chain counts
-    size_t legIntCount = 0, legExtCount = 0, legIntSegCount = 0, legExtSegCount = 0;
-    // Taproot (BIP86 / P2TR) chain counts
-    size_t taprootIntCount = 0, taprootExtCount = 0;
-    size_t rest = (addrsCount == 0 ? 100000 : addrsCount);
+    size_t r;
 
     assert(wallet != NULL);
     pthread_mutex_lock(&wallet->lock);
-
-    internalCountSegwit = (! addrs || array_count(wallet->internalChainSegwit) < rest) ?
-        array_count(wallet->internalChainSegwit) : (addrsCount / 4);
-    rest -= internalCountSegwit;
-
-    internalCount = (! addrs || array_count(wallet->internalChain) < rest) ?
-        array_count(wallet->internalChain) : (addrsCount / 4);
-    rest -= internalCount;
-
-    // Add the segwit addresses first
-    for (i = 0; addrs && i < internalCountSegwit; i++)
-        addrs[i] = wallet->internalChainSegwit[i];
-
-    // Add the legacy addresses second
-    for (i = 0; addrs && i < internalCount; i++)
-        addrs[i + internalCountSegwit] = wallet->internalChain[i];
-
-    externalCountSegwit = (! addrs || array_count(wallet->externalChainSegwit) < rest) ?
-        array_count(wallet->externalChainSegwit) : (addrsCount / 4);
-    rest -= externalCountSegwit;
-
-    externalCount = (! addrs || array_count(wallet->externalChain) < rest) ?
-                    array_count(wallet->externalChain) : rest;
-    rest -= externalCount;
-
-    // Add the external segwit addresses first
-    for (i = 0; addrs && i < externalCountSegwit; i++)
-        addrs[i + internalCount + internalCountSegwit] = wallet->externalChainSegwit[i];
-
-    // Add the external legacy addresses second
-    for (i = 0; addrs && i < externalCount; i++)
-        addrs[i + internalCount + internalCountSegwit + externalCountSegwit] = wallet->externalChain[i];
-
-    // Add legacy key chains (populated only when hasLegacyKey == 1)
-    size_t primaryTotal = internalCount + externalCount + internalCountSegwit + externalCountSegwit;
-    if (wallet->hasLegacyKey) {
-        legIntSegCount = (! addrs || array_count(wallet->legacyInternalChainSegwit) < rest) ?
-            array_count(wallet->legacyInternalChainSegwit) : rest;
-        rest -= legIntSegCount;
-        legIntCount = (! addrs || array_count(wallet->legacyInternalChain) < rest) ?
-            array_count(wallet->legacyInternalChain) : rest;
-        rest -= legIntCount;
-        legExtSegCount = (! addrs || array_count(wallet->legacyExternalChainSegwit) < rest) ?
-            array_count(wallet->legacyExternalChainSegwit) : rest;
-        rest -= legExtSegCount;
-        legExtCount = (! addrs || array_count(wallet->legacyExternalChain) < rest) ?
-            array_count(wallet->legacyExternalChain) : rest;
-
-        size_t off = primaryTotal;
-        for (i = 0; addrs && i < legIntSegCount; i++)
-            addrs[off + i] = wallet->legacyInternalChainSegwit[i];
-        off += legIntSegCount;
-        for (i = 0; addrs && i < legIntCount; i++)
-            addrs[off + i] = wallet->legacyInternalChain[i];
-        off += legIntCount;
-        for (i = 0; addrs && i < legExtSegCount; i++)
-            addrs[off + i] = wallet->legacyExternalChainSegwit[i];
-        off += legExtSegCount;
-        for (i = 0; addrs && i < legExtCount; i++)
-            addrs[off + i] = wallet->legacyExternalChain[i];
-    }
-
-    // Taproot (BIP86 / P2TR) key chains — the SOLE source feeding bloom + BIP158,
-    // so these MUST be enumerated or received P2TR is never watched/credited.
-    // Emitted after the legacy block, continuing the same offset accounting so the
-    // caller buffer (sized by the addrs==NULL count return below) is not overrun.
-    size_t legacyTotal = legIntCount + legExtCount + legIntSegCount + legExtSegCount;
-    if (wallet->hasTaprootKey) {
-        taprootIntCount = (! addrs || array_count(wallet->taprootInternalChain) < rest) ?
-            array_count(wallet->taprootInternalChain) : rest;
-        rest -= taprootIntCount;
-        taprootExtCount = (! addrs || array_count(wallet->taprootExternalChain) < rest) ?
-            array_count(wallet->taprootExternalChain) : rest;
-        rest -= taprootExtCount;
-
-        size_t toff = primaryTotal + legacyTotal;
-        for (i = 0; addrs && i < taprootIntCount; i++)
-            addrs[toff + i] = wallet->taprootInternalChain[i];
-        toff += taprootIntCount;
-        for (i = 0; addrs && i < taprootExtCount; i++)
-            addrs[toff + i] = wallet->taprootExternalChain[i];
-    }
-
-    // Explicitly-watched addresses (Receive-screen pins) — always appended so an
-    // address that fell outside the derived gap window is still in the match set.
-    size_t watchedCount = (! addrs || array_count(wallet->watchedAddrs) < rest) ?
-        array_count(wallet->watchedAddrs) : rest;
-    size_t woff = primaryTotal + legacyTotal + taprootIntCount + taprootExtCount;
-    for (i = 0; addrs && i < watchedCount; i++)
-        addrs[woff + i] = wallet->watchedAddrs[i];
-
+    r = _BRWalletCollectAddrsLocked(wallet, addrs, addrs ? addrsCount : 0, NULL);
     pthread_mutex_unlock(&wallet->lock);
-    return primaryTotal + legacyTotal + taprootIntCount + taprootExtCount + watchedCount;
+    return r;
+}
+
+// Single-call snapshot — no window between sizing and filling. See BRWallet.h for the
+// deadlock rationale behind allocating inside the lock.
+BRAddress *BRWalletCopyAllAddrs(BRWallet *wallet, size_t *countOut, BRWalletAddrOrigins *originsOut)
+{
+    BRAddress *addrs = NULL;
+    size_t total, written = 0;
+
+    if (countOut) *countOut = 0;
+    if (originsOut) { originsOut->derived = 0; originsOut->watched = 0; }
+    if (! wallet) return NULL;
+
+    pthread_mutex_lock(&wallet->lock);
+    // Both calls run under the SAME hold, so `total` cannot go stale before the fill.
+    total = _BRWalletCollectAddrsLocked(wallet, NULL, 0, NULL);
+    if (total > 0) {
+        addrs = (BRAddress *)malloc(total * sizeof(*addrs));
+        if (addrs) written = _BRWalletCollectAddrsLocked(wallet, addrs, total, originsOut);
+    }
+    pthread_mutex_unlock(&wallet->lock);
+
+    if (! addrs || written == 0) {
+        free(addrs);                  // NULL-safe; also covers the total>0 but written==0 case
+        if (originsOut) { originsOut->derived = 0; originsOut->watched = 0; }
+        return NULL;
+    }
+
+    if (countOut) *countOut = written;
+    return addrs;
 }
 
 // true if the address was previously generated by BRWalletUnusedAddrs() (even if it's now used)

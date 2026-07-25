@@ -47,6 +47,33 @@ BRWalletFilterElements *BRWalletGetFilterElements(BRWallet *wallet);
 /** Releases all memory associated with the element list. Accepts NULL. */
 void BRWalletFilterElementsFree(BRWalletFilterElements *fe);
 
+/**
+ * Counters from the most recent BRWalletGetFilterElements build.
+ *
+ * There is deliberately no DigiDollar bucket: a DD address (Base58Check over a 34-byte
+ * payload) has no encodable scriptPubKey and needs none — a DD token output is a plain
+ * P2TR script, so its 34-byte element is already emitted by the taproot chain.
+ */
+typedef struct {
+    size_t addrs;          // addresses enumerated from the wallet
+    size_t elements;       // filter elements actually produced
+    size_t derived;        // elements sourced from the derived chains
+    size_t watched;        // elements sourced from explicitly-watched pins
+    size_t dropped;        // addresses with no encodable scriptPubKey (silently skipped pre-fix)
+    size_t allocFailures;  // sticky: builds abandoned on an allocation failure
+    char   firstDroppedPrefix[7]; // first 6 chars of the first dropped address, never the full string
+} BRWalletFilterElementsStats;
+
+/**
+ * Copy the last build's counters. Pass the wallet to assert ownership (a KAT with two
+ * wallets must not read the other's counters), or NULL to accept whichever wallet built
+ * last. Returns 1 if `out` was populated, 0 if no build has happened for that wallet.
+ *
+ * Takes only a private leaf mutex — never PEER_GUARD, never wallet->lock — so it is safe
+ * to call from a JNI getter on any thread.
+ */
+int BRWalletFilterElementsGetStats(const BRWallet *wallet, BRWalletFilterElementsStats *out);
+
 #ifdef __cplusplus
 }
 #endif

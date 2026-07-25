@@ -244,6 +244,26 @@ static void _BRWalletUpdateBalance(BRWallet *wallet)
             
             if (isPending) {
                 BRSetAdd(wallet->pendingTx, tx);
+
+                // A pending tx's outputs are not credited -- but the wallet must still record
+                // which of its addresses were PAID, or an unconfirmed receive never marks the
+                // address used and the Receive screen keeps handing out the same address.
+                //
+                // This matters disproportionately for DigiDollar: a DD token output is
+                // zero-value by protocol (the dollar amount lives in the OP_RETURN), so it
+                // ALWAYS trips the dust check above. Before this, the `continue` skipped the
+                // whole output loop and an unconfirmed DD receive left no trace at all in the
+                // wallet's address bookkeeping. A plain DGB receive is credited at 0-conf, so
+                // for DGB a late confirmation is only cosmetic -- which is exactly why the
+                // "missed receive" symptom looked DigiDollar-specific.
+                //
+                // Credit is still withheld until the tx confirms; only the used-address
+                // bookkeeping happens here.
+                for (j = 0; j < tx->outCount; j++) {
+                    if (tx->outputs[j].address[0] != '\0')
+                        BRSetAdd(wallet->usedAddrs, tx->outputs[j].address);
+                }
+
                 array_add(wallet->balanceHist, balance);
                 continue;
             }

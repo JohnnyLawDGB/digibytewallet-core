@@ -1,0 +1,192 @@
+//
+//  BRCFScanLedger.h
+//
+//  Per-height compact-filter (BIP157/158) scan-completeness ledger.
+//
+//  In COMPACT_FILTERS_ONLY the wallet requests cfilters in forward batches
+//  and advances a single monotonic cursor (BRPeerManager's
+//  autoFetchCFiltersThrough) the moment a getcfilters is *sent* — not when
+//  each cfilter is *evaluated*. Any height whose cfilter is dropped before
+//  evaluation (header race, verify-fail, GCS parse-fail, or a peer that
+//  disconnected mid-batch) becomes a permanent hole, and a hole over a block
+//  that pays the wallet is a missed receive. This ledger keeps a per-height
+//  record so a "scanned" high-water (scannedThrough) advances ONLY over
+//  heights that were actually evaluated, and so dropped heights can be
+//  re-requested (Phase 2).
+//
+//  This module is PURE: it holds no locks and no sockets and depends only on
+//  BRInt.h (UInt128/UInt256). BRPeerManager owns one instance and calls into
+//  it only while holding manager->lock. Being pure, it is host-KAT-testable
+//  standalone (see native/src/test/host/cf_scan_ledger_kat/), the same shape
+//  as BRPeerCFStatus.h / BRComputeCFPeerStatus.
+//
+//  Design: docs/superpowers/specs/2026-07-25-cf-scan-ledger-design.md
+//
+//  Permission is hereby granted, free of charge, to any person obtaining a copy
+//  of this software and associated documentation files (the "Software"), to deal
+//  in the Software without restriction, including without limitation the rights
+//  to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+//  copies of the Software, and to permit persons to whom the Software is
+//  furnished to do so, subject to the following conditions:
+//
+//  The above copyright notice and this permission notice shall be included in
+//  all copies or substantial portions of the Software.
+//
+//  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+//  IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+//  FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+//  AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+//  LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+//  OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+//  THE SOFTWARE.
+
+#ifndef BRCFScanLedger_h
+#define BRCFScanLedger_h
+
+#include <stdint.h>
+#include <stddef.h>
+#include "BRInt.h"
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+// ---- Phase gate (§6) -------------------------------------------------------
+// A single, clearly-named compile-time constant gates all *behavior change* at
+// the caller (BRPeerManager). Phase 1 = 0 (observe only): populate the ledger,
+// log holes, expose counts — but never re-request. The Phase 2 PR flips this to
+// 1 to arm the re-request driver / back-pressure / header-race retry.
+//
+// NOTE: this gate is a CALLER guard. BRCFScanLedgerNextRerequest (the Phase-2
+// driver logic) is ALWAYS compiled so it stays unit-testable; production simply
+// does not invoke it while the gate is 0.
+#define CF_LEDGER_DRIVE_REREQUEST 0
+
+// ---- Bounds & pinned constants (§3) ----------------------------------------
+#define CF_OUTSTANDING_MAX      4096  // hard cap; overflow drops OLDEST (caller LOGWs its height range)
+#define CF_PENDING_CONFIRM_MAX   256  // blocks awaiting header-connect confirmation
+#define CF_PENDING_TX_MAX         32  // wallet txs recorded per pending block (small, capped)
+#define CF_GAVEUP_MAX            512  // heights that exhausted retries — REPORTED, never dropped
+
+// Phase-2 re-request backoff — PINNED 2026-07-25 (§3, §13):
+#define CF_REREQ_HEADERRACE_SECS  10  // header-race first retry — the header connects quickly
+#define CF_REREQ_BASE_SECS        30  // all other holes: base delay
+#define CF_REREQ_BACKOFF_CAP_SECS 120 // delay = min(BASE << attempts, CAP) → 30/60/120/120/120
+#define CF_REREQ_MAX_ATTEMPTS      5  // per-height cap; on reaching it → gaveUp list (NEVER silent)
+
+// ---- Records ---------------------------------------------------------------
+
+// One requested-but-not-yet-evaluated height. `outstanding` is kept sorted
+// ascending by height so the scannedThrough walk is O(gap) and the lowest hole
+// is always outstanding[0].
+typedef struct {
+    uint32_t height;
+    UInt128  peer;         // peer the getcfilters was sent to (for rotate-away)
+    uint16_t port;
+    uint32_t requestedAt;  // unix secs; re-request backoff clock (NOT persisted)
+    uint8_t  attempts;     // re-requests already made; capped at CF_REREQ_MAX_ATTEMPTS (NOT persisted)
+    uint8_t  headerRace;   // dropped because the block header wasn't known yet → short retry
+} BRCFOutstanding;
+
+// Wallet txs from a CF-driven full block whose header hasn't connected yet.
+// Transient (in-memory only) — NOT persisted (a re-anchor/rescan rebuilds it).
+typedef struct {
+    UInt256  blockHash;
+    UInt256  txHashes[CF_PENDING_TX_MAX];   // wallet txs awaiting this block's header
+    uint16_t txCount;
+    uint32_t recordedAt;
+} BRCFPendingConfirm;
+
+typedef struct {
+    uint32_t start;              // birth height, inclusive (mirrors autoFetchCFiltersStart)
+    uint32_t scannedThrough;     // contiguous high-water: EVERY height in [start..this] was EVALUATED
+                                 //   (matched or cleanly missed). Never passes an outstanding/gaveUp hole.
+    uint32_t requestedThrough;   // max stop ever recorded — scannedThrough's ceiling, tracked here so it is
+                                 //   independent of BRPeerManager's autoFetchCFiltersThrough.
+    BRCFOutstanding    outstanding[CF_OUTSTANDING_MAX];   // sorted ascending by height
+    size_t             outstandingCount;
+    BRCFPendingConfirm pending[CF_PENDING_CONFIRM_MAX];
+    size_t             pendingCount;
+    uint32_t           gaveUp[CF_GAVEUP_MAX];  // sorted ascending; heights past the attempt cap — reported,
+    size_t             gaveUpCount;            //   persisted, NEVER silently dropped (else we rebuild the bug)
+    uint32_t           lastDriveAt;            // re-request driver throttle (Phase 2)
+} BRCFScanLedger;
+
+// ---- Pure operations (host-testable) ---------------------------------------
+
+// Zero the ledger and set the scan floor. scannedThrough/requestedThrough start
+// at start-1 (nothing evaluated/requested yet). `start` is a real birth height (>0).
+void     BRCFScanLedgerInit(BRCFScanLedger *l, uint32_t start);
+
+// Add every height in [startH..stopH] to `outstanding` (sorted, de-duplicated)
+// and raise requestedThrough. A height already outstanding just refreshes its
+// target (peer/port/requestedAt) — used by a re-request. On CF_OUTSTANDING_MAX
+// overflow the OLDEST (lowest-height, front) entry is dropped in-module; the
+// loud height-range log is the caller's job.
+void     BRCFScanLedgerRecordRequested(BRCFScanLedger *l, uint32_t startH, uint32_t stopH,
+                                        UInt128 peer, uint16_t port, uint32_t now);
+
+// A cfilter for `height` was evaluated (matched or cleanly missed). Remove it
+// from outstanding (and, defensively, gaveUp) and advance scannedThrough over
+// any newly-contiguous evaluated run.
+void     BRCFScanLedgerMarkEvaluated(BRCFScanLedger *l, uint32_t height);
+
+// The cfilter for `height` was dropped because its block header wasn't known
+// yet. Keep it outstanding and flag it for the fast (10s) header-race retry.
+void     BRCFScanLedgerMarkHeaderRace(BRCFScanLedger *l, uint32_t height);
+
+// A peer disconnected with a batch in flight: clear the recorded peer on every
+// outstanding height that targeted (peer,port), keeping the heights (and their
+// attempt counts) so the driver re-requests them from someone else.
+void     BRCFScanLedgerReArmPeer(BRCFScanLedger *l, UInt128 peer, uint16_t port);
+
+// Phase-2 driver: offer the lowest-height outstanding hole whose backoff has
+// elapsed, applying the pinned schedule (header-race 10s first, else
+// 30/60/120/120/120). Increments that height's attempt count and re-stamps its
+// clock. A height that reaches CF_REREQ_MAX_ATTEMPTS is moved to the `gaveUp`
+// list (reported, never silently dropped) and no longer offered. Returns 1 and
+// writes *outHeight when a height is offered, else 0. Always compiled so it is
+// unit-testable; production gates its invocation on CF_LEDGER_DRIVE_REREQUEST.
+int      BRCFScanLedgerNextRerequest(BRCFScanLedger *l, uint32_t now, uint32_t *outHeight);
+
+uint32_t BRCFScanLedgerScannedThrough(const BRCFScanLedger *l);
+size_t   BRCFScanLedgerOutstandingCount(const BRCFScanLedger *l);
+size_t   BRCFScanLedgerGaveUpCount(const BRCFScanLedger *l);
+
+// Coalesce the outstanding + gaveUp heights into ascending [start..end] ranges
+// for the JNI/UI hole report. Writes up to `cap` ranges into outStarts/outEnds
+// and returns the number written.
+size_t   BRCFScanLedgerHoleRanges(const BRCFScanLedger *l, uint32_t *outStarts, uint32_t *outEnds, size_t cap);
+
+// ---- Pending-confirm (confirmation-side twin) ------------------------------
+
+// Record wallet txs from a CF-driven full block whose header hasn't connected
+// yet. On CF_PENDING_CONFIRM_MAX overflow the OLDEST entry is dropped (caller
+// logs). A re-record of the same blockHash replaces its tx set.
+void     BRCFScanLedgerRecordPending(BRCFScanLedger *l, UInt256 blockHash,
+                                     const UInt256 *txHashes, size_t n, uint32_t now);
+
+// Drain (remove + return) the wallet txs recorded for blockHash, e.g. once its
+// header connects. Copies up to `cap` hashes into outTx; returns the count.
+size_t   BRCFScanLedgerTakePending(BRCFScanLedger *l, UInt256 blockHash, UInt256 *outTx, size_t cap);
+
+// ---- Persistence (§5) ------------------------------------------------------
+// Persists ONLY: start, scannedThrough, requestedThrough, the outstanding
+// heights + their headerRace flag, and the gaveUp list. attempts/timestamps/
+// peers are NOT persisted (a fresh process gets fresh peers) and pending is NOT
+// persisted (rebuilt by a re-anchor/rescan). On Parse those reset.
+
+// Serialize into buf. Returns the number of bytes the blob needs; writes it iff
+// buflen is large enough (call with buflen 0 / NULL buf to size first).
+size_t   BRCFScanLedgerSerialize(const BRCFScanLedger *l, uint8_t *buf, size_t buflen);
+
+// Parse a blob produced by BRCFScanLedgerSerialize. Returns 1 on success
+// (l fully populated; attempts/timestamps/peers reset, pending empty), 0 on a
+// garbled/oversized/short blob (l left as an empty ledger — the caller rebuilds).
+int      BRCFScanLedgerParse(BRCFScanLedger *l, const uint8_t *buf, size_t buflen);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif // BRCFScanLedger_h

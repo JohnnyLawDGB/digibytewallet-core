@@ -301,6 +301,33 @@ void BRPeerManagerSetSaveFilterHeaders(BRPeerManager *manager, void *info,
                                        void (*saveFilterHeaders)(void *info,
                                                                   const BRCompactFilterChain *chain));
 
+// ---- CF scan-completeness ledger (Phase 1: observe-only) -------------------
+// Per-height BIP157/158 scan-completeness bookkeeping. The manager owns one
+// ledger, populated under manager->lock by the CF request/eval/drop paths. In
+// Phase 1 these accessors are read-only reporting for the UI/JNI; nothing here
+// alters sync behavior. Each takes manager->lock for the duration of the call.
+
+// Snapshot the ledger's scalar counts. Any out-pointer may be NULL to skip it.
+void BRPeerManagerCFLedgerCounts(BRPeerManager *manager, uint32_t *scannedThrough, uint32_t *outstanding,
+                                 uint32_t *gaveUp, uint32_t *pending);
+
+// Coalesce the outstanding + gaveUp heights into ascending [start..end] ranges.
+// Writes up to `cap` ranges into outStarts/outEnds; returns the number written.
+size_t BRPeerManagerCFLedgerHoleRanges(BRPeerManager *manager, uint32_t *outStarts, uint32_t *outEnds, size_t cap);
+
+// Serialize the ledger into buf. Returns the byte count the blob needs; writes it
+// iff buflen is large enough (call with buf NULL / buflen 0 to size first).
+size_t BRPeerManagerCFLedgerSerialize(BRPeerManager *manager, uint8_t *buf, size_t buflen);
+
+// Restore a ledger blob produced by BRPeerManagerCFLedgerSerialize. Returns 1 on
+// success, 0 on a garbled/short blob (ledger left empty for the caller to rebuild).
+int BRPeerManagerCFLedgerRestore(BRPeerManager *manager, const uint8_t *buf, size_t buflen);
+
+// Persistence hook. Called from inside the manager lock after each successful
+// cfheaders extend, with the serialized ledger blob. Pass NULL to clear.
+void BRPeerManagerSetSaveCFLedger(BRPeerManager *manager, void *info,
+                                  void (*callback)(void *info, const uint8_t *bytes, size_t len));
+
 // Request cfilters for the inclusive range [startHeight, stopHeight] from
 // any filter-capable peer that is currently connected. Caps the range at
 // MAX_CFILTERS_RESULTS; if the requested range is larger, only the first

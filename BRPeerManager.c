@@ -35,6 +35,7 @@
 #include "BRPeerPenalty.h"
 #include "BRPeerPin.h"
 #include "BRPeerCFStatus.h"
+#include "BRCFScanLedger.h"
 #include <stdlib.h>
 #include <stdatomic.h>
 #include <stdio.h>
@@ -226,6 +227,12 @@ struct BRPeerManagerStruct {
     BRCompactFilterChain *compactFilterChain;
     void *saveFilterHeadersInfo;
     void (*saveFilterHeaders)(void *info, const BRCompactFilterChain *chain);
+    // Per-height CF scan-completeness ledger (Phase 1: observe-only). Populated by
+    // the CF request/eval/drop paths while manager->lock is held; persisted via the
+    // saveCFLedger callback (coalesced Kotlin-side, same as saveFilterHeaders).
+    void *saveCFLedgerInfo;
+    void (*saveCFLedger)(void *info, const uint8_t *bytes, size_t len);
+    BRCFScanLedger cfLedger;
     int autoFetchCFiltersEnabled;
     uint32_t autoFetchCFiltersStart;     // wallet birth height (inclusive)
     uint32_t autoFetchCFiltersThrough;   // highest height already requested (or
@@ -990,6 +997,11 @@ static void _peerDisconnected(void *info, int error)
         break;
     }
 
+    // Clear this disconnected peer off any outstanding CF-scan heights that targeted
+    // it, so Phase 2's re-request driver picks a fresh peer. Cheap bookkeeping; a
+    // no-op for Phase-1 reads. manager->lock is held here.
+    BRCFScanLedgerReArmPeer(&manager->cfLedger, peer->address, peer->port);
+
     BRPeerFree(peer);
     // Peer left connectedPeers (and possibly was the downloadPeer) — refresh the
     // mirrors so the overlay's peer count reflects the drop without taking the lock.
@@ -1594,6 +1606,11 @@ static void _peerRelayedBlockTxns(void *info, UInt256 blockHash, const UInt256 t
     b = BRSetGet(manager->blocks, &blockHash);
 
     if (! b) { // header not synced yet; the block will be re-requested/re-relayed once it is
+        // Observe-only (Phase 1): record the wallet txs against this not-yet-connected
+        // block so a pending-confirm hole is visible. Record only — do NOT drain.
+        BRCFScanLedgerRecordPending(&manager->cfLedger, blockHash, txHashes, txCount, (uint32_t)time(NULL));
+        debug_log("cf-ledger: pending-confirm hole — recorded %zu wallet tx(s) for not-yet-connected block %s\n",
+                  txCount, log_u256_hex_encode(blockHash));
         pthread_mutex_unlock(&manager->lock);
         return;
     }
@@ -2056,6 +2073,8 @@ static void _BRPeerManagerRequestNextCFHeaders(BRPeerManager *manager, BRPeer *p
             manager->autoFetchCFiltersEnabled  = 1;
             manager->autoFetchCFiltersStart    = floor;
             manager->autoFetchCFiltersThrough  = floor > 0 ? floor - 1 : 0;
+            // Snap-up re-anchor rebuilds the CF scan-completeness ledger (Phase 1: observe-only).
+            BRCFScanLedgerInit(&manager->cfLedger, floor);
             manager->cfHeadersRequestedThrough = 0;
             next     = floor;
             batchEnd = next + (MAX_CFHEADERS_RESULTS - 1);
@@ -2359,6 +2378,19 @@ static void _peerRelayedCFHeaders(void *info, uint8_t filterType, UInt256 stopHa
         manager->saveFilterHeaders(manager->saveFilterHeadersInfo, manager->compactFilterChain);
     }
 
+    // Persist the CF scan-completeness ledger alongside the filter headers. Size
+    // first (NULL buf), then malloc + fill. Coalescing/throttling is the Kotlin
+    // caller's job (same contract as saveFilterHeaders).
+    if (manager->saveCFLedger) {
+        size_t ledgerLen = BRCFScanLedgerSerialize(&manager->cfLedger, NULL, 0);
+        uint8_t *ledgerBuf = (ledgerLen > 0) ? malloc(ledgerLen) : NULL;
+        if (ledgerBuf) {
+            size_t wrote = BRCFScanLedgerSerialize(&manager->cfLedger, ledgerBuf, ledgerLen);
+            if (wrote == ledgerLen) manager->saveCFLedger(manager->saveCFLedgerInfo, ledgerBuf, ledgerLen);
+            free(ledgerBuf);
+        }
+    }
+
     // Auto-fetch cfilters for the newly validated range, capped at the spec
     // MAX_CFILTERS_RESULTS. The driver requests one batch per cfheaders
     // arrival; consecutive cfheaders responses advance the cursor through
@@ -2374,6 +2406,8 @@ static void _peerRelayedCFHeaders(void *info, uint8_t filterType, UInt256 stopHa
             size_t n = _BRPeerManagerRequestCFiltersLocked(manager, reqStart, reqStop, peer);
             if (n > 0) {
                 manager->autoFetchCFiltersThrough = reqStop;
+                BRCFScanLedgerRecordRequested(&manager->cfLedger, reqStart, reqStop,
+                                              peer->address, peer->port, (uint32_t)time(NULL));
                 peer_log(peer, "cfilters: auto-requested [%u..%u] (%zu blocks)",
                          reqStart, reqStop, n);
             }
@@ -2411,6 +2445,10 @@ static void _peerRelayedCFilter(void *info, uint8_t filterType, UInt256 blockHas
     BRMerkleBlock *b = BRSetGet(manager->blocks, &blockHash);
     if (!b) {
         peer_log(peer, "cfilter: unknown block %s, dropping", log_u256_hex_encode(blockHash));
+        // Observe-only (Phase 1): the height stays outstanding in the ledger (we do
+        // NOT MarkEvaluated), so scannedThrough naturally holds below it.
+        peer_log(peer, "cf-ledger: header-race hole (block %s unknown) — left outstanding",
+                 log_u256_hex_encode(blockHash));
         pthread_mutex_unlock(&manager->lock);
         return;
     }
@@ -2419,6 +2457,10 @@ static void _peerRelayedCFilter(void *info, uint8_t filterType, UInt256 blockHas
         peer_log(peer, "cfilter: filter for block %s does not match chain — misbehavin'",
                  log_u256_hex_encode(blockHash));
         _BRPeerManagerPeerMisbehavin(manager, peer);
+        // Observe-only (Phase 1): height left outstanding (not MarkEvaluated).
+        peer_log(peer, "cf-ledger: hole @ %u reason=verify_fail — left outstanding (scannedThrough=%u, outstanding=%zu)",
+                 b->height, BRCFScanLedgerScannedThrough(&manager->cfLedger),
+                 BRCFScanLedgerOutstandingCount(&manager->cfLedger));
         pthread_mutex_unlock(&manager->lock);
         return;
     }
@@ -2431,6 +2473,10 @@ static void _peerRelayedCFilter(void *info, uint8_t filterType, UInt256 blockHas
     if (!gcs) {
         peer_log(peer, "cfilter: failed to parse filter for block %s",
                  log_u256_hex_encode(blockHash));
+        // Observe-only (Phase 1): height left outstanding (not MarkEvaluated).
+        peer_log(peer, "cf-ledger: hole @ %u reason=parse_fail — left outstanding (scannedThrough=%u, outstanding=%zu)",
+                 b->height, BRCFScanLedgerScannedThrough(&manager->cfLedger),
+                 BRCFScanLedgerOutstandingCount(&manager->cfLedger));
         pthread_mutex_unlock(&manager->lock);
         return;
     }
@@ -2471,6 +2517,10 @@ static void _peerRelayedCFilter(void *info, uint8_t filterType, UInt256 blockHas
         // under the lock). The lock guards manager state, not the socket.
         BRPeerSendGetdataBlocks(peer, &blockHash, 1);
     }
+
+    // The cfilter was evaluated (matched above or cleanly missed) — remove this
+    // height from the ledger's outstanding set and advance scannedThrough.
+    BRCFScanLedgerMarkEvaluated(&manager->cfLedger, b->height);
 
     pthread_mutex_unlock(&manager->lock);
 }
@@ -3480,6 +3530,8 @@ static int _BRPeerManagerReanchorAtFloorLocked(BRPeerManager *manager, int force
     manager->autoFetchCFiltersEnabled  = 1;
     manager->autoFetchCFiltersStart    = floor;
     manager->autoFetchCFiltersThrough  = floor > 0 ? floor - 1 : 0;
+    // Re-anchor rebuilds the CF scan-completeness ledger at the floor (Phase 1: observe-only).
+    BRCFScanLedgerInit(&manager->cfLedger, floor);
     manager->cfHeadersRequestedThrough = 0;
     manager->cfDisagreedCount          = 0;   // fresh disagreement window
     manager->cfSingleDisagreeRounds    = 0;   // fresh single-peer diverged-round window
@@ -3562,6 +3614,59 @@ void BRPeerManagerSetSaveFilterHeaders(BRPeerManager *manager, void *info,
     pthread_mutex_lock(&manager->lock);
     manager->saveFilterHeadersInfo = info;
     manager->saveFilterHeaders = saveFilterHeaders;
+    pthread_mutex_unlock(&manager->lock);
+}
+
+// ---- CF scan-completeness ledger accessors (Phase 1: guarded reads) --------
+// These take manager->lock for every read; the lock-free bridge mirror (like the
+// cachedCFTip pattern) is a later sequence. Safe on a zeroed/never-armed ledger.
+
+void BRPeerManagerCFLedgerCounts(BRPeerManager *manager, uint32_t *scannedThrough, uint32_t *outstanding,
+                                 uint32_t *gaveUp, uint32_t *pending)
+{
+    assert(manager != NULL);
+    pthread_mutex_lock(&manager->lock);
+    if (scannedThrough) *scannedThrough = BRCFScanLedgerScannedThrough(&manager->cfLedger);
+    if (outstanding)    *outstanding    = (uint32_t)BRCFScanLedgerOutstandingCount(&manager->cfLedger);
+    if (gaveUp)         *gaveUp         = (uint32_t)BRCFScanLedgerGaveUpCount(&manager->cfLedger);
+    if (pending)        *pending        = (uint32_t)manager->cfLedger.pendingCount;
+    pthread_mutex_unlock(&manager->lock);
+}
+
+size_t BRPeerManagerCFLedgerHoleRanges(BRPeerManager *manager, uint32_t *outStarts, uint32_t *outEnds, size_t cap)
+{
+    assert(manager != NULL);
+    pthread_mutex_lock(&manager->lock);
+    size_t n = BRCFScanLedgerHoleRanges(&manager->cfLedger, outStarts, outEnds, cap);
+    pthread_mutex_unlock(&manager->lock);
+    return n;
+}
+
+size_t BRPeerManagerCFLedgerSerialize(BRPeerManager *manager, uint8_t *buf, size_t buflen)
+{
+    assert(manager != NULL);
+    pthread_mutex_lock(&manager->lock);
+    size_t n = BRCFScanLedgerSerialize(&manager->cfLedger, buf, buflen);
+    pthread_mutex_unlock(&manager->lock);
+    return n;
+}
+
+int BRPeerManagerCFLedgerRestore(BRPeerManager *manager, const uint8_t *buf, size_t buflen)
+{
+    assert(manager != NULL);
+    pthread_mutex_lock(&manager->lock);
+    int ok = BRCFScanLedgerParse(&manager->cfLedger, buf, buflen);
+    pthread_mutex_unlock(&manager->lock);
+    return ok;
+}
+
+void BRPeerManagerSetSaveCFLedger(BRPeerManager *manager, void *info,
+                                  void (*callback)(void *info, const uint8_t *bytes, size_t len))
+{
+    assert(manager != NULL);
+    pthread_mutex_lock(&manager->lock);
+    manager->saveCFLedgerInfo = info;
+    manager->saveCFLedger = callback;
     pthread_mutex_unlock(&manager->lock);
 }
 
@@ -3659,6 +3764,8 @@ void BRPeerManagerEnableAutoCompactFilterFetch(BRPeerManager *manager, uint32_t 
     // Reset cursor to (start - 1) so the first cfheaders batch covering the
     // range immediately triggers a cfilter fetch at startHeight.
     manager->autoFetchCFiltersThrough = (startHeight > 0) ? startHeight - 1 : 0;
+    // Rebuild the CF scan-completeness ledger at the same floor (Phase 1: observe-only).
+    BRCFScanLedgerInit(&manager->cfLedger, startHeight);
     pthread_mutex_unlock(&manager->lock);
 }
 

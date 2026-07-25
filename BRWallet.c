@@ -1075,12 +1075,72 @@ int BRWalletContainsAddress(BRWallet *wallet, const char *addr)
 // Register an address to watch permanently, independent of gap-limit derivation.
 // Idempotent: no-op if already watched. Used to pin every address ever shown on
 // the Receive screen into the BIP158 match set so a receive to it is never missed.
+// Is this address in the DERIVED set (as opposed to merely watched)? Caller must hold
+// wallet->lock. Being derived is what makes an address creditable AND signable.
+static int _BRWalletIsDerivedLocked(BRWallet *wallet, const char *addr)
+{
+    return BRSetContains(wallet->allAddrs, addr) ? 1 : 0;
+}
+
+// How far past the current chain end we are willing to derive while trying to resolve a
+// watched address to a real chain index. Bounded on purpose: each step is EC point maths
+// over 6 chain/scriptType combinations, and every derived address also becomes a compact-
+// filter element, so an unbounded search would cost both CPU and filter bandwidth.
+#define WATCH_RESOLVE_MAX_SPAN 200
+
+// Try to make a watched address DERIVED by extending whichever chain it belongs to.
+//
+// WHY THIS MATTERS: a watch-only address is enumerated by BRWalletAllAddrs, so it becomes a
+// BIP158 filter element and a payment to it DOES get its block downloaded — but the credit
+// side never consults watchedAddrs (_BRWalletContainsTx and _BRWalletUpdateBalance both gate
+// on the allAddrs BRSet), so the transaction is then discarded. Half a feature.
+//
+// It cannot be fixed by simply OR-ing a watchedAddrs scan into those gates: BRWalletSignTransaction
+// resolves an address to a key INDEX by scanning the derived chain arrays, and never looks at
+// watchedAddrs. Crediting a watch-only address would therefore produce balance the wallet can
+// see, select for spending, and then fail to sign — unspendable funds, strictly worse than the
+// current behaviour. The invariant to preserve is: credit if and only if derived.
+//
+// So instead of widening the credit gate, we widen the DERIVED set. Caller must NOT hold
+// wallet->lock — BRWalletUnusedAddrs takes it internally and it is non-recursive (BRWallet.c:517).
+// Returns 1 if the address ended up derived.
+static int _BRWalletResolveWatchedToDerived(BRWallet *wallet, const char *addr)
+{
+    int derived;
+
+    pthread_mutex_lock(&wallet->lock);
+    derived = _BRWalletIsDerivedLocked(wallet, addr);
+    pthread_mutex_unlock(&wallet->lock);
+    if (derived) return 1;   // the common case: it was handed out by BRWalletUnusedAddrs
+
+    for (uint32_t span = 50; span <= WATCH_RESOLVE_MAX_SPAN; span += 50) {
+        for (int scriptType = 0; scriptType <= 2; scriptType++) {
+            for (int internal = 0; internal <= 1; internal++)
+                BRWalletUnusedAddrs(wallet, NULL, span, internal, scriptType);
+        }
+
+        pthread_mutex_lock(&wallet->lock);
+        derived = _BRWalletIsDerivedLocked(wallet, addr);
+        pthread_mutex_unlock(&wallet->lock);
+        if (derived) return 1;
+    }
+
+    // Not ours, or further out than we are willing to derive. It stays watch-only: it will
+    // still match compact filters, but a payment to it cannot be credited. Kept rather than
+    // rejected so the match is not lost outright.
+    return 0;
+}
+
 void BRWalletAddWatchedAddress(BRWallet *wallet, const char *addr)
 {
     assert(wallet != NULL);
     assert(addr != NULL);
     if (! addr || ! addr[0]) return;
     if (! BRAddressIsValid(addr)) return;
+
+    // Before pinning, try to bring it into the derived set so a payment to it can actually
+    // be credited and later spent — not merely matched.
+    _BRWalletResolveWatchedToDerived(wallet, addr);
 
     pthread_mutex_lock(&wallet->lock);
     int known = 0;

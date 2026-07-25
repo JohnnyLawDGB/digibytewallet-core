@@ -151,6 +151,10 @@ void BRPeerManagerSetCallbacks(BRPeerManager *manager, void *info,
 // set address to UINT128_ZERO to revert to default behavior
 void BRPeerManagerSetFixedPeer(BRPeerManager *manager, UInt128 address, uint16_t port);
 
+// dynamically set the target peer connection count (full while catching up, fewer once synced);
+// reducing gently disconnects the excess (never the download peer or the pinned own-node)
+void BRPeerManagerSetMaxConnectCount(BRPeerManager *manager, size_t count);
+
 // add a peer to the live candidate pool the manager picks from on the next
 // BRPeerManagerConnect cycle. Idempotent — if the address+port pair is already
 // present, this is a no-op. Returns 1 if the peer was newly added, 0 if it was

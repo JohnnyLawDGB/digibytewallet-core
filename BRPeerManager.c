@@ -2547,6 +2547,36 @@ void BRPeerManagerSetFixedPeer(BRPeerManager *manager, UInt128 address, uint16_t
     pthread_mutex_unlock(&manager->lock);
 }
 
+// Dynamically set the target connection count (demand-side load-spread): the wallet holds the
+// full PEER_MAX_CONNECTIONS while CATCHING UP (fast sync + wedge buffer), then drops to a small
+// count once SYNCED so thousands of idle wallets stop each pinning 8 slots on the shared
+// filter-node fleet. Reducing gently schedule-disconnects the excess via the SAME async path
+// idle-eviction uses (BRPeerScheduleDisconnect) — NEVER the download peer (it drives the sync)
+// or the pinned own-node. maxConnectCount then gates re-dials so the reduced set is maintained;
+// increasing (fell behind → catch up) tops back up via BRPeerManagerConnect.
+void BRPeerManagerSetMaxConnectCount(BRPeerManager *manager, size_t count)
+{
+    assert(manager != NULL);
+    if (count < 1) count = 1;
+    pthread_mutex_lock(&manager->lock);
+    size_t prev = manager->maxConnectCount;
+    manager->maxConnectCount = count;
+    if (count < prev) {
+        size_t keeping = array_count(manager->connectedPeers);
+        for (size_t i = array_count(manager->connectedPeers); i > 0 && keeping > count; i--) {
+            BRPeer *p = manager->connectedPeers[i - 1];
+            if (p == manager->downloadPeer) continue;                 // keep the sync driver
+            if (BRPeerIsPinned(manager->pinnedAddr, manager->pinnedPort,
+                               p->address, p->port)) continue;        // keep the pinned own-node
+            if (BRPeerConnectStatus(p) == BRPeerStatusDisconnected) continue;
+            BRPeerScheduleDisconnect(p, 0);
+            keeping--;
+        }
+    }
+    pthread_mutex_unlock(&manager->lock);
+    if (count > prev) BRPeerManagerConnect(manager);                  // fell behind — top back up
+}
+
 // current connect status
 BRPeerStatus BRPeerManagerConnectStatus(BRPeerManager *manager)
 {

@@ -61,7 +61,7 @@ extern "C" {
 // driver logic) is ALWAYS compiled so it stays unit-testable; production simply
 // does not invoke it while the gate is 0.
 #ifndef CF_LEDGER_DRIVE_REREQUEST
-#define CF_LEDGER_DRIVE_REREQUEST 0   // Phase 1: observe. Task 6 flips to 1. -D wins for KATs.
+#define CF_LEDGER_DRIVE_REREQUEST 1   // Phase 2: driver ARMED (buffer-drain + residual re-request + back-pressure). -D wins for KATs.
 #endif
 
 // Sentinel: "no height was evicted" — returned by the overflow-drop-reporting

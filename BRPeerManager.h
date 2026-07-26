@@ -132,7 +132,9 @@ BRPeerManager* BRPeerManagerNewEx(const BRChainParams* params, BRWallet* wallet,
 // void syncStarted(void *) - called when blockchain syncing starts
 // void syncStopped(void *, int) - called when blockchain syncing stops, error is an errno.h code
 // void txStatusUpdate(void *) - called when transaction status may have changed such as when a new block arrives
-// void saveBlocks(void *, int, BRMerkleBlock *[], size_t) - called when blocks should be saved to the persistent store
+// void saveBlocks(void *, int, const uint8_t *bytes, size_t len) - called when blocks should be saved to the
+//   persistent store. The core serializes the blocks UNDER its lock and hands the immutable `bytes` buffer (NOT
+//   live block pointers), so the callback can do a slow JNI upcall without racing a concurrent reorg free.
 // - if replace is true, remove any previously saved blocks first
 // void savePeers(void *, int, const BRPeer[], size_t) - called when peers should be saved to the persistent store
 // - if replace is true, remove any previously saved peers first
@@ -142,7 +144,7 @@ void BRPeerManagerSetCallbacks(BRPeerManager *manager, void *info,
                                void (*syncStarted)(void *info),
                                void (*syncStopped)(void *info, int error),
                                void (*txStatusUpdate)(void *info),
-                               void (*saveBlocks)(void *info, int replace, BRMerkleBlock *blocks[], size_t blocksCount, uint64_t* memIntegrityCheck),
+                               void (*saveBlocks)(void *info, int replace, const uint8_t *bytes, size_t len, uint64_t* memIntegrityCheck),
                                void (*savePeers)(void *info, int replace, const BRPeer peers[], size_t peersCount),
                                int (*networkIsReachable)(void *info),
                                void (*threadCleanup)(void *info));
@@ -187,7 +189,8 @@ int BRPeerManagerCompactFilterPeerStatus(BRPeerManager *manager, UInt128 addr, u
 // connect to bitcoin peer-to-peer network (also call this whenever networkIsReachable() status changes)
 void BRPeerManagerConnect(BRPeerManager *manager);
 
-// disconnect from bitcoin peer-to-peer network (may cause syncFailed(), saveBlocks() or savePeers() callbacks to fire)
+// disconnect from bitcoin peer-to-peer network (may cause syncStopped() or savePeers() callbacks to fire; NOT
+// saveBlocks() — in this codebase saveBlocks fires only from _peerRelayedBlock, never from a disconnect)
 void BRPeerManagerDisconnect(BRPeerManager *manager);
 
 // send a keepalive ping to every connected peer so idle CF filter-peer connections don't get

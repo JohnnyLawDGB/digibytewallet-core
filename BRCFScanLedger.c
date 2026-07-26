@@ -413,21 +413,46 @@ static uint32_t _cfLedgerRerequestDelay(const BRCFOutstanding *e)
     return d;
 }
 
+// Move outstanding[i] to gaveUp. Returns 1 if the entry was removed (added to
+// gaveUp), 0 if kept (gaveUp is full — the caller leaves it outstanding but
+// no longer offers it; still counted/reported, so nothing is silently lost).
+static int _cfLedgerMoveToGaveUp(BRCFScanLedger *l, size_t i)
+{
+    if (! _cfLedgerAddGaveUp(l, l->outstanding[i].height)) return 0;  // gaveUp full -> keep outstanding
+    memmove(&l->outstanding[i], &l->outstanding[i + 1],
+            (l->outstandingCount - i - 1) * sizeof(BRCFOutstanding));
+    l->outstandingCount--;
+    return 1;
+}
+
+// Is this entry due for re-request right now, per the pinned backoff schedule?
+// Underflow-guarded: a clock that appears to move backward (or a stale
+// requestedAt) reads as "just requested" (elapsed 0), never as a huge
+// wrapped-around elapsed time.
+static int _cfLedgerDue(const BRCFOutstanding *e, uint32_t now)
+{
+    uint32_t elapsed = (now >= e->requestedAt) ? (now - e->requestedAt) : 0;
+    return elapsed >= _cfLedgerRerequestDelay(e);
+}
+
+// PUBLIC — the caller runs this once per driver "tick" (NOT automatically
+// inside Peek). Moves every capped entry to gaveUp (reported, never dropped).
+void BRCFScanLedgerRetireCapped(BRCFScanLedger *l)
+{
+    for (size_t i = 0; i < l->outstandingCount; ) {
+        if (l->outstanding[i].attempts >= CF_REREQ_MAX_ATTEMPTS) {
+            if (! _cfLedgerMoveToGaveUp(l, i)) i++;   // full: skip past the kept entry
+            // else: do not advance i — a new entry shifted into this slot
+        } else {
+            i++;
+        }
+    }
+}
+
 int BRCFScanLedgerNextRerequest(BRCFScanLedger *l, uint32_t now, uint32_t *outHeight)
 {
-    // 1. Retire any capped entries to gaveUp (reported, never dropped). If gaveUp
-    //    is full they stay outstanding but are no longer offered (step 2 skips
-    //    them) — still counted/reported, so nothing is lost.
-    for (size_t i = 0; i < l->outstandingCount; ) {
-        if (l->outstanding[i].attempts >= CF_REREQ_MAX_ATTEMPTS &&
-            _cfLedgerAddGaveUp(l, l->outstanding[i].height)) {
-            memmove(&l->outstanding[i], &l->outstanding[i + 1],
-                    (l->outstandingCount - i - 1) * sizeof(BRCFOutstanding));
-            l->outstandingCount--;
-            continue; // do not advance i — a new entry shifted into this slot
-        }
-        i++;
-    }
+    // 1. Retire any capped entries to gaveUp (reported, never dropped).
+    BRCFScanLedgerRetireCapped(l);
 
     l->lastDriveAt = now;
 
@@ -436,9 +461,7 @@ int BRCFScanLedgerNextRerequest(BRCFScanLedger *l, uint32_t now, uint32_t *outHe
         BRCFOutstanding *e = &l->outstanding[i];
         if (e->attempts >= CF_REREQ_MAX_ATTEMPTS) continue; // capped (gaveUp-full case)
 
-        uint32_t delay   = _cfLedgerRerequestDelay(e);
-        uint32_t elapsed = (now >= e->requestedAt) ? (now - e->requestedAt) : 0;
-        if (elapsed >= delay) {
+        if (_cfLedgerDue(e, now)) {
             e->attempts++;
             e->requestedAt = now;   // re-stamp for the next backoff step
             if (outHeight) *outHeight = e->height;
@@ -446,6 +469,55 @@ int BRCFScanLedgerNextRerequest(BRCFScanLedger *l, uint32_t now, uint32_t *outHe
         }
     }
     return 0;
+}
+
+// ---- Phase-2 residual re-request driver (Task 3) ---------------------------
+// peek/commit + retire: a best-effort path for the RESIDUAL drop set
+// (verify/parse/disconnect). The dominant header-race floor cluster is
+// handled by the Task 2 filter buffer instead, so the earlier
+// livelock/pruning concerns don't apply here.
+
+int BRCFScanLedgerPeekRerequestRange(BRCFScanLedger *l, uint32_t now, uint32_t minHeight,
+                                     uint32_t *outStart, uint32_t *outStop)
+{
+    size_t start = l->outstandingCount;  // no retire here — that's RetireCapped's job
+    for (size_t i = 0; i < l->outstandingCount; i++) {
+        if (l->outstanding[i].height < minHeight) continue;  // lower-bound cursor (livelock guard)
+        if (l->outstanding[i].attempts < CF_REREQ_MAX_ATTEMPTS && _cfLedgerDue(&l->outstanding[i], now)) {
+            start = i;
+            break;
+        }
+    }
+    if (start == l->outstandingCount) return 0;
+
+    const BRCFOutstanding *s = &l->outstanding[start];
+    size_t end = start;
+    while (end + 1 < l->outstandingCount) {
+        const BRCFOutstanding *nx = &l->outstanding[end + 1];
+        if (nx->height != l->outstanding[end].height + 1) break;     // must be contiguous
+        if (nx->attempts >= CF_REREQ_MAX_ATTEMPTS) break;            // capped: stop the run
+        if (! _cfLedgerDue(nx, now)) break;                          // not yet due: stop the run
+        if (nx->port != s->port || ! UInt128Eq(nx->peer, s->peer)) break; // same (peer,port) only
+        if (nx->height - s->height + 1 > CF_REREQ_MAX_RANGE) break;  // cap the coalesced run
+        end++;
+    }
+    *outStart = l->outstanding[start].height;
+    *outStop  = l->outstanding[end].height;
+    return 1;   // NO mutation of the offered run — Commit does the mutation
+}
+
+void BRCFScanLedgerCommitRerequest(BRCFScanLedger *l, uint32_t startH, uint32_t stopH,
+                                   UInt128 peer, uint16_t port, uint32_t now)
+{
+    for (size_t i = 0; i < l->outstandingCount; i++) {
+        uint32_t h = l->outstanding[i].height;
+        if (h >= startH && h <= stopH) {
+            l->outstanding[i].attempts++;
+            l->outstanding[i].requestedAt = now;
+            l->outstanding[i].peer = peer;
+            l->outstanding[i].port = port;
+        }
+    }
 }
 
 // ---- reporters -------------------------------------------------------------

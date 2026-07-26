@@ -80,6 +80,7 @@ extern "C" {
 #define CF_REREQ_BASE_SECS        30  // all other holes: base delay
 #define CF_REREQ_BACKOFF_CAP_SECS 120 // delay = min(BASE << attempts, CAP) → 30/60/120/120/120
 #define CF_REREQ_MAX_ATTEMPTS      5  // per-height cap; on reaching it → gaveUp list (NEVER silent)
+#define CF_REREQ_MAX_RANGE      1000  // == MAX_CFILTERS_RESULTS (BRPeer.h:116) — Peek's coalesced-run cap
 
 // Filter-byte buffer (Phase 2 Task 2, §7) — a header-race-dropped cfilter's raw
 // (unverified) bytes are held here, keyed by blockHash, until its header AND
@@ -202,6 +203,38 @@ void     BRCFScanLedgerReArmPeer(BRCFScanLedger *l, UInt128 peer, uint16_t port)
 // writes *outHeight when a height is offered, else 0. Always compiled so it is
 // unit-testable; production gates its invocation on CF_LEDGER_DRIVE_REREQUEST.
 int      BRCFScanLedgerNextRerequest(BRCFScanLedger *l, uint32_t now, uint32_t *outHeight);
+
+// ---- Phase-2 residual re-request driver (Task 3, peek/commit + retire) ----
+// Serves only the RESIDUAL drop set (verify/parse/disconnect — the dominant
+// header-race floor cluster is handled by the Task 2 filter buffer instead).
+// The three-call shape lets the caller (BRPeerManager) build a real
+// getcfilters wire message from the offered range before committing to it:
+// a failed/partial send never burns an attempt on heights it didn't reach.
+
+// Move every outstanding entry that has reached CF_REREQ_MAX_ATTEMPTS to the
+// gaveUp list (reported, never silently dropped). PUBLIC — the caller runs
+// this once per driver "tick", NOT automatically inside Peek.
+void     BRCFScanLedgerRetireCapped(BRCFScanLedger *l);
+
+// Offer (without mutating) the lowest-height outstanding, sub-cap-attempt,
+// due (backoff-elapsed per the pinned schedule) hole at height >= minHeight.
+// Coalesces forward into the longest contiguous run sharing the same
+// (peer,port), all due, all sub-cap, capped at CF_REREQ_MAX_RANGE heights.
+// Writes [*outStart..*outStop] and returns 1 when a run is offered, 0 if
+// nothing is due. Does NOT retire capped entries (see RetireCapped) and does
+// NOT bump attempts/timestamps (see CommitRerequest) — purely a peek.
+int      BRCFScanLedgerPeekRerequestRange(BRCFScanLedger *l, uint32_t now, uint32_t minHeight,
+                                          uint32_t *outStart, uint32_t *outStop);
+
+// Record that a getcfilters covering [startH..stopH] was actually sent to
+// (peer,port) at `now`: for every height in range that is STILL outstanding,
+// bump its attempt count and re-stamp its peer/port/requestedAt. Heights in
+// range that were already evaluated (no longer outstanding) are silently
+// skipped. A caller that only sent part of an offered range (e.g. a partial
+// batch) should pass just the sub-range that actually went on the wire — the
+// rest keeps its old attempt count and is offered again next tick.
+void     BRCFScanLedgerCommitRerequest(BRCFScanLedger *l, uint32_t startH, uint32_t stopH,
+                                       UInt128 peer, uint16_t port, uint32_t now);
 
 uint32_t BRCFScanLedgerScannedThrough(const BRCFScanLedger *l);
 size_t   BRCFScanLedgerOutstandingCount(const BRCFScanLedger *l);

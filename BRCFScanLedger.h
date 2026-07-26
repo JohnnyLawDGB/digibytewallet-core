@@ -81,6 +81,16 @@ extern "C" {
 #define CF_REREQ_BACKOFF_CAP_SECS 120 // delay = min(BASE << attempts, CAP) → 30/60/120/120/120
 #define CF_REREQ_MAX_ATTEMPTS      5  // per-height cap; on reaching it → gaveUp list (NEVER silent)
 
+// Filter-byte buffer (Phase 2 Task 2, §7) — a header-race-dropped cfilter's raw
+// (unverified) bytes are held here, keyed by blockHash, until its header AND
+// cfheader both connect. Byte-budgeted, not count-budgeted: eviction is driven
+// by CF_FILTER_BUFFER_MAX_BYTES; CF_FILTER_BUF_SLOTS is only a fixed-capacity
+// backstop against a pathological run of many tiny filters exhausting the
+// pointer array (real GCS filters average well under budget/slots bytes).
+#define CF_FILTER_BUFFER_MAX_BYTES 262144  // 256 KiB total buffered raw filter bytes
+#define CF_FILTER_DRAIN_PER_TICK   128      // max READY entries dispatched per DrainConnected call
+#define CF_FILTER_BUF_SLOTS        2048     // fixed-capacity backstop, independent of the byte budget
+
 // ---- Records ---------------------------------------------------------------
 
 // One requested-but-not-yet-evaluated height. `outstanding` is kept sorted
@@ -104,6 +114,17 @@ typedef struct {
     uint32_t recordedAt;
 } BRCFPendingConfirm;
 
+// One buffered raw (unverified) cfilter awaiting both its block header and its
+// cfheader to connect. `bytes` is a malloc'd copy of the wire payload; freed on
+// eviction, drain-removal, ClearFilterBuffer, or Free. In-memory only — NOT
+// persisted (§ClearFilterBuffer note d: process death -> normal floor re-anchor).
+typedef struct {
+    UInt256  blockHash;
+    uint8_t *bytes;
+    size_t   len;
+    uint32_t at;    // unix secs when buffered (observability only)
+} BRCFFilterBufEntry;
+
 typedef struct {
     uint32_t start;              // birth height, inclusive (mirrors autoFetchCFiltersStart)
     uint32_t scannedThrough;     // contiguous high-water: EVERY height in [start..this] was EVALUATED
@@ -117,6 +138,18 @@ typedef struct {
     uint32_t           gaveUp[CF_GAVEUP_MAX];  // sorted ascending; heights past the attempt cap — reported,
     size_t             gaveUpCount;            //   persisted, NEVER silently dropped (else we rebuild the bug)
     uint32_t           lastDriveAt;            // re-request driver throttle (Phase 2)
+
+    // Filter-byte buffer (Task 2, §7): FIFO, oldest at index 0. In-memory only —
+    // NOT persisted (Serialize/Parse never touch this section).
+    BRCFFilterBufEntry *filterBuf[CF_FILTER_BUF_SLOTS];
+    size_t              filterBufCount;
+    size_t              bufferedBytes;
+    // Internal validity marker (NOT part of the persisted/public contract): set
+    // by Init/Parse/BufferFilter once the struct is a real, live ledger. Lets
+    // the free-before-memset step in Init/Parse tell a live filterBuf[] apart
+    // from raw/uninitialized memory (a freshly-declared, never-Init'd struct)
+    // before trusting filterBufCount enough to call free() on its entries.
+    uint32_t            filterBufMagic;
 } BRCFScanLedger;
 
 // ---- Pure operations (host-testable) ---------------------------------------
@@ -174,6 +207,47 @@ size_t   BRCFScanLedgerGaveUpCount(const BRCFScanLedger *l);
 // for the JNI/UI hole report. Writes up to `cap` ranges into outStarts/outEnds
 // and returns the number written.
 size_t   BRCFScanLedgerHoleRanges(const BRCFScanLedger *l, uint32_t *outStarts, uint32_t *outEnds, size_t cap);
+
+// ---- Filter-byte buffer (§7, header-race hold) -----------------------------
+
+// Store a raw (unverified) cfilter keyed by blockHash. De-dups by hash (a
+// re-buffer of the same block replaces its bytes in place). Byte-budgeted:
+// while bufferedBytes + len > CF_FILTER_BUFFER_MAX_BYTES, evicts the OLDEST
+// entry (FIFO; freed) to make room. Returns 1 if stored, 0 if the single
+// filter itself exceeds the budget (caller leaves the height outstanding for
+// the ordinary re-request fallback — nothing is buffered in that case).
+int      BRCFScanLedgerBufferFilter(BRCFScanLedger *l, UInt256 blockHash,
+                                     const uint8_t *bytes, size_t len, uint32_t now);
+
+// For up to maxDrain buffered entries whose isReady(blockHash)->height returns
+// 1, copy the bytes (bounded by scratchCap) into scratch and call
+// evalFn(ctx, height, blockHash, scratch, len). The entry is removed (and its
+// bytes freed) ONLY when evalFn returns 1 (credited, or a clean verified
+// miss); a 0 return (a wallet HIT that could not dispatch this tick — e.g. no
+// CF-capable peer connected) KEEPS the entry buffered so the next tick
+// retries. isReady requires the caller to gate on BOTH the block header and
+// the cfheader for that height — buffered bytes are raw/unverified. Returns
+// the number of entries REMOVED. Pure: reaches BRPeerManager only through the
+// two function pointers.
+size_t   BRCFScanLedgerDrainConnected(BRCFScanLedger *l,
+                                      int (*isReady)(void *ctx, UInt256 blockHash, uint32_t *outHeight),
+                                      void *ctx,
+                                      uint8_t *scratch, size_t scratchCap,
+                                      int (*evalFn)(void *ctx, uint32_t height, UInt256 blockHash,
+                                                    const uint8_t *bytes, size_t len),
+                                      size_t maxDrain);
+
+// Free and discard ALL buffered filter bytes (re-anchor/wipe). In-memory only —
+// the ledger's persisted fields are unaffected; a re-anchored/rescanned floor
+// naturally re-requests anything that was buffered here.
+void     BRCFScanLedgerClearFilterBuffer(BRCFScanLedger *l);
+
+// Free all buffered filter bytes (teardown). Safe to call on an empty (or
+// never-buffered) ledger. Call from BRPeerManagerFree alongside the other frees.
+void     BRCFScanLedgerFree(BRCFScanLedger *l);
+
+size_t   BRCFScanLedgerBufferedCount(const BRCFScanLedger *l);
+size_t   BRCFScanLedgerBufferedBytes(const BRCFScanLedger *l);
 
 // ---- Pending-confirm (confirmation-side twin) ------------------------------
 

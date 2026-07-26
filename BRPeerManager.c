@@ -3433,6 +3433,7 @@ void BRPeerManagerFree(BRPeerManager *manager)
         BRCompactFilterChainFree(manager->compactFilterChain);
         manager->compactFilterChain = NULL;
     }
+    BRCFScanLedgerFree(&manager->cfLedger); // frees any still-buffered raw filter bytes (Phase 2 Task 2)
     pthread_mutex_unlock(&manager->lock);
     pthread_mutex_destroy(&manager->lock);
     free(manager);

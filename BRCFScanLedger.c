@@ -91,11 +91,166 @@ static void _cfLedgerRemoveGaveUp(BRCFScanLedger *l, uint32_t height)
     }
 }
 
+// ---- filter-byte buffer (§7, header-race hold) -----------------------------
+
+#define CF_FILTER_BUF_MAGIC 0x43464246u  // "CFBF" — marks a live (Init'd/Parse'd) filter buffer
+
+static void _cfLedgerFreeFilterEntry(BRCFFilterBufEntry *e)
+{
+    if (! e) return;
+    free(e->bytes);
+    free(e);
+}
+
+// Free every buffered entry and reset the buffer to empty. Guarded by
+// filterBufMagic: on a struct that has never been through Init/Parse/
+// BufferFilter (raw/uninitialized memory), filterBufCount and filterBuf[] are
+// garbage — the magic check keeps this a safe no-op in that case instead of
+// calling free() on whatever garbage bit pattern happens to look like a
+// pointer. On a genuinely live ledger the magic is set and every entry is
+// freed as expected.
+static void _cfLedgerFreeFilterBuffer(BRCFScanLedger *l)
+{
+    if (l->filterBufMagic == CF_FILTER_BUF_MAGIC) {
+        size_t n = l->filterBufCount;
+        if (n > CF_FILTER_BUF_SLOTS) n = CF_FILTER_BUF_SLOTS; // defensive bound
+        for (size_t i = 0; i < n; i++) {
+            _cfLedgerFreeFilterEntry(l->filterBuf[i]);
+            l->filterBuf[i] = NULL;
+        }
+    }
+    l->filterBufCount = 0;
+    l->bufferedBytes  = 0;
+}
+
+static void _cfLedgerEvictOldestFilter(BRCFScanLedger *l)
+{
+    if (l->filterBufCount == 0) return;
+    BRCFFilterBufEntry *e = l->filterBuf[0];
+    l->bufferedBytes -= e->len;
+    _cfLedgerFreeFilterEntry(e);
+    memmove(&l->filterBuf[0], &l->filterBuf[1], (l->filterBufCount - 1) * sizeof(l->filterBuf[0]));
+    l->filterBufCount--;
+}
+
+int BRCFScanLedgerBufferFilter(BRCFScanLedger *l, UInt256 blockHash,
+                               const uint8_t *bytes, size_t len, uint32_t now)
+{
+    l->filterBufMagic = CF_FILTER_BUF_MAGIC; // this ledger is definitely live now
+
+    if (len > CF_FILTER_BUFFER_MAX_BYTES) return 0; // can never fit even alone
+
+    // De-dup by hash: replace bytes in place, keeping the entry's FIFO position.
+    for (size_t i = 0; i < l->filterBufCount; i++) {
+        BRCFFilterBufEntry *e = l->filterBuf[i];
+        if (UInt256Eq(e->blockHash, blockHash)) {
+            uint8_t *copy = malloc(len ? len : 1);
+            memcpy(copy, bytes, len);
+            free(e->bytes);
+            e->bytes = copy;
+            l->bufferedBytes = l->bufferedBytes - e->len + len;
+            e->len = len;
+            e->at  = now;
+            // >= (not just >): keep the resident total strictly under the cap
+            // once a churn is underway, rather than letting it settle exactly
+            // AT the cap — see BufferFilter's insert-path comment below.
+            while (l->bufferedBytes >= CF_FILTER_BUFFER_MAX_BYTES && l->filterBufCount > 1) {
+                _cfLedgerEvictOldestFilter(l);
+            }
+            return 1;
+        }
+    }
+
+    // FIFO-evict-oldest while the incoming filter would meet-or-push us over
+    // budget. >= (not just >): CF_FILTER_BUFFER_MAX_BYTES divides evenly by
+    // common filter sizes, so a strict > would let bufferedBytes settle
+    // exactly AT the cap and never trigger again on same-size churn — using
+    // >= keeps eviction live (a byte-for-byte swap never grows unbounded).
+    while (l->bufferedBytes + len >= CF_FILTER_BUFFER_MAX_BYTES && l->filterBufCount > 0) {
+        _cfLedgerEvictOldestFilter(l);
+    }
+    // Fixed-capacity backstop, independent of the byte budget — guards against
+    // a pathological run of many tiny filters exhausting the pointer array.
+    if (l->filterBufCount >= CF_FILTER_BUF_SLOTS) {
+        _cfLedgerEvictOldestFilter(l);
+    }
+
+    BRCFFilterBufEntry *entry = malloc(sizeof(*entry));
+    entry->blockHash = blockHash;
+    entry->bytes     = malloc(len ? len : 1);
+    memcpy(entry->bytes, bytes, len);
+    entry->len = len;
+    entry->at  = now;
+
+    l->filterBuf[l->filterBufCount] = entry;
+    l->filterBufCount++;
+    l->bufferedBytes += len;
+    return 1;
+}
+
+size_t BRCFScanLedgerDrainConnected(BRCFScanLedger *l,
+                                    int (*isReady)(void *ctx, UInt256 blockHash, uint32_t *outHeight),
+                                    void *ctx,
+                                    uint8_t *scratch, size_t scratchCap,
+                                    int (*evalFn)(void *ctx, uint32_t height, UInt256 blockHash,
+                                                  const uint8_t *bytes, size_t len),
+                                    size_t maxDrain)
+{
+    size_t removed   = 0;
+    size_t processed = 0;
+    size_t i = 0;
+
+    while (i < l->filterBufCount && processed < maxDrain) {
+        BRCFFilterBufEntry *e = l->filterBuf[i];
+        uint32_t height = 0;
+
+        if (! isReady || ! isReady(ctx, e->blockHash, &height)) {
+            i++; // not ready yet — leave it, check the next entry
+            continue;
+        }
+
+        processed++;
+
+        size_t n = e->len;
+        if (n > scratchCap) n = scratchCap; // defensive: never overrun the caller's scratch buffer
+        if (scratch && n > 0) memcpy(scratch, e->bytes, n);
+
+        int credited = evalFn ? evalFn(ctx, height, e->blockHash, scratch, n) : 0;
+        if (credited) {
+            l->bufferedBytes -= e->len;
+            _cfLedgerFreeFilterEntry(e);
+            memmove(&l->filterBuf[i], &l->filterBuf[i + 1],
+                    (l->filterBufCount - i - 1) * sizeof(l->filterBuf[0]));
+            l->filterBufCount--;
+            removed++;
+            // do not advance i — the next entry has shifted into slot i
+        } else {
+            i++; // evalFn couldn't dispatch this tick (e.g. no CF peer) — keep, retry next tick
+        }
+    }
+    return removed;
+}
+
+void BRCFScanLedgerClearFilterBuffer(BRCFScanLedger *l)
+{
+    _cfLedgerFreeFilterBuffer(l);
+}
+
+void BRCFScanLedgerFree(BRCFScanLedger *l)
+{
+    _cfLedgerFreeFilterBuffer(l);
+}
+
+size_t BRCFScanLedgerBufferedCount(const BRCFScanLedger *l) { return l->filterBufCount; }
+size_t BRCFScanLedgerBufferedBytes(const BRCFScanLedger *l) { return l->bufferedBytes; }
+
 // ---- init ------------------------------------------------------------------
 
 void BRCFScanLedgerInit(BRCFScanLedger *l, uint32_t start)
 {
+    _cfLedgerFreeFilterBuffer(l); // BEFORE the memset below — else a live filterBuf[] leaks
     memset(l, 0, sizeof(*l));
+    l->filterBufMagic = CF_FILTER_BUF_MAGIC;
     l->start = start;
     // Nothing evaluated/requested yet: floor sits just below the birth height.
     // Birth height is a real block (>0); guard the genesis degenerate case.
@@ -429,7 +584,9 @@ size_t BRCFScanLedgerSerialize(const BRCFScanLedger *l, uint8_t *buf, size_t buf
 int BRCFScanLedgerParse(BRCFScanLedger *l, const uint8_t *buf, size_t buflen)
 {
     // Garbled/short blob -> empty ledger (caller rebuilds via re-anchor/rescan).
+    _cfLedgerFreeFilterBuffer(l); // BEFORE the memset below — else a live filterBuf[] leaks
     memset(l, 0, sizeof(*l));
+    l->filterBufMagic = CF_FILTER_BUF_MAGIC;
     if (buf == NULL || buflen < 24) return 0;
 
     const uint8_t *p = buf;

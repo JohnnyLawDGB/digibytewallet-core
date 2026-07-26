@@ -60,7 +60,14 @@ extern "C" {
 // NOTE: this gate is a CALLER guard. BRCFScanLedgerNextRerequest (the Phase-2
 // driver logic) is ALWAYS compiled so it stays unit-testable; production simply
 // does not invoke it while the gate is 0.
-#define CF_LEDGER_DRIVE_REREQUEST 0
+#ifndef CF_LEDGER_DRIVE_REREQUEST
+#define CF_LEDGER_DRIVE_REREQUEST 1   // Phase 2: driver ARMED (buffer-drain + residual re-request + back-pressure). -D wins for KATs.
+#endif
+
+// Sentinel: "no height was evicted" — returned by the overflow-drop-reporting
+// insert/record paths so a real (32-bit) evicted height is never ambiguous
+// with "nothing dropped".
+#define CF_LEDGER_NO_DROP 0xFFFFFFFFu
 
 // ---- Bounds & pinned constants (§3) ----------------------------------------
 #define CF_OUTSTANDING_MAX      4096  // hard cap; overflow drops OLDEST (caller LOGWs its height range)
@@ -73,6 +80,27 @@ extern "C" {
 #define CF_REREQ_BASE_SECS        30  // all other holes: base delay
 #define CF_REREQ_BACKOFF_CAP_SECS 120 // delay = min(BASE << attempts, CAP) → 30/60/120/120/120
 #define CF_REREQ_MAX_ATTEMPTS      5  // per-height cap; on reaching it → gaveUp list (NEVER silent)
+#define CF_REREQ_MAX_RANGE      1000  // == MAX_CFILTERS_RESULTS (BRPeer.h:116) — Peek's coalesced-run cap
+
+// Phase-2 driver back-pressure (Task 5, BRPeerManagerKeepAlive) — PINNED 2026-07-26:
+// forward auto-fetch pauses once outstandingCount reaches this low-water mark, so a
+// stalled/slow filter peer can't grow the outstanding set past CF_OUTSTANDING_MAX
+// (which would start silently evicting the oldest holes). Left with headroom under
+// the hard cap so eviction should never actually trigger in practice.
+#define CF_OUTSTANDING_LOWWATER 3072
+// Cap on residual re-request ranges (peek/commit) offered per BRPeerManagerKeepAlive
+// tick — bounds the driver's per-tick work under a large outstanding/gaveUp set.
+#define CF_REREQ_BATCH_PER_TICK   64
+
+// Filter-byte buffer (Phase 2 Task 2, §7) — a header-race-dropped cfilter's raw
+// (unverified) bytes are held here, keyed by blockHash, until its header AND
+// cfheader both connect. Byte-budgeted, not count-budgeted: eviction is driven
+// by CF_FILTER_BUFFER_MAX_BYTES; CF_FILTER_BUF_SLOTS is only a fixed-capacity
+// backstop against a pathological run of many tiny filters exhausting the
+// pointer array (real GCS filters average well under budget/slots bytes).
+#define CF_FILTER_BUFFER_MAX_BYTES 262144  // 256 KiB total buffered raw filter bytes
+#define CF_FILTER_DRAIN_PER_TICK   128      // max READY entries dispatched per DrainConnected call
+#define CF_FILTER_BUF_SLOTS        2048     // fixed-capacity backstop, independent of the byte budget
 
 // ---- Records ---------------------------------------------------------------
 
@@ -97,6 +125,17 @@ typedef struct {
     uint32_t recordedAt;
 } BRCFPendingConfirm;
 
+// One buffered raw (unverified) cfilter awaiting both its block header and its
+// cfheader to connect. `bytes` is a malloc'd copy of the wire payload; freed on
+// eviction, drain-removal, ClearFilterBuffer, or Free. In-memory only — NOT
+// persisted (§ClearFilterBuffer note d: process death -> normal floor re-anchor).
+typedef struct {
+    UInt256  blockHash;
+    uint8_t *bytes;
+    size_t   len;
+    uint32_t at;    // unix secs when buffered (observability only)
+} BRCFFilterBufEntry;
+
 typedef struct {
     uint32_t start;              // birth height, inclusive (mirrors autoFetchCFiltersStart)
     uint32_t scannedThrough;     // contiguous high-water: EVERY height in [start..this] was EVALUATED
@@ -110,6 +149,22 @@ typedef struct {
     uint32_t           gaveUp[CF_GAVEUP_MAX];  // sorted ascending; heights past the attempt cap — reported,
     size_t             gaveUpCount;            //   persisted, NEVER silently dropped (else we rebuild the bug)
     uint32_t           lastDriveAt;            // re-request driver throttle (Phase 2)
+
+    // Filter-byte buffer (Task 2, §7): FIFO, oldest at index 0. In-memory only —
+    // NOT persisted (Serialize/Parse never touch this section).
+    BRCFFilterBufEntry *filterBuf[CF_FILTER_BUF_SLOTS];
+    size_t              filterBufCount;
+    size_t              bufferedBytes;
+    // Internal marker (NOT part of the persisted/public contract, NOT a
+    // memory-safety guarantee): set only by Init/Parse. It is a defensive
+    // heuristic so the free-before-memset step in Init/Parse behaves
+    // predictably under the host-KAT's unzeroed-stack test pattern (see the
+    // comment on _cfLedgerFreeFilterBuffer in BRCFScanLedger.c for why it
+    // isn't, and can't be, a real guarantee). The actual precondition every
+    // caller must uphold is: `l` is zeroed (e.g. calloc'd, as the real
+    // production BRPeerManager ledger always is) or already Init/Parse'd
+    // before the first BufferFilter/Init/Parse call on it.
+    uint32_t            filterBufMagic;
 } BRCFScanLedger;
 
 // ---- Pure operations (host-testable) ---------------------------------------
@@ -125,6 +180,16 @@ void     BRCFScanLedgerInit(BRCFScanLedger *l, uint32_t start);
 // loud height-range log is the caller's job.
 void     BRCFScanLedgerRecordRequested(BRCFScanLedger *l, uint32_t startH, uint32_t stopH,
                                         UInt128 peer, uint16_t port, uint32_t now);
+
+// Same as BRCFScanLedgerRecordRequested but never silent about CF_OUTSTANDING_MAX
+// overflow: returns the count of oldest heights evicted to make room and, if
+// outLow/outHigh are non-NULL, writes the evicted heights' [low..high] range
+// (CF_LEDGER_NO_DROP in each if none were evicted). requestedThrough still
+// advances to stopH regardless — it is scannedThrough's ceiling and must never
+// fail to track the caller's actual request range.
+int      BRCFScanLedgerRecordRequestedDropped(BRCFScanLedger *l, uint32_t startH, uint32_t stopH,
+                                              UInt128 peer, uint16_t port, uint32_t now,
+                                              uint32_t *outLow, uint32_t *outHigh);
 
 // A cfilter for `height` was evaluated (matched or cleanly missed). Remove it
 // from outstanding (and, defensively, gaveUp) and advance scannedThrough over
@@ -149,6 +214,38 @@ void     BRCFScanLedgerReArmPeer(BRCFScanLedger *l, UInt128 peer, uint16_t port)
 // unit-testable; production gates its invocation on CF_LEDGER_DRIVE_REREQUEST.
 int      BRCFScanLedgerNextRerequest(BRCFScanLedger *l, uint32_t now, uint32_t *outHeight);
 
+// ---- Phase-2 residual re-request driver (Task 3, peek/commit + retire) ----
+// Serves only the RESIDUAL drop set (verify/parse/disconnect — the dominant
+// header-race floor cluster is handled by the Task 2 filter buffer instead).
+// The three-call shape lets the caller (BRPeerManager) build a real
+// getcfilters wire message from the offered range before committing to it:
+// a failed/partial send never burns an attempt on heights it didn't reach.
+
+// Move every outstanding entry that has reached CF_REREQ_MAX_ATTEMPTS to the
+// gaveUp list (reported, never silently dropped). PUBLIC — the caller runs
+// this once per driver "tick", NOT automatically inside Peek.
+void     BRCFScanLedgerRetireCapped(BRCFScanLedger *l);
+
+// Offer (without mutating) the lowest-height outstanding, sub-cap-attempt,
+// due (backoff-elapsed per the pinned schedule) hole at height >= minHeight.
+// Coalesces forward into the longest contiguous run sharing the same
+// (peer,port), all due, all sub-cap, capped at CF_REREQ_MAX_RANGE heights.
+// Writes [*outStart..*outStop] and returns 1 when a run is offered, 0 if
+// nothing is due. Does NOT retire capped entries (see RetireCapped) and does
+// NOT bump attempts/timestamps (see CommitRerequest) — purely a peek.
+int      BRCFScanLedgerPeekRerequestRange(BRCFScanLedger *l, uint32_t now, uint32_t minHeight,
+                                          uint32_t *outStart, uint32_t *outStop);
+
+// Record that a getcfilters covering [startH..stopH] was actually sent to
+// (peer,port) at `now`: for every height in range that is STILL outstanding,
+// bump its attempt count and re-stamp its peer/port/requestedAt. Heights in
+// range that were already evaluated (no longer outstanding) are silently
+// skipped. A caller that only sent part of an offered range (e.g. a partial
+// batch) should pass just the sub-range that actually went on the wire — the
+// rest keeps its old attempt count and is offered again next tick.
+void     BRCFScanLedgerCommitRerequest(BRCFScanLedger *l, uint32_t startH, uint32_t stopH,
+                                       UInt128 peer, uint16_t port, uint32_t now);
+
 uint32_t BRCFScanLedgerScannedThrough(const BRCFScanLedger *l);
 size_t   BRCFScanLedgerOutstandingCount(const BRCFScanLedger *l);
 size_t   BRCFScanLedgerGaveUpCount(const BRCFScanLedger *l);
@@ -157,6 +254,54 @@ size_t   BRCFScanLedgerGaveUpCount(const BRCFScanLedger *l);
 // for the JNI/UI hole report. Writes up to `cap` ranges into outStarts/outEnds
 // and returns the number written.
 size_t   BRCFScanLedgerHoleRanges(const BRCFScanLedger *l, uint32_t *outStarts, uint32_t *outEnds, size_t cap);
+
+// ---- Filter-byte buffer (§7, header-race hold) -----------------------------
+
+// PRECONDITION: `l` must already have been through BRCFScanLedgerInit or
+// BRCFScanLedgerParse (or otherwise be a zeroed struct) before the FIRST call
+// to BufferFilter. BufferFilter does not — and cannot — establish that on its
+// own: it reads filterBufCount/filterBuf[] as part of the de-dup scan on
+// every call, so calling it on a never-Init'd struct is unconditionally
+// unsafe regardless of anything BufferFilter itself does first.
+//
+// Store a raw (unverified) cfilter keyed by blockHash. De-dups by hash (a
+// re-buffer of the same block replaces its bytes in place). Byte-budgeted:
+// while bufferedBytes + len > CF_FILTER_BUFFER_MAX_BYTES, evicts the OLDEST
+// entry (FIFO; freed) to make room. Returns 1 if stored, 0 if the single
+// filter itself exceeds the budget (caller leaves the height outstanding for
+// the ordinary re-request fallback — nothing is buffered in that case).
+int      BRCFScanLedgerBufferFilter(BRCFScanLedger *l, UInt256 blockHash,
+                                     const uint8_t *bytes, size_t len, uint32_t now);
+
+// For up to maxDrain buffered entries whose isReady(blockHash)->height returns
+// 1, copy the bytes (bounded by scratchCap) into scratch and call
+// evalFn(ctx, height, blockHash, scratch, len). The entry is removed (and its
+// bytes freed) ONLY when evalFn returns 1 (credited, or a clean verified
+// miss); a 0 return (a wallet HIT that could not dispatch this tick — e.g. no
+// CF-capable peer connected) KEEPS the entry buffered so the next tick
+// retries. isReady requires the caller to gate on BOTH the block header and
+// the cfheader for that height — buffered bytes are raw/unverified. Returns
+// the number of entries REMOVED. Pure: reaches BRPeerManager only through the
+// two function pointers.
+size_t   BRCFScanLedgerDrainConnected(BRCFScanLedger *l,
+                                      int (*isReady)(void *ctx, UInt256 blockHash, uint32_t *outHeight),
+                                      void *ctx,
+                                      uint8_t *scratch, size_t scratchCap,
+                                      int (*evalFn)(void *ctx, uint32_t height, UInt256 blockHash,
+                                                    const uint8_t *bytes, size_t len),
+                                      size_t maxDrain);
+
+// Free and discard ALL buffered filter bytes (re-anchor/wipe). In-memory only —
+// the ledger's persisted fields are unaffected; a re-anchored/rescanned floor
+// naturally re-requests anything that was buffered here.
+void     BRCFScanLedgerClearFilterBuffer(BRCFScanLedger *l);
+
+// Free all buffered filter bytes (teardown). Safe to call on an empty (or
+// never-buffered) ledger. Call from BRPeerManagerFree alongside the other frees.
+void     BRCFScanLedgerFree(BRCFScanLedger *l);
+
+size_t   BRCFScanLedgerBufferedCount(const BRCFScanLedger *l);
+size_t   BRCFScanLedgerBufferedBytes(const BRCFScanLedger *l);
 
 // ---- Pending-confirm (confirmation-side twin) ------------------------------
 

@@ -91,11 +91,189 @@ static void _cfLedgerRemoveGaveUp(BRCFScanLedger *l, uint32_t height)
     }
 }
 
+// ---- filter-byte buffer (§7, header-race hold) -----------------------------
+
+#define CF_FILTER_BUF_MAGIC 0x43464246u  // "CFBF" — marks a live (Init'd/Parse'd) filter buffer
+
+static void _cfLedgerFreeFilterEntry(BRCFFilterBufEntry *e)
+{
+    if (! e) return;
+    free(e->bytes);
+    free(e);
+}
+
+// Free every buffered entry and reset the buffer to empty.
+//
+// filterBufMagic is a defensive HEURISTIC, not a memory-safety guarantee: it
+// exists only to make the host-KAT's raw-stack test pattern
+// (`BRCFScanLedger l; BRCFScanLedgerInit(&l, 1);` — no calloc, no memset by
+// the test itself) behave safely across the many sibling test functions in
+// that binary that reuse the same stack slot. The REAL production ledger is
+// a field embedded in a `calloc`'d BRPeerManager (BRPeerManager.c), so it is
+// already zeroed the first time Init ever touches it — filterBufMagic does
+// nothing for that path. On a virgin (never-written) stack struct, reading
+// filterBufMagic is itself a read of indeterminate memory, which is
+// undefined behavior that plain ASan does not flag (that's MSan's job); the
+// magic check just makes the overwhelmingly likely outcome (a mismatch, so
+// this function no-ops instead of calling free() on garbage) the guaranteed
+// one for the specific reuse pattern this test binary exhibits. It is not a
+// substitute for the real precondition: `l` must already be a live
+// (Init/Parse'd) or zeroed struct before this is called.
+static void _cfLedgerFreeFilterBuffer(BRCFScanLedger *l)
+{
+    if (l->filterBufMagic == CF_FILTER_BUF_MAGIC) {
+        size_t n = l->filterBufCount;
+        if (n > CF_FILTER_BUF_SLOTS) n = CF_FILTER_BUF_SLOTS; // defensive bound
+        for (size_t i = 0; i < n; i++) {
+            _cfLedgerFreeFilterEntry(l->filterBuf[i]);
+            l->filterBuf[i] = NULL;
+        }
+    }
+    l->filterBufCount = 0;
+    l->bufferedBytes  = 0;
+}
+
+static void _cfLedgerEvictOldestFilter(BRCFScanLedger *l)
+{
+    if (l->filterBufCount == 0) return;
+    BRCFFilterBufEntry *e = l->filterBuf[0];
+    l->bufferedBytes -= e->len;
+    _cfLedgerFreeFilterEntry(e);
+    memmove(&l->filterBuf[0], &l->filterBuf[1], (l->filterBufCount - 1) * sizeof(l->filterBuf[0]));
+    l->filterBufCount--;
+}
+
+// PRECONDITION (see BRCFScanLedger.h): `l` must already be Init/Parse'd (or
+// otherwise zeroed) before the first call — this function reads
+// filterBufCount/filterBuf[] below as part of the de-dup scan, so there is no
+// line it could add here that would make an un-Init'd struct safe. It does
+// NOT stamp filterBufMagic itself: Init/Parse already do that, and stamping
+// it here would be a no-op for a struct that satisfies the precondition, and
+// would NOT rescue one that doesn't (the de-dup loop right below still walks
+// filterBufCount before this function could establish anything).
+int BRCFScanLedgerBufferFilter(BRCFScanLedger *l, UInt256 blockHash,
+                               const uint8_t *bytes, size_t len, uint32_t now)
+{
+    if (len > CF_FILTER_BUFFER_MAX_BYTES) return 0; // can never fit even alone
+
+    // De-dup by hash: replace bytes in place, keeping the entry's FIFO position.
+    for (size_t i = 0; i < l->filterBufCount; i++) {
+        BRCFFilterBufEntry *e = l->filterBuf[i];
+        if (UInt256Eq(e->blockHash, blockHash)) {
+            uint8_t *copy = malloc(len ? len : 1);
+            memcpy(copy, bytes, len);
+            free(e->bytes);
+            e->bytes = copy;
+            l->bufferedBytes = l->bufferedBytes - e->len + len;
+            e->len = len;
+            e->at  = now;
+            // >= (not just >): keep the resident total strictly under the cap
+            // once a churn is underway, rather than letting it settle exactly
+            // AT the cap — see BufferFilter's insert-path comment below.
+            while (l->bufferedBytes >= CF_FILTER_BUFFER_MAX_BYTES && l->filterBufCount > 1) {
+                _cfLedgerEvictOldestFilter(l);
+            }
+            return 1;
+        }
+    }
+
+    // FIFO-evict-oldest while the incoming filter would meet-or-push us over
+    // budget. >= (not just >): CF_FILTER_BUFFER_MAX_BYTES divides evenly by
+    // common filter sizes, so a strict > would let bufferedBytes settle
+    // exactly AT the cap and never trigger again on same-size churn — using
+    // >= keeps eviction live (a byte-for-byte swap never grows unbounded).
+    while (l->bufferedBytes + len >= CF_FILTER_BUFFER_MAX_BYTES && l->filterBufCount > 0) {
+        _cfLedgerEvictOldestFilter(l);
+    }
+    // Fixed-capacity backstop, independent of the byte budget — guards against
+    // a pathological run of many tiny filters exhausting the pointer array.
+    if (l->filterBufCount >= CF_FILTER_BUF_SLOTS) {
+        _cfLedgerEvictOldestFilter(l);
+    }
+
+    BRCFFilterBufEntry *entry = malloc(sizeof(*entry));
+    entry->blockHash = blockHash;
+    entry->bytes     = malloc(len ? len : 1);
+    memcpy(entry->bytes, bytes, len);
+    entry->len = len;
+    entry->at  = now;
+
+    l->filterBuf[l->filterBufCount] = entry;
+    l->filterBufCount++;
+    l->bufferedBytes += len;
+    return 1;
+}
+
+size_t BRCFScanLedgerDrainConnected(BRCFScanLedger *l,
+                                    int (*isReady)(void *ctx, UInt256 blockHash, uint32_t *outHeight),
+                                    void *ctx,
+                                    uint8_t *scratch, size_t scratchCap,
+                                    int (*evalFn)(void *ctx, uint32_t height, UInt256 blockHash,
+                                                  const uint8_t *bytes, size_t len),
+                                    size_t maxDrain)
+{
+    size_t removed   = 0;
+    size_t processed = 0;
+    size_t i = 0;
+
+    while (i < l->filterBufCount && processed < maxDrain) {
+        BRCFFilterBufEntry *e = l->filterBuf[i];
+        uint32_t height = 0;
+
+        if (! isReady || ! isReady(ctx, e->blockHash, &height)) {
+            i++; // not ready yet — leave it, check the next entry
+            continue;
+        }
+
+        processed++;
+
+        size_t n = e->len;
+        if (n > scratchCap) n = scratchCap; // defensive: never overrun the caller's scratch buffer
+        if (scratch && n > 0) memcpy(scratch, e->bytes, n);
+
+        int credited = evalFn ? evalFn(ctx, height, e->blockHash, scratch, n) : 0;
+        if (credited) {
+            l->bufferedBytes -= e->len;
+            _cfLedgerFreeFilterEntry(e);
+            memmove(&l->filterBuf[i], &l->filterBuf[i + 1],
+                    (l->filterBufCount - i - 1) * sizeof(l->filterBuf[0]));
+            l->filterBufCount--;
+            removed++;
+            // do not advance i — the next entry has shifted into slot i
+        } else {
+            i++; // evalFn couldn't dispatch this tick (e.g. no CF peer) — keep, retry next tick
+        }
+    }
+    return removed;
+}
+
+void BRCFScanLedgerClearFilterBuffer(BRCFScanLedger *l)
+{
+    _cfLedgerFreeFilterBuffer(l);
+}
+
+void BRCFScanLedgerFree(BRCFScanLedger *l)
+{
+    _cfLedgerFreeFilterBuffer(l);
+}
+
+size_t BRCFScanLedgerBufferedCount(const BRCFScanLedger *l) { return l->filterBufCount; }
+size_t BRCFScanLedgerBufferedBytes(const BRCFScanLedger *l) { return l->bufferedBytes; }
+
 // ---- init ------------------------------------------------------------------
 
 void BRCFScanLedgerInit(BRCFScanLedger *l, uint32_t start)
 {
+    // BEFORE the memset below — a live filterBuf[] would otherwise leak. The
+    // filterBufMagic check inside is a defensive heuristic for the host-KAT's
+    // unzeroed-stack test pattern, not a memory-safety guarantee (see the
+    // comment on _cfLedgerFreeFilterBuffer). The real production ledger is
+    // always zeroed here already (embedded in a calloc'd BRPeerManager), so
+    // this call is a genuine no-op there — its only job is re-init/reload on
+    // an already-live ledger.
+    _cfLedgerFreeFilterBuffer(l);
     memset(l, 0, sizeof(*l));
+    l->filterBufMagic = CF_FILTER_BUF_MAGIC;
     l->start = start;
     // Nothing evaluated/requested yet: floor sits just below the birth height.
     // Birth height is a real block (>0); guard the genesis degenerate case.
@@ -107,22 +285,25 @@ void BRCFScanLedgerInit(BRCFScanLedger *l, uint32_t start)
 
 // Insert one height into outstanding (sorted, de-duplicated). A height already
 // present just refreshes its target (a re-request). Overflow drops the OLDEST
-// (front / lowest-height) entry in-module; the loud log is the caller's job.
-static void _cfLedgerInsertOutstanding(BRCFScanLedger *l, uint32_t height,
-                                       UInt128 peer, uint16_t port, uint32_t now)
+// (front / lowest-height) entry in-module; returns that dropped height so the
+// caller can report it (CF_LEDGER_NO_DROP if nothing was evicted).
+static uint32_t _cfLedgerInsertOutstanding(BRCFScanLedger *l, uint32_t height,
+                                           UInt128 peer, uint16_t port, uint32_t now)
 {
     size_t i = _cfLedgerLowerBound(l, height);
+    uint32_t dropped = CF_LEDGER_NO_DROP;
 
     if (i < l->outstandingCount && l->outstanding[i].height == height) {
         // Already outstanding — a re-request records the new target/clock.
         l->outstanding[i].peer        = peer;
         l->outstanding[i].port        = port;
         l->outstanding[i].requestedAt = now;
-        return;
+        return dropped;
     }
 
     if (l->outstandingCount >= CF_OUTSTANDING_MAX) {
-        // Drop the oldest (front, lowest height). Coverage cap — caller LOGWs it.
+        // Drop the oldest (front, lowest height). Coverage cap — caller reports it.
+        dropped = l->outstanding[0].height;
         memmove(&l->outstanding[0], &l->outstanding[1],
                 (l->outstandingCount - 1) * sizeof(BRCFOutstanding));
         l->outstandingCount--;
@@ -138,18 +319,33 @@ static void _cfLedgerInsertOutstanding(BRCFScanLedger *l, uint32_t height,
     l->outstanding[i].attempts    = 0;
     l->outstanding[i].headerRace  = 0;
     l->outstandingCount++;
+    return dropped;
+}
+
+// Same as BRCFScanLedgerRecordRequested but never silent about CF_OUTSTANDING_MAX
+// overflow: returns the count of oldest heights evicted to make room, and (if
+// outLow/outHigh non-NULL) their [low..high] range (CF_LEDGER_NO_DROP if none).
+int BRCFScanLedgerRecordRequestedDropped(BRCFScanLedger *l, uint32_t startH, uint32_t stopH,
+                                         UInt128 peer, uint16_t port, uint32_t now,
+                                         uint32_t *outLow, uint32_t *outHigh)
+{
+    if (stopH < startH) return 0;
+    int n = 0; uint32_t lo = CF_LEDGER_NO_DROP, hi = 0;
+    for (uint32_t h = startH; ; h++) {
+        uint32_t d = _cfLedgerInsertOutstanding(l, h, peer, port, now);
+        if (d != CF_LEDGER_NO_DROP) { n++; if (d < lo) lo = d; if (d > hi) hi = d; }
+        if (h == stopH) break;                       // guards h==UINT32_MAX
+    }
+    if (stopH > l->requestedThrough) l->requestedThrough = stopH;   // ★ MUST NOT drop this (scannedThrough ceiling)
+    if (outLow) *outLow = (n ? lo : CF_LEDGER_NO_DROP);
+    if (outHigh) *outHigh = (n ? hi : CF_LEDGER_NO_DROP);
+    return n;
 }
 
 void BRCFScanLedgerRecordRequested(BRCFScanLedger *l, uint32_t startH, uint32_t stopH,
                                    UInt128 peer, uint16_t port, uint32_t now)
 {
-    if (stopH < startH) return;
-
-    for (uint32_t h = startH; ; h++) {
-        _cfLedgerInsertOutstanding(l, h, peer, port, now);
-        if (h == stopH) break; // guard uint32 wrap when stopH == UINT32_MAX
-    }
-    if (stopH > l->requestedThrough) l->requestedThrough = stopH;
+    BRCFScanLedgerRecordRequestedDropped(l, startH, stopH, peer, port, now, NULL, NULL);
 }
 
 // ---- mark evaluated --------------------------------------------------------
@@ -217,21 +413,46 @@ static uint32_t _cfLedgerRerequestDelay(const BRCFOutstanding *e)
     return d;
 }
 
+// Move outstanding[i] to gaveUp. Returns 1 if the entry was removed (added to
+// gaveUp), 0 if kept (gaveUp is full — the caller leaves it outstanding but
+// no longer offers it; still counted/reported, so nothing is silently lost).
+static int _cfLedgerMoveToGaveUp(BRCFScanLedger *l, size_t i)
+{
+    if (! _cfLedgerAddGaveUp(l, l->outstanding[i].height)) return 0;  // gaveUp full -> keep outstanding
+    memmove(&l->outstanding[i], &l->outstanding[i + 1],
+            (l->outstandingCount - i - 1) * sizeof(BRCFOutstanding));
+    l->outstandingCount--;
+    return 1;
+}
+
+// Is this entry due for re-request right now, per the pinned backoff schedule?
+// Underflow-guarded: a clock that appears to move backward (or a stale
+// requestedAt) reads as "just requested" (elapsed 0), never as a huge
+// wrapped-around elapsed time.
+static int _cfLedgerDue(const BRCFOutstanding *e, uint32_t now)
+{
+    uint32_t elapsed = (now >= e->requestedAt) ? (now - e->requestedAt) : 0;
+    return elapsed >= _cfLedgerRerequestDelay(e);
+}
+
+// PUBLIC — the caller runs this once per driver "tick" (NOT automatically
+// inside Peek). Moves every capped entry to gaveUp (reported, never dropped).
+void BRCFScanLedgerRetireCapped(BRCFScanLedger *l)
+{
+    for (size_t i = 0; i < l->outstandingCount; ) {
+        if (l->outstanding[i].attempts >= CF_REREQ_MAX_ATTEMPTS) {
+            if (! _cfLedgerMoveToGaveUp(l, i)) i++;   // full: skip past the kept entry
+            // else: do not advance i — a new entry shifted into this slot
+        } else {
+            i++;
+        }
+    }
+}
+
 int BRCFScanLedgerNextRerequest(BRCFScanLedger *l, uint32_t now, uint32_t *outHeight)
 {
-    // 1. Retire any capped entries to gaveUp (reported, never dropped). If gaveUp
-    //    is full they stay outstanding but are no longer offered (step 2 skips
-    //    them) — still counted/reported, so nothing is lost.
-    for (size_t i = 0; i < l->outstandingCount; ) {
-        if (l->outstanding[i].attempts >= CF_REREQ_MAX_ATTEMPTS &&
-            _cfLedgerAddGaveUp(l, l->outstanding[i].height)) {
-            memmove(&l->outstanding[i], &l->outstanding[i + 1],
-                    (l->outstandingCount - i - 1) * sizeof(BRCFOutstanding));
-            l->outstandingCount--;
-            continue; // do not advance i — a new entry shifted into this slot
-        }
-        i++;
-    }
+    // 1. Retire any capped entries to gaveUp (reported, never dropped).
+    BRCFScanLedgerRetireCapped(l);
 
     l->lastDriveAt = now;
 
@@ -240,9 +461,7 @@ int BRCFScanLedgerNextRerequest(BRCFScanLedger *l, uint32_t now, uint32_t *outHe
         BRCFOutstanding *e = &l->outstanding[i];
         if (e->attempts >= CF_REREQ_MAX_ATTEMPTS) continue; // capped (gaveUp-full case)
 
-        uint32_t delay   = _cfLedgerRerequestDelay(e);
-        uint32_t elapsed = (now >= e->requestedAt) ? (now - e->requestedAt) : 0;
-        if (elapsed >= delay) {
+        if (_cfLedgerDue(e, now)) {
             e->attempts++;
             e->requestedAt = now;   // re-stamp for the next backoff step
             if (outHeight) *outHeight = e->height;
@@ -250,6 +469,55 @@ int BRCFScanLedgerNextRerequest(BRCFScanLedger *l, uint32_t now, uint32_t *outHe
         }
     }
     return 0;
+}
+
+// ---- Phase-2 residual re-request driver (Task 3) ---------------------------
+// peek/commit + retire: a best-effort path for the RESIDUAL drop set
+// (verify/parse/disconnect). The dominant header-race floor cluster is
+// handled by the Task 2 filter buffer instead, so the earlier
+// livelock/pruning concerns don't apply here.
+
+int BRCFScanLedgerPeekRerequestRange(BRCFScanLedger *l, uint32_t now, uint32_t minHeight,
+                                     uint32_t *outStart, uint32_t *outStop)
+{
+    size_t start = l->outstandingCount;  // no retire here — that's RetireCapped's job
+    for (size_t i = 0; i < l->outstandingCount; i++) {
+        if (l->outstanding[i].height < minHeight) continue;  // lower-bound cursor (livelock guard)
+        if (l->outstanding[i].attempts < CF_REREQ_MAX_ATTEMPTS && _cfLedgerDue(&l->outstanding[i], now)) {
+            start = i;
+            break;
+        }
+    }
+    if (start == l->outstandingCount) return 0;
+
+    const BRCFOutstanding *s = &l->outstanding[start];
+    size_t end = start;
+    while (end + 1 < l->outstandingCount) {
+        const BRCFOutstanding *nx = &l->outstanding[end + 1];
+        if (nx->height != l->outstanding[end].height + 1) break;     // must be contiguous
+        if (nx->attempts >= CF_REREQ_MAX_ATTEMPTS) break;            // capped: stop the run
+        if (! _cfLedgerDue(nx, now)) break;                          // not yet due: stop the run
+        if (nx->port != s->port || ! UInt128Eq(nx->peer, s->peer)) break; // same (peer,port) only
+        if (nx->height - s->height + 1 > CF_REREQ_MAX_RANGE) break;  // cap the coalesced run
+        end++;
+    }
+    *outStart = l->outstanding[start].height;
+    *outStop  = l->outstanding[end].height;
+    return 1;   // NO mutation of the offered run — Commit does the mutation
+}
+
+void BRCFScanLedgerCommitRerequest(BRCFScanLedger *l, uint32_t startH, uint32_t stopH,
+                                   UInt128 peer, uint16_t port, uint32_t now)
+{
+    for (size_t i = 0; i < l->outstandingCount; i++) {
+        uint32_t h = l->outstanding[i].height;
+        if (h >= startH && h <= stopH) {
+            l->outstanding[i].attempts++;
+            l->outstanding[i].requestedAt = now;
+            l->outstanding[i].peer = peer;
+            l->outstanding[i].port = port;
+        }
+    }
 }
 
 // ---- reporters -------------------------------------------------------------
@@ -411,7 +679,16 @@ size_t BRCFScanLedgerSerialize(const BRCFScanLedger *l, uint8_t *buf, size_t buf
 int BRCFScanLedgerParse(BRCFScanLedger *l, const uint8_t *buf, size_t buflen)
 {
     // Garbled/short blob -> empty ledger (caller rebuilds via re-anchor/rescan).
+    // BEFORE the memset below — a live filterBuf[] would otherwise leak. The
+    // filterBufMagic check inside is a defensive heuristic for the host-KAT's
+    // unzeroed-stack test pattern, not a memory-safety guarantee (see the
+    // comment on _cfLedgerFreeFilterBuffer). The real production ledger is
+    // always zeroed here already (embedded in a calloc'd BRPeerManager), so
+    // this call is a genuine no-op there — its only job is re-init/reload on
+    // an already-live ledger.
+    _cfLedgerFreeFilterBuffer(l);
     memset(l, 0, sizeof(*l));
+    l->filterBufMagic = CF_FILTER_BUF_MAGIC;
     if (buf == NULL || buflen < 24) return 0;
 
     const uint8_t *p = buf;

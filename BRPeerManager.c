@@ -756,6 +756,10 @@ static size_t _BRPeerManagerRequestCFiltersLocked(BRPeerManager *manager,
 static BRPeer *_BRPeerManagerAnyFilterCapablePeer(BRPeerManager *manager);
 static void _BRPeerManagerRequestNextCFHeaders(BRPeerManager *manager, BRPeer *peer);
 static int _BRPeerManagerReanchorAtFloorLocked(BRPeerManager *manager, int force);
+// Defined near BRPeerManagerRequestCompactFilters; forward-declared so the Phase 2
+// buffered-drain trampolines (_cfBufEval, above BRPeerManagerKeepAlive) and
+// BRPeerManagerKeepAlive's residual re-request driver can both use it.
+static int _BRPeerManagerPeerCanServeFilters(BRPeer *p);
 static uint32_t _BRPeerManagerBlockFloor(BRPeerManager *manager);
 static int _BRPeerManagerConnectedFilterPeerCount(BRPeerManager *manager); // defined below; used by the cfheaders stall-drop floor guard
 static void _BRPeerManagerProbeOtherFilterPeersForCFHeaders(BRPeerManager *manager, BRPeer *current,
@@ -2075,6 +2079,13 @@ static void _BRPeerManagerRequestNextCFHeaders(BRPeerManager *manager, BRPeer *p
             manager->autoFetchCFiltersThrough  = floor > 0 ? floor - 1 : 0;
             // Snap-up re-anchor rebuilds the CF scan-completeness ledger (Phase 1: observe-only).
             BRCFScanLedgerInit(&manager->cfLedger, floor);
+#if CF_LEDGER_DRIVE_REREQUEST
+            // Stale buffered raw filter bytes from the old floor must not survive a
+            // floor change — Init already frees them internally, but this call is
+            // explicit/defensive (Task 5 EDIT 4) so the invariant holds even if
+            // Init's internals change.
+            BRCFScanLedgerClearFilterBuffer(&manager->cfLedger);
+#endif
             manager->cfHeadersRequestedThrough = 0;
             next     = floor;
             batchEnd = next + (MAX_CFHEADERS_RESULTS - 1);
@@ -2395,7 +2406,18 @@ static void _peerRelayedCFHeaders(void *info, uint8_t filterType, UInt256 stopHa
     // MAX_CFILTERS_RESULTS. The driver requests one batch per cfheaders
     // arrival; consecutive cfheaders responses advance the cursor through
     // the chain until it catches up to the block tip.
-    if (manager->autoFetchCFiltersEnabled) {
+    //
+    // Phase 2 back-pressure: once the ledger's outstanding set reaches
+    // CF_OUTSTANDING_LOWWATER, pause forward auto-fetch so a stalled/slow
+    // filter peer can't keep growing outstanding toward CF_OUTSTANDING_MAX
+    // (which would start silently evicting the oldest holes). The residual
+    // re-request driver (BRPeerManagerKeepAlive) keeps working the existing
+    // backlog down in the meantime.
+    if (manager->autoFetchCFiltersEnabled
+#if CF_LEDGER_DRIVE_REREQUEST
+        && BRCFScanLedgerOutstandingCount(&manager->cfLedger) < CF_OUTSTANDING_LOWWATER
+#endif
+        ) {
         uint32_t reqStart = manager->autoFetchCFiltersThrough + 1;
         if (reqStart < manager->autoFetchCFiltersStart) reqStart = manager->autoFetchCFiltersStart;
         if (reqStart <= chainTip) {
@@ -2406,8 +2428,21 @@ static void _peerRelayedCFHeaders(void *info, uint8_t filterType, UInt256 stopHa
             size_t n = _BRPeerManagerRequestCFiltersLocked(manager, reqStart, reqStop, peer);
             if (n > 0) {
                 manager->autoFetchCFiltersThrough = reqStop;
+#if CF_LEDGER_DRIVE_REREQUEST
+                // Never silent about CF_OUTSTANDING_MAX overflow (Phase 2): log the
+                // dropped-oldest-holes range so a hole caused by hitting the hard cap
+                // is loud instead of a silent missed-scan.
+                uint32_t dLo = CF_LEDGER_NO_DROP, dHi = CF_LEDGER_NO_DROP;
+                int nDropReq = BRCFScanLedgerRecordRequestedDropped(&manager->cfLedger, reqStart, reqStop,
+                                              peer->address, peer->port, (uint32_t)time(NULL), &dLo, &dHi);
+                if (nDropReq > 0) {
+                    peer_log(peer, "cf-ledger: OUTSTANDING OVERFLOW — dropped %d oldest holes [%u..%u]",
+                             nDropReq, dLo, dHi);
+                }
+#else
                 BRCFScanLedgerRecordRequested(&manager->cfLedger, reqStart, reqStop,
                                               peer->address, peer->port, (uint32_t)time(NULL));
+#endif
                 peer_log(peer, "cfilters: auto-requested [%u..%u] (%zu blocks)",
                          reqStart, reqStop, n);
             }
@@ -2449,6 +2484,14 @@ static void _peerRelayedCFilter(void *info, uint8_t filterType, UInt256 blockHas
         // NOT MarkEvaluated), so scannedThrough naturally holds below it.
         peer_log(peer, "cf-ledger: header-race hole (block %s unknown) — left outstanding",
                  log_u256_hex_encode(blockHash));
+#if CF_LEDGER_DRIVE_REREQUEST
+        // Phase 2: hold the raw (unverified) filter bytes keyed by blockHash so a
+        // buffered-drain (BRPeerManagerKeepAlive) can evaluate it the moment the
+        // block header AND cfheader both connect, instead of relying solely on the
+        // slower residual re-request path for what is usually just a brief race.
+        if (! BRCFScanLedgerBufferFilter(&manager->cfLedger, blockHash, encoded, encodedLen, (uint32_t)time(NULL)))
+            ; /* too big / not stored — height stays outstanding for the residual re-request path */
+#endif
         pthread_mutex_unlock(&manager->lock);
         return;
     }
@@ -3017,6 +3060,66 @@ void BRPeerManagerConnect(BRPeerManager *manager)
 // within ~1s via the single existing _peerDisconnected free path. Neither mechanism
 // frees or array_rm's anything itself; both are idempotent no-ops on an
 // already-evicted peer.
+// ---------------------------------------------------------------------------
+// Phase 2 (Task 5): buffered header-race filter drain.
+//
+// BRCFScanLedgerDrainConnected (BRCFScanLedger.c, pure module) reaches this
+// BRPeerManager-aware logic only through the two function pointers below, so
+// the ledger module itself stays BRPeerManager-free / host-KAT-testable.
+//
+// THE crux invariant: on a wallet HIT, the block is fetched via getdata
+// (BRPeerSendGetdataBlocks) BEFORE MarkEvaluated -- that fetch is what
+// actually credits the receive. Marking the height evaluated without
+// dispatching getdata would silently lose a payment that arrived during a
+// header race. A hit with no CF-capable peer connected KEEPS the entry
+// buffered (returns 0, not 1) so the very next drive tick retries instead of
+// the payment being lost. This mirrors the live match path's own
+// getdata-then-MarkEvaluated order at _peerRelayedCFilter above.
+#if CF_LEDGER_DRIVE_REREQUEST
+struct _cfDrainCtx { BRPeerManager *m; BRWalletFilterElements *elems; };  // elems fetched ONCE per drain batch (perf)
+
+// isReady: both the block header (in manager->blocks) AND its cfheader (the
+// compact-filter chain must have advanced past this height) must be present.
+// Buffered bytes are raw/unverified -- BRCompactFilterChainVerifyFilter below
+// needs the cfheader at this height to exist or it can never succeed.
+static int _cfBufIsReady(void *vctx, UInt256 h, uint32_t *outH)
+{
+    BRPeerManager *m = ((struct _cfDrainCtx *)vctx)->m;
+    BRMerkleBlock *b = BRSetGet(m->blocks, &h);
+    if (! b || b->height == BLOCK_UNKNOWN_HEIGHT) return 0;                 // block header not connected
+    if (BRCompactFilterChainNextHeight(m->compactFilterChain) <= b->height) return 0; // cfheader not yet present
+    *outH = b->height;
+    return 1;
+}
+
+static int _cfBufEval(void *vctx, uint32_t height, UInt256 blockHash, const uint8_t *bytes, size_t len)
+{
+    struct _cfDrainCtx *c = vctx;
+    BRPeerManager *m = c->m;
+
+    if (! BRCompactFilterChainVerifyFilter(m->compactFilterChain, height, bytes, len)) return 1; // bad bytes: drop, leave outstanding (re-request)
+    BRGCSFilter *gcs = BRGCSFilterBasicParse(bytes, len, blockHash);        // blockHash is the SipHash key (3-arg)
+    if (! gcs) return 1;                                                   // unparseable: drop, leave outstanding
+
+    int hit = (c->elems && c->elems->count > 0)
+              ? BRGCSFilterMatchAny(gcs, c->elems->elements, c->elems->elementLens, c->elems->count) // real match (see _peerRelayedCFilter)
+              : 0;
+    BRGCSFilterFree(gcs);
+
+    if (hit) {
+        BRPeer *p = NULL;                                                  // a connected CF-capable peer for the getdata
+        for (size_t i = array_count(m->connectedPeers); i > 0; i--) {
+            if (_BRPeerManagerPeerCanServeFilters(m->connectedPeers[i - 1])) { p = m->connectedPeers[i - 1]; break; }
+        }
+        if (! p) return 0;                                                 // hit but no peer -> KEEP buffered, stay outstanding, retry
+        BRPeerSendGetdataBlocks(p, &blockHash, 1);                         // credit: fetch the block -> tx registered on arrival
+    }
+
+    BRCFScanLedgerMarkEvaluated(&m->cfLedger, height);                     // scanned (hit dispatched, or clean verified miss)
+    return 1;                                                              // remove from buffer
+}
+#endif // CF_LEDGER_DRIVE_REREQUEST
+
 void BRPeerManagerKeepAlive(BRPeerManager *manager)
 {
     assert(manager != NULL);
@@ -3047,6 +3150,67 @@ void BRPeerManagerKeepAlive(BRPeerManager *manager)
             BRPeerScheduleDisconnect(p, 0); // real deadline instead of the DBL_MAX idle sentinel
         }
     }
+
+#if CF_LEDGER_DRIVE_REREQUEST
+    // Phase 2 driver: (1) drain any buffered header-race filters whose block
+    // header + cfheader have since connected (the crux credit path above),
+    // then (2) best-effort re-request the RESIDUAL drop set (verify/parse/
+    // disconnect holes) via peek/commit, gated on an empty buffer so
+    // undrained-but-outstanding header-race heights are never
+    // duplicate-requested (they belong to the buffer path, not this one).
+    {
+        uint32_t nowSec = (uint32_t)time(NULL);
+        uint8_t scratch[1024];                              // >= max cfilter (675 B observed)
+        struct _cfDrainCtx dctx = { manager, BRWalletGetFilterElements(manager->wallet) }; // elements ONCE per batch
+        BRCFScanLedgerDrainConnected(&manager->cfLedger, _cfBufIsReady, &dctx,
+                                     scratch, sizeof scratch, _cfBufEval, CF_FILTER_DRAIN_PER_TICK);
+        BRWalletFilterElementsFree(dctx.elems);             // free once (accepts NULL)
+
+        if (BRCFScanLedgerBufferedCount(&manager->cfLedger) == 0) {
+            BRCFScanLedgerRetireCapped(&manager->cfLedger);
+            uint32_t tipH = manager->lastBlock ? manager->lastBlock->height : 0, minH = 0;
+            for (unsigned n = 0; n < CF_REREQ_BATCH_PER_TICK; n++) {
+                uint32_t rs = 0, re = 0;
+                if (! BRCFScanLedgerPeekRerequestRange(&manager->cfLedger, nowSec, minH, &rs, &re)) break;
+                uint32_t cap = (re <= tipH) ? re : tipH;
+                if (cap < rs) { minH = re + 1; continue; }  // whole offered run is beyond the tip -- skip past it
+
+                // Rotate away from whichever peer this hole's lowest height was last
+                // sent to (if any) -- same "don't re-dial the peer that just dropped
+                // it" intent as the forward driver's peer selection.
+                UInt128 avoidA = UINT128_ZERO;
+                uint16_t avoidP = 0;
+                for (size_t i = 0; i < manager->cfLedger.outstandingCount; i++) {
+                    if (manager->cfLedger.outstanding[i].height == rs) {
+                        avoidA = manager->cfLedger.outstanding[i].peer;
+                        avoidP = manager->cfLedger.outstanding[i].port;
+                        break;
+                    }
+                }
+
+                BRPeer *chosen = NULL, *any = NULL;
+                for (size_t i = array_count(manager->connectedPeers); i > 0; i--) {
+                    BRPeer *p = manager->connectedPeers[i - 1];
+                    if (! _BRPeerManagerPeerCanServeFilters(p)) continue;
+                    if (! any) any = p;
+                    if (avoidP != 0 && p->port == avoidP && UInt128Eq(p->address, avoidA)) continue;
+                    chosen = p;
+                    break;
+                }
+                if (! chosen) chosen = any;
+                if (! chosen) break; // no CF-capable peer connected at all -- nothing to do this tick
+
+                size_t sent = _BRPeerManagerRequestCFiltersLocked(manager, rs, cap, chosen);
+                if (sent > 0) {
+                    BRCFScanLedgerCommitRerequest(&manager->cfLedger, rs, cap, chosen->address, chosen->port, nowSec);
+                    peer_log(chosen, "cf-ledger: re-requested residual holes [%u..%u]", rs, cap);
+                }
+                minH = re + 1;
+            }
+        }
+        manager->cfLedger.lastDriveAt = nowSec;
+    }
+#endif // CF_LEDGER_DRIVE_REREQUEST
 
     pthread_mutex_unlock(&manager->lock);
 }
@@ -3533,6 +3697,11 @@ static int _BRPeerManagerReanchorAtFloorLocked(BRPeerManager *manager, int force
     manager->autoFetchCFiltersThrough  = floor > 0 ? floor - 1 : 0;
     // Re-anchor rebuilds the CF scan-completeness ledger at the floor (Phase 1: observe-only).
     BRCFScanLedgerInit(&manager->cfLedger, floor);
+#if CF_LEDGER_DRIVE_REREQUEST
+    // Explicit/defensive (Task 5 EDIT 4): stale buffered raw filter bytes from the
+    // pre-reanchor chain must not survive — Init already frees them internally.
+    BRCFScanLedgerClearFilterBuffer(&manager->cfLedger);
+#endif
     manager->cfHeadersRequestedThrough = 0;
     manager->cfDisagreedCount          = 0;   // fresh disagreement window
     manager->cfSingleDisagreeRounds    = 0;   // fresh single-peer diverged-round window
@@ -3767,6 +3936,11 @@ void BRPeerManagerEnableAutoCompactFilterFetch(BRPeerManager *manager, uint32_t 
     manager->autoFetchCFiltersThrough = (startHeight > 0) ? startHeight - 1 : 0;
     // Rebuild the CF scan-completeness ledger at the same floor (Phase 1: observe-only).
     BRCFScanLedgerInit(&manager->cfLedger, startHeight);
+#if CF_LEDGER_DRIVE_REREQUEST
+    // Explicit/defensive (Task 5 EDIT 4): re-arm must not carry stale buffered raw
+    // filter bytes from before this (re-)enable — Init already frees them internally.
+    BRCFScanLedgerClearFilterBuffer(&manager->cfLedger);
+#endif
     pthread_mutex_unlock(&manager->lock);
 }
 
@@ -3777,6 +3951,12 @@ void BRPeerManagerDisableAutoCompactFilterFetch(BRPeerManager *manager)
     manager->autoFetchCFiltersEnabled = 0;
     manager->autoFetchCFiltersStart = 0;
     manager->autoFetchCFiltersThrough = 0;
+#if CF_LEDGER_DRIVE_REREQUEST
+    // Hygiene (Task 5 EDIT 4): a disable must not leave stale buffered bytes
+    // lingering — unlike the re-anchor/re-arm sites, Disable does NOT call
+    // BRCFScanLedgerInit, so this is the only place that clears them here.
+    BRCFScanLedgerClearFilterBuffer(&manager->cfLedger);
+#endif
     pthread_mutex_unlock(&manager->lock);
 }
 

@@ -82,6 +82,16 @@ extern "C" {
 #define CF_REREQ_MAX_ATTEMPTS      5  // per-height cap; on reaching it → gaveUp list (NEVER silent)
 #define CF_REREQ_MAX_RANGE      1000  // == MAX_CFILTERS_RESULTS (BRPeer.h:116) — Peek's coalesced-run cap
 
+// Phase-2 driver back-pressure (Task 5, BRPeerManagerKeepAlive) — PINNED 2026-07-26:
+// forward auto-fetch pauses once outstandingCount reaches this low-water mark, so a
+// stalled/slow filter peer can't grow the outstanding set past CF_OUTSTANDING_MAX
+// (which would start silently evicting the oldest holes). Left with headroom under
+// the hard cap so eviction should never actually trigger in practice.
+#define CF_OUTSTANDING_LOWWATER 3072
+// Cap on residual re-request ranges (peek/commit) offered per BRPeerManagerKeepAlive
+// tick — bounds the driver's per-tick work under a large outstanding/gaveUp set.
+#define CF_REREQ_BATCH_PER_TICK   64
+
 // Filter-byte buffer (Phase 2 Task 2, §7) — a header-race-dropped cfilter's raw
 // (unverified) bytes are held here, keyed by blockHash, until its header AND
 // cfheader both connect. Byte-budgeted, not count-budgeted: eviction is driven

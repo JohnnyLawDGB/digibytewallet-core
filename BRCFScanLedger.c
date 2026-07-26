@@ -102,13 +102,23 @@ static void _cfLedgerFreeFilterEntry(BRCFFilterBufEntry *e)
     free(e);
 }
 
-// Free every buffered entry and reset the buffer to empty. Guarded by
-// filterBufMagic: on a struct that has never been through Init/Parse/
-// BufferFilter (raw/uninitialized memory), filterBufCount and filterBuf[] are
-// garbage — the magic check keeps this a safe no-op in that case instead of
-// calling free() on whatever garbage bit pattern happens to look like a
-// pointer. On a genuinely live ledger the magic is set and every entry is
-// freed as expected.
+// Free every buffered entry and reset the buffer to empty.
+//
+// filterBufMagic is a defensive HEURISTIC, not a memory-safety guarantee: it
+// exists only to make the host-KAT's raw-stack test pattern
+// (`BRCFScanLedger l; BRCFScanLedgerInit(&l, 1);` — no calloc, no memset by
+// the test itself) behave safely across the many sibling test functions in
+// that binary that reuse the same stack slot. The REAL production ledger is
+// a field embedded in a `calloc`'d BRPeerManager (BRPeerManager.c), so it is
+// already zeroed the first time Init ever touches it — filterBufMagic does
+// nothing for that path. On a virgin (never-written) stack struct, reading
+// filterBufMagic is itself a read of indeterminate memory, which is
+// undefined behavior that plain ASan does not flag (that's MSan's job); the
+// magic check just makes the overwhelmingly likely outcome (a mismatch, so
+// this function no-ops instead of calling free() on garbage) the guaranteed
+// one for the specific reuse pattern this test binary exhibits. It is not a
+// substitute for the real precondition: `l` must already be a live
+// (Init/Parse'd) or zeroed struct before this is called.
 static void _cfLedgerFreeFilterBuffer(BRCFScanLedger *l)
 {
     if (l->filterBufMagic == CF_FILTER_BUF_MAGIC) {
@@ -133,11 +143,17 @@ static void _cfLedgerEvictOldestFilter(BRCFScanLedger *l)
     l->filterBufCount--;
 }
 
+// PRECONDITION (see BRCFScanLedger.h): `l` must already be Init/Parse'd (or
+// otherwise zeroed) before the first call — this function reads
+// filterBufCount/filterBuf[] below as part of the de-dup scan, so there is no
+// line it could add here that would make an un-Init'd struct safe. It does
+// NOT stamp filterBufMagic itself: Init/Parse already do that, and stamping
+// it here would be a no-op for a struct that satisfies the precondition, and
+// would NOT rescue one that doesn't (the de-dup loop right below still walks
+// filterBufCount before this function could establish anything).
 int BRCFScanLedgerBufferFilter(BRCFScanLedger *l, UInt256 blockHash,
                                const uint8_t *bytes, size_t len, uint32_t now)
 {
-    l->filterBufMagic = CF_FILTER_BUF_MAGIC; // this ledger is definitely live now
-
     if (len > CF_FILTER_BUFFER_MAX_BYTES) return 0; // can never fit even alone
 
     // De-dup by hash: replace bytes in place, keeping the entry's FIFO position.
@@ -248,7 +264,14 @@ size_t BRCFScanLedgerBufferedBytes(const BRCFScanLedger *l) { return l->buffered
 
 void BRCFScanLedgerInit(BRCFScanLedger *l, uint32_t start)
 {
-    _cfLedgerFreeFilterBuffer(l); // BEFORE the memset below — else a live filterBuf[] leaks
+    // BEFORE the memset below — a live filterBuf[] would otherwise leak. The
+    // filterBufMagic check inside is a defensive heuristic for the host-KAT's
+    // unzeroed-stack test pattern, not a memory-safety guarantee (see the
+    // comment on _cfLedgerFreeFilterBuffer). The real production ledger is
+    // always zeroed here already (embedded in a calloc'd BRPeerManager), so
+    // this call is a genuine no-op there — its only job is re-init/reload on
+    // an already-live ledger.
+    _cfLedgerFreeFilterBuffer(l);
     memset(l, 0, sizeof(*l));
     l->filterBufMagic = CF_FILTER_BUF_MAGIC;
     l->start = start;
@@ -584,7 +607,14 @@ size_t BRCFScanLedgerSerialize(const BRCFScanLedger *l, uint8_t *buf, size_t buf
 int BRCFScanLedgerParse(BRCFScanLedger *l, const uint8_t *buf, size_t buflen)
 {
     // Garbled/short blob -> empty ledger (caller rebuilds via re-anchor/rescan).
-    _cfLedgerFreeFilterBuffer(l); // BEFORE the memset below — else a live filterBuf[] leaks
+    // BEFORE the memset below — a live filterBuf[] would otherwise leak. The
+    // filterBufMagic check inside is a defensive heuristic for the host-KAT's
+    // unzeroed-stack test pattern, not a memory-safety guarantee (see the
+    // comment on _cfLedgerFreeFilterBuffer). The real production ledger is
+    // always zeroed here already (embedded in a calloc'd BRPeerManager), so
+    // this call is a genuine no-op there — its only job is re-init/reload on
+    // an already-live ledger.
+    _cfLedgerFreeFilterBuffer(l);
     memset(l, 0, sizeof(*l));
     l->filterBufMagic = CF_FILTER_BUF_MAGIC;
     if (buf == NULL || buflen < 24) return 0;

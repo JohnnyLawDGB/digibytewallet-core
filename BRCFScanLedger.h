@@ -144,11 +144,15 @@ typedef struct {
     BRCFFilterBufEntry *filterBuf[CF_FILTER_BUF_SLOTS];
     size_t              filterBufCount;
     size_t              bufferedBytes;
-    // Internal validity marker (NOT part of the persisted/public contract): set
-    // by Init/Parse/BufferFilter once the struct is a real, live ledger. Lets
-    // the free-before-memset step in Init/Parse tell a live filterBuf[] apart
-    // from raw/uninitialized memory (a freshly-declared, never-Init'd struct)
-    // before trusting filterBufCount enough to call free() on its entries.
+    // Internal marker (NOT part of the persisted/public contract, NOT a
+    // memory-safety guarantee): set only by Init/Parse. It is a defensive
+    // heuristic so the free-before-memset step in Init/Parse behaves
+    // predictably under the host-KAT's unzeroed-stack test pattern (see the
+    // comment on _cfLedgerFreeFilterBuffer in BRCFScanLedger.c for why it
+    // isn't, and can't be, a real guarantee). The actual precondition every
+    // caller must uphold is: `l` is zeroed (e.g. calloc'd, as the real
+    // production BRPeerManager ledger always is) or already Init/Parse'd
+    // before the first BufferFilter/Init/Parse call on it.
     uint32_t            filterBufMagic;
 } BRCFScanLedger;
 
@@ -210,6 +214,13 @@ size_t   BRCFScanLedgerHoleRanges(const BRCFScanLedger *l, uint32_t *outStarts, 
 
 // ---- Filter-byte buffer (§7, header-race hold) -----------------------------
 
+// PRECONDITION: `l` must already have been through BRCFScanLedgerInit or
+// BRCFScanLedgerParse (or otherwise be a zeroed struct) before the FIRST call
+// to BufferFilter. BufferFilter does not — and cannot — establish that on its
+// own: it reads filterBufCount/filterBuf[] as part of the de-dup scan on
+// every call, so calling it on a never-Init'd struct is unconditionally
+// unsafe regardless of anything BufferFilter itself does first.
+//
 // Store a raw (unverified) cfilter keyed by blockHash. De-dups by hash (a
 // re-buffer of the same block replaces its bytes in place). Byte-budgeted:
 // while bufferedBytes + len > CF_FILTER_BUFFER_MAX_BYTES, evicts the OLDEST

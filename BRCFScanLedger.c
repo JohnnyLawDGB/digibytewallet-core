@@ -107,22 +107,25 @@ void BRCFScanLedgerInit(BRCFScanLedger *l, uint32_t start)
 
 // Insert one height into outstanding (sorted, de-duplicated). A height already
 // present just refreshes its target (a re-request). Overflow drops the OLDEST
-// (front / lowest-height) entry in-module; the loud log is the caller's job.
-static void _cfLedgerInsertOutstanding(BRCFScanLedger *l, uint32_t height,
-                                       UInt128 peer, uint16_t port, uint32_t now)
+// (front / lowest-height) entry in-module; returns that dropped height so the
+// caller can report it (CF_LEDGER_NO_DROP if nothing was evicted).
+static uint32_t _cfLedgerInsertOutstanding(BRCFScanLedger *l, uint32_t height,
+                                           UInt128 peer, uint16_t port, uint32_t now)
 {
     size_t i = _cfLedgerLowerBound(l, height);
+    uint32_t dropped = CF_LEDGER_NO_DROP;
 
     if (i < l->outstandingCount && l->outstanding[i].height == height) {
         // Already outstanding — a re-request records the new target/clock.
         l->outstanding[i].peer        = peer;
         l->outstanding[i].port        = port;
         l->outstanding[i].requestedAt = now;
-        return;
+        return dropped;
     }
 
     if (l->outstandingCount >= CF_OUTSTANDING_MAX) {
-        // Drop the oldest (front, lowest height). Coverage cap — caller LOGWs it.
+        // Drop the oldest (front, lowest height). Coverage cap — caller reports it.
+        dropped = l->outstanding[0].height;
         memmove(&l->outstanding[0], &l->outstanding[1],
                 (l->outstandingCount - 1) * sizeof(BRCFOutstanding));
         l->outstandingCount--;
@@ -138,18 +141,33 @@ static void _cfLedgerInsertOutstanding(BRCFScanLedger *l, uint32_t height,
     l->outstanding[i].attempts    = 0;
     l->outstanding[i].headerRace  = 0;
     l->outstandingCount++;
+    return dropped;
+}
+
+// Same as BRCFScanLedgerRecordRequested but never silent about CF_OUTSTANDING_MAX
+// overflow: returns the count of oldest heights evicted to make room, and (if
+// outLow/outHigh non-NULL) their [low..high] range (CF_LEDGER_NO_DROP if none).
+int BRCFScanLedgerRecordRequestedDropped(BRCFScanLedger *l, uint32_t startH, uint32_t stopH,
+                                         UInt128 peer, uint16_t port, uint32_t now,
+                                         uint32_t *outLow, uint32_t *outHigh)
+{
+    if (stopH < startH) return 0;
+    int n = 0; uint32_t lo = CF_LEDGER_NO_DROP, hi = 0;
+    for (uint32_t h = startH; ; h++) {
+        uint32_t d = _cfLedgerInsertOutstanding(l, h, peer, port, now);
+        if (d != CF_LEDGER_NO_DROP) { n++; if (d < lo) lo = d; if (d > hi) hi = d; }
+        if (h == stopH) break;                       // guards h==UINT32_MAX
+    }
+    if (stopH > l->requestedThrough) l->requestedThrough = stopH;   // ★ MUST NOT drop this (scannedThrough ceiling)
+    if (outLow) *outLow = (n ? lo : CF_LEDGER_NO_DROP);
+    if (outHigh) *outHigh = (n ? hi : CF_LEDGER_NO_DROP);
+    return n;
 }
 
 void BRCFScanLedgerRecordRequested(BRCFScanLedger *l, uint32_t startH, uint32_t stopH,
                                    UInt128 peer, uint16_t port, uint32_t now)
 {
-    if (stopH < startH) return;
-
-    for (uint32_t h = startH; ; h++) {
-        _cfLedgerInsertOutstanding(l, h, peer, port, now);
-        if (h == stopH) break; // guard uint32 wrap when stopH == UINT32_MAX
-    }
-    if (stopH > l->requestedThrough) l->requestedThrough = stopH;
+    BRCFScanLedgerRecordRequestedDropped(l, startH, stopH, peer, port, now, NULL, NULL);
 }
 
 // ---- mark evaluated --------------------------------------------------------

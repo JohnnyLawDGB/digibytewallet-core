@@ -60,7 +60,14 @@ extern "C" {
 // NOTE: this gate is a CALLER guard. BRCFScanLedgerNextRerequest (the Phase-2
 // driver logic) is ALWAYS compiled so it stays unit-testable; production simply
 // does not invoke it while the gate is 0.
-#define CF_LEDGER_DRIVE_REREQUEST 0
+#ifndef CF_LEDGER_DRIVE_REREQUEST
+#define CF_LEDGER_DRIVE_REREQUEST 0   // Phase 1: observe. Task 6 flips to 1. -D wins for KATs.
+#endif
+
+// Sentinel: "no height was evicted" — returned by the overflow-drop-reporting
+// insert/record paths so a real (32-bit) evicted height is never ambiguous
+// with "nothing dropped".
+#define CF_LEDGER_NO_DROP 0xFFFFFFFFu
 
 // ---- Bounds & pinned constants (§3) ----------------------------------------
 #define CF_OUTSTANDING_MAX      4096  // hard cap; overflow drops OLDEST (caller LOGWs its height range)
@@ -125,6 +132,16 @@ void     BRCFScanLedgerInit(BRCFScanLedger *l, uint32_t start);
 // loud height-range log is the caller's job.
 void     BRCFScanLedgerRecordRequested(BRCFScanLedger *l, uint32_t startH, uint32_t stopH,
                                         UInt128 peer, uint16_t port, uint32_t now);
+
+// Same as BRCFScanLedgerRecordRequested but never silent about CF_OUTSTANDING_MAX
+// overflow: returns the count of oldest heights evicted to make room and, if
+// outLow/outHigh are non-NULL, writes the evicted heights' [low..high] range
+// (CF_LEDGER_NO_DROP in each if none were evicted). requestedThrough still
+// advances to stopH regardless — it is scannedThrough's ceiling and must never
+// fail to track the caller's actual request range.
+int      BRCFScanLedgerRecordRequestedDropped(BRCFScanLedger *l, uint32_t startH, uint32_t stopH,
+                                              UInt128 peer, uint16_t port, uint32_t now,
+                                              uint32_t *outLow, uint32_t *outHigh);
 
 // A cfilter for `height` was evaluated (matched or cleanly missed). Remove it
 // from outstanding (and, defensively, gaveUp) and advance scannedThrough over

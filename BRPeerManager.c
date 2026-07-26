@@ -3160,7 +3160,11 @@ void BRPeerManagerKeepAlive(BRPeerManager *manager)
     // duplicate-requested (they belong to the buffer path, not this one).
     {
         uint32_t nowSec = (uint32_t)time(NULL);
-        uint8_t scratch[1024];                              // >= max cfilter (675 B observed)
+        uint8_t scratch[2048];                              // >= max cfilter (675 B observed); 3x headroom vs a
+                                                            // protocol change / unusually dense block making
+                                                            // ~675 B history. A filter beyond this still self-heals
+                                                            // via the residual re-request path (no loss), but this
+                                                            // keeps the fast buffer-drain covering all realistic sizes.
         struct _cfDrainCtx dctx = { manager, BRWalletGetFilterElements(manager->wallet) }; // elements ONCE per batch
         BRCFScanLedgerDrainConnected(&manager->cfLedger, _cfBufIsReady, &dctx,
                                      scratch, sizeof scratch, _cfBufEval, CF_FILTER_DRAIN_PER_TICK);

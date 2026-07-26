@@ -1629,8 +1629,11 @@ static void _peerRelayedBlock(void *info, BRMerkleBlock *block)
      * The saveBlocks[] entries are live pointers into manager->blocks, which a
      * concurrent peer thread's reorg can free; serializing here — before the
      * unlock, not in the callback after it — is the fix for the lock-release-
-     * then-use UAF. Only the immutable bytes cross the unlock; no manager-owned
-     * block pointer is dereferenced once the lock is dropped. */
+     * then-use UAF. Only the immutable bytes cross the unlock in THE SAVE PATH —
+     * no saveBlocks[]/manager->blocks pointer is serialized after the lock drops.
+     * (NB: the pre-existing `block->height` read below at the txStatusUpdate gate
+     * is the SAME UAF class but predates this fix and its exposure is unchanged —
+     * out of scope here; tracked as a follow-up.) */
     uint8_t *saveBuf = NULL;
     size_t   saveLen = 0;
     if (i > 0 && manager->saveBlocks) {

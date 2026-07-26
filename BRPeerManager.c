@@ -75,7 +75,15 @@
 //  implement the following procedure in order to prevent the issues.
 // We will pass 0xAAAAAAAAAAAAAAAA to the native side (iOS/android), which will then check its value before saving the blocks.
 // Important: stackIntegrityCheck_val is marked as volatile memory in order to prevent the compiler from optimizing this variable to a constant.
-// Explanation: Assuming that the saveBlocks callback gets called successfully, the stack has to be valid in that very moment. So it's not the stack that's corrupted when calling the callback, but rather the allocated memory of the c-application. Perhaps iOS is killing the C part of the app first, shortly after that, it's killing the native side. Between these two, memory corruption can occur.
+// CORRECTED 2026-07-26: the memory corruption this canary was chasing was NOT an
+// app-shutdown artifact ("iOS killing the C part first" — that story was wrong and
+// misled diagnosis for years). It was a lock-release-then-use RACE: saveBlocks used
+// to be handed LIVE pointers into manager->blocks AFTER manager->lock was released,
+// and a concurrent peer thread's reorg (BRSetRemove + BRMerkleBlockFree) freed a
+// block while the callback serialized it → heap-overflow / use-after-free. Fixed by
+// serializing the blocks to bytes UNDER the lock (see _serializeSavedBlocks +
+// _peerRelayedBlock) so no manager-owned pointer crosses the unlock. The canary is
+// kept as belt-and-suspenders, but the real defect is closed at the source.
 volatile uint64_t stackIntegrityCheck = 0xAAAAAAAAAAAAAAAA;
 
 typedef struct {
@@ -215,7 +223,7 @@ struct BRPeerManagerStruct {
     void (*syncStarted)(void *info);
     void (*syncStopped)(void *info, int error);
     void (*txStatusUpdate)(void *info);
-    void (*saveBlocks)(void *info, int replace, BRMerkleBlock *blocks[], size_t blocksCount, uint64_t* stackIntegrityCheck);
+    void (*saveBlocks)(void *info, int replace, const uint8_t *bytes, size_t len, uint64_t* stackIntegrityCheck);
     void (*savePeers)(void *info, int replace, const BRPeer peers[], size_t peersCount);
     int (*networkIsReachable)(void *info);
     void (*threadCleanup)(void *info);
@@ -1350,6 +1358,45 @@ static int _BRPeerManagerVerifyBlock(BRPeerManager *manager, BRMerkleBlock *bloc
     return r;
 }
 
+// Serialize a set of saved blocks into the flat persistence buffer WHILE THE
+// CALLER HOLDS manager->lock. Format (unchanged — the Kotlin onSaveBlocks parser
+// relies on it): [u32 count][ per block: u32 serLen, u32 height, serLen bytes ].
+// Doing this here, before the lock is released, is what closes the lock-release-
+// then-use UAF: a concurrent reorg (BRSetRemove + BRMerkleBlockFree) cannot free
+// a block mid-serialize because we still hold the lock, so no manager-owned block
+// pointer is dereferenced after the unlock — only the returned flat bytes cross
+// the JNI boundary. malloc'd (NOT a VLA: worst case ~24KB of headers, up to
+// ~219KB one-time for legacy full merkleblocks); caller frees after the callback.
+// Returns NULL (and *outLen = 0) on empty input or alloc failure.
+static uint8_t *_serializeSavedBlocks(BRMerkleBlock *blocks[], size_t count, size_t *outLen)
+{
+    *outLen = 0;
+    if (count == 0 || ! blocks) return NULL;
+
+    size_t totalSize = 4; // leading u32 block count
+    size_t *sizes = malloc(count * sizeof(size_t));
+    if (! sizes) return NULL;
+    for (size_t i = 0; i < count; i++) {
+        sizes[i] = BRMerkleBlockSerialize(blocks[i], NULL, 0);
+        totalSize += 4 + 4 + sizes[i]; // serLen + height + data
+    }
+
+    uint8_t *buf = malloc(totalSize);
+    if (! buf) { free(sizes); return NULL; }
+
+    size_t pos = 0;
+    UInt32SetLE(&buf[pos], (uint32_t)count); pos += 4;
+    for (size_t i = 0; i < count; i++) {
+        UInt32SetLE(&buf[pos], (uint32_t)sizes[i]); pos += 4;
+        UInt32SetLE(&buf[pos], blocks[i]->height);  pos += 4;
+        BRMerkleBlockSerialize(blocks[i], &buf[pos], sizes[i]);
+        pos += sizes[i];
+    }
+    free(sizes);
+    *outLen = pos;
+    return buf;
+}
+
 static void _peerRelayedBlock(void *info, BRMerkleBlock *block)
 {
     BRPeer *peer = ((BRPeerCallbackInfo *)info)->peer;
@@ -1578,12 +1625,25 @@ static void _peerRelayedBlock(void *info, BRMerkleBlock *block)
     // cfTip current for the overlay without the UI ever taking manager->lock.
     _BRPeerManagerRefreshCachedStatus(manager);
 
-    /* save the blocks */
-    pthread_mutex_unlock(&manager->lock);
-
+    /* Serialize the saved blocks to a flat byte buffer WHILE HOLDING THE LOCK.
+     * The saveBlocks[] entries are live pointers into manager->blocks, which a
+     * concurrent peer thread's reorg can free; serializing here — before the
+     * unlock, not in the callback after it — is the fix for the lock-release-
+     * then-use UAF. Only the immutable bytes cross the unlock; no manager-owned
+     * block pointer is dereferenced once the lock is dropped. */
+    uint8_t *saveBuf = NULL;
+    size_t   saveLen = 0;
     if (i > 0 && manager->saveBlocks) {
         debug_log("[STATS]: orphan_count = %ld, block_count = %ld\n", BRSetCount(manager->orphans), BRSetCount(manager->blocks));
-        manager->saveBlocks(manager->info, REPLACE_SAVED_BLOCKS, saveBlocks, i, (uint64_t*) &stackIntegrityCheck);
+        saveBuf = _serializeSavedBlocks(saveBlocks, i, &saveLen); // malloc'd under the lock
+    }
+
+    pthread_mutex_unlock(&manager->lock);
+
+    /* Hand the immutable BYTES to the (lock-free) JNI upcall, then free them. */
+    if (saveBuf) {
+        manager->saveBlocks(manager->info, REPLACE_SAVED_BLOCKS, saveBuf, saveLen, (uint64_t*) &stackIntegrityCheck);
+        free(saveBuf);
     }
     
     if (block && block->height != BLOCK_UNKNOWN_HEIGHT && block->height >= BRPeerLastBlock(peer) &&
@@ -2385,6 +2445,12 @@ static void _peerRelayedCFHeaders(void *info, uint8_t filterType, UInt256 stopHa
     peer_log(peer, "cfheaders: chain extended to height %u (added %zu, stop %s)",
              chainTip, count, log_u256_hex_encode(stopHash));
 
+    // ⚠️ LOCK-PLACEMENT INVARIANT (do NOT "optimize" by moving the unlock above this):
+    // this hands the callback a LIVE manager-owned pointer (manager->compactFilterChain).
+    // It is safe ONLY because manager->lock is still held here — the bridge copies the
+    // chain into its own buffer under the lock and does not re-lock. Releasing the lock
+    // before this call would make it byte-for-byte the saveBlocks lock-release-then-use
+    // UAF (see _serializeSavedBlocks) on the CF header chain. The unlock MUST stay below.
     if (manager->saveFilterHeaders) {
         manager->saveFilterHeaders(manager->saveFilterHeadersInfo, manager->compactFilterChain);
     }
@@ -2602,7 +2668,9 @@ static void _BRPeerManagerOnFilterCapablePeerConnected(BRPeerManager *manager, v
 // void syncStarted(void *) - called when blockchain syncing starts
 // void syncStopped(void *, int) - called when blockchain syncing stops, error is an errno.h code
 // void txStatusUpdate(void *) - called when transaction status may have changed such as when a new block arrives
-// void saveBlocks(void *, int, BRMerkleBlock *[], size_t) - called when blocks should be saved to the persistent store
+// void saveBlocks(void *, int, const uint8_t *bytes, size_t len) - called when blocks should be saved to the
+//   persistent store. The core serializes the blocks to `bytes` UNDER its lock and hands the immutable buffer
+//   here (NOT live block pointers), so the callback is free to do a slow JNI upcall without racing a reorg free.
 // - if replace is true, remove any previously saved blocks first
 // void savePeers(void *, int, const BRPeer[], size_t) - called when peers should be saved to the persistent store
 // - if replace is true, remove any previously saved peers first
@@ -2612,7 +2680,7 @@ void BRPeerManagerSetCallbacks(BRPeerManager *manager, void *info,
                                void (*syncStarted)(void *info),
                                void (*syncStopped)(void *info, int error),
                                void (*txStatusUpdate)(void *info),
-                               void (*saveBlocks)(void *info, int replace, BRMerkleBlock *blocks[], size_t blocksCount, uint64_t* memIntegrityCheck),
+                               void (*saveBlocks)(void *info, int replace, const uint8_t *bytes, size_t len, uint64_t* memIntegrityCheck),
                                void (*savePeers)(void *info, int replace, const BRPeer peers[], size_t peersCount),
                                int (*networkIsReachable)(void *info),
                                void (*threadCleanup)(void *info))

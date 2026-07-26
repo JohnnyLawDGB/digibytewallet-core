@@ -2530,24 +2530,25 @@ static void _peerRelayedCFilter(void *info, uint8_t filterType, UInt256 blockHas
     if (fe && fe->count > 0) {
         hit = BRGCSFilterMatchAny(gcs, fe->elements, fe->elementLens, fe->count);
     }
-    // DIAGNOSTIC (v3.10.8, temporary): make the compact-filter match decision visible.
-    // Reports, per block, how many wallet scriptPubKeys we're matching against, the
-    // block filter's byte size, and whether it hit. If feCount is ~0 the wallet match
-    // set is empty/broken; if feCount is large and hit=0 on a block that pays us, the
-    // filter genuinely lacks our script (address-set/derivation gap). Remove once CF
-    // confirmation is proven on-device.
-    peer_log(peer, "cfilter: block %u — matching %zu wallet element(s) vs %zu-byte filter, hit=%d",
-             b->height, feCount, encodedLen, hit);
-    if (feCount > 0 && fe->elementLens && fe->elements) {
-        // Log the first wallet element (as hex) so we can confirm it's a real
-        // scriptPubKey and cross-check against the block's actual outputs.
-        const uint8_t *e0 = fe->elements[0];
-        size_t l0 = fe->elementLens[0];
-        char hx[2*40 + 1];
-        size_t hn = (l0 < 40 ? l0 : 40);
-        for (size_t k = 0; k < hn; k++) sprintf(&hx[k*2], "%02x", e0[k]);
-        hx[hn*2] = '\0';
-        peer_log(peer, "cfilter:   sample wallet element[0] len=%zu spk=%s", l0, hx);
+    // DIAGNOSTIC (v3.10.8): compact-filter match decision, now GATED ON hit. The
+    // per-block line used to fire for EVERY scanned block — thousands of lines
+    // during catch-up that flooded logd and plausibly starved the binder buffer
+    // on the acceptance rig (2026-07-26). Scan progress is already covered by the
+    // `cf-ledger: scannedThrough=…` counts, so only log the rare, interesting
+    // event: an actual match (how many elements matched, the filter's byte size,
+    // and the first element as hex to cross-check against the block's outputs).
+    if (hit) {
+        peer_log(peer, "cfilter: block %u — matched %zu wallet element(s) vs %zu-byte filter",
+                 b->height, feCount, encodedLen);
+        if (feCount > 0 && fe->elementLens && fe->elements) {
+            const uint8_t *e0 = fe->elements[0];
+            size_t l0 = fe->elementLens[0];
+            char hx[2*40 + 1];
+            size_t hn = (l0 < 40 ? l0 : 40);
+            for (size_t k = 0; k < hn; k++) sprintf(&hx[k*2], "%02x", e0[k]);
+            hx[hn*2] = '\0';
+            peer_log(peer, "cfilter:   sample wallet element[0] len=%zu spk=%s", l0, hx);
+        }
     }
     BRWalletFilterElementsFree(fe);
     BRGCSFilterFree(gcs);

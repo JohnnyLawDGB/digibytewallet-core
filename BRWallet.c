@@ -1630,6 +1630,14 @@ int BRWalletRegisterTransaction(BRWallet *wallet, BRTransaction *tx)
             BRWalletUnusedAddrs(wallet, NULL, SEQUENCE_GAP_LIMIT_EXTERNAL, 0, 2);
             BRWalletUnusedAddrs(wallet, NULL, SEQUENCE_GAP_LIMIT_INTERNAL, 1, 2);
         }
+        // ⚠️ KNOWN HAZARD — lock-release-then-use, SAME CLASS as the saveBlocks race
+        // (fixed in seq/saveblocks-serialize-under-lock / the 2026-07-26 spec). wallet->lock
+        // was released at :1610, yet these callbacks are handed the LIVE `tx` pointer — owned
+        // by wallet->allTx, freeable under the lock by BRWalletRemoveTransaction — so a
+        // concurrent free during the JNI serialize of `tx` is a UAF on the credit path.
+        // NOT yet fixed here (no crash record; BRTransaction is ref-counted/shared, so the fix
+        // differs from the block path) — tracked as its own spec/review/TSan item. DO NOT
+        // extend this release-then-dispatch-a-live-pointer pattern to new callbacks/sites.
         if (wallet->balanceChanged) wallet->balanceChanged(wallet->callbackInfo, wallet->balance);
         if (wallet->txAdded) wallet->txAdded(wallet->callbackInfo, tx);
     }

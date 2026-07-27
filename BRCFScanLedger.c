@@ -294,6 +294,19 @@ void BRCFScanLedgerFree(BRCFScanLedger *l)
 size_t BRCFScanLedgerBufferedCount(const BRCFScanLedger *l) { return l->filterBufCount; }
 size_t BRCFScanLedgerBufferedBytes(const BRCFScanLedger *l) { return l->bufferedBytes; }
 
+// Pure reverse-map input (Task 4): enumerate the buffered blockHashes so the
+// caller can resolve each to a main-chain height via its own block set (O(1)
+// per hash) — never a forward canonical(H)/prevBlock walk. FIFO order (oldest
+// at index 0), returns min(filterBufCount, cap).
+size_t BRCFScanLedgerBufferedHashes(const BRCFScanLedger *l, UInt256 *out, size_t cap)
+{
+    if (! out) return 0;
+    size_t n = l->filterBufCount;
+    if (n > cap) n = cap;
+    for (size_t i = 0; i < n; i++) out[i] = l->filterBuf[i]->blockHash;
+    return n;
+}
+
 // ---- init ------------------------------------------------------------------
 
 void BRCFScanLedgerInit(BRCFScanLedger *l, uint32_t start)

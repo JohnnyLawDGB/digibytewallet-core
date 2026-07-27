@@ -325,6 +325,15 @@ void     BRCFScanLedgerFree(BRCFScanLedger *l);
 size_t   BRCFScanLedgerBufferedCount(const BRCFScanLedger *l);
 size_t   BRCFScanLedgerBufferedBytes(const BRCFScanLedger *l);
 
+// Copy up to `cap` buffered blockHashes (FIFO order, oldest at index 0) into
+// out[] and return the count written (min(filterBufCount, cap); 0 if out is
+// NULL). O(filterBufCount), holds no locks, no BRPeerManager dependency — the
+// pure reverse-map input BRPeerManager's residual re-request suppressor uses to
+// skip re-requesting heights whose canonical block is currently buffered
+// (in-flight), by resolving each hash through manager->blocks (an O(1) set
+// lookup per hash) rather than ever computing canonical(H) by a forward walk.
+size_t   BRCFScanLedgerBufferedHashes(const BRCFScanLedger *l, UInt256 *out, size_t cap);
+
 // ---- Pending-confirm (confirmation-side twin) ------------------------------
 
 // Record wallet txs from a CF-driven full block whose header hasn't connected

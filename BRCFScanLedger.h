@@ -154,6 +154,11 @@ typedef struct {
                                  //   (matched or cleanly missed). Never passes an outstanding/gaveUp hole.
     uint32_t requestedThrough;   // max stop ever recorded — scannedThrough's ceiling, tracked here so it is
                                  //   independent of BRPeerManager's autoFetchCFiltersThrough.
+    uint32_t abandonedBelow;     // retention HARD FLOOR (CF-retention scan-floor, Task 1): heights below this
+                                 //   have been abandoned (too deep to retain — their headers pruned by the
+                                 //   memory ceiling) and are NEVER re-requested. MONOTONIC (only advances).
+                                 //   Advanced ONLY by BRCFScanLedgerAbandonGaveUpBelow, never past a still-
+                                 //   outstanding (retrying) hole. Persisted (blob v2; a v1 blob loads it as 0).
     BRCFOutstanding    outstanding[CF_OUTSTANDING_MAX];   // sorted ascending by height
     size_t             outstandingCount;
     BRCFPendingConfirm pending[CF_PENDING_CONFIRM_MAX];
@@ -261,6 +266,43 @@ void     BRCFScanLedgerCommitRerequest(BRCFScanLedger *l, uint32_t startH, uint3
 uint32_t BRCFScanLedgerScannedThrough(const BRCFScanLedger *l);
 size_t   BRCFScanLedgerOutstandingCount(const BRCFScanLedger *l);
 size_t   BRCFScanLedgerGaveUpCount(const BRCFScanLedger *l);
+
+// ---- CF-retention scan-floor (Task 1) --------------------------------------
+
+// Lowest height the CF scan still needs a header retained for. O(1).
+//   == max(scannedThrough+1, abandonedBelow)
+// gaveUp-INCLUSIVE by construction: _cfLedgerAdvance already caps scannedThrough
+// at min(outstanding[0], gaveUp[0]) - 1, so scannedThrough+1 folds in gaveUp
+// (retry-exhausted holes whose buffered bytes still need the header to
+// drain+credit) AND buffered heights (buffered ⊆ outstanding∪gaveUp). Do NOT
+// "simplify" this to exclude gaveUp: a buffered+gaveUp height would lose its
+// header and its receive is silently lost. BRPeerManager's _BRPeerManagerClearMemory
+// bounds the retained span at min(cfNext, this) - CLEAR_MEM_CF_RETENTION_MARGIN.
+uint32_t BRCFScanLedgerLowestNeededHeight(const BRCFScanLedger *l);
+
+// The retention hard-floor watermark: heights below this are abandoned (too deep
+// to retain) and never re-requested. MONOTONIC. Surfaced to the UI/status so the
+// abandoned count is a reported, countable event — distinct from "scanned".
+uint32_t BRCFScanLedgerAbandonedBelow(const BRCFScanLedger *l);
+
+// Retention memory ceiling reached: abandon retry-exhausted (gaveUp) heights that
+// are too deep to keep retaining. The PURE ledger has no logger — it RETURNS the
+// data the caller (BRPeerManager) warn-logs; do not add a logger dependency here.
+//   - Drops gaveUp[] entries < target (= min(clamp, lowest-still-outstanding),
+//     the new watermark) — NOT < clamp. A gaveUp in [target, clamp), i.e. above a
+//     still-outstanding hole, is KEPT: dropping it would lose it silently after a
+//     restart (gone from gaveUp, not below the persisted abandonedBelow watermark).
+//   - Advances abandonedBelow to min(clamp, lowest-still-OUTSTANDING-height): NEVER
+//     past a still-retrying outstanding hole (that hole is recoverable — not
+//     abandoned; only retry-exhausted gaveUp heights are). abandonedBelow only
+//     ever advances (monotonic — a lower clamp never regresses it).
+//   - If outCount/outLo/outHi are non-NULL, writes the number of gaveUp heights
+//     abandoned by THIS call and their [lo..hi] range (CF_LEDGER_NO_DROP in each
+//     when none were abandoned) so the caller can warn-log it.
+// Returns the new lowest-still-needed height (== BRCFScanLedgerLowestNeededHeight
+// after the mutation) — the caller's new retention floor target.
+uint32_t BRCFScanLedgerAbandonGaveUpBelow(BRCFScanLedger *l, uint32_t clamp,
+                                          uint32_t *outCount, uint32_t *outLo, uint32_t *outHi);
 
 // Coalesce the outstanding + gaveUp heights into ascending [start..end] ranges
 // for the JNI/UI hole report. Writes up to `cap` ranges into outStarts/outEnds

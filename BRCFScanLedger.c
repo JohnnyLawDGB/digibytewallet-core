@@ -377,6 +377,12 @@ int BRCFScanLedgerRecordRequestedDropped(BRCFScanLedger *l, uint32_t startH, uin
                                          uint32_t *outLow, uint32_t *outHigh)
 {
     if (stopH < startH) return 0;
+    // Hard floor (Task 1): never record a height below abandonedBelow — it was
+    // abandoned (too deep, header pruned) and must never be re-requested. Clamp
+    // the low end up; a range wholly below the floor is a complete no-op (does
+    // not even touch requestedThrough).
+    if (startH < l->abandonedBelow) startH = l->abandonedBelow;
+    if (stopH < startH) return 0;
     int n = 0; uint32_t lo = CF_LEDGER_NO_DROP, hi = 0;
     for (uint32_t h = startH; ; h++) {
         uint32_t d = _cfLedgerInsertOutstanding(l, h, peer, port, now);
@@ -414,6 +420,8 @@ void BRCFScanLedgerMarkEvaluated(BRCFScanLedger *l, uint32_t height)
 
 void BRCFScanLedgerMarkHeaderRace(BRCFScanLedger *l, uint32_t height)
 {
+    // Hard floor (Task 1): a below-floor height was abandoned — never resurrect it.
+    if (height < l->abandonedBelow) return;
     size_t i = _cfLedgerLowerBound(l, height);
     if (i < l->outstandingCount && l->outstanding[i].height == height) {
         l->outstanding[i].headerRace = 1; // keep outstanding, flag the fast retry
@@ -527,6 +535,8 @@ int BRCFScanLedgerNextRerequest(BRCFScanLedger *l, uint32_t now, uint32_t *outHe
 int BRCFScanLedgerPeekRerequestRange(BRCFScanLedger *l, uint32_t now, uint32_t minHeight,
                                      uint32_t *outStart, uint32_t *outStop)
 {
+    // Hard floor (Task 1): never offer a height below abandonedBelow.
+    if (minHeight < l->abandonedBelow) minHeight = l->abandonedBelow;
     size_t start = l->outstandingCount;  // no retire here — that's RetireCapped's job
     for (size_t i = 0; i < l->outstandingCount; i++) {
         if (l->outstanding[i].height < minHeight) continue;  // lower-bound cursor (livelock guard)
@@ -572,6 +582,58 @@ void BRCFScanLedgerCommitRerequest(BRCFScanLedger *l, uint32_t startH, uint32_t 
 uint32_t BRCFScanLedgerScannedThrough(const BRCFScanLedger *l) { return l->scannedThrough; }
 size_t   BRCFScanLedgerOutstandingCount(const BRCFScanLedger *l) { return l->outstandingCount; }
 size_t   BRCFScanLedgerGaveUpCount(const BRCFScanLedger *l) { return l->gaveUpCount; }
+
+// ---- CF-retention scan-floor (Task 1) --------------------------------------
+
+// max(scannedThrough+1, abandonedBelow). gaveUp-INCLUSIVE by construction — see
+// the header contract (scannedThrough+1 already folds in min(outstanding[0],
+// gaveUp[0]) via _cfLedgerAdvance). Do NOT change to exclude gaveUp.
+uint32_t BRCFScanLedgerLowestNeededHeight(const BRCFScanLedger *l)
+{
+    uint32_t lo = l->scannedThrough + 1;
+    if (l->abandonedBelow > lo) lo = l->abandonedBelow;   // hard floor
+    return lo;
+}
+
+uint32_t BRCFScanLedgerAbandonedBelow(const BRCFScanLedger *l) { return l->abandonedBelow; }
+
+uint32_t BRCFScanLedgerAbandonGaveUpBelow(BRCFScanLedger *l, uint32_t clamp,
+                                          uint32_t *outCount, uint32_t *outLo, uint32_t *outHi)
+{
+    // The new hard floor = min(clamp, lowest-still-OUTSTANDING). NEVER advance past
+    // a still-retrying outstanding hole (recoverable — we do not abandon it), and
+    // never backward (monotonic). outstanding[] is sorted, so outstanding[0] is
+    // the lowest still-retrying hole. Compute this FIRST — it bounds the drop.
+    uint32_t target = clamp;
+    if (l->outstandingCount > 0 && l->outstanding[0].height < target) {
+        target = l->outstanding[0].height;
+    }
+
+    // Drop the retry-exhausted (gaveUp) prefix below `target` — NOT below `clamp`.
+    // abandonedBelow is the SINGLE PERSISTED source of truth for abandonment, and
+    // it only reaches `target`; a gaveUp height in [target, clamp) (i.e. above a
+    // still-outstanding hole) must be KEPT so it survives a restart in the
+    // persisted gaveUp list — dropping it would lose it silently (not in gaveUp,
+    // not below the persisted watermark, never scanned). gaveUp[] is sorted, so
+    // entries < target form a front prefix [0..k). The dropped count + [lo..hi]
+    // range are RETURNED (the pure ledger has no logger) for the caller to warn-log.
+    size_t k = 0;
+    while (k < l->gaveUpCount && l->gaveUp[k] < target) k++;
+    uint32_t count = (uint32_t)k;
+    uint32_t lo = (k > 0) ? l->gaveUp[0]     : CF_LEDGER_NO_DROP;
+    uint32_t hi = (k > 0) ? l->gaveUp[k - 1] : CF_LEDGER_NO_DROP;
+    if (k > 0) {
+        memmove(&l->gaveUp[0], &l->gaveUp[k], (l->gaveUpCount - k) * sizeof(uint32_t));
+        l->gaveUpCount -= k;
+    }
+
+    if (target > l->abandonedBelow) l->abandonedBelow = target;   // monotonic
+
+    if (outCount) *outCount = count;
+    if (outLo)    *outLo    = lo;
+    if (outHi)    *outHi    = hi;
+    return BRCFScanLedgerLowestNeededHeight(l);
+}
 
 size_t BRCFScanLedgerHoleRanges(const BRCFScanLedger *l, uint32_t *outStarts, uint32_t *outEnds, size_t cap)
 {
@@ -671,12 +733,18 @@ size_t BRCFScanLedgerTakePending(BRCFScanLedger *l, UInt256 blockHash, UInt256 *
 //
 // Blob layout (little-endian, deterministic so the round-trip is byte-identical):
 //   magic u32 | version u32 | start u32 | scannedThrough u32 | requestedThrough u32
+//   abandonedBelow u32 (v2+ only)
 //   outstandingCount u32 | { height u32, headerRace u8 } * count
 //   gaveUpCount u32 | { height u32 } * count
 // Persisted set only (§5): NOT attempts/timestamps/peers, NOT pending.
+//
+// Versioning (Task 1): v2 added the abandonedBelow field after requestedThrough.
+// Parse accepts a v1 blob (which has no such field) and loads abandonedBelow = 0
+// (backward compatible); Serialize always writes the current (v2) layout.
 
-#define CF_LEDGER_MAGIC   0x43464C31u  // "CFL1"
-#define CF_LEDGER_VERSION 1u
+#define CF_LEDGER_MAGIC     0x43464C31u  // "CFL1"
+#define CF_LEDGER_VERSION_1 1u           // pre-abandonedBelow (24-byte fixed header)
+#define CF_LEDGER_VERSION   2u           // adds abandonedBelow (28-byte fixed header)
 
 static void _putU32(uint8_t *p, uint32_t v)
 {
@@ -694,6 +762,7 @@ static uint32_t _getU32(const uint8_t *p)
 static size_t _cfLedgerSerializedSize(const BRCFScanLedger *l)
 {
     return 4 /*magic*/ + 4 /*version*/ + 4 /*start*/ + 4 /*scanned*/ + 4 /*requested*/
+         + 4 /*abandonedBelow (v2)*/
          + 4 /*outCount*/ + l->outstandingCount * (4 + 1)
          + 4 /*gaveUpCount*/ + l->gaveUpCount * 4;
 }
@@ -709,6 +778,7 @@ size_t BRCFScanLedgerSerialize(const BRCFScanLedger *l, uint8_t *buf, size_t buf
     _putU32(p, l->start);             p += 4;
     _putU32(p, l->scannedThrough);    p += 4;
     _putU32(p, l->requestedThrough);  p += 4;
+    _putU32(p, l->abandonedBelow);    p += 4;   // v2
 
     _putU32(p, (uint32_t)l->outstandingCount); p += 4;
     for (size_t i = 0; i < l->outstandingCount; i++) {
@@ -741,13 +811,28 @@ int BRCFScanLedgerParse(BRCFScanLedger *l, const uint8_t *buf, size_t buflen)
     const uint8_t *p = buf;
     size_t remaining = buflen;
 
-    if (_getU32(p) != CF_LEDGER_MAGIC)   return 0;
-    if (_getU32(p + 4) != CF_LEDGER_VERSION) return 0;
+    if (_getU32(p) != CF_LEDGER_MAGIC) return 0;
+    uint32_t version = _getU32(p + 4);
+    if (version < CF_LEDGER_VERSION_1 || version > CF_LEDGER_VERSION) return 0;
     l->start            = _getU32(p + 8);
     l->scannedThrough   = _getU32(p + 12);
     l->requestedThrough = _getU32(p + 16);
-    uint32_t outCount   = _getU32(p + 20);
-    p += 24; remaining -= 24;
+
+    // v2 added abandonedBelow after requestedThrough (28-byte fixed header). A v1
+    // blob has no such field (24-byte header) → load abandonedBelow = 0 (back-compat).
+    uint32_t outCount;
+    size_t hdr;
+    if (version >= CF_LEDGER_VERSION) {
+        if (buflen < 28) return 0;
+        l->abandonedBelow = _getU32(p + 20);
+        outCount          = _getU32(p + 24);
+        hdr = 28;
+    } else {
+        l->abandonedBelow = 0;
+        outCount          = _getU32(p + 20);
+        hdr = 24;
+    }
+    p += hdr; remaining -= hdr;
 
     if (outCount > CF_OUTSTANDING_MAX) return 0;
     if (remaining < (size_t)outCount * (4 + 1) + 4) return 0;

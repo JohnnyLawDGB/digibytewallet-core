@@ -102,6 +102,16 @@ extern "C" {
 #define CF_FILTER_DRAIN_PER_TICK   128      // max READY entries dispatched per DrainConnected call
 #define CF_FILTER_BUF_SLOTS        2048     // fixed-capacity backstop, independent of the byte budget
 
+// Age-out backstop (Task 3, stale-buffer livelock fix, §7): a pruned/orphaned
+// hash can be re-served by a peer indefinitely, keeping its bytes buffered
+// forever (BufferFilter's de-dup path resets `at` on every re-buffer, so an
+// `at`-keyed age-out would never fire). This is byte reclamation, NOT a
+// livelock guarantee (Task 4 handles correctness) — 900s (15 min) is chosen
+// to sit well above the re-request retry schedule (30+60+120+120+120 = 7.5
+// min), so a legitimately-slow header still drains before age-out, and well
+// below the retention margin.
+#define CF_FILTER_BUF_MAX_AGE_SECS 900
+
 // ---- Records ---------------------------------------------------------------
 
 // One requested-but-not-yet-evaluated height. `outstanding` is kept sorted
@@ -133,7 +143,9 @@ typedef struct {
     UInt256  blockHash;
     uint8_t *bytes;
     size_t   len;
-    uint32_t at;    // unix secs when buffered (observability only)
+    uint32_t at;      // unix secs when (re-)buffered; reset on every re-buffer (observability only)
+    uint32_t firstAt;  // unix secs when FIRST buffered; immutable-per-entry so age-out
+                       // (BRCFScanLedgerEvictAgedFilters) can't be rejuvenated by a re-serving peer
 } BRCFFilterBufEntry;
 
 typedef struct {
@@ -295,6 +307,16 @@ size_t   BRCFScanLedgerDrainConnected(BRCFScanLedger *l,
 // the ledger's persisted fields are unaffected; a re-anchored/rescanned floor
 // naturally re-requests anything that was buffered here.
 void     BRCFScanLedgerClearFilterBuffer(BRCFScanLedger *l);
+
+// Age-out byte-reclamation backstop (Task 3, §7): free every buffered entry
+// whose `nowSec - firstAt > CF_FILTER_BUF_MAX_AGE_SECS` (keyed off the
+// IMMUTABLE first-buffered timestamp, NOT the re-buffer-reset `at`), and
+// compact the FIFO array. Touches ONLY filterBuf[]/filterBufCount/
+// bufferedBytes — never outstanding/scannedThrough/requestedThrough/gaveUp,
+// and never calls MarkEvaluated. This is a pure byte-budget reclaim, NOT a
+// livelock cure: an evicted hash's height is simply left to the ordinary
+// re-request path (Task 4 handles the correctness/skip-set side).
+void     BRCFScanLedgerEvictAgedFilters(BRCFScanLedger *l, uint32_t nowSec);
 
 // Free all buffered filter bytes (teardown). Safe to call on an empty (or
 // never-buffered) ledger. Call from BRPeerManagerFree alongside the other frees.

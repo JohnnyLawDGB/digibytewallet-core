@@ -3263,14 +3263,23 @@ void BRPeerManagerKeepAlive(BRPeerManager *manager)
         // prevBlock walk (thousands of derefs deep in the floor/recovery regime,
         // under manager->lock, would ANR). An orphaned/pruned/header-not-connected
         // hash resolves to NULL and contributes no skip height (correct: its
-        // outstanding height is still re-requested). Bounded by CF_FILTER_BUF_SLOTS.
-        UInt256  bufHashes[CF_FILTER_BUF_SLOTS];
-        uint32_t skipHeights[CF_FILTER_BUF_SLOTS];
-        size_t nBuf = BRCFScanLedgerBufferedHashes(&manager->cfLedger, bufHashes, CF_FILTER_BUF_SLOTS);
+        // outstanding height is still re-requested). Heap-sized to the ACTUAL
+        // buffered count (not the CF_FILTER_BUF_SLOTS=2048 worst case), so
+        // KeepAlive's stack frame carries no ~72 KiB fixed reservation --
+        // KeepAlive runs ~every 10s under the lock, so a per-tick malloc/free is
+        // negligible. If the buffer is empty or a malloc fails, nSkip stays 0 ->
+        // no suppression this tick (the bounded, harmless redundant re-fetch the
+        // volume analysis already accepts), never a crash.
+        size_t nBuf = BRCFScanLedgerBufferedCount(&manager->cfLedger);
+        UInt256  *bufHashes   = nBuf ? malloc(nBuf * sizeof(*bufHashes))   : NULL;
+        uint32_t *skipHeights = nBuf ? malloc(nBuf * sizeof(*skipHeights)) : NULL;
         size_t nSkip = 0;
-        for (size_t i = 0; i < nBuf; i++) {
-            BRMerkleBlock *b = BRSetGet(manager->blocks, &bufHashes[i]);
-            if (b && b->height != BLOCK_UNKNOWN_HEIGHT) skipHeights[nSkip++] = b->height;
+        if (bufHashes && skipHeights) {
+            size_t got = BRCFScanLedgerBufferedHashes(&manager->cfLedger, bufHashes, nBuf);
+            for (size_t i = 0; i < got; i++) {
+                BRMerkleBlock *b = BRSetGet(manager->blocks, &bufHashes[i]);
+                if (b && b->height != BLOCK_UNKNOWN_HEIGHT) skipHeights[nSkip++] = b->height;
+            }
         }
 
         uint32_t tipH = manager->lastBlock ? manager->lastBlock->height : 0, minH = 0;
@@ -3323,6 +3332,8 @@ void BRPeerManagerKeepAlive(BRPeerManager *manager)
             }
             minH = re + 1;
         }
+        free(bufHashes);      // per-tick heap skip-set (free(NULL) is safe)
+        free(skipHeights);
         manager->cfLedger.lastDriveAt = nowSec;
     }
 #endif // CF_LEDGER_DRIVE_REREQUEST

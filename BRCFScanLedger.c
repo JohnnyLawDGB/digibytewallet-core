@@ -143,6 +143,36 @@ static void _cfLedgerEvictOldestFilter(BRCFScanLedger *l)
     l->filterBufCount--;
 }
 
+// Age-out byte-reclamation backstop (Task 3, §7). Keyed off the IMMUTABLE
+// `firstAt` (set once, on insert; never touched by a re-buffer), NOT the
+// mutable `at` — a re-serving peer that keeps re-buffering the same hash
+// resets `at` on every call, so an `at`-keyed check would never fire on a
+// pruned/orphaned hash that a peer keeps re-serving.
+//
+// Touches ONLY filterBuf[]/filterBufCount/bufferedBytes. Deliberately does
+// NOT touch outstanding/scannedThrough/requestedThrough/gaveUp and does NOT
+// call BRCFScanLedgerMarkEvaluated — this is a pure byte-budget reclaim, not a
+// correctness path (an evicted hash's height is simply left for the ordinary
+// re-request machinery to pick back up).
+void BRCFScanLedgerEvictAgedFilters(BRCFScanLedger *l, uint32_t nowSec)
+{
+    size_t i = 0;
+    while (i < l->filterBufCount) {
+        BRCFFilterBufEntry *e = l->filterBuf[i];
+        uint32_t age = (nowSec >= e->firstAt) ? (nowSec - e->firstAt) : 0; // underflow-guarded
+        if (age > CF_FILTER_BUF_MAX_AGE_SECS) {
+            l->bufferedBytes -= e->len;
+            _cfLedgerFreeFilterEntry(e);
+            memmove(&l->filterBuf[i], &l->filterBuf[i + 1],
+                    (l->filterBufCount - i - 1) * sizeof(l->filterBuf[0]));
+            l->filterBufCount--;
+            // do not advance i — the next entry has shifted into slot i
+        } else {
+            i++;
+        }
+    }
+}
+
 // PRECONDITION (see BRCFScanLedger.h): `l` must already be Init/Parse'd (or
 // otherwise zeroed) before the first call — this function reads
 // filterBufCount/filterBuf[] below as part of the de-dup scan, so there is no
@@ -167,6 +197,9 @@ int BRCFScanLedgerBufferFilter(BRCFScanLedger *l, UInt256 blockHash,
             l->bufferedBytes = l->bufferedBytes - e->len + len;
             e->len = len;
             e->at  = now;
+            // firstAt is intentionally NOT touched here — it is immutable-per-
+            // entry so age-out (BRCFScanLedgerEvictAgedFilters) can't be
+            // rejuvenated by a re-serving peer re-buffering the same hash.
             // >= (not just >): keep the resident total strictly under the cap
             // once a churn is underway, rather than letting it settle exactly
             // AT the cap — see BufferFilter's insert-path comment below.
@@ -195,8 +228,9 @@ int BRCFScanLedgerBufferFilter(BRCFScanLedger *l, UInt256 blockHash,
     entry->blockHash = blockHash;
     entry->bytes     = malloc(len ? len : 1);
     memcpy(entry->bytes, bytes, len);
-    entry->len = len;
-    entry->at  = now;
+    entry->len     = len;
+    entry->at      = now;
+    entry->firstAt = now;  // immutable: stamped once, on insert only
 
     l->filterBuf[l->filterBufCount] = entry;
     l->filterBufCount++;
@@ -259,6 +293,19 @@ void BRCFScanLedgerFree(BRCFScanLedger *l)
 
 size_t BRCFScanLedgerBufferedCount(const BRCFScanLedger *l) { return l->filterBufCount; }
 size_t BRCFScanLedgerBufferedBytes(const BRCFScanLedger *l) { return l->bufferedBytes; }
+
+// Pure reverse-map input (Task 4): enumerate the buffered blockHashes so the
+// caller can resolve each to a main-chain height via its own block set (O(1)
+// per hash) — never a forward canonical(H)/prevBlock walk. FIFO order (oldest
+// at index 0), returns min(filterBufCount, cap).
+size_t BRCFScanLedgerBufferedHashes(const BRCFScanLedger *l, UInt256 *out, size_t cap)
+{
+    if (! out) return 0;
+    size_t n = l->filterBufCount;
+    if (n > cap) n = cap;
+    for (size_t i = 0; i < n; i++) out[i] = l->filterBuf[i]->blockHash;
+    return n;
+}
 
 // ---- init ------------------------------------------------------------------
 

@@ -3225,11 +3225,16 @@ void BRPeerManagerKeepAlive(BRPeerManager *manager)
 
 #if CF_LEDGER_DRIVE_REREQUEST
     // Phase 2 driver: (1) drain any buffered header-race filters whose block
-    // header + cfheader have since connected (the crux credit path above),
-    // then (2) best-effort re-request the RESIDUAL drop set (verify/parse/
-    // disconnect holes) via peek/commit, gated on an empty buffer so
-    // undrained-but-outstanding header-race heights are never
-    // duplicate-requested (they belong to the buffer path, not this one).
+    // header + cfheader have since connected (the crux credit path above) and
+    // age out stale buffered bytes, then (2) best-effort re-request the RESIDUAL
+    // drop set (verify/parse/disconnect holes) via peek/commit EVERY tick. The
+    // old global `if (BufferedCount == 0)` gate is DELETED (Task 4): a header
+    // re-sync can orphan buffered hashes, and those stale entries kept
+    // BufferedCount>0 forever, starving residual re-request for every height
+    // (the production livelock). Instead a per-height O(1) reverse-map suppressor
+    // skips only heights whose canonical block is currently buffered (in-flight),
+    // so undrained header-race heights are still not duplicate-requested — without
+    // any single stale buffered hash being able to wedge the whole path shut.
     {
         uint32_t nowSec = (uint32_t)time(NULL);
         uint8_t scratch[2048];                              // >= max cfilter (675 B observed); 3x headroom vs a
@@ -3242,48 +3247,93 @@ void BRPeerManagerKeepAlive(BRPeerManager *manager)
                                      scratch, sizeof scratch, _cfBufEval, CF_FILTER_DRAIN_PER_TICK);
         BRWalletFilterElementsFree(dctx.elems);             // free once (accepts NULL)
 
-        if (BRCFScanLedgerBufferedCount(&manager->cfLedger) == 0) {
-            BRCFScanLedgerRetireCapped(&manager->cfLedger);
-            uint32_t tipH = manager->lastBlock ? manager->lastBlock->height : 0, minH = 0;
-            for (unsigned n = 0; n < CF_REREQ_BATCH_PER_TICK; n++) {
-                uint32_t rs = 0, re = 0;
-                if (! BRCFScanLedgerPeekRerequestRange(&manager->cfLedger, nowSec, minH, &rs, &re)) break;
-                uint32_t cap = (re <= tipH) ? re : tipH;
-                if (cap < rs) { minH = re + 1; continue; }  // whole offered run is beyond the tip -- skip past it
+        // Task 3 byte-reclamation backstop, once per tick: age out any pruned/
+        // orphaned buffered filter a peer keeps re-serving (BufferFilter's de-dup
+        // resets `at`, so an `at`-keyed age-out never fires; this keys off the
+        // immutable firstAt). Now that the buffer no longer gates the residual
+        // path, this must run every tick so those bytes are eventually reclaimed.
+        BRCFScanLedgerEvictAgedFilters(&manager->cfLedger, nowSec);
 
-                // Rotate away from whichever peer this hole's lowest height was last
-                // sent to (if any) -- same "don't re-dial the peer that just dropped
-                // it" intent as the forward driver's peer selection.
-                UInt128 avoidA = UINT128_ZERO;
-                uint16_t avoidP = 0;
-                for (size_t i = 0; i < manager->cfLedger.outstandingCount; i++) {
-                    if (manager->cfLedger.outstanding[i].height == rs) {
-                        avoidA = manager->cfLedger.outstanding[i].peer;
-                        avoidP = manager->cfLedger.outstanding[i].port;
-                        break;
-                    }
-                }
+        BRCFScanLedgerRetireCapped(&manager->cfLedger);
 
-                BRPeer *chosen = NULL, *any = NULL;
-                for (size_t i = array_count(manager->connectedPeers); i > 0; i--) {
-                    BRPeer *p = manager->connectedPeers[i - 1];
-                    if (! _BRPeerManagerPeerCanServeFilters(p)) continue;
-                    if (! any) any = p;
-                    if (avoidP != 0 && p->port == avoidP && UInt128Eq(p->address, avoidA)) continue;
-                    chosen = p;
-                    break;
-                }
-                if (! chosen) chosen = any;
-                if (! chosen) break; // no CF-capable peer connected at all -- nothing to do this tick
-
-                size_t sent = _BRPeerManagerRequestCFiltersLocked(manager, rs, cap, chosen);
-                if (sent > 0) {
-                    BRCFScanLedgerCommitRerequest(&manager->cfLedger, rs, cap, chosen->address, chosen->port, nowSec);
-                    peer_log(chosen, "cf-ledger: re-requested residual holes [%u..%u]", rs, cap);
-                }
-                minH = re + 1;
+        // Build the reverse-map skip set ONCE per tick (before the peek loop):
+        // enumerate the SMALL buffered hash set and resolve each to its main-chain
+        // height via manager->blocks (BRSetGet, O(1) per hash). This is the whole
+        // point of the reverse map — NEVER compute canonical(H) by a forward
+        // prevBlock walk (thousands of derefs deep in the floor/recovery regime,
+        // under manager->lock, would ANR). An orphaned/pruned/header-not-connected
+        // hash resolves to NULL and contributes no skip height (correct: its
+        // outstanding height is still re-requested). Heap-sized to the ACTUAL
+        // buffered count (not the CF_FILTER_BUF_SLOTS=2048 worst case), so
+        // KeepAlive's stack frame carries no ~72 KiB fixed reservation --
+        // KeepAlive runs ~every 10s under the lock, so a per-tick malloc/free is
+        // negligible. If the buffer is empty or a malloc fails, nSkip stays 0 ->
+        // no suppression this tick (the bounded, harmless redundant re-fetch the
+        // volume analysis already accepts), never a crash.
+        size_t nBuf = BRCFScanLedgerBufferedCount(&manager->cfLedger);
+        UInt256  *bufHashes   = nBuf ? malloc(nBuf * sizeof(*bufHashes))   : NULL;
+        uint32_t *skipHeights = nBuf ? malloc(nBuf * sizeof(*skipHeights)) : NULL;
+        size_t nSkip = 0;
+        if (bufHashes && skipHeights) {
+            size_t got = BRCFScanLedgerBufferedHashes(&manager->cfLedger, bufHashes, nBuf);
+            for (size_t i = 0; i < got; i++) {
+                BRMerkleBlock *b = BRSetGet(manager->blocks, &bufHashes[i]);
+                if (b && b->height != BLOCK_UNKNOWN_HEIGHT) skipHeights[nSkip++] = b->height;
             }
         }
+
+        uint32_t tipH = manager->lastBlock ? manager->lastBlock->height : 0, minH = 0;
+        for (unsigned n = 0; n < CF_REREQ_BATCH_PER_TICK; n++) {
+            uint32_t rs = 0, re = 0;
+            if (! BRCFScanLedgerPeekRerequestRange(&manager->cfLedger, nowSec, minH, &rs, &re)) break;
+
+            // Reverse-map suppressor: rs's canonical block is currently buffered
+            // (in-flight via the buffer-drain path) -- skip past just rs so the
+            // next peek can still offer rs+1..re, the same skip-past idiom as the
+            // tip clip below. A buffered height sparse mid-run may ride along in a
+            // coalesced range: the accepted, bounded (backoff x 5-cap) redundant
+            // fetch -- deliberately NOT prevented here (no per-candidate walk).
+            int rsInFlight = 0;
+            for (size_t i = 0; i < nSkip; i++) { if (skipHeights[i] == rs) { rsInFlight = 1; break; } }
+            if (rsInFlight) { minH = rs + 1; continue; }
+
+            uint32_t cap = (re <= tipH) ? re : tipH;
+            if (cap < rs) { minH = re + 1; continue; }  // whole offered run is beyond the tip -- skip past it
+
+            // Rotate away from whichever peer this hole's lowest height was last
+            // sent to (if any) -- same "don't re-dial the peer that just dropped
+            // it" intent as the forward driver's peer selection.
+            UInt128 avoidA = UINT128_ZERO;
+            uint16_t avoidP = 0;
+            for (size_t i = 0; i < manager->cfLedger.outstandingCount; i++) {
+                if (manager->cfLedger.outstanding[i].height == rs) {
+                    avoidA = manager->cfLedger.outstanding[i].peer;
+                    avoidP = manager->cfLedger.outstanding[i].port;
+                    break;
+                }
+            }
+
+            BRPeer *chosen = NULL, *any = NULL;
+            for (size_t i = array_count(manager->connectedPeers); i > 0; i--) {
+                BRPeer *p = manager->connectedPeers[i - 1];
+                if (! _BRPeerManagerPeerCanServeFilters(p)) continue;
+                if (! any) any = p;
+                if (avoidP != 0 && p->port == avoidP && UInt128Eq(p->address, avoidA)) continue;
+                chosen = p;
+                break;
+            }
+            if (! chosen) chosen = any;
+            if (! chosen) break; // no CF-capable peer connected at all -- nothing to do this tick
+
+            size_t sent = _BRPeerManagerRequestCFiltersLocked(manager, rs, cap, chosen);
+            if (sent > 0) {
+                BRCFScanLedgerCommitRerequest(&manager->cfLedger, rs, cap, chosen->address, chosen->port, nowSec);
+                peer_log(chosen, "cf-ledger: re-requested residual holes [%u..%u]", rs, cap);
+            }
+            minH = re + 1;
+        }
+        free(bufHashes);      // per-tick heap skip-set (free(NULL) is safe)
+        free(skipHeights);
         manager->cfLedger.lastDriveAt = nowSec;
     }
 #endif // CF_LEDGER_DRIVE_REREQUEST

@@ -761,6 +761,15 @@ static void _BRPeerManagerOnFilterCapablePeerConnected(BRPeerManager *manager, v
 static size_t _BRPeerManagerRequestCFiltersLocked(BRPeerManager *manager,
                                                   uint32_t startHeight, uint32_t stopHeight,
                                                   BRPeer *preferred);
+// Task 3: pre-resolved-hash sibling of the above. The residual batch resolves
+// every range's stop hash in ONE descent (Pass B) and hands the result straight
+// through here (Pass C) so this never re-walks manager->blocks. Same send/return
+// contract as the resolving wrapper, minus the _BRPeerManagerBlockHashAtHeight
+// walk. Forward-declared so BRPeerManagerKeepAlive (above the definition) can
+// call it.
+static size_t _BRPeerManagerRequestCFiltersWithStopHashLocked(BRPeerManager *manager,
+                                                             uint32_t startHeight, uint32_t stopHeight,
+                                                             UInt256 stopHash, BRPeer *preferred);
 static BRPeer *_BRPeerManagerAnyFilterCapablePeer(BRPeerManager *manager);
 static void _BRPeerManagerRequestNextCFHeaders(BRPeerManager *manager, BRPeer *peer);
 static int _BRPeerManagerReanchorAtFloorLocked(BRPeerManager *manager, int force);
@@ -3344,7 +3353,23 @@ void BRPeerManagerKeepAlive(BRPeerManager *manager)
             }
         }
 
+        // Task 3 — single-descent residual tick, restructured into three passes
+        // so all stop hashes resolve in ONE O(chainLen) descent (Pass B) instead
+        // of up to CF_REREQ_BATCH_PER_TICK deep _BRPeerManagerBlockHashAtHeight
+        // walks under manager->lock (the raised-floor ANR class). The passes are
+        // behaviour-identical to the old fused peek->send->commit loop:
+        //   Pass A collects the SAME (rs,cap,chosen) tuples the fused loop would
+        //          have sent — same suppressor skip, same tip-clip, same rotate-
+        //          away peer selection, same minH advance, same break conditions;
+        //   Pass B resolves every collected stop height to its hash in one descent;
+        //   Pass C sends each range with its pre-resolved stop hash and commits
+        //          ONLY on a real send (sent>0), exactly as before.
+        // Per-tick fixed-size scratch (no malloc), bounded by CF_REREQ_BATCH_PER_TICK.
+        struct { uint32_t rs; uint32_t cap; BRPeer *chosen; } collected[CF_REREQ_BATCH_PER_TICK];
+        size_t nCollected = 0;
+
         uint32_t tipH = manager->lastBlock ? manager->lastBlock->height : 0, minH = 0;
+        // ---- Pass A: collect (no resolve, no send, no commit) ----
         for (unsigned n = 0; n < CF_REREQ_BATCH_PER_TICK; n++) {
             uint32_t rs = 0, re = 0;
             if (! BRCFScanLedgerPeekRerequestRange(&manager->cfLedger, nowSec, minH, &rs, &re)) break;
@@ -3387,12 +3412,47 @@ void BRPeerManagerKeepAlive(BRPeerManager *manager)
             if (! chosen) chosen = any;
             if (! chosen) break; // no CF-capable peer connected at all -- nothing to do this tick
 
-            size_t sent = _BRPeerManagerRequestCFiltersLocked(manager, rs, cap, chosen);
+            collected[nCollected].rs     = rs;
+            collected[nCollected].cap    = cap;
+            collected[nCollected].chosen = chosen;
+            nCollected++;
+            minH = re + 1;
+        }
+
+        // ---- Pass B: resolve every collected stop height in ONE descent ----
+        // The getcfilters wire message carries startHeight as an integer and the
+        // STOP as a hash, so only the cap heights need resolving (resolving the
+        // start too would be dead work — and gating on a start-hash miss would
+        // suppress a send the fused loop makes, breaking send-set identity). n is
+        // bounded by CF_REREQ_BATCH_PER_TICK (<= 2*CF_REREQ_BATCH_PER_TICK).
+        uint32_t stopHeights[CF_REREQ_BATCH_PER_TICK];
+        UInt256  stopHashes[CF_REREQ_BATCH_PER_TICK];
+        for (size_t c = 0; c < nCollected; c++) stopHeights[c] = collected[c].cap;
+        _BRPeerManagerResolveHashesAtHeightsLocked(manager, stopHeights, nCollected, stopHashes);
+
+        // ---- Pass C: send each range with its pre-resolved stop hash + commit ----
+        for (size_t c = 0; c < nCollected; c++) {
+            uint32_t rs = collected[c].rs, cap = collected[c].cap;
+            BRPeer  *chosen = collected[c].chosen;
+
+            // Between-pass staleness guard (defensive operator condition): a
+            // height collected in Pass A may have DRAINED (MarkEvaluated) before
+            // Pass C reaches it. Nothing drains between passes within one locked
+            // tick today, but re-check the range's LOWEST height (rs) is still
+            // outstanding so a future change can't silently double-request or
+            // mis-commit a resolved height. If rs is gone, skip both the send
+            // and the commit — no getcfilters, no attempt bump.
+            int rsStillOutstanding = 0;
+            for (size_t i = 0; i < manager->cfLedger.outstandingCount; i++) {
+                if (manager->cfLedger.outstanding[i].height == rs) { rsStillOutstanding = 1; break; }
+            }
+            if (! rsStillOutstanding) continue;
+
+            size_t sent = _BRPeerManagerRequestCFiltersWithStopHashLocked(manager, rs, cap, stopHashes[c], chosen);
             if (sent > 0) {
                 BRCFScanLedgerCommitRerequest(&manager->cfLedger, rs, cap, chosen->address, chosen->port, nowSec);
                 peer_log(chosen, "cf-ledger: re-requested residual holes [%u..%u]", rs, cap);
             }
-            minH = re + 1;
         }
         free(bufHashes);      // per-tick heap skip-set (free(NULL) is safe)
         free(skipHeights);
@@ -4037,18 +4097,30 @@ static int _BRPeerManagerPeerCanServeFilters(BRPeer *p)
            (p->services & SERVICES_NODE_COMPACT_FILTERS) == SERVICES_NODE_COMPACT_FILTERS;
 }
 
-static size_t _BRPeerManagerRequestCFiltersLocked(BRPeerManager *manager,
-                                                  uint32_t startHeight, uint32_t stopHeight,
-                                                  BRPeer *preferred)
+// Send getcfilters([startHeight..stopHeight]) with a PRE-RESOLVED stop hash —
+// the walk-free half of _BRPeerManagerRequestCFiltersLocked. Same contract as
+// the resolving wrapper below, except the caller supplies stopHash (resolved
+// once per residual tick in the Pass B batch descent) instead of this function
+// walking manager->blocks. Returns the number of filters requested (0 on any
+// no-send condition: empty range, bloom mode, unresolvable stop, or no peer).
+static size_t _BRPeerManagerRequestCFiltersWithStopHashLocked(BRPeerManager *manager,
+                                                             uint32_t startHeight, uint32_t stopHeight,
+                                                             UInt256 stopHash, BRPeer *preferred)
 {
     if (stopHeight < startHeight) return 0;
     if (manager->syncMode == BR_SYNC_MODE_BLOOM_ONLY) return 0;
 
-    uint32_t cap = startHeight + (MAX_CFILTERS_RESULTS - 1);
-    if (stopHeight > cap) stopHeight = cap;
+    // The caller resolved stopHash at exactly `stopHeight`. Every caller keeps
+    // the range within one getcfilters window (the resolving wrapper clamps to
+    // startHeight + MAX_CFILTERS_RESULTS - 1 BEFORE resolving; the residual peek
+    // coalesces at most CF_REREQ_MAX_RANGE == MAX_CFILTERS_RESULTS heights), so
+    // stopHash always corresponds to the height that goes on the wire. A stop
+    // beyond that window would mean the hash is for a DIFFERENT height than the
+    // getcfilters stop — precisely the silent wrong-range fetch the single-
+    // descent design rejects a persistent index to avoid; assert it can't happen.
+    assert(stopHeight <= startHeight + (MAX_CFILTERS_RESULTS - 1));
 
-    UInt256 stopHash = _BRPeerManagerBlockHashAtHeight(manager, stopHeight);
-    if (UInt256IsZero(stopHash)) return 0;
+    if (UInt256IsZero(stopHash)) return 0;   // stop height not in the in-memory window -> don't send (as before)
 
     uint8_t filterType = manager->compactFilterChain
                          ? BRCompactFilterChainType(manager->compactFilterChain)
@@ -4073,6 +4145,24 @@ static size_t _BRPeerManagerRequestCFiltersLocked(BRPeerManager *manager,
 
     BRPeerSendGetCFilters(target, filterType, startHeight, stopHash);
     return stopHeight - startHeight + 1;
+}
+
+static size_t _BRPeerManagerRequestCFiltersLocked(BRPeerManager *manager,
+                                                  uint32_t startHeight, uint32_t stopHeight,
+                                                  BRPeer *preferred)
+{
+    if (stopHeight < startHeight) return 0;
+    if (manager->syncMode == BR_SYNC_MODE_BLOOM_ONLY) return 0;
+
+    uint32_t cap = startHeight + (MAX_CFILTERS_RESULTS - 1);
+    if (stopHeight > cap) stopHeight = cap;
+
+    // Resolve the stop hash HERE (the deep, ≤64/tick walk on the residual path)
+    // then delegate to the pre-resolved sibling. The clamp above guarantees the
+    // sibling's window assert holds. The residual batch skips this wrapper and
+    // resolves all its stops in one descent (Pass B) instead.
+    UInt256 stopHash = _BRPeerManagerBlockHashAtHeight(manager, stopHeight);
+    return _BRPeerManagerRequestCFiltersWithStopHashLocked(manager, startHeight, stopHeight, stopHash, preferred);
 }
 
 size_t BRPeerManagerRequestCompactFilters(BRPeerManager *manager,

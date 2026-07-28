@@ -1995,6 +1995,68 @@ static UInt256 _BRPeerManagerBlockHashAtHeight(BRPeerManager *manager, uint32_t 
     return UINT256_ZERO;
 }
 
+#if CF_LEDGER_DRIVE_REREQUEST
+// Resolve N heights to block hashes in ONE descent from lastBlock. Equivalent to
+// calling _BRPeerManagerBlockHashAtHeight for each height, but O(chainLen) once
+// instead of O(chainLen)*N. Per-call scratch, no persistent state, correct-by-
+// construction from the current chain view. outHashes[i] corresponds to
+// heights[i] (UINT256_ZERO if the height is above the tip or not in the
+// in-memory window). heights[] may be unsorted and may contain duplicates.
+// Caller must hold manager->lock.
+//
+// A persistent height->hash index was deliberately REJECTED (a stale entry
+// would hand getcfilters a wrong stop-hash = silent wrong-range fetch); this
+// per-call resolver is correct-by-construction and cannot go stale.
+static void _BRPeerManagerResolveHashesAtHeightsLocked(BRPeerManager *manager,
+                                                       const uint32_t *heights, size_t n,
+                                                       UInt256 *outHashes)
+{
+    if (n == 0 || heights == NULL || outHashes == NULL) return;
+
+    // Default every slot to ZERO up front: an early return (malloc failure) or a
+    // height that never matches leaves the clean "not found" sentinel, not garbage.
+    for (size_t i = 0; i < n; i++) outHashes[i] = UINT256_ZERO;
+
+    // Per-call scratch of (height, originalIndex) pairs. No persistent state, so
+    // a reorg between ticks can never resurface a stale hash. n is bounded by the
+    // residual tick's CF_REREQ_BATCH_PER_TICK-derived range count, but malloc/free
+    // per call keeps this correct for any n with no fixed-cap overflow risk.
+    typedef struct { uint32_t height; size_t idx; } cfResolveReq;
+    cfResolveReq *req = malloc(n * sizeof(*req));
+    if (req == NULL) return; // outHashes already all-ZERO -> safe conservative no-op
+    for (size_t i = 0; i < n; i++) { req[i].height = heights[i]; req[i].idx = i; }
+
+    // Insertion sort DESCENDING by height. n is small (the CF residual batch) and
+    // this O(n^2) sort is independent of chain length, so it is dwarfed by the
+    // single O(chainLen) descent below — the whole point of batching.
+    for (size_t i = 1; i < n; i++) {
+        cfResolveReq key = req[i];
+        size_t j = i;
+        while (j > 0 && req[j - 1].height < key.height) { req[j] = req[j - 1]; j--; }
+        req[j] = key;
+    }
+
+    // ONE descent from lastBlock. Because the requested heights are now
+    // non-increasing, the walk pointer only ever moves DOWN — each height
+    // continues from where the previous (higher) one stopped. `b` is always on
+    // lastBlock's prevBlock chain, so continuing is identical to restarting from
+    // lastBlock: it reaches exactly the blocks N independent naive walks would,
+    // including hitting the SAME severed prevBlock link (-> ZERO) on a gap and
+    // NEVER an orphan/fork block off the main chain.
+    BRMerkleBlock *b = manager->lastBlock;
+    for (size_t k = 0; k < n; k++) {
+        uint32_t h = req[k].height;
+        while (b && b->height > h) b = BRSetGet(manager->blocks, &b->prevBlock);
+        if (b && b->height == h) outHashes[req[k].idx] = b->blockHash;
+        // else: leave the pre-set UINT256_ZERO (above tip, off the bottom, or a
+        // severed link) — byte-identical to what _BRPeerManagerBlockHashAtHeight
+        // returns for that height.
+    }
+
+    free(req);
+}
+#endif // CF_LEDGER_DRIVE_REREQUEST
+
 // Returns 1 if the peer is eligible to serve BIP 158 messages given the
 // manager's current sync mode, 0 otherwise.
 static int _BRPeerManagerPeerSupportsCompactFilters(BRPeerManager *manager, BRPeer *peer)

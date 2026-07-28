@@ -583,9 +583,29 @@ uint32_t BRPeerManagerGetAutoFetchCFiltersThrough(BRPeerManager *manager);
 // make the next fetch start one height too high and silently skip it forever,
 // the exact bug class this ledger subsystem exists to prevent). Folds in the
 // ledger's abandonedBelow hard floor via LowestNeededHeight, so an abandoned
-// prefix is never re-requested either. MONOTONIC: only ever raises the cursor
-// (max), never lowers it; a no-op on a not-yet-armed ledger (LowestNeededHeight
-// == 0).
+// prefix is never re-requested either. A no-op on a not-yet-armed ledger
+// (LowestNeededHeight == 0).
+//
+// ⚠️ IT IS NO LONGER RAISE-ONLY (paced-convoy fix wave, C-1) — do not "restore"
+// that. On a RESUME, BRPeerManagerEnableAutoCompactFilterFetch's resolvability
+// clamp lands on the SAVED-BLOCKS TIP, because BRPeerManagerNewEx puts the saved
+// blocks in `orphans` and chains FORWARD from the highest one, so manager->blocks
+// holds the checkpoints plus exactly ONE saved block and a deep birth height
+// cannot resolve. Both `autoFetchCFiltersStart` and the cursor therefore start
+// ~CF_CONVOY_WINDOW ABOVE the restored scan frontier, and every forward-fetch site
+// clamps reqStart UP to autoFetchCFiltersStart — so a raise-only snap could never
+// pull them back down and the next forward request began at the clamped tip, which
+// made _cfLedgerAdvance sail scannedThrough over ~CF_CONVOY_WINDOW never-requested
+// heights with abandonedBelow still 0 (no WARN, no banner, wallet reports Synced).
+// This function therefore now:
+//   1. SURFACES any still-needed history below the in-memory block floor
+//      (BRCFScanLedgerAbandonUnscannableBelow + WARN) — that band is unservable for
+//      the whole session, so it becomes skipped-and-surfaced-and-recoverable
+//      instead of silently skipped;
+//   2. lowers autoFetchCFiltersStart to the frontier and clamps the cursor down to
+//      cfLedger.requestedThrough (a cursor above what was actually requested is
+//      what lets a non-contiguous RecordRequested sail), then raises it to
+//      LowestNeededHeight - 1 as before.
 //
 // LOCKING: unlike the file-static _cfConvoy*/B1-driver helpers (which run INSIDE
 // an already-locked BRPeerManagerKeepAlive pass and must NOT take the lock),
@@ -593,6 +613,25 @@ uint32_t BRPeerManagerGetAutoFetchCFiltersThrough(BRPeerManager *manager);
 // lock, so it takes manager->lock itself. Do NOT call it from any already-locked
 // path -- manager->lock is NON-recursive.
 void BRPeerManagerSnapAutoFetchThroughToScanFrontier(BRPeerManager *manager);
+
+// ---- Runtime-readable convoy constants (spec Part C: "ideally runtime-readable")
+//
+// CF_CONVOY_WINDOW and CF_CONVOY_REARM_MAX are consumed on BOTH sides of the JNI
+// boundary: the native gate/valve use them directly, and the Kotlin tip-stall +
+// BIP158 watchdogs need them to decide "the header tip is frozen BY DESIGN"
+// (isConvoyWindowFull) and "the valve still owns this stall" (isConvoySuppressed,
+// bounded at CF_CONVOY_REARM_MAX + 1). Hand-mirroring them in Kotlin is a DRIFT
+// TRAP with teeth, and the spec's own tuning signal tells the operator to raise
+// CF_CONVOY_REARM_MAX here when an abandoned height later reconciles:
+//   * REARM_MAX raised natively only -> Kotlin releases its suppression at 4 while
+//     the valve is legitimately still working cycles 4..N, so the tip-stall
+//     watchdog escalates INTO a productive valve and tier 2 recreates the manager;
+//   * WINDOW lowered natively only -> Kotlin reads "window not full", drops the
+//     tip-frozen conjunct, and arms tier 1/tier 2 during a HEALTHY paced descent.
+// These accessors exist so Kotlin DERIVES both values at runtime and there is no
+// second copy to drift. Pure constant readers: no manager, no lock, safe anywhere.
+uint32_t BRPeerManagerConvoyWindow(void);
+uint32_t BRPeerManagerConvoyRearmMax(void);
 
 // ----------- end BIP 158 opt-in -----------
 

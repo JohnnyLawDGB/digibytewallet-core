@@ -380,6 +380,40 @@ uint32_t BRCFScanLedgerAbandonedBelow(const BRCFScanLedger *l);
 uint32_t BRCFScanLedgerAbandonGaveUpBelow(BRCFScanLedger *l, uint32_t clamp,
                                           uint32_t *outCount, uint32_t *outLo, uint32_t *outHi);
 
+// STRUCTURALLY UNSCANNABLE band (paced-convoy C-1): surface `[lo .. floor-1]`
+// instead of letting the scan floor move past it silently.
+//
+// WHY THIS EXISTS, AND WHY IT IS NOT AbandonGaveUpBelow. A cfilter can only be
+// EVALUATED for a block the peer manager still holds (_peerRelayedCFilter resolves
+// the response's blockHash in manager->blocks; an unknown block is dropped), and a
+// getcfilters can only be SENT for a range whose stop height resolves to a hash by
+// walking prevBlock down from lastBlock. So every height below the manager's block
+// FLOOR is unservable AND unevaluatable for the whole session — no retry, no peer
+// and no re-request driver can ever change that. Such a height therefore never
+// reaches gaveUp (attempts only advance on a real send), so the B2 valve is
+// structurally BLIND to it: it pins the scan frontier forever, invisibly. That is
+// exactly the resume shape C-1 describes — BRPeerManagerNewEx chains forward from
+// the highest saved block, so a resumed manager's floor is the SAVED TIP and a
+// restored scan frontier sits ~CF_CONVOY_WINDOW below it.
+//
+// CONTRACT (mirrors AbandonGaveUpBelow's determinism guard — the caller MUST warn):
+//   - `lo` is first clamped UP to the existing abandonedBelow, so history already
+//     surfaced by an earlier call is never counted or warned about twice. That is
+//     what makes *outCount > 0 hold EXACTLY when abandonedBelow advances.
+//   - No-op unless 0 < lo < floor: *outCount = 0 and abandonedBelow is UNCHANGED.
+//     There is no preemptive raise here either.
+//   - Otherwise raises abandonedBelow to `floor` (monotonic), drops every
+//     outstanding[] and gaveUp[] entry below `floor` (they can never be served),
+//     and re-advances scannedThrough.
+//   - *outCount = floor - lo = the number of heights surfaced; the band is
+//     [lo .. floor-1]. *outCount > 0 ⟺ abandonedBelow advanced ⟺ caller WARNs.
+// `lo` is supplied by the caller rather than read from the ledger because the two
+// call shapes differ: a LIVE check passes BRCFScanLedgerLowestNeededHeight, while a
+// re-Init-at-a-new-floor passes the frontier observed BEFORE the Init wiped it.
+// Returns the new BRCFScanLedgerLowestNeededHeight.
+uint32_t BRCFScanLedgerAbandonUnscannableBelow(BRCFScanLedger *l, uint32_t lo, uint32_t floor,
+                                               uint32_t *outCount);
+
 // Coalesce the outstanding + gaveUp heights into ascending [start..end] ranges
 // for the JNI/UI hole report. Writes up to `cap` ranges into outStarts/outEnds
 // and returns the number written.

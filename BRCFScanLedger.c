@@ -767,11 +767,13 @@ uint32_t BRCFScanLedgerAbandonGaveUpBelow(BRCFScanLedger *l, uint32_t clamp,
     // is a verified log fact. Every dropped height hi < target ≤ outstanding[0],
     // so hi+1 ≤ outstanding[0] never advances past a still-outstanding
     // (recoverable) hole; the `> l->abandonedBelow` test keeps it monotonic.
-#ifdef RETENTION_PREEMPTIVE_ADVANCE
+#ifdef DETERMINISM_GUARD_PREEMPTIVE_ADVANCE
     // PRE-GUARD shape — host-KAT red-before-green ONLY (never defined in a
     // production build). Advanced to `target` even when NOTHING was dropped
-    // (k==0), the wrong-balance regression the scan-not-started ceiling KAT
-    // reproduces as RED.
+    // (k==0), the wrong-balance regression test_abandon_guard_no_preemptive_advance
+    // reproduces as RED. (Renamed from RETENTION_PREEMPTIVE_ADVANCE: the tip-anchored
+    // retention CEILING it was originally named for was deleted in paced-convoy
+    // Task 5; what this flag actually toggles is the DETERMINISM GUARD below.)
     if (target > l->abandonedBelow) l->abandonedBelow = target;   // monotonic
 #else
     if (k > 0 && hi + 1 > l->abandonedBelow) l->abandonedBelow = hi + 1;   // monotonic
@@ -786,6 +788,46 @@ uint32_t BRCFScanLedgerAbandonGaveUpBelow(BRCFScanLedger *l, uint32_t clamp,
     if (outCount) *outCount = count;
     if (outLo)    *outLo    = lo;
     if (outHi)    *outHi    = hi;
+    return BRCFScanLedgerLowestNeededHeight(l);
+}
+
+uint32_t BRCFScanLedgerAbandonUnscannableBelow(BRCFScanLedger *l, uint32_t lo, uint32_t floor,
+                                               uint32_t *outCount)
+{
+    if (outCount) *outCount = 0;
+
+    if (lo == 0 || floor == 0) return BRCFScanLedgerLowestNeededHeight(l);
+    // Heights already below the watermark were surfaced by an earlier call — they
+    // must not be counted (or warned about) twice. Clamping here is what makes the
+    // contract EXACT: *outCount > 0 now holds iff abandonedBelow actually advances,
+    // so a caller's WARN is still precisely a WARN on every advance and nothing else.
+    if (lo < l->abandonedBelow) lo = l->abandonedBelow;
+    // No preemptive raise (same discipline as AbandonGaveUpBelow): a floor at or
+    // below the low edge surfaces nothing, so abandonedBelow must not move and the
+    // caller must not warn.
+    if (lo >= floor) return BRCFScanLedgerLowestNeededHeight(l);
+
+    // Drop the unservable prefix from BOTH hole lists. These heights are below the
+    // block floor: no getcfilters can carry a resolvable stop hash for them and no
+    // cfilter response for them could be evaluated, so leaving them would pin
+    // _cfLedgerAdvance's min(outstanding[0], gaveUp[0]) cap forever — the invisible
+    // permanent pin. Both arrays are sorted ascending, so the entries form a front
+    // prefix.
+    size_t ko = 0;
+    while (ko < l->outstandingCount && l->outstanding[ko].height < floor) ko++;
+    if (ko > 0) {
+        memmove(&l->outstanding[0], &l->outstanding[ko],
+                (l->outstandingCount - ko) * sizeof(BRCFOutstanding));
+        l->outstandingCount -= ko;
+    }
+    size_t kg = 0;
+    while (kg < l->gaveUpCount && l->gaveUp[kg] < floor) kg++;
+    _cfLedgerGaveUpDropPrefix(l, kg);   // shifts gaveUp[] + its two parallel B2 arrays together
+
+    if (floor > l->abandonedBelow) l->abandonedBelow = floor;   // monotonic
+    _cfLedgerAdvance(l);
+
+    if (outCount) *outCount = floor - lo;
     return BRCFScanLedgerLowestNeededHeight(l);
 }
 
@@ -916,10 +958,27 @@ size_t BRCFScanLedgerTakePending(BRCFScanLedger *l, UInt256 blockHash, UInt256 *
 // simply gets its full CF_CONVOY_REARM_MAX re-arm budget again after the upgrade —
 // generous, never eager. Nothing is abandoned that would not have been.
 
+// EVERY back-compat branch below MUST compare against its OWN numbered constant
+// (CF_LEDGER_VERSION_2 / CF_LEDGER_VERSION_3), NEVER against CF_LEDGER_VERSION.
+// CF_LEDGER_VERSION means "the layout Serialize writes TODAY" and moves on every
+// bump; a branch written as `version >= CF_LEDGER_VERSION` silently changes
+// meaning at the next bump, so every already-shipped blob then takes the NARROWER
+// previous entry stride and mis-parses outstanding[]/gaveUp[] heights. The length
+// checks can still pass (a narrower stride needs FEWER bytes), so the failure is
+// silent, and a garbage gaveUp height feeds the B2 valve, which can raise the
+// MONOTONIC hard floor abandonedBelow to an arbitrary height = a permanent skip
+// of real history. This bit the v2->v3 bump once already (caught in review) and
+// the identical latent form survived one line over on the isV3 branch.
 #define CF_LEDGER_MAGIC     0x43464C31u  // "CFL1"
 #define CF_LEDGER_VERSION_1 1u           // pre-abandonedBelow (24-byte fixed header)
 #define CF_LEDGER_VERSION_2 2u           // adds abandonedBelow (28-byte fixed header)
-#define CF_LEDGER_VERSION   3u           // adds the B2 valve bytes per outstanding + gaveUp entry
+#define CF_LEDGER_VERSION_3 3u           // adds the B2 valve bytes per outstanding + gaveUp entry
+// The CURRENT layout. Overridable ONLY so the host KAT can simulate the NEXT
+// version bump (-DCF_LEDGER_VERSION=4u) and prove a v3 blob still takes the v3
+// stride; never overridden in a production build.
+#ifndef CF_LEDGER_VERSION
+#define CF_LEDGER_VERSION   CF_LEDGER_VERSION_3
+#endif
 
 // Per-entry sizes of the CURRENT (v3) layout, and of the pre-v3 layout Parse
 // still accepts.
@@ -1022,7 +1081,15 @@ int BRCFScanLedgerParse(BRCFScanLedger *l, const uint8_t *buf, size_t buflen)
     // v3 added the two B2 valve bytes to each outstanding and each gaveUp entry.
     // Same back-compat shape as v1→v2: a pre-v3 blob simply has narrower entries
     // and the new fields load as 0.
+#ifdef CF_LEDGER_STRIDE_GATE_UNFIXED
+    // PRE-FIX shape — host-KAT red-before-green ONLY (never a production build).
+    // Compares against the CURRENT version instead of v3's own constant, so with
+    // -DCF_LEDGER_VERSION=4u (the simulated next bump) a real v3 blob takes the
+    // NARROW v2 stride and mis-parses, silently.
     const int      isV3        = (version >= CF_LEDGER_VERSION) ? 1 : 0;
+#else
+    const int      isV3        = (version >= CF_LEDGER_VERSION_3) ? 1 : 0;
+#endif
     const size_t   outEntry    = isV3 ? CF_LEDGER_OUT_ENTRY_V3 : CF_LEDGER_OUT_ENTRY_V2;
     const size_t   guEntry     = isV3 ? CF_LEDGER_GU_ENTRY_V3  : CF_LEDGER_GU_ENTRY_V2;
 

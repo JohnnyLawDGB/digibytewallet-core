@@ -245,6 +245,14 @@ struct BRPeerManagerStruct {
     uint32_t autoFetchCFiltersStart;     // wallet birth height (inclusive)
     uint32_t autoFetchCFiltersThrough;   // highest height already requested (or
                                          // start-1 if no request has fired yet)
+    uint32_t autoFetchCFiltersRequested; // the floor the APP asked for, BEFORE
+                                         // BRPeerManagerEnableAutoCompactFilterFetch's
+                                         // resolvability clamp moved it (0 = never armed).
+                                         // Kept so the resume reconciliation can tell a
+                                         // ledger that was CLAMPED above the requested floor
+                                         // (and never restored) from one that legitimately
+                                         // starts there — see C-1 in
+                                         // BRPeerManagerSnapAutoFetchThroughToScanFrontier.
     // BIP 158 cfheaders are a linear chain — only one getcfheaders batch may be
     // in flight at a time, else the rapid per-block driver kicks send duplicate
     // requests whose late responses fail the continuity check and get filter
@@ -1430,6 +1438,45 @@ static void _peerRejectedTx(void *info, UInt256 txHash, uint8_t code)
 #endif
 #endif
 
+// ---- Structurally-unscannable surfacing (paced-convoy fix wave, C-1) -------
+//
+// THE INVARIANT THIS ENFORCES: no height is ever marked scanned without either
+// being scanned or being surfaced as abandoned.
+//
+// Three things in this file raise the CF scan floor: the arming clamp in
+// BRPeerManagerEnableAutoCompactFilterFetch, the cfheaders floor snap, and the
+// floor re-anchor. Each of them used to move the floor over still-unscanned
+// history with a bare BRCFScanLedgerInit, which resets scannedThrough to
+// floor-1 and abandonedBelow to 0 — i.e. the skipped band vanished with no
+// watermark, no WARN, no banner and no recovery affordance. Same for the resume
+// path, where a restored scan frontier can sit ~CF_CONVOY_WINDOW BELOW the
+// resumed manager's block floor (BRPeerManagerNewEx chains forward from the
+// highest saved block, so the floor IS the saved tip).
+//
+// Everything below the block floor is unservable for the whole session in BOTH
+// directions — the getcfilters stop hash can't resolve, and even a volunteered
+// cfilter would be dropped by _peerRelayedCFilter for an unknown block — so the
+// honest disposition is this branch's own designed outcome: SKIPPED, SURFACED
+// and RECOVERABLE (abandonedBelow → CfAbandonmentStore → banner → rescan /
+// node-reconcile), never silent.
+//
+// `lo` is the low edge observed BEFORE the floor moved. Caller MUST hold
+// manager->lock, so this uses the lock-free BRCFScanLedger* API only.
+static void _BRPeerManagerSurfaceUnscannableLocked(BRPeerManager *manager, uint32_t lo,
+                                                   uint32_t floor, const char *why)
+{
+    uint32_t cnt = 0;
+    BRCFScanLedgerAbandonUnscannableBelow(&manager->cfLedger, lo, floor, &cnt);
+    // Determinism, same shape as the B2 valve: cnt>0 <=> abandonedBelow advanced
+    // <=> this WARN. "abandonedBelow == 0" therefore stays a verified log fact.
+    if (cnt > 0) {
+        CF_RETENTION_WLOG("[CF-SCAN] ABANDONED %u height(s) [%u..%u] — below the in-memory block floor "
+                          "%u, unscannable this session (%s). Surfaced for recovery "
+                          "(rescan or 'Scan for missing transactions').\n",
+                          cnt, lo, floor - 1, floor, why ? why : "");
+    }
+}
+
 // NOTE (paced-convoy Task 5): the tip-anchored DEPTH CEILING that used to live
 // here (_cfApplyRetentionCeiling, `tip - floorH > CF_RETENTION_MAX_SPAN` →
 // abandon the gaveUp prefix) is DELETED — as is the CF_RETENTION_MAX_SPAN
@@ -2487,13 +2534,28 @@ static void _BRPeerManagerRequestNextCFHeaders(BRPeerManager *manager, BRPeer *p
         // it — and CF scanning below the block floor is impossible anyway (no
         // in-memory block to match a filter against). So snap the CF start UP to the
         // resolvable block floor and retry, instead of busy-looping "no block hash for
-        // height H, deferring" forever. The floor is <= the wallet's birth height
-        // (the header chain anchors at the last checkpoint at/before wallet birth),
-        // so this never skips a wallet transaction.
+        // height H, deferring" forever.
+        //
+        // ⚠️ THE OLD RATIONALE HERE WAS FALSE AND IS CORRECTED (paced-convoy C-1).
+        // It read: "The floor is <= the wallet's birth height (the header chain
+        // anchors at the last checkpoint at/before wallet birth), so this never skips
+        // a wallet transaction." That holds only on a FRESH sync. On a RESUME the
+        // header chain anchors at the SAVED TIP, not at a checkpoint
+        // (BRPeerManagerNewEx puts the saved blocks in `orphans` and chains FORWARD
+        // from the highest one, so manager->blocks ends up holding the checkpoints
+        // plus exactly ONE saved block) — the floor is then far ABOVE the wallet's
+        // birth height and this snap DOES skip history. A stale rationale on a safety
+        // guard is how the guard gets deleted later by someone who believes it, so:
+        // the snap still happens, but the skipped band is now SURFACED below.
         uint32_t floor = _BRPeerManagerBlockFloor(manager);
         if (floor > next) {
             peer_log(peer, "cfheaders: CF start %u below block floor %u — snapping start up to floor",
                      next, floor);
+            // Capture the scan frontier BEFORE Init wipes it (Init sets scannedThrough
+            // to floor-1 and abandonedBelow to 0), and capture "was the scan armed"
+            // before the flag below is forced on.
+            uint32_t lowestBefore = _cfConvoyScanArmed(manager)
+                                    ? BRCFScanLedgerLowestNeededHeight(&manager->cfLedger) : 0;
             if (manager->compactFilterChain) {
                 BRCompactFilterChainFree(manager->compactFilterChain);
                 manager->compactFilterChain = NULL;
@@ -2503,6 +2565,10 @@ static void _BRPeerManagerRequestNextCFHeaders(BRPeerManager *manager, BRPeer *p
             manager->autoFetchCFiltersThrough  = floor > 0 ? floor - 1 : 0;
             // Snap-up re-anchor rebuilds the CF scan-completeness ledger (Phase 1: observe-only).
             BRCFScanLedgerInit(&manager->cfLedger, floor);
+#ifndef CONVOY_C1_UNFIXED
+            _BRPeerManagerSurfaceUnscannableLocked(manager, lowestBefore, floor,
+                                                   "cfheaders floor snap");
+#endif
 #if CF_LEDGER_DRIVE_REREQUEST
             // Stale buffered raw filter bytes from the old floor must not survive a
             // floor change — Init already frees them internally, but this call is
@@ -3621,6 +3687,46 @@ void BRPeerManagerKeepAlive(BRPeerManager *manager)
         }
     }
 
+#ifndef CONVOY_C1_UNFIXED
+    // ---- UNSERVABLE-HOLE backstop (paced-convoy fix wave, C-1 variant) ------
+    //
+    // Runs BEFORE the residual driver and the B2 valve, because a HOLE below the
+    // in-memory block floor is exactly the hole neither of them can ever act on:
+    // its getcfilters stop hash cannot resolve, so
+    // _BRPeerManagerRequestCFiltersWithStopHashLocked returns 0, Pass C commits
+    // only on `sent > 0`, `attempts` never increments, RetireCapped never fires —
+    // so it can never reach gaveUp and the B2 valve is structurally BLIND to it.
+    // Meanwhile _cfLedgerAdvance caps scannedThrough at min(outstanding[0],
+    // gaveUp[0]) - 1, so that one hole pins the scan frontier the whole convoy
+    // keys on, FOREVER and INVISIBLY. (Even a volunteered cfilter would not help:
+    // _peerRelayedCFilter drops a response whose block is not in manager->blocks.)
+    //
+    // SCOPE, deliberately narrow. This covers the PIN — a hole that exists and can
+    // never be served. The other half of C-1, a resumed frontier below the floor
+    // with NO hole at all, is owned by BRPeerManagerSnapAutoFetchThroughToScanFrontier
+    // (which SyncService calls on every sync start, right after the ledger restore
+    // — the only moment that state can be created), and the two re-Init-at-a-new-
+    // floor sites surface their own skipped band. Keeping this predicate keyed on a
+    // real hole also keeps it silent through the steady state, where holes sit
+    // comfortably above the retention floor (min(cfNext, LowestNeededHeight) - 144).
+    if (_cfConvoyScanArmed(manager)) {
+        uint32_t pinH = UINT32_MAX;
+        if (manager->cfLedger.outstandingCount > 0) pinH = manager->cfLedger.outstanding[0].height;
+        if (manager->cfLedger.gaveUpCount > 0 && manager->cfLedger.gaveUp[0] < pinH) {
+            pinH = manager->cfLedger.gaveUp[0];
+        }
+        if (pinH != UINT32_MAX) {
+            uint32_t c1Floor = _BRPeerManagerBlockFloor(manager);
+            if (c1Floor > 0 && pinH < c1Floor) {
+                uint32_t c1Lowest = BRCFScanLedgerLowestNeededHeight(&manager->cfLedger);
+                _BRPeerManagerSurfaceUnscannableLocked(manager, c1Lowest, c1Floor,
+                                                       "KeepAlive: a hole below the in-memory block floor "
+                                                       "that no retry could ever serve");
+            }
+        }
+    }
+#endif
+
 #if CF_LEDGER_DRIVE_REREQUEST
     // Phase 2 driver: (1) drain any buffered header-race filters whose block
     // header + cfheader have since connected (the crux credit path above) and
@@ -4632,6 +4738,14 @@ static int _BRPeerManagerReanchorAtFloorLocked(BRPeerManager *manager, int force
     _peer_log("cfheaders: re-anchoring filter chain (force=%d) from tip %u to block floor %u\n",
               force, next > 0 ? next - 1 : 0, floor);
 
+    // Capture the scan frontier BEFORE Init wipes it (paced-convoy C-1): the
+    // "historical gap is intentionally skipped" line above dates from the bloom era
+    // ("those blocks were already scanned by bloom in prior sessions") and bloom was
+    // excised in v4.0.0 — nothing re-covers that gap now, so it must be SURFACED
+    // rather than silently discarded.
+    uint32_t lowestBefore = _cfConvoyScanArmed(manager)
+                            ? BRCFScanLedgerLowestNeededHeight(&manager->cfLedger) : 0;
+
     BRCompactFilterChainFree(manager->compactFilterChain);
     manager->compactFilterChain = NULL;
     // Arm auto-fetch so the chain-less driver resolves `next` to the floor (not
@@ -4641,6 +4755,9 @@ static int _BRPeerManagerReanchorAtFloorLocked(BRPeerManager *manager, int force
     manager->autoFetchCFiltersThrough  = floor > 0 ? floor - 1 : 0;
     // Re-anchor rebuilds the CF scan-completeness ledger at the floor (Phase 1: observe-only).
     BRCFScanLedgerInit(&manager->cfLedger, floor);
+#ifndef CONVOY_C1_UNFIXED
+    _BRPeerManagerSurfaceUnscannableLocked(manager, lowestBefore, floor, "CF chain floor re-anchor");
+#endif
 #if CF_LEDGER_DRIVE_REREQUEST
     // Explicit/defensive (Task 5 EDIT 4): stale buffered raw filter bytes from the
     // pre-reanchor chain must not survive — Init already frees them internally.
@@ -4963,6 +5080,13 @@ void BRPeerManagerEnableAutoCompactFilterFetch(BRPeerManager *manager, uint32_t 
     assert(manager != NULL);
     pthread_mutex_lock(&manager->lock);
 
+    // Remember what the APP asked for, before the clamp below can move it. On a
+    // RESUME the clamp lands on the saved-blocks tip (see C-1), so a ledger that is
+    // Init'd here and then NOT restored would start ~CF_CONVOY_WINDOW above the
+    // requested floor with nothing recording that fact. The resume reconciliation
+    // reads this to tell that case from a ledger that legitimately starts here.
+    manager->autoFetchCFiltersRequested = startHeight;
+
     // Clamp startHeight up to a value the in-memory block window can
     // resolve. _BRPeerManagerBlockHashAtHeight walks lastBlock backwards
     // via prevBlock pointers; if startHeight is below that window the
@@ -5012,6 +5136,7 @@ void BRPeerManagerDisableAutoCompactFilterFetch(BRPeerManager *manager)
     manager->autoFetchCFiltersEnabled = 0;
     manager->autoFetchCFiltersStart = 0;
     manager->autoFetchCFiltersThrough = 0;
+    manager->autoFetchCFiltersRequested = 0;   // hygiene: no stale requested floor for the next arm
 #if CF_LEDGER_DRIVE_REREQUEST
     // Hygiene (Task 5 EDIT 4): a disable must not leave stale buffered bytes
     // lingering — unlike the re-anchor/re-arm sites, Disable does NOT call
@@ -5020,6 +5145,12 @@ void BRPeerManagerDisableAutoCompactFilterFetch(BRPeerManager *manager)
 #endif
     pthread_mutex_unlock(&manager->lock);
 }
+
+// Runtime-readable convoy constants — see the contract in BRPeerManager.h. The
+// Kotlin watchdogs DERIVE their copies from these so there is no hand-mirrored
+// second value to drift when the operator tunes CF_CONVOY_REARM_MAX.
+uint32_t BRPeerManagerConvoyWindow(void)   { return (uint32_t)CF_CONVOY_WINDOW; }
+uint32_t BRPeerManagerConvoyRearmMax(void) { return (uint32_t)CF_CONVOY_REARM_MAX; }
 
 uint32_t BRPeerManagerGetAutoFetchCFiltersStart(BRPeerManager *manager)
 {
@@ -5049,13 +5180,73 @@ void BRPeerManagerSnapAutoFetchThroughToScanFrontier(BRPeerManager *manager)
     assert(manager != NULL);
     pthread_mutex_lock(&manager->lock);
 #ifndef RESUME_SNAP_UNFIXED
+
+    // ---- C-1 STEP 1: surface anything the resumed manager can never scan -----
+    //
+    // BRPeerManagerEnableAutoCompactFilterFetch ran BEFORE the ledger restore, and
+    // on a resume its clamp lands on the SAVED-BLOCKS TIP: the deep birth height
+    // does not resolve, because BRPeerManagerNewEx puts the saved blocks in
+    // `orphans` and chains FORWARD from the highest one, leaving manager->blocks
+    // holding the checkpoints plus exactly ONE saved block. So after the restore
+    // the scan frontier can sit ~CF_CONVOY_WINDOW BELOW the block floor, and that
+    // band is unservable for the whole session in both directions (no resolvable
+    // getcfilters stop hash; a volunteered cfilter would be dropped by
+    // _peerRelayedCFilter as an unknown block). Left alone it is either a silent
+    // ~CF_CONVOY_WINDOW skip (the forward fetch starts at the clamped cursor and
+    // _cfLedgerAdvance sails scannedThrough up to it) or an invisible permanent pin
+    // (a restored outstanding hole whose stop hash never resolves never burns an
+    // attempt, so it can never reach gaveUp and the B2 valve can never see it).
+    // Surface it instead.
     uint32_t lowest = BRCFScanLedgerLowestNeededHeight(&manager->cfLedger);
+#ifndef CONVOY_C1_UNFIXED
+    if (_cfConvoyScanArmed(manager)) {
+        // Low edge of the band. Normally the restored scan frontier. But if the
+        // ledger's own start is ABOVE the floor the app asked for, no ledger was
+        // restored over the clamped Init at all, so nothing has ever covered
+        // [requested .. start-1] either — take the requested floor as the low edge.
+        uint32_t lo = lowest;
+        if (manager->autoFetchCFiltersRequested > 0 &&
+            manager->cfLedger.start > manager->autoFetchCFiltersRequested) {
+            lo = manager->autoFetchCFiltersRequested;
+        }
+        uint32_t floor = _BRPeerManagerBlockFloor(manager);
+        if (lo > 0 && floor > 0 && lo < floor) {
+            _BRPeerManagerSurfaceUnscannableLocked(manager, lo, floor, "resume: scan frontier below the "
+                                                   "resumed block floor (saved-blocks tip)");
+            lowest = BRCFScanLedgerLowestNeededHeight(&manager->cfLedger);
+        }
+    }
+#endif
+
+    // ---- C-1 STEP 2: reconcile the forward-fetch window to that frontier -----
+    //
+    // RAISE (Task 4): the cursor was armed at birth-1 before the restore, so a
+    // resumed descent must not re-request already-scanned history from birth.
     // lowest - 1, NEVER lowest itself -- reqStart is autoFetchCFiltersThrough+1,
     // so snapping to `lowest` would make the next forward fetch start at
     // lowest+1 and silently skip height `lowest` forever. Guard lowest==0 (an
-    // unarmed ledger) and never lower the cursor (max).
-    if (lowest > 0 && (lowest - 1) > manager->autoFetchCFiltersThrough) {
-        manager->autoFetchCFiltersThrough = lowest - 1;
+    // unarmed ledger).
+    //
+    // LOWER (C-1): the clamp can leave BOTH `start` and the cursor ABOVE the
+    // restored frontier, and every forward-fetch site clamps reqStart UP to
+    // autoFetchCFiltersStart — so a raise-only snap can never pull them back and
+    // the next request starts at the clamped tip, which is exactly the silent skip.
+    // The cursor may never sit above what was actually REQUESTED either
+    // (cfLedger.requestedThrough is the persisted truth): a cursor above it means
+    // the gap in between was never requested, and recording a non-contiguous range
+    // is what lets _cfLedgerAdvance sail. Order matters: clamp DOWN to
+    // requestedThrough first, then UP to lowest-1, so the result is always >= the
+    // frontier.
+    if (lowest > 0) {
+#ifndef CONVOY_C1_UNFIXED
+        if (manager->autoFetchCFiltersStart > lowest) manager->autoFetchCFiltersStart = lowest;
+        if (manager->autoFetchCFiltersThrough > manager->cfLedger.requestedThrough) {
+            manager->autoFetchCFiltersThrough = manager->cfLedger.requestedThrough;
+        }
+#endif
+        if ((lowest - 1) > manager->autoFetchCFiltersThrough) {
+            manager->autoFetchCFiltersThrough = lowest - 1;
+        }
     }
 #endif
     pthread_mutex_unlock(&manager->lock);

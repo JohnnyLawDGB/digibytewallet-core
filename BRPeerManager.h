@@ -89,19 +89,40 @@ Remarks:
    expands transiently while a large cfTip deficit is being recovered. */
 #define CLEAR_MEM_CF_RETENTION_MARGIN 144
 
-/* CF-retention memory ceiling (scan-floor retention). The retained block-header
-   span is bounded to this many blocks BELOW the chain tip. gaveUp-inclusive
-   retention means a single permanent (retry-exhausted) hole would otherwise pin
-   the retention floor forever — the span is NOT self-bounding — so this ceiling
-   is a ROUTINE bound, not a rare backstop. When the scan floor would sit deeper
-   than the tip minus this span, _BRPeerManagerClearMemory abandons ONLY
-   retry-exhausted (gaveUp) heights below the clamp (NEVER a still-outstanding,
-   recoverable hole) and warn-logs the VISIBLE abandonment. ~6.6 MB at
-   ~220 B/header. #ifndef-guarded so the host retention KAT can -D-override it
-   small to exercise the ceiling without building a 30k-block chain. */
+/* CF-retention DEPTH CEILING -- RETIRED as a trigger (paced-convoy design, the
+   KEPT/REMOVED/REPURPOSED block). It used to bound the retained block-header span
+   to this many blocks below the chain tip and abandon retry-exhausted (gaveUp)
+   heights below the clamp. That was a DEPTH REFUSAL -- "too old, don't try" --
+   which the paced convoy removes outright: no restore is refused at any depth,
+   because the convoy bounds resident headers to CF_CONVOY_WINDOW at ANY depth.
+   The abandonment VALVE the ceiling doubled as is retained but re-triggered on
+   proven connected-CF-subset refusal (Part B2, BRPeerManagerKeepAlive), not depth.
+   The retention FLOOR (min(cfNext, LowestNeededHeight) - CLEAR_MEM_CF_RETENTION_MARGIN)
+   is untouched. This #define now survives only for jni_peer.c's restore-depth
+   accessor, which the depth-refusal removal task deletes together with it. */
 #ifndef CF_RETENTION_MAX_SPAN
 #define CF_RETENTION_MAX_SPAN 30000
 #endif
+
+/* PACED-CONVOY B2 -- how many FRESH retry cycles a retry-exhausted (gaveUp) hole
+   is granted against a LIVE CF-peer set before the abandonment valve may abandon
+   it (spec Part C / Part B2). Each cycle is a full re-request backoff schedule
+   (30/60/120/120/120 = 7.5 min) during which the residual driver rotates the hole
+   across every connected CF peer, so 2 cycles is ~15 min of productive rotated
+   retry (~22 min counting the original cycle).
+
+   >= 2 DELIBERATELY, not 1: a single unlucky peer-rotation cycle -- the peer set
+   churning, the fleet momentarily saturated -- must not be able to false-positive
+   into abandoning a height the fleet can actually serve.
+
+   This is an ACCEPTANCE-INFORMED TUNABLE, not a blind constant. It is calibrated
+   on how fast the CONNECTED CF-peer subset rotates through the fleet, and the
+   accepted residual (fleet saturation: the oracle that HAS the filter is at
+   maxconnections, so we never connect to it) is exactly where rotation is
+   SLOWEST. Every abandonment warn-logs its height range: if a height abandons and
+   a later node-reconcile CREDITS it, that is the signal to RAISE this number --
+   not that the valve is broken. */
+#define CF_CONVOY_REARM_MAX 2
 
 /* PACED-CONVOY FETCH WINDOW (spec 2026-07-28-paced-convoy-fetch-design.md,
    Parts A + C). The maximum number of blocks the block-header frontier

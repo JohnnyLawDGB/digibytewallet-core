@@ -124,6 +124,24 @@ typedef struct {
     uint32_t requestedAt;  // unix secs; re-request backoff clock (NOT persisted)
     uint8_t  attempts;     // re-requests already made; capped at CF_REREQ_MAX_ATTEMPTS (NOT persisted)
     uint8_t  headerRace;   // dropped because the block header wasn't known yet → short retry
+
+    // ---- B2 abandonment-valve state (paced-convoy design Part B2) ----------
+    uint8_t  rearmCycles;  // PERSISTED (blob v3; a v1/v2 blob loads it as 0). How many FRESH
+                           //   retry cycles the valve has already granted this hole against a
+                           //   live CF-peer set. 0 == the original cycle. Saturating (never
+                           //   wraps). Carried across the outstanding→gaveUp→outstanding round
+                           //   trip by gaveUpRearmCycles[].
+    uint8_t  offersReachedLivePeer;  // NOT persisted for an outstanding entry (it follows
+                           //   `attempts`, the cycle it describes — see the persistence section);
+                           //   its parked twin gaveUpOffersLive[] IS.
+                           //   PER-CYCLE LATCH. 1 while EVERY retry offer made during
+                           //   THIS cycle actually reached a CONNECTED CF-capable peer; cleared
+                           //   the moment one did not (no CF peer to offer to, a send that never
+                           //   went on the wire, or the target peer disconnecting with the offer
+                           //   in flight). Set to 1 when a cycle STARTS (insert / ReArmGaveUp)
+                           //   and never re-raised within a cycle — a tainted cycle can never be
+                           //   un-tainted. This is what makes an abandonment "offered AND refused
+                           //   by live peers" rather than merely "un-offered".
 } BRCFOutstanding;
 
 // Wallet txs from a CF-driven full block whose header hasn't connected yet.
@@ -165,6 +183,20 @@ typedef struct {
     size_t             pendingCount;
     uint32_t           gaveUp[CF_GAVEUP_MAX];  // sorted ascending; heights past the attempt cap — reported,
     size_t             gaveUpCount;            //   persisted, NEVER silently dropped (else we rebuild the bug)
+
+    // B2 valve state PARKED with a retired hole, INDEX-PARALLEL to gaveUp[] (entry i
+    // describes gaveUp[i]). A retiring hole's BRCFOutstanding record is destroyed by
+    // _cfLedgerMoveToGaveUp, so without this the re-arm cycle counter would reset to 0
+    // on every retirement and `rearmCycles >= CF_CONVOY_REARM_MAX` could NEVER be
+    // reached — a valve that re-arms forever and never abandons, i.e. the permanent
+    // convoy wedge this valve exists to prevent. Persisted (blob v3; v1/v2 → 0).
+    //
+    // INVARIANT: these two arrays are mutated ONLY through _cfLedgerAddGaveUp /
+    // _cfLedgerRemoveGaveUp / _cfLedgerGaveUpDropPrefix, which shift all three arrays
+    // together. Never memmove gaveUp[] by hand.
+    uint8_t            gaveUpRearmCycles[CF_GAVEUP_MAX];
+    uint8_t            gaveUpOffersLive[CF_GAVEUP_MAX];
+
     uint32_t           lastDriveAt;            // re-request driver throttle (Phase 2)
 
     // Filter-byte buffer (Task 2, §7): FIFO, oldest at index 0. In-memory only —
@@ -262,6 +294,43 @@ int      BRCFScanLedgerPeekRerequestRange(BRCFScanLedger *l, uint32_t now, uint3
 // rest keeps its old attempt count and is offered again next tick.
 void     BRCFScanLedgerCommitRerequest(BRCFScanLedger *l, uint32_t startH, uint32_t stopH,
                                        UInt128 peer, uint16_t port, uint32_t now);
+
+// ---- B2 abandonment valve (paced-convoy design Part B2) --------------------
+// Once BRCFScanLedgerRetireCapped parks a hole in `gaveUp`, NO driver ever
+// re-requests it (both NextRerequest and PeekRerequestRange iterate `outstanding`
+// only), and because scannedThrough is capped at min(outstanding[0], gaveUp[0])-1
+// that one hole pins the scan frontier — and therefore the whole paced convoy —
+// FOREVER. `gaveUp` is only a HEURISTIC for "unservable": during a convoy climb
+// retries can exhaust for transient, convoy-induced reasons (the peer set rotated,
+// the fleet was momentarily saturated, the range was briefly unavailable). So the
+// valve NEVER abandons on gaveUp alone; it re-arms the hole against the CURRENT
+// (possibly healed) peer set first, and abandons only on re-exhaustion that was
+// provably OFFERED AND REFUSED by connected CF peers. These two calls are the
+// ledger-side primitives; the decision itself lives in BRPeerManagerKeepAlive.
+
+// Move `height` from gaveUp back into `outstanding` for a FRESH full retry cycle:
+// attempts = 0 (immediately due), rearmCycles = the parked count + 1 (saturating),
+// offersReachedLivePeer = 1 (a new, so-far-untainted cycle) — and REMOVE it from
+// gaveUp, so the height has exactly ONE home. (Leaving it in both would make
+// gaveUp[0]/gaveUpCount — which the valve's own decision and _cfLedgerAdvance both
+// read — describe a hole that is simultaneously being retried.) Returns 1 if
+// re-armed; 0 if `height` is not a gaveUp hole, is below the abandonedBelow hard
+// floor, or `outstanding` is full (re-arming through a full outstanding array would
+// evict the lowest-height hole, silently losing it — better to leave it parked).
+int      BRCFScanLedgerReArmGaveUp(BRCFScanLedger *l, uint32_t height);
+
+// Read the LOWEST parked (gaveUp) hole plus its parked valve state. Returns 1 and
+// writes the outputs when gaveUp is non-empty, else 0 (outputs untouched). gaveUp
+// is sorted ascending, so gaveUp[0] is the hole that pins the scan frontier.
+int      BRCFScanLedgerLowestGaveUp(const BRCFScanLedger *l, uint32_t *outHeight,
+                                    uint8_t *outRearmCycles, uint8_t *outOffersReachedLivePeer);
+
+// Clear the per-cycle offersReachedLivePeer latch on every OUTSTANDING height in
+// [startH..stopH]: a retry offer for those heights did NOT reach a connected
+// CF-capable peer this round (no peer was available to offer to, or the send never
+// went on the wire), so this cycle can no longer serve as proof of refusal. The
+// latch is only ever raised at the START of a cycle — never here.
+void     BRCFScanLedgerMarkOffersMissedLivePeer(BRCFScanLedger *l, uint32_t startH, uint32_t stopH);
 
 uint32_t BRCFScanLedgerScannedThrough(const BRCFScanLedger *l);
 size_t   BRCFScanLedgerOutstandingCount(const BRCFScanLedger *l);
@@ -396,10 +465,19 @@ void     BRCFScanLedgerRecordPending(BRCFScanLedger *l, UInt256 blockHash,
 size_t   BRCFScanLedgerTakePending(BRCFScanLedger *l, UInt256 blockHash, UInt256 *outTx, size_t cap);
 
 // ---- Persistence (§5) ------------------------------------------------------
-// Persists ONLY: start, scannedThrough, requestedThrough, the outstanding
-// heights + their headerRace flag, and the gaveUp list. attempts/timestamps/
+// Persists ONLY: start, scannedThrough, requestedThrough, abandonedBelow (v2+),
+// the outstanding heights + their headerRace flag + their rearmCycles (v3+), and
+// the gaveUp list + BOTH of its parked B2 valve bytes (v3+). attempts/timestamps/
 // peers are NOT persisted (a fresh process gets fresh peers) and pending is NOT
 // persisted (rebuilt by a re-anchor/rescan). On Parse those reset.
+//
+// An OUTSTANDING entry's offersReachedLivePeer follows `attempts` into the
+// NOT-persisted set, because it describes precisely the cycle `attempts` counts:
+// Parse starts a fresh cycle, so the latch starts clean (1). rearmCycles is the
+// opposite case and MUST persist — if it reset on every process restart, a wallet
+// backgrounded once per cycle could never reach CF_CONVOY_REARM_MAX and the valve
+// would never fire. A PARKED (gaveUp) hole's cycle is finished, so both of its
+// bytes are a frozen verdict and both persist.
 
 // Serialize into buf. Returns the number of bytes the blob needs; writes it iff
 // buflen is large enough (call with buflen 0 / NULL buf to size first).

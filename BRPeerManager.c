@@ -4783,6 +4783,56 @@ size_t BRPeerManagerAbandonedCount(BRPeerManager *manager)
     return (abandonedBelow > start) ? (size_t)(abandonedBelow - start) : 0;
 }
 
+// B2-valve/watchdog ordering signal (see the header for the full contract and the
+// MANDATORY suppression bound). Returns cycles+1 of the frontier-pinning hole the
+// valve currently owns, or 0 when the valve owns nothing.
+//
+// TWO states count as "pending" — spec Part C defers the watchdog while a gaveUp
+// abandonment is "pending re-arm/abandonment", and a re-arm cycle IN FLIGHT is the
+// larger half of that window (~7.5 min of rotated retry vs. the instant of the
+// decision itself):
+//   (a) PARKED: the pinning hole is a gaveUp entry — the valve decides on it at the
+//       next KeepAlive tick (re-arm, or abandon once refusal is proven);
+//   (b) RE-ARM IN FLIGHT: the pinning hole is OUTSTANDING with rearmCycles > 0 —
+//       the valve put it back for a fresh retry cycle and the residual driver is
+//       rotating it across the connected CF peers right now. That is productive
+//       work with a known owner; escalating a watchdog on top of it is pure churn.
+// An ordinary outstanding hole (rearmCycles == 0) is NOT the valve's — the residual
+// driver owns it and the watchdog is right to keep watching it — so it reads 0.
+//
+// "Pinning" is deliberately the SAME shape the valve itself uses in
+// BRPeerManagerKeepAlive (the LOWEST hole of either kind, since _cfLedgerAdvance
+// caps scannedThrough at min(outstanding[0], gaveUp[0]) - 1) rather than a
+// comparison against LowestNeededHeight: LowestNeededHeight reads scannedThrough,
+// which only moves in MarkEvaluated, so a floor gap that was never evaluated would
+// leave it BELOW the hole and this accessor would report "nothing pending" for a
+// hole the valve is actively working. Keep the two in step.
+uint32_t BRPeerManagerHasPendingAbandonment(BRPeerManager *manager)
+{
+    assert(manager != NULL);
+    pthread_mutex_lock(&manager->lock);
+
+    const BRCFScanLedger *l = &manager->cfLedger;
+    uint32_t gvH = 0, pending = 0;
+    uint8_t  gvCycles = 0;
+    int      haveGaveUp = BRCFScanLedgerLowestGaveUp(l, &gvH, &gvCycles, NULL);
+    int      haveOut    = (l->outstandingCount > 0);
+    uint32_t outH       = haveOut ? l->outstanding[0].height      : 0;
+    uint8_t  outCycles  = haveOut ? l->outstanding[0].rearmCycles : 0;
+
+    // uint8_t + 1 widened to uint32_t: cannot wrap, so a saturated cycle counter can
+    // never be misread as "not pending".
+    if (haveGaveUp && (! haveOut || gvH < outH)) {
+        pending = (uint32_t)gvCycles + 1;    // (a) parked, awaiting the valve's decision
+    }
+    else if (haveOut && (! haveGaveUp || outH < gvH) && outCycles > 0) {
+        pending = (uint32_t)outCycles + 1;   // (b) a valve-granted re-arm cycle in flight
+    }
+
+    pthread_mutex_unlock(&manager->lock);
+    return pending;
+}
+
 void BRPeerManagerSetSaveCFLedger(BRPeerManager *manager, void *info,
                                   void (*callback)(void *info, const uint8_t *bytes, size_t len))
 {

@@ -137,13 +137,36 @@ Remarks:
    RECOVERY and SYNC-START sends are NEVER gated -- suppressing one deadlocks the
    convoy from the other side.
 
-   The value is a floor-derived bound, not a magic number: it must exceed
-   (1) the scan lookahead CF_OUTSTANDING_MAX(4096) + MAX_CFILTERS_RESULTS(1000),
-   (2) the cfheader quantum MAX_CFHEADERS_RESULTS(2000), and
-   (3) a re-kick-latency margin at DGB's ~15 s blocks.
-   At 10000 the resident header span is ~(W + CLEAR_MEM_CF_RETENTION_MARGIN)
-   * ~220 B ~= 2.2 MB, FLAT at any restore depth, and the tip-down prevBlock walk
-   is bounded to ~W by construction. */
+   The value is a floor-derived bound, not a magic number. It must EXCEED all of:
+   (1) the scan lookahead CF_OUTSTANDING_MAX(4096) + MAX_CFILTERS_RESULTS(1000)
+       = 5096 -- a smaller window starves the scan: the forward cfilter fetch can
+       only ask for heights the cfheader frontier already covers, so a window
+       below the in-flight ceiling would throttle the very path that ADVANCES the
+       scan frontier the window is measured from (deadlock from the other side);
+   (2) the cfheader quantum MAX_CFHEADERS_RESULTS(2000) -- below one batch the
+       gate would suppress every cfheaders advance and never re-open;
+   (3) a re-kick-latency margin at DGB's ~15 s blocks -- the window must hold
+       enough headers to keep the scan fed across one CF_CONVOY_HDR_REKICK_BASE_SECS
+       (30 s) re-kick interval, i.e. >= 30 s x the scan's 100 heights/s ceiling.
+   W = 10000 clears (1) by 4904, (2) by 8000, (3) by ~2 orders of magnitude.
+
+   THE THREE CONSEQUENCES OF THE CHOSEN VALUE (state them when changing it):
+   a. MAX RESIDENT BLOCK HEADERS ~= W + CLEAR_MEM_CF_RETENTION_MARGIN = 10144
+      (the retention floor sits 144 below the scan frontier, the header frontier
+      at most W above it), x ~220 B/header ~= 2.2 MB -- FLAT AT ANY RESTORE
+      DEPTH. That is the whole feature: the deep-restore OOM stops existing.
+      (Add the ~2-batch stale-flag overshoot at BRPeer.c:648, ~4000 headers /
+      ~0.88 MB, for the true instantaneous peak: ~14.1k headers / ~3.1 MB.)
+   b. MAX prevBlock WALK DEPTH = W_hdr ~= 10000. Every getcfilters/getcfheaders
+      stop hash resolves by walking down from lastBlock (_BRPeerManagerBlockHashAtHeight,
+      batched at _BRPeerManagerResolveHashesAtHeightsLocked), so the walk is short
+      BY CONSTRUCTION rather than by optimization -- depth-independent, sub-ANR,
+      and it is why no height->hash index is needed (or possible: the reorg path
+      never BRSetRemoves, so an index has no eviction hook).
+   c. SCAN-LOOKAHEAD HEADROOM = W - (CF_OUTSTANDING_MAX + MAX_CFILTERS_RESULTS)
+      = 10000 - 5096 = 4904 blocks of cfheader frontier the scan can consume
+      before the convoy has to re-kick, i.e. ~5 full forward-fetch batches of
+      slack against a stalled header supply. */
 #define CF_CONVOY_WINDOW 10000
 
 /* PACED-CONVOY driver B1.3 -- the getheaders re-kick's RATE LIMIT (spec Part B1
@@ -456,6 +479,60 @@ uint32_t BRPeerManagerAbandonedBelow(BRPeerManager *manager);
 // Cumulative count of heights abandoned so far: heights in
 // [start .. abandonedBelow-1], i.e. max(abandonedBelow - start, 0).
 size_t BRPeerManagerAbandonedCount(BRPeerManager *manager);
+
+// ---- B2 valve / watchdog ORDERING (paced-convoy fetch, Task 6, spec Part C) -
+//
+// "Is the B2 abandonment valve currently mid-decision on the hole that PINS the
+// scan frontier?" — the signal the Kotlin tip-stall watchdog uses to stand down
+// while the valve does its work, so the two scan-stall watchers do not race
+// (the valve owns a KNOWN gaveUp stall and its re-arm IS productive work, where
+// the watchdog's escalation — an ungated getheaders, then a manager recreate —
+// is pure churn on top of it).
+//
+// PENDING covers BOTH halves of the valve's window, not just the decision instant:
+//   (a) the frontier-pinning hole is PARKED in gaveUp — the valve decides at the
+//       next KeepAlive tick; and
+//   (b) the frontier-pinning hole is OUTSTANDING with rearmCycles > 0 — a
+//       valve-granted RE-ARM CYCLE IS IN FLIGHT (~7.5 min of rotated retry, the
+//       larger half of the window). An ordinary outstanding hole (rearmCycles == 0)
+//       belongs to the residual driver, not the valve, and reads 0.
+//
+// RETURN VALUE — a COUNT, not a boolean, and that is load-bearing:
+//   0  == the valve owns nothing at the scan frontier; nothing pending.
+//   N>0 == the valve is on cycle N of that hole: N == 1 is the ORIGINAL cycle
+//          (exhausted, no re-arm granted yet); N == 2 is the first re-arm cycle
+//          (in flight, or exhausted and being decided); in general
+//          N == rearmCycles + 1, and the valve may abandon once
+//          N == CF_CONVOY_REARM_MAX + 1. Saturating (rearmCycles is a uint8_t
+//          widened to uint32_t), so it never wraps back to 0 and can never be
+//          mistaken for "not pending".
+//
+// WHY A COUNT (do NOT reduce this to a bare boolean — the Task-5 review found the
+// failure it prevents). The valve's per-cycle offersReachedLivePeer latch is
+// cleared by ANY disconnect of the peer stamped on the hole, and a deciding cycle
+// is 5 offers over ~7.5 min. On a churny fleet — canon oracles at maxconnections,
+// errno-101 blips, ~8 peers rotating — EVERY cycle can be tainted, so the valve
+// re-arms INDEFINITELY and this function returns non-zero forever. A consumer
+// that suppresses its watchdog on a bare "pending" would then stand down FOREVER,
+// in exactly the case the backstop exists for. So BOUND THE SUPPRESSION on this
+// value: suppress only while the returned N is within the cycles the valve is
+// actually entitled to (N <= CF_CONVOY_REARM_MAX + 1, i.e. through the deciding
+// cycle); once N exceeds that, the hole is re-arming without converging and MUST
+// be re-exposed to the watchdog. The resulting failure mode is a bounded-memory
+// VISIBLE stall (the convoy gate holds manager->blocks flat at ~W+144), never an
+// OOM and never a silent wrong balance.
+//
+// The pinning-hole predicate is the valve's own (the LOWEST hole of either kind —
+// _cfLedgerAdvance caps scannedThrough at min(outstanding[0], gaveUp[0]) - 1), so a
+// consumer can never defer to a valve decision that is not actually happening: a
+// gaveUp height sitting ABOVE a still-outstanding hole does not pin the frontier,
+// is not the valve's business, and reads 0 here.
+//
+// LOCKING: takes manager->lock, like every other public accessor here. Call it
+// from the JNI layer OUTSIDE any lock — NEVER from in-lock code (KeepAlive,
+// _peerRelayed*, _BRPeerManagerRequestNextCFHeaders); manager->lock is
+// NON-recursive and in-lock callers must read BRCFScanLedgerLowestGaveUp directly.
+uint32_t BRPeerManagerHasPendingAbandonment(BRPeerManager *manager);
 
 // Request cfilters for the inclusive range [startHeight, stopHeight] from
 // any filter-capable peer that is currently connected. Caps the range at

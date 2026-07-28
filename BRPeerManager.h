@@ -345,6 +345,27 @@ int BRPeerManagerCFLedgerRestore(BRPeerManager *manager, const uint8_t *buf, siz
 void BRPeerManagerSetSaveCFLedger(BRPeerManager *manager, void *info,
                                   void (*callback)(void *info, const uint8_t *bytes, size_t len));
 
+// ---- CF scan-frontier + abandonment accessors (paced-convoy fetch, Task 1) -
+// Read-only wrappers around the ledger's CF-retention scan-floor API (see
+// BRCFScanLedger.h "CF-retention scan-floor (Task 1)"). Each takes
+// manager->lock for the duration of the call, same as the Phase 1 accessors
+// above. The paced-convoy fetch gate/driver's fetch frontier is
+// LowestNeededHeight, NOT scannedThrough — LowestNeededHeight folds in the
+// hard abandonedBelow floor, scannedThrough alone does not.
+
+// Lowest height the CF scan still needs a header retained for:
+// max(scannedThrough+1, abandonedBelow). O(1).
+uint32_t BRPeerManagerLowestNeededHeight(BRPeerManager *manager);
+
+// The retention hard-floor watermark: heights below this have been
+// permanently abandoned (too deep to retain) and are never re-requested.
+// MONOTONIC (only ever advances).
+uint32_t BRPeerManagerAbandonedBelow(BRPeerManager *manager);
+
+// Cumulative count of heights abandoned so far: heights in
+// [start .. abandonedBelow-1], i.e. max(abandonedBelow - start, 0).
+size_t BRPeerManagerAbandonedCount(BRPeerManager *manager);
+
 // Request cfilters for the inclusive range [startHeight, stopHeight] from
 // any filter-capable peer that is currently connected. Caps the range at
 // MAX_CFILTERS_RESULTS; if the requested range is larger, only the first

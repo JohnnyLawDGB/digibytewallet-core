@@ -4166,6 +4166,39 @@ int BRPeerManagerCFLedgerRestore(BRPeerManager *manager, const uint8_t *buf, siz
     return ok;
 }
 
+// ---- CF scan-frontier + abandonment accessors (paced-convoy fetch, Task 1) -
+// Lock -> read the ledger's CF-retention scan-floor API -> unlock, same shape
+// as the Phase 1 accessors above. These are the frontier reads the paced-
+// convoy gate/driver/valve/watchdogs poll.
+
+uint32_t BRPeerManagerLowestNeededHeight(BRPeerManager *manager)
+{
+    assert(manager != NULL);
+    pthread_mutex_lock(&manager->lock);
+    uint32_t h = BRCFScanLedgerLowestNeededHeight(&manager->cfLedger);
+    pthread_mutex_unlock(&manager->lock);
+    return h;
+}
+
+uint32_t BRPeerManagerAbandonedBelow(BRPeerManager *manager)
+{
+    assert(manager != NULL);
+    pthread_mutex_lock(&manager->lock);
+    uint32_t h = BRCFScanLedgerAbandonedBelow(&manager->cfLedger);
+    pthread_mutex_unlock(&manager->lock);
+    return h;
+}
+
+size_t BRPeerManagerAbandonedCount(BRPeerManager *manager)
+{
+    assert(manager != NULL);
+    pthread_mutex_lock(&manager->lock);
+    uint32_t start = manager->cfLedger.start;
+    uint32_t abandonedBelow = manager->cfLedger.abandonedBelow;
+    pthread_mutex_unlock(&manager->lock);
+    return (abandonedBelow > start) ? (size_t)(abandonedBelow - start) : 0;
+}
+
 void BRPeerManagerSetSaveCFLedger(BRPeerManager *manager, void *info,
                                   void (*callback)(void *info, const uint8_t *bytes, size_t len))
 {

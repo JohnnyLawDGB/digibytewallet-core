@@ -776,8 +776,11 @@ uint32_t BRCFScanLedgerAbandonGaveUpBelow(BRCFScanLedger *l, uint32_t clamp,
 #else
     if (k > 0 && hi + 1 > l->abandonedBelow) l->abandonedBelow = hi + 1;   // monotonic
     // k == 0 → abandonedBelow unchanged: no preemptive raise. An empty
-    // gaveUp-below-clamp deep restore fails toward loud OOM (refused up front by
-    // the app-layer depth gate), never a silent confident-wrong balance.
+    // gaveUp-below-clamp deep restore leaves the floor where it is and keeps
+    // retrying under the paced convoy, never a silent confident-wrong balance.
+    // (There is no app-layer depth refusal any more — no restore is refused at
+    // any depth — so this guard is the only thing standing between an unscanned
+    // deep history and a completed-but-wrong balance.)
 #endif
 
     if (outCount) *outCount = count;

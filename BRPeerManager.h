@@ -89,20 +89,16 @@ Remarks:
    expands transiently while a large cfTip deficit is being recovered. */
 #define CLEAR_MEM_CF_RETENTION_MARGIN 144
 
-/* CF-retention DEPTH CEILING -- RETIRED as a trigger (paced-convoy design, the
-   KEPT/REMOVED/REPURPOSED block). It used to bound the retained block-header span
-   to this many blocks below the chain tip and abandon retry-exhausted (gaveUp)
-   heights below the clamp. That was a DEPTH REFUSAL -- "too old, don't try" --
-   which the paced convoy removes outright: no restore is refused at any depth,
-   because the convoy bounds resident headers to CF_CONVOY_WINDOW at ANY depth.
-   The abandonment VALVE the ceiling doubled as is retained but re-triggered on
-   proven connected-CF-subset refusal (Part B2, BRPeerManagerKeepAlive), not depth.
-   The retention FLOOR (min(cfNext, LowestNeededHeight) - CLEAR_MEM_CF_RETENTION_MARGIN)
-   is untouched. This #define now survives only for jni_peer.c's restore-depth
-   accessor, which the depth-refusal removal task deletes together with it. */
-#ifndef CF_RETENTION_MAX_SPAN
-#define CF_RETENTION_MAX_SPAN 30000
-#endif
+/* NOTE: there is deliberately NO depth ceiling here. CF_RETENTION_MAX_SPAN used
+   to bound the retained block-header span to a fixed depth below the chain tip
+   and abandon retry-exhausted (gaveUp) heights below the clamp; the app layer
+   read the same constant to REFUSE deep restores up front. Both halves are
+   DELETED (paced-convoy design, KEPT/REMOVED/REPURPOSED): no restore is refused
+   at any depth, because the convoy bounds resident headers to CF_CONVOY_WINDOW
+   at ANY depth. The abandonment VALVE the ceiling doubled as is RETAINED but
+   re-triggered on proven connected-CF-subset refusal (Part B2,
+   BRPeerManagerKeepAlive), not on depth. The retention FLOOR
+   (min(cfNext, LowestNeededHeight) - CLEAR_MEM_CF_RETENTION_MARGIN) is untouched. */
 
 /* PACED-CONVOY B2 -- how many FRESH retry cycles a retry-exhausted (gaveUp) hole
    is granted against a LIVE CF-peer set before the abandonment valve may abandon

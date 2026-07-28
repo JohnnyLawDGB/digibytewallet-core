@@ -1432,7 +1432,9 @@ static void _peerRejectedTx(void *info, UInt256 txHash, uint8_t code)
 
 // NOTE (paced-convoy Task 5): the tip-anchored DEPTH CEILING that used to live
 // here (_cfApplyRetentionCeiling, `tip - floorH > CF_RETENTION_MAX_SPAN` →
-// abandon the gaveUp prefix) is DELETED. It was a depth refusal — "this history
+// abandon the gaveUp prefix) is DELETED — as is the CF_RETENTION_MAX_SPAN
+// #define itself, together with the app-layer refusal gate that read it via
+// jni_peer.c. It was a depth refusal — "this history
 // is too old to keep trying" — and the paced convoy removes depth refusal
 // outright: with the header/cfheader frontiers paced to CF_CONVOY_WINDOW of the
 // scan frontier, the resident header span is flat at ~2.2 MB at ANY restore

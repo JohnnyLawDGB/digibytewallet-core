@@ -268,6 +268,17 @@ struct BRPeerManagerStruct {
     // traffic on exactly the deep restore the convoy exists to make cheap). 0 on a
     // calloc'd manager, so the first tick only samples (never re-kicks).
     uint32_t convoyLastHdrTip;
+    // ...and a frozen tip alone is NOT sufficient: BRPeer.c issues its continuation
+    // BEFORE the relay loop, so lastBlock stays put until the whole ~440 KB batch is
+    // parsed, and a stale-HIGH estimatedHeight (only ever raised) keeps a synced
+    // wallet permanently "frozen below the network tip". So the re-kick is also
+    // rate-limited: convoyLastHdrKickAt stamps the last one, convoyHdrKickBackoff is
+    // the interval before the next (doubling while unproductive, capped at
+    // CF_CONVOY_HDR_REKICK_MAX_SECS, RESET to CF_CONVOY_HDR_REKICK_BASE_SECS the
+    // moment the header tip actually advances). Both 0 on a calloc'd manager: 0
+    // backoff reads as BASE, 0 stamp reads as "never kicked" (immediately due).
+    time_t   convoyLastHdrKickAt;
+    uint32_t convoyHdrKickBackoff;
     // Lock-free mirrors of the scalar status values the Android UI polls for the
     // sync overlay. Written by the sync/worker threads WHERE THEY ALREADY HOLD
     // manager->lock (via _BRPeerManagerRefreshCachedStatus); read by the JNI status
@@ -885,6 +896,21 @@ static int _cfConvoyCfhGated(BRPeerManager *manager)
 #else
 #define CF_CONVOY_HDR_GATED(m) _cfConvoyHdrGated(m)
 #define CF_CONVOY_CFH_GATED(m) _cfConvoyCfhGated(m)
+#endif
+
+// B1.3 getheaders re-kick RATE LIMIT (see CF_CONVOY_HDR_REKICK_BASE_SECS in
+// BRPeerManager.h for the full cost argument in both directions). A zero stamp
+// means "never re-kicked" == immediately due. Routed through a macro for the same
+// reason as the gate above: -DCONVOY_HDR_REKICK_UNTHROTTLED builds the pre-fix
+// shape (re-kick on EVERY frozen tick) with the backoff bookkeeping still live,
+// so what the host KAT proves red is the THROTTLE, not the arithmetic. Never
+// defined in any production build.
+#ifdef CONVOY_HDR_REKICK_UNTHROTTLED
+#define CF_CONVOY_HDR_REKICK_DUE(m, backoff) (1)
+#else
+#define CF_CONVOY_HDR_REKICK_DUE(m, backoff) \
+    ((m)->convoyLastHdrKickAt == 0 || \
+     (time(NULL) - (m)->convoyLastHdrKickAt) >= (time_t)(backoff))
 #endif
 
 // Recompute the header window ONCE and stamp the verdict onto every connected
@@ -3851,38 +3877,69 @@ void BRPeerManagerKeepAlive(BRPeerManager *manager)
 
         // ---- B1.3: getheaders advance re-kick -------------------------------
         // Re-issues the CF-only header continuation BRPeer.c holds while the window
-        // is full. Conditioned on an OBSERVED FROZEN TIP (see convoyLastHdrTip):
-        // BRPeerSendGetheaders has no in-flight guard of its own, and during
-        // ordinary open-window sync BRPeer.c's own continuation is already running,
-        // so an unconditional per-tick re-issue would duplicate every 2000-header
-        // batch. Full exponential locators (same primitive as the orphan re-anchor
-        // and the tip-stall watchdog) so a walk-back is possible, not just a
-        // forward pull. Prefer the download peer; fall back to any live peer, since
-        // a resumed manager can have downloadPeer == NULL while peers are connected.
-        if (! CF_CONVOY_HDR_GATED(manager) && manager->lastBlock &&
-            manager->lastBlock->height < manager->estimatedHeight &&
-            manager->lastBlock->height <= manager->convoyLastHdrTip) {
-            BRPeer *dp = manager->downloadPeer;
-            if (! dp || BRPeerConnectStatus(dp) != BRPeerStatusConnected || ! BRPeerIsSocketOpen(dp)) {
-                dp = NULL;
-                for (size_t i = array_count(manager->connectedPeers); i > 0; i--) {
-                    BRPeer *p = manager->connectedPeers[i - 1];
-                    if (BRPeerConnectStatus(p) != BRPeerStatusConnected) continue;
-                    if (! BRPeerIsSocketOpen(p)) continue;
-                    dp = p;
-                    break;
+        // is full. Full exponential locators (same primitive as the orphan re-anchor
+        // and the tip-stall watchdog) so a walk-back is possible, not just a forward
+        // pull. Prefer the download peer; fall back to any live peer, since a
+        // resumed manager can have downloadPeer == NULL while peers are connected.
+        //
+        // TWO conditions, both load-bearing (see CF_CONVOY_HDR_REKICK_BASE_SECS in
+        // BRPeerManager.h for the full cost argument):
+        //   (i)  an OBSERVED FROZEN TIP (convoyLastHdrTip) -- BRPeerSendGetheaders
+        //        has no in-flight guard of its own and BRPeer.c's own continuation
+        //        is already running while the window is open, so firing on an
+        //        ADVANCING tip would duplicate every 2000-header batch;
+        //   (ii) a RATE LIMIT on top, because "frozen" cannot tell "nothing is in
+        //        flight" from "a ~440 KB reply is in flight and not parsed yet"
+        //        (BRPeer.c issues its continuation BEFORE the relay loop). Without
+        //        it a slow link gets one injected getheaders per ~10 s tick, each
+        //        reply spawning its own persistent lockstep continuation chain
+        //        (N x ~2.2 MB of duplicate headers per window-open period), and a
+        //        stale-HIGH estimatedHeight -- which is only ever RAISED, never
+        //        lowered -- leaves a fully-synced wallet permanently "below the
+        //        network tip" with the window permanently open, i.e. ~10 MB/day of
+        //        0-header round trips forever. The interval doubles while
+        //        unproductive and RESETS on real tip progress below, so an ordinary
+        //        descent always pays only BASE.
+        uint32_t hdrTip   = manager->lastBlock ? manager->lastBlock->height : 0;
+        int      hdrFrozen = (hdrTip <= manager->convoyLastHdrTip);
+        if (! hdrFrozen) {
+            // The continuation chain is demonstrably alive: forget the backoff so the
+            // NEXT stall is re-kicked at BASE rather than at the ceiling.
+            manager->convoyHdrKickBackoff = CF_CONVOY_HDR_REKICK_BASE_SECS;
+        }
+        if (hdrFrozen && ! CF_CONVOY_HDR_GATED(manager) && manager->lastBlock &&
+            hdrTip < manager->estimatedHeight) {
+            uint32_t backoff = manager->convoyHdrKickBackoff
+                               ? manager->convoyHdrKickBackoff : CF_CONVOY_HDR_REKICK_BASE_SECS;
+            if (CF_CONVOY_HDR_REKICK_DUE(manager, backoff)) {
+                BRPeer *dp = manager->downloadPeer;
+                if (! dp || BRPeerConnectStatus(dp) != BRPeerStatusConnected || ! BRPeerIsSocketOpen(dp)) {
+                    dp = NULL;
+                    for (size_t i = array_count(manager->connectedPeers); i > 0; i--) {
+                        BRPeer *p = manager->connectedPeers[i - 1];
+                        if (BRPeerConnectStatus(p) != BRPeerStatusConnected) continue;
+                        if (! BRPeerIsSocketOpen(p)) continue;
+                        dp = p;
+                        break;
+                    }
+                }
+                if (dp) {
+                    UInt256 locators[_BRPeerManagerBlockLocators(manager, NULL, 0)];
+                    size_t locatorsCount = _BRPeerManagerBlockLocators(manager, locators,
+                                                                       sizeof(locators)/sizeof(*locators));
+                    peer_log(dp, "paced convoy: re-kicking held header continuation from tip %"PRIu32
+                             " (window open, header frontier frozen; next re-kick in >=%us)",
+                             hdrTip, backoff);
+                    BRPeerSendGetheaders(dp, locators, locatorsCount, UINT256_ZERO);
+                    // Stamp + back off ONLY on a real send, so a tick with no eligible
+                    // peer neither consumes the interval nor escalates the backoff.
+                    manager->convoyLastHdrKickAt  = time(NULL);
+                    manager->convoyHdrKickBackoff = (backoff >= CF_CONVOY_HDR_REKICK_MAX_SECS / 2)
+                                                    ? CF_CONVOY_HDR_REKICK_MAX_SECS : backoff * 2;
                 }
             }
-            if (dp) {
-                UInt256 locators[_BRPeerManagerBlockLocators(manager, NULL, 0)];
-                size_t locatorsCount = _BRPeerManagerBlockLocators(manager, locators,
-                                                                   sizeof(locators)/sizeof(*locators));
-                peer_log(dp, "paced convoy: re-kicking held header continuation from tip %"PRIu32
-                         " (window re-opened, header frontier frozen)", manager->lastBlock->height);
-                BRPeerSendGetheaders(dp, locators, locatorsCount, UINT256_ZERO);
-            }
         }
-        manager->convoyLastHdrTip = manager->lastBlock ? manager->lastBlock->height : 0;
+        manager->convoyLastHdrTip = hdrTip;
 
         // B1.2 can floor-snap/re-anchor (BRCFScanLedgerInit at a new floor +
         // compactFilterChain freed), which moves the scan frontier and therefore the

@@ -125,6 +125,47 @@ Remarks:
    is bounded to ~W by construction. */
 #define CF_CONVOY_WINDOW 10000
 
+/* PACED-CONVOY driver B1.3 -- the getheaders re-kick's RATE LIMIT (spec Part B1
+   step 3). KeepAlive re-issues the header continuation BRPeer.c holds while the
+   window is full; the trigger (a header frontier frozen across a whole ~10 s
+   tick) is necessary but NOT sufficient, because "frozen" cannot distinguish
+   "the continuation was suppressed and nothing is in flight" (re-kick wanted)
+   from "a reply IS in flight and just hasn't been parsed yet" (re-kick harmful).
+   BRPeer.c issues its continuation BEFORE the relay loop, so lastBlock does not
+   move until the whole ~440 KB batch is parsed -- on a slow link that is minutes
+   of "frozen". So the re-kick is additionally rate-limited by an interval that
+   BACKS OFF while unproductive and RESETS the moment the header tip actually
+   advances. Same 'delay = min(BASE << n, CAP), reset on progress' idiom the CF
+   scan-ledger's residual re-request driver already uses (CF_REREQ_BASE_SECS /
+   CF_REREQ_BACKOFF_CAP_SECS) -- deliberately not a new mechanism.
+
+   Sequence: 30, 60, 120, 240, 480, 600, 600, ... (reset to 30 on tip progress).
+
+   TOO SHORT costs bandwidth, and it COMPOUNDS: each injected getheaders is
+   answered with a full 2000-header batch, and because count >= 2000 every reply
+   spawns its OWN independent, lockstep continuation chain that persists until
+   the gate shuts it -- N re-kicks during one slow batch means N x ~2.2 MB of
+   duplicate headers per window-open period, recurring on every re-open of a
+   multi-hour deep restore, amplifying exactly on the slow mobile links the
+   convoy exists to make cheap. It also has a STEADY-STATE leak: estimatedHeight
+   is only ever RAISED, so a peer that advertised a height we never reach leaves
+   lastBlock->height < estimatedHeight forever on a fully-synced wallet (where
+   W_hdr ~ 0, i.e. the window is permanently open) -- at the bare 10 s tick that
+   is a ~1.2 KB full-locator getheaders every 10 s forever (~10 MB/day upstream),
+   each answered with 0 headers. The 600 s ceiling bounds that to ~170 KB/day.
+
+   TOO LONG costs window-reopen recovery latency: after the scan climbs enough to
+   re-open the window, the header frontier stays frozen until the next re-kick is
+   due. BASE is what that path actually pays, because the previous batch landing
+   is itself tip progress and RESETS the backoff -- so an ordinary descent always
+   re-kicks at 30 s, never at the ceiling. At 30 s the header supply is ~4000
+   headers per interval (the M-2 two-batch overshoot: BRPeer.c reads the gate
+   flag one batch stale), i.e. ~133 heights/s, which stays ahead of the scan's
+   ceiling of MAX_CFILTERS_RESULTS(1000) per ~10 s tick == 100 heights/s. So the
+   convoy is never header-starved by this throttle. */
+#define CF_CONVOY_HDR_REKICK_BASE_SECS 30
+#define CF_CONVOY_HDR_REKICK_MAX_SECS  600
+
 /* BIP 158 continuity-failure recovery. If this many DISTINCT peers fail the
    cfheaders continuity check against our current tip since the last successful
    append, our chain is the outlier (it diverged via unverified TOFU) — re-anchor

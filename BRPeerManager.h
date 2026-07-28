@@ -103,6 +103,28 @@ Remarks:
 #define CF_RETENTION_MAX_SPAN 30000
 #endif
 
+/* PACED-CONVOY FETCH WINDOW (spec 2026-07-28-paced-convoy-fetch-design.md,
+   Parts A + C). The maximum number of blocks the block-header frontier
+   (manager->lastBlock->height) and the cfheader frontier
+   (BRCompactFilterChainNextHeight - 1) may lead the CF SCAN frontier
+   (BRCFScanLedgerLowestNeededHeight) by. Beyond it the two TIP-RACING
+   continuations -- BRPeer.c's CF-only 2000-header continuation and
+   _BRPeerManagerRequestNextCFHeaders' clean-append advance -- are suppressed, so
+   the header/cfheader/scan frontiers climb birth->tip as one convoy instead of
+   the headers fast-forwarding to the tip and filling manager->blocks with
+   [birth..tip] before the scan has processed anything (the deep-restore OOM).
+   RECOVERY and SYNC-START sends are NEVER gated -- suppressing one deadlocks the
+   convoy from the other side.
+
+   The value is a floor-derived bound, not a magic number: it must exceed
+   (1) the scan lookahead CF_OUTSTANDING_MAX(4096) + MAX_CFILTERS_RESULTS(1000),
+   (2) the cfheader quantum MAX_CFHEADERS_RESULTS(2000), and
+   (3) a re-kick-latency margin at DGB's ~15 s blocks.
+   At 10000 the resident header span is ~(W + CLEAR_MEM_CF_RETENTION_MARGIN)
+   * ~220 B ~= 2.2 MB, FLAT at any restore depth, and the tip-down prevBlock walk
+   is bounded to ~W by construction. */
+#define CF_CONVOY_WINDOW 10000
+
 /* BIP 158 continuity-failure recovery. If this many DISTINCT peers fail the
    cfheaders continuity check against our current tip since the last successful
    append, our chain is the outlier (it diverged via unverified TOFU) — re-anchor

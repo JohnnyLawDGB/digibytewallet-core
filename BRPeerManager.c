@@ -771,7 +771,13 @@ static size_t _BRPeerManagerRequestCFiltersWithStopHashLocked(BRPeerManager *man
                                                              uint32_t startHeight, uint32_t stopHeight,
                                                              UInt256 stopHash, BRPeer *preferred);
 static BRPeer *_BRPeerManagerAnyFilterCapablePeer(BRPeerManager *manager);
-static void _BRPeerManagerRequestNextCFHeaders(BRPeerManager *manager, BRPeer *peer);
+// isConvoyAdvance: 1 == this is a routine CONVOY ADVANCE toward the tip (the
+// clean-append continuation / the block-extend kick) and may be suppressed by
+// the paced-convoy gate; 0 == this is a SYNC-START or RECOVERY send (filter-peer
+// connect, floor re-anchor) that must ALWAYS go out -- gating one of those
+// deadlocks the convoy from the other side. See the per-call-site table in the
+// definition below.
+static void _BRPeerManagerRequestNextCFHeaders(BRPeerManager *manager, BRPeer *peer, int isConvoyAdvance);
 static int _BRPeerManagerReanchorAtFloorLocked(BRPeerManager *manager, int force);
 // Defined near BRPeerManagerRequestCompactFilters; forward-declared so the Phase 2
 // buffered-drain trampolines (_cfBufEval, above BRPeerManagerKeepAlive) and
@@ -782,6 +788,109 @@ static int _BRPeerManagerConnectedFilterPeerCount(BRPeerManager *manager); // de
 static void _BRPeerManagerProbeOtherFilterPeersForCFHeaders(BRPeerManager *manager, BRPeer *current,
                                                             uint8_t filterType, uint32_t startHeight,
                                                             UInt256 stopHash);
+
+// ---- PACED-CONVOY FETCH: the two window predicates -------------------------
+// (spec 2026-07-28-paced-convoy-fetch-design.md, Part A)
+//
+// Both windows are keyed on the CF SCAN frontier -- BRCFScanLedgerLowestNeededHeight,
+// NOT raw scannedThrough: after an abandonment `abandonedBelow` jumps WITHOUT
+// _cfLedgerAdvance running, so LowestNeededHeight is current where scannedThrough
+// lags, and a gate keyed on the lagging value would stay shut after the valve
+// deliberately re-opened the convoy.
+//
+// LOCKING (load-bearing): manager->lock is a NON-recursive mutex
+// (pthread_mutex_init(..., NULL)). Every caller of these -- the KeepAlive tick,
+// _peerRelayedBlock, _peerRelayedBlockInv, _BRPeerManagerRequestNextCFHeaders --
+// ALREADY HOLDS it. So these read manager->cfLedger DIRECTLY via the lock-free
+// ledger-level BRCFScanLedgerLowestNeededHeight and must NEVER call the public
+// BRPeerManagerLowestNeededHeight accessor, which takes manager->lock itself and
+// would self-deadlock. Caller must hold manager->lock.
+
+// ARMING GUARD (wedge-class; do not remove). The convoy only paces a LIVE
+// compact-filter scan. Until the scan is armed, manager->cfLedger is still the
+// calloc'd zero state -- scannedThrough == 0 makes LowestNeededHeight == 1,
+// which against a mainnet checkpoint tip scores BOTH windows as permanently full
+// and would suppress the very block-header sync that has to run FIRST (and that
+// EnableAutoCompactFilterFetch needs a tip from before it can even pick a floor):
+// a permanent sync wedge on every fresh start. syncMode likewise defaults to
+// BR_SYNC_MODE_BLOOM_ONLY (== 0) on a calloc'd manager, and there is no CF scan
+// to pace in that mode at all. Every path that arms the scan
+// (BRPeerManagerEnableAutoCompactFilterFetch, the cfheaders floor snap, the
+// floor re-anchor) sets autoFetchCFiltersEnabled and BRCFScanLedgerInits the
+// ledger at a real floor together under this same lock, so this one flag is a
+// sound proxy for "the ledger holds a real scan frontier". Caller holds the lock.
+static int _cfConvoyScanArmed(BRPeerManager *manager)
+{
+    return (manager->syncMode != BR_SYNC_MODE_BLOOM_ONLY && manager->autoFetchCFiltersEnabled) ? 1 : 0;
+}
+
+// W_hdr: does the BLOCK-HEADER frontier already lead the scan frontier by a full
+// window? Underflow-guarded -- the scan frontier can legitimately sit ABOVE
+// lastBlock->height (e.g. an abandonment watermark past a not-yet-synced tip),
+// and an unsigned wrap there would read as "permanently full" and wedge sync.
+static int _cfConvoyHdrGated(BRPeerManager *manager)
+{
+    if (! _cfConvoyScanArmed(manager)) return 0;
+    if (! manager->lastBlock) return 0;
+    uint32_t scanFrontier = BRCFScanLedgerLowestNeededHeight(&manager->cfLedger);
+    uint32_t hdrFrontier  = manager->lastBlock->height;
+    if (hdrFrontier <= scanFrontier) return 0;
+    return (hdrFrontier - scanFrontier) >= CF_CONVOY_WINDOW ? 1 : 0;
+}
+
+// W_cfh: does the CFHEADER frontier already lead the scan frontier by a full
+// window?
+//
+// NULL-CHAIN CARVE-OUT (spec blocker B-3, do not "simplify" away):
+// compactFilterChain is created LAZILY on the first cfheaders RESPONSE, so on a
+// fresh restore it is NULL and BRCompactFilterChainNextHeight(NULL) == 0. The
+// naive `NextHeight - 1` would therefore underflow to 0xFFFFFFFF, score the
+// window as permanently FULL, and suppress the very FIRST cfheaders request --
+// which is the only thing that would ever create the chain. That deadlocks every
+// fresh deep restore forever. A NULL chain (and a genesis-anchored empty chain,
+// NextHeight == 0) is an OPEN gate.
+static int _cfConvoyCfhGated(BRPeerManager *manager)
+{
+    if (! _cfConvoyScanArmed(manager)) return 0;   // see _cfConvoyScanArmed (wedge-class guard)
+    uint32_t scanFrontier = BRCFScanLedgerLowestNeededHeight(&manager->cfLedger);
+#ifndef CONVOY_NULLCHAIN_NAIVE
+    if (! manager->compactFilterChain) return 0;   // carve-out: no chain yet -> gate OPEN
+#endif
+    uint32_t next = BRCompactFilterChainNextHeight(manager->compactFilterChain);
+#ifndef CONVOY_NULLCHAIN_NAIVE
+    if (next == 0) return 0;                       // carve-out: nothing appended -> gate OPEN
+#endif
+    uint32_t cfhFrontier = next - 1;
+    if (cfhFrontier <= scanFrontier) return 0;
+    return (cfhFrontier - scanFrontier) >= CF_CONVOY_WINDOW ? 1 : 0;
+}
+
+// The SUPPRESSION sites go through these macros so the host KAT can build the
+// pre-fix shape (-DCONVOY_UNGATED) for its red-before-green gate while the
+// predicates above stay live as pure measurement -- what that build proves red
+// is the GATE, not the arithmetic. -DCONVOY_UNGATED is never defined in any
+// production build.
+#ifdef CONVOY_UNGATED
+#define CF_CONVOY_HDR_GATED(m) (0)
+#define CF_CONVOY_CFH_GATED(m) (0)
+#else
+#define CF_CONVOY_HDR_GATED(m) _cfConvoyHdrGated(m)
+#define CF_CONVOY_CFH_GATED(m) _cfConvoyCfhGated(m)
+#endif
+
+// Recompute the header window ONCE and stamp the verdict onto every connected
+// peer, so BRPeer.c's CF-only header continuation (_BRPeerAcceptHeadersMessage,
+// which runs on each peer's read thread with no access to the opaque manager)
+// can read it lock-free. Called on every block-add and every KeepAlive tick;
+// deliberately no locking on the peer side -- see BRPeerSetConvoyHdrGated.
+// Caller must hold manager->lock.
+static void _BRPeerManagerPushConvoyHdrGate(BRPeerManager *manager)
+{
+    int gated = CF_CONVOY_HDR_GATED(manager);
+    for (size_t i = array_count(manager->connectedPeers); i > 0; i--) {
+        BRPeerSetConvoyHdrGated(manager->connectedPeers[i - 1], gated);
+    }
+}
 
 // Ring-buffer insert/refresh for the churn-fix penalty set (see PEER_PENALTY_*
 // above). If (addr, port) is already on the list its window is refreshed;
@@ -1585,14 +1694,22 @@ static void _peerRelayedBlock(void *info, BRMerkleBlock *block)
         BRSetAdd(manager->blocks, block);
         manager->lastBlock = block;
 
+        // Paced-convoy: lastBlock just advanced, so the header window changed —
+        // recompute it once and re-push the verdict to every connected peer
+        // before anything else this pass reads it. (KeepAlive re-pushes on its
+        // own ~10 s tick as the backstop for every other lastBlock mutation.)
+        _BRPeerManagerPushConvoyHdrGate(manager);
+
         // Kick cfheaders driver — on fresh-boot the autoFetchCFiltersStart
         // height may sit above the checkpoint, so OnFilterCapablePeerConnected
         // saw tip<start and bailed. Each block that advances lastBlock gives
         // the driver another chance; it self-no-ops once caught up.
+        // isConvoyAdvance=1: this kick races the tip alongside header sync, so it
+        // is exactly what the convoy paces.
         if (manager->autoFetchCFiltersEnabled &&
             manager->syncMode != BR_SYNC_MODE_BLOOM_ONLY) {
             BRPeer *fp = _BRPeerManagerAnyFilterCapablePeer(manager);
-            if (fp) _BRPeerManagerRequestNextCFHeaders(manager, fp);
+            if (fp) _BRPeerManagerRequestNextCFHeaders(manager, fp, /*isConvoyAdvance=*/1);
         }
 
         // clear some memory
@@ -1822,8 +1939,17 @@ static void _peerRelayedBlockInv(void *info, UInt256 blockHash)
 
     pthread_mutex_lock(&manager->lock);
 
+    // PACED-CONVOY GATE, getheaders half (spec Part A). This is the second
+    // tip-racing continuation: every block inv pulls headers from our tip, so on
+    // a deep restore it drags the header frontier toward the tip in lockstep with
+    // BRPeer.c's batch continuation. Suppressed on the same window; unlike the
+    // BRPeer.c:622 site this one runs in-manager under the lock, so it reads the
+    // predicate directly instead of a pushed flag. Never gates the sync-start
+    // (_peerConnected), orphan re-anchor or tip-stall-watchdog getheaders — those
+    // are separate call sites that are not this driver.
     if (manager->syncMode == BR_SYNC_MODE_COMPACT_FILTERS_ONLY && manager->lastBlock &&
         BRPeerConnectStatus(peer) == BRPeerStatusConnected &&
+        ! CF_CONVOY_HDR_GATED(manager) &&
         ! BRSetGet(manager->blocks, &blockHash)) { // header not yet known — pull it from our tip
         UInt256 locators[_BRPeerManagerBlockLocators(manager, NULL, 0)];
         size_t count = _BRPeerManagerBlockLocators(manager, locators, sizeof(locators)/sizeof(*locators));
@@ -2235,7 +2361,21 @@ static void _BRPeerManagerDropStalledFilterPeer(BRPeerManager *manager)
 #define CF_HEADERS_REQUEST_TIMEOUT_TOR_SECS 20
 #define CF_REQUEST_TIMEOUT_SECS() (BRPeerHasSocksProxy() ? CF_HEADERS_REQUEST_TIMEOUT_TOR_SECS : CF_HEADERS_REQUEST_TIMEOUT_SECS)
 
-static void _BRPeerManagerRequestNextCFHeaders(BRPeerManager *manager, BRPeer *peer)
+// PACED-CONVOY GATE, getcfheaders half (spec Part A). `isConvoyAdvance` is
+// supplied per CALL SITE — this function serves both roles and the classification
+// is NOT re-derivable from inside it:
+//   isConvoyAdvance = 1 (GATEABLE, races the tip):
+//     * continuation on a clean cfheaders append (_peerRelayedCFHeaders)
+//     * the block-extend kick in _peerRelayedBlock
+//   isConvoyAdvance = 0 (NEVER gated — suppressing one wedges sync forever):
+//     * sync-start on filter-capable peer connect (_BRPeerManagerOnFilterCapablePeerConnected)
+//     * floor re-anchor recovery (_BRPeerManagerReanchorAtFloorLocked)
+// Two more never-gated paths are structural rather than call-site-tagged: the
+// TIMEOUT RETRY is a branch INSIDE this function (isTimeoutRetry below, excluded
+// from the gate condition), and the CONTINUITY PROBE sends via
+// _BRPeerManagerProbeOtherFilterPeersForCFHeaders -> BRPeerSendGetCFHeaders
+// directly, never through here.
+static void _BRPeerManagerRequestNextCFHeaders(BRPeerManager *manager, BRPeer *peer, int isConvoyAdvance)
 {
     if (!_BRPeerManagerPeerSupportsCompactFilters(manager, peer)) return;
     if (!manager->lastBlock) return;
@@ -2318,6 +2458,25 @@ static void _BRPeerManagerRequestNextCFHeaders(BRPeerManager *manager, BRPeer *p
             peer_log(peer, "cfheaders: no block hash for height %u, deferring", batchEnd);
             return;
         }
+    }
+
+    // ---- PACED-CONVOY GATE (spec Part A) -----------------------------------
+    // Deliberately placed BELOW the isTimeoutRetry determination and BELOW the
+    // floor-snap/re-anchor branch above, so neither recovery path is ever
+    // suppressed:
+    //   * a TIMEOUT RETRY is excluded explicitly (`! isTimeoutRetry`) — the
+    //     previous request went unanswered, so re-sending it is recovery, not an
+    //     advance;
+    //   * a FLOOR SNAP has already run by this point and freed compactFilterChain,
+    //     which opens the window predicate via the NULL-chain carve-out, so the
+    //     re-anchored request continues out on this same pass.
+    // Suppressing here (rather than at BRPeerSendGetCFHeaders) also leaves
+    // cfHeadersRequestedThrough / cfHeadersRequestTime untouched, so a held
+    // advance records no phantom in-flight batch and the next tick re-evaluates
+    // cleanly. The KeepAlive convoy driver re-issues the advance once the scan
+    // frontier climbs back inside the window.
+    if (isConvoyAdvance && ! isTimeoutRetry && CF_CONVOY_CFH_GATED(manager)) {
+        return;
     }
 
     // On a timeout retry, cycle to a filter peer we haven't tried yet for THIS batch.
@@ -2678,7 +2837,11 @@ static void _peerRelayedCFHeaders(void *info, uint8_t filterType, UInt256 stopHa
     }
 
     // Request the next batch if still behind the local block tip.
-    _BRPeerManagerRequestNextCFHeaders(manager, peer);
+    // isConvoyAdvance=1: THE tip-racing cfheaders continuation — this is the
+    // self-sustaining loop the convoy paces (a clean append immediately asks for
+    // the next 2000). Held when the cfheader frontier is already a full window
+    // ahead of the scan; the KeepAlive convoy driver re-fires it.
+    _BRPeerManagerRequestNextCFHeaders(manager, peer, /*isConvoyAdvance=*/1);
     // cfheaders advanced — refresh cachedCFTip so the watchdog/overlay see progress
     // between blocks (cfheaders can climb faster than new blocks arrive).
     _BRPeerManagerRefreshCachedStatus(manager);
@@ -2822,7 +2985,11 @@ static void _BRPeerManagerOnFilterCapablePeerConnected(BRPeerManager *manager, v
     // addresses are used and a look-ahead receive would be missed. Follows the same
     // manager->wallet lock ordering as the bloom path's pregen.
     _BRPeerManagerPregenAddrWindow(manager);
-    _BRPeerManagerRequestNextCFHeaders(manager, peer);
+    // isConvoyAdvance=0: SYNC-START. This is the only thing that gets cfheaders
+    // moving when a filter-capable peer connects (including the first peer of a
+    // fresh restore, and the first filter peer after a fleet-wide drop). Gating
+    // it would leave the convoy with no starter — a permanent 0-progress wedge.
+    _BRPeerManagerRequestNextCFHeaders(manager, peer, /*isConvoyAdvance=*/0);
 }
 
 // not thread-safe, set callbacks once before calling BRPeerManagerConnect()
@@ -3359,6 +3526,16 @@ void BRPeerManagerKeepAlive(BRPeerManager *manager)
     struct timeval tv;
     gettimeofday(&tv, NULL);
     double t0 = tv.tv_sec + (double)tv.tv_usec/1000000;
+
+    // Paced-convoy: re-stamp the header-window verdict on every connected peer.
+    // _peerRelayedBlock pushes on each block-add; this is the periodic backstop
+    // that covers every OTHER way the window can move — the scan frontier
+    // climbing (which no block-add signals), an abandonment jumping
+    // abandonedBelow, a reorg, and peers that connected since the last push.
+    // Without it a peer that went gated during the descent would never be told
+    // the window re-opened. Not inside the tick-budget loop below: this is a
+    // plain int store per peer, no I/O, and it must reach ALL peers every tick.
+    _BRPeerManagerPushConvoyHdrGate(manager);
 
     for (size_t i = array_count(manager->connectedPeers); i > 0; i--) {
         BRPeer *p = manager->connectedPeers[i - 1];
@@ -4044,8 +4221,12 @@ static int _BRPeerManagerReanchorAtFloorLocked(BRPeerManager *manager, int force
 
     // Kick recovery immediately if a filter peer is connected; otherwise the
     // next block-extend kick handles it once filter-first connects one.
+    // isConvoyAdvance=0: RECOVERY. The re-anchor just tore the CF chain down and
+    // rebuilt the ledger at the floor; this send is how the rebuilt chain gets
+    // its first batch. Gating it would strand the wallet in the very stall the
+    // re-anchor exists to escape.
     BRPeer *fp = _BRPeerManagerAnyFilterCapablePeer(manager);
-    if (fp) _BRPeerManagerRequestNextCFHeaders(manager, fp);
+    if (fp) _BRPeerManagerRequestNextCFHeaders(manager, fp, /*isConvoyAdvance=*/0);
     return 1;
 }
 

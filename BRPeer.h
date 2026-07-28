@@ -190,6 +190,18 @@ void BRPeerSetEarliestKeyTime(BRPeer *peer, uint32_t earliestKeyTime);
 // (there is no bloom filter to match against). Set once before BRPeerConnect. Default 0 = legacy.
 void BRPeerSetCompactFiltersOnly(BRPeer *peer, int compactFiltersOnly);
 
+// Paced-convoy fetch gate (BRPeerManager.h CF_CONVOY_WINDOW). Set nonzero by the
+// manager while the block-header frontier is already a full convoy window ahead
+// of the CF scan frontier: the CF-only header handler then HOLDS its getheaders
+// continuation (the headers already received are still processed -- only the
+// request for the NEXT 2000-header batch is suppressed) so header sync cannot
+// fast-forward to the chain tip ahead of the compact-filter scan. Unlike
+// BRPeerSetCompactFiltersOnly this FLIPS over the life of the connection: the
+// manager recomputes and re-pushes it on every block-add and every KeepAlive
+// tick. Read lock-free from the peer's read thread; a stale read costs at most
+// one extra 2000-header batch and self-corrects on the next one.
+void BRPeerSetConvoyHdrGated(BRPeer *peer, int gated);
+
 // call this when local best block height changes (helps detect tarpit nodes)
 void BRPeerSetCurrentBlockHeight(BRPeer *peer, uint32_t currentBlockHeight);
 

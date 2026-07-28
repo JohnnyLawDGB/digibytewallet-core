@@ -588,10 +588,12 @@ uint32_t BRPeerManagerGetAutoFetchCFiltersThrough(BRPeerManager *manager);
 //
 // ⚠️ IT IS NO LONGER RAISE-ONLY (paced-convoy fix wave, C-1) — do not "restore"
 // that. On a RESUME, BRPeerManagerEnableAutoCompactFilterFetch's resolvability
-// clamp lands on the SAVED-BLOCKS TIP, because BRPeerManagerNewEx puts the saved
-// blocks in `orphans` and chains FORWARD from the highest one, so manager->blocks
-// holds the checkpoints plus exactly ONE saved block and a deep birth height
-// cannot resolve. Both `autoFetchCFiltersStart` and the cursor therefore start
+// clamp lands on the SAVED-BLOCKS TIP, because a resumed manager's in-memory chain
+// is only the checkpoints plus the persisted
+// [savedTip-(SAVE_BLOCK_COUNT-1) .. savedTip] run, so a deep birth height cannot
+// resolve. (Fix wave R2 lowered that floor from the saved tip itself, where the old
+// FORWARD chaining left it, to savedTip-299 — still ~a full convoy window above a
+// resumed deep descent's frontier, so nothing here changes.) Both `autoFetchCFiltersStart` and the cursor therefore start
 // ~CF_CONVOY_WINDOW ABOVE the restored scan frontier, and every forward-fetch site
 // clamps reqStart UP to autoFetchCFiltersStart — so a raise-only snap could never
 // pull them back down and the next forward request began at the clamped tip, which

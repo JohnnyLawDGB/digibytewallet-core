@@ -392,9 +392,14 @@ uint32_t BRCFScanLedgerAbandonGaveUpBelow(BRCFScanLedger *l, uint32_t clamp,
 // and no re-request driver can ever change that. Such a height therefore never
 // reaches gaveUp (attempts only advance on a real send), so the B2 valve is
 // structurally BLIND to it: it pins the scan frontier forever, invisibly. That is
-// exactly the resume shape C-1 describes — BRPeerManagerNewEx chains forward from
-// the highest saved block, so a resumed manager's floor is the SAVED TIP and a
-// restored scan frontier sits ~CF_CONVOY_WINDOW below it.
+// exactly the resume shape C-1 describes — BRPeerManagerNewEx makes only the
+// persisted [tip-(SAVE_BLOCK_COUNT-1) .. tip] run resident, so a resumed manager's
+// floor is 299 below the SAVED TIP while a restored scan frontier sits a full
+// ~CF_CONVOY_WINDOW below it. (Before fix-wave R2 the chaining ran FORWARD from
+// the highest saved block and only ONE header was resident, putting the floor at
+// the saved tip itself — which also surfaced a spurious 1–2 height band on an
+// ordinary kill of a healthy wallet, since the CF ledger's 20-s coalesced write
+// trails the per-callback saved-blocks write.)
 //
 // CONTRACT (mirrors AbandonGaveUpBelow's determinism guard — the caller MUST warn):
 //   - `lo` is first clamped UP to the existing abandonedBelow, so history already

@@ -1450,8 +1450,9 @@ static void _peerRejectedTx(void *info, UInt256 txHash, uint8_t code)
 // floor-1 and abandonedBelow to 0 — i.e. the skipped band vanished with no
 // watermark, no WARN, no banner and no recovery affordance. Same for the resume
 // path, where a restored scan frontier can sit ~CF_CONVOY_WINDOW BELOW the
-// resumed manager's block floor (BRPeerManagerNewEx chains forward from the
-// highest saved block, so the floor IS the saved tip).
+// resumed manager's block floor (BRPeerManagerNewEx makes the persisted
+// [tip-(SAVE_BLOCK_COUNT-1) .. tip] run resident, so the floor is 299 below the
+// saved tip — far above a frontier a full convoy window down).
 //
 // Everything below the block floor is unservable for the whole session in BOTH
 // directions — the getcfilters stop hash can't resolve, and even a volunteered
@@ -2276,6 +2277,50 @@ BRPeerManager *BRPeerManagerNewEx(const BRChainParams *params, BRWallet *wallet,
             block = blocks[i];
     }
     
+    // ---- Chain the persisted run DOWNWARD (fix wave R2) --------------------
+    //
+    // This loop used to chain FORWARD: it added `block` (the HIGHEST saved
+    // header) to manager->blocks, then looked in `orphans` — which is indexed by
+    // prevBlock — for that block's CHILD. The highest saved header has no child,
+    // so BRSetGet returned NULL and the loop exited after exactly ONE iteration.
+    // Exactly one of the SAVE_BLOCK_COUNT persisted headers ever reached
+    // manager->blocks; the other 299 stayed stranded in `orphans`, unreachable
+    // for the whole session and freed at teardown.
+    //
+    // Consequence: on EVERY resume the resolvable block FLOOR
+    // (_BRPeerManagerBlockFloor — a prevBlock walk through manager->blocks) was
+    // the saved TIP, so every height below it was unservable in both directions
+    // (getcfilters stop hash can't resolve; a volunteered cfilter is dropped by
+    // _peerRelayedCFilter as an unknown block). The CF scan ledger is persisted on
+    // a 20-s coalescing timer while saved blocks are written on every save
+    // callback, so an abrupt kill of a HEALTHY, fully-synced wallet routinely left
+    // the restored ledger 1–2 heights below the restored block tip — and those
+    // heights, though genuinely scanned, then had to be SURFACED as an abandoned
+    // band (non-dismissible banner, "Synced" withheld). Walking prevBlock DOWNWARD
+    // makes the whole persisted [tip-299..tip] run resident, so the floor is
+    // savedTip-(SAVE_BLOCK_COUNT-1) and that entire class is simply resolvable
+    // again — no band is surfaced at all. (It does NOT cure the deep-restore band:
+    // 300 << CF_CONVOY_WINDOW, so a resumed deep descent still surfaces, correctly.)
+    //
+    // SET MEMBERSHIP IS LOAD-BEARING — BRPeerManagerFree frees `blocks` and
+    // `orphans` SEPARATELY (BRSetApply(..., _setApplyFreeBlock) on each, :4634-4637),
+    // so a block living in BOTH sets is DOUBLE-FREED. Every header this loop adds
+    // to `blocks` is therefore removed from `orphans` first, keyed by its own
+    // prevBlock (the `orphans` index). If some other block — a saved sibling on a
+    // fork sharing the same parent, which BRSetAdd would have collapsed onto that
+    // one key — is what actually sat under the key, it is put straight back, so it
+    // stays owned by exactly one set too.
+    //
+    // `savedByHash` is a lookup index ONLY: it is needed because `orphans` is keyed
+    // by prevBlock and the downward step needs a lookup BY blockHash. BRSetFree
+    // releases only the hash table, never the items (unlike the BRSetApply pairs in
+    // BRPeerManagerFree), so it never competes for ownership of a header.
+#ifdef RESUME_FLOOR_UNFIXED
+    // Pre-fix shape, built ONLY by the host-KAT red-before-green gate
+    // (-DRESUME_FLOOR_UNFIXED). Chains FORWARD from the highest saved block:
+    // looks for a child, finds none, exits after ONE iteration. Everything else
+    // in the resume path stays live, so what is proven red is the DIRECTION of
+    // the chaining, not the surrounding machinery.
     while (block) {
         BRSetAdd(manager->blocks, block);
         manager->lastBlock = block;
@@ -2284,7 +2329,33 @@ BRPeerManager *BRPeerManagerNewEx(const BRChainParams *params, BRWallet *wallet,
         orphan.prevBlock = block->blockHash;
         block = BRSetGet(manager->orphans, &orphan);
     }
-    
+#else
+    if (block) {
+        BRSet *savedByHash = BRSetNew(BRMerkleBlockHash, BRMerkleBlockEq, blocksCount);
+
+        for (size_t i = 0; blocks && i < blocksCount; i++) BRSetAdd(savedByHash, blocks[i]);
+
+        manager->lastBlock = block;   // the TOP of the run — set ONCE, not per step
+                                      // (the forward loop's per-iteration assignment
+                                      // ended on the highest block; walking down, that
+                                      // is where we START, so it must not be re-assigned)
+
+        // Bounded by blocksCount: a corrupt saved blob whose prevBlock links form a
+        // cycle can never spin here, and the BRSetContains check stops the walk the
+        // moment it would revisit a header already made resident.
+        for (size_t i = 0; block && i < blocksCount; i++) {
+            BRSetAdd(manager->blocks, block);
+            orphan.prevBlock = block->prevBlock;
+            BRMerkleBlock *dropped = BRSetRemove(manager->orphans, &orphan);
+            if (dropped && dropped != block) BRSetAdd(manager->orphans, dropped);   // a sibling: keep it owned
+            block = BRSetGet(savedByHash, &block->prevBlock);
+            if (block && BRSetContains(manager->blocks, block)) block = NULL;       // already resident: stop
+        }
+
+        BRSetFree(savedByHash);
+    }
+#endif  // RESUME_FLOOR_UNFIXED
+
     if (startSyncFrom) {
         manager->lastBlock = startSyncFrom;
     }
@@ -2540,13 +2611,14 @@ static void _BRPeerManagerRequestNextCFHeaders(BRPeerManager *manager, BRPeer *p
         // It read: "The floor is <= the wallet's birth height (the header chain
         // anchors at the last checkpoint at/before wallet birth), so this never skips
         // a wallet transaction." That holds only on a FRESH sync. On a RESUME the
-        // header chain anchors at the SAVED TIP, not at a checkpoint
-        // (BRPeerManagerNewEx puts the saved blocks in `orphans` and chains FORWARD
-        // from the highest one, so manager->blocks ends up holding the checkpoints
-        // plus exactly ONE saved block) — the floor is then far ABOVE the wallet's
+        // header chain anchors just under the SAVED TIP, not at a checkpoint
+        // (BRPeerManagerNewEx makes only the persisted
+        // [savedTip-(SAVE_BLOCK_COUNT-1) .. savedTip] run resident) — the floor is then far ABOVE the wallet's
         // birth height and this snap DOES skip history. A stale rationale on a safety
         // guard is how the guard gets deleted later by someone who believes it, so:
         // the snap still happens, but the skipped band is now SURFACED below.
+        // (Fix wave R2 moved that resume floor down to savedTip-(SAVE_BLOCK_COUNT-1);
+        // it is still far above a deep-restore birth height, so nothing here changes.)
         uint32_t floor = _BRPeerManagerBlockFloor(manager);
         if (floor > next) {
             peer_log(peer, "cfheaders: CF start %u below block floor %u — snapping start up to floor",
@@ -3722,6 +3794,42 @@ void BRPeerManagerKeepAlive(BRPeerManager *manager)
                 _BRPeerManagerSurfaceUnscannableLocked(manager, c1Lowest, c1Floor,
                                                        "KeepAlive: a hole below the in-memory block floor "
                                                        "that no retry could ever serve");
+                // RECONCILE THE FORWARD-FETCH CURSOR TO THE SURFACED FRONTIER —
+                // the same Step-2 reconciliation BRPeerManagerSnapAutoFetchThrough-
+                // ToScanFrontier does, and for the same reason. The other three
+                // surfacing sites (the arming clamp, the cfheaders floor snap and
+                // the floor re-anchor) all set start/cursor to the new floor
+                // THEMSELVES; this one did not, and left alone it re-opens the very
+                // silent skip the surfacing exists to close: the cursor can sit
+                // ABOVE the frontier (e.g. armed at the saved tip by the
+                // EnableAutoCompactFilterFetch clamp), so the next forward fetch
+                // starts above it and RecordRequested raises requestedThrough
+                // NON-CONTIGUOUSLY over the gap — and _cfLedgerAdvance then sails
+                // scannedThrough across heights that were never requested and are
+                // NOT below abandonedBelow. Before fix-wave R2 that gap was zero by
+                // coincidence (the resume floor WAS the clamped cursor + 1); with
+                // the floor now SAVE_BLOCK_COUNT-1 lower it is a real 299-height
+                // hole, so the reconciliation has to be explicit.
+                //
+                // Order matters, exactly as in the snap: clamp DOWN to what was
+                // actually requested (cfLedger.requestedThrough is the persisted
+                // truth — a cursor above it means the range in between was never on
+                // the wire), then UP to frontier-1, so the result is always >= the
+                // frontier and the next reqStart == the frontier itself.
+                uint32_t c1After = BRCFScanLedgerLowestNeededHeight(&manager->cfLedger);
+#ifdef CONVOY_C1_NO_CURSOR_RECONCILE
+                c1After = 0;   // RED-before-green shape ONLY: the surfacing still runs,
+                               // only the cursor reconciliation is compiled out.
+#endif
+                if (c1After > 0) {
+                    if (manager->autoFetchCFiltersStart > c1After) manager->autoFetchCFiltersStart = c1After;
+                    if (manager->autoFetchCFiltersThrough > manager->cfLedger.requestedThrough) {
+                        manager->autoFetchCFiltersThrough = manager->cfLedger.requestedThrough;
+                    }
+                    if ((c1After - 1) > manager->autoFetchCFiltersThrough) {
+                        manager->autoFetchCFiltersThrough = c1After - 1;
+                    }
+                }
             }
         }
     }
@@ -5184,11 +5292,12 @@ void BRPeerManagerSnapAutoFetchThroughToScanFrontier(BRPeerManager *manager)
     // ---- C-1 STEP 1: surface anything the resumed manager can never scan -----
     //
     // BRPeerManagerEnableAutoCompactFilterFetch ran BEFORE the ledger restore, and
-    // on a resume its clamp lands on the SAVED-BLOCKS TIP: the deep birth height
-    // does not resolve, because BRPeerManagerNewEx puts the saved blocks in
-    // `orphans` and chains FORWARD from the highest one, leaving manager->blocks
-    // holding the checkpoints plus exactly ONE saved block. So after the restore
-    // the scan frontier can sit ~CF_CONVOY_WINDOW BELOW the block floor, and that
+    // on a resume its clamp lands at or just under the SAVED-BLOCKS TIP: the deep
+    // birth height does not resolve, because BRPeerManagerNewEx only makes the
+    // persisted [tip-(SAVE_BLOCK_COUNT-1) .. tip] run resident (fix wave R2 —
+    // before that it was ONE saved block and the floor was the tip itself). So
+    // after the restore the scan frontier can still sit ~CF_CONVOY_WINDOW BELOW
+    // the block floor (10000 >> 300), and that
     // band is unservable for the whole session in both directions (no resolvable
     // getcfilters stop hash; a volunteered cfilter would be dropped by
     // _peerRelayedCFilter as an unknown block). Left alone it is either a silent

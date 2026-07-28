@@ -466,6 +466,40 @@ void BRPeerManagerEnableAutoCompactFilterFetch(BRPeerManager *manager, uint32_t 
 void BRPeerManagerDisableAutoCompactFilterFetch(BRPeerManager *manager);
 uint32_t BRPeerManagerGetAutoFetchCFiltersStart(BRPeerManager *manager);
 
+// Read back the current forward-fetch cursor (autoFetchCFiltersThrough). Mostly
+// useful for before/after logging around BRPeerManagerSnapAutoFetchThroughToScanFrontier
+// below.
+uint32_t BRPeerManagerGetAutoFetchCFiltersThrough(BRPeerManager *manager);
+
+// ---- Resume cursor reconciliation (paced-convoy fetch, Task 4, spec Part
+// B1-resume) --------------------------------------------------------------
+//
+// On resume, the caller arms auto-fetch via BRPeerManagerEnableAutoCompactFilterFetch
+// (autoFetchCFiltersThrough = birthHeight-1) BEFORE the persisted CF scan ledger
+// is restored (BRPeerManagerCFLedgerRestore), which can set scannedThrough far
+// above birthHeight. Left unreconciled, the very next forward-fetch tick
+// re-requests from birthHeight (reqStart = autoFetchCFiltersThrough+1) --
+// already-scanned history -- and BRCFScanLedgerRecordRequested re-inserts those
+// heights as outstanding, dragging scannedThrough back down: the persisted scan
+// progress is thrown away and the whole birth->tip descent restarts.
+//
+// Call this ONCE, immediately after restoring the ledger, to snap the cursor up
+// to BRCFScanLedgerLowestNeededHeight - 1 (NOT LowestNeededHeight itself --
+// reqStart is autoFetchCFiltersThrough+1, so snapping to LowestNeededHeight would
+// make the next fetch start one height too high and silently skip it forever,
+// the exact bug class this ledger subsystem exists to prevent). Folds in the
+// ledger's abandonedBelow hard floor via LowestNeededHeight, so an abandoned
+// prefix is never re-requested either. MONOTONIC: only ever raises the cursor
+// (max), never lowers it; a no-op on a not-yet-armed ledger (LowestNeededHeight
+// == 0).
+//
+// LOCKING: unlike the file-static _cfConvoy*/B1-driver helpers (which run INSIDE
+// an already-locked BRPeerManagerKeepAlive pass and must NOT take the lock),
+// this is a public entry point meant to be called from the JNI layer OUTSIDE any
+// lock, so it takes manager->lock itself. Do NOT call it from any already-locked
+// path -- manager->lock is NON-recursive.
+void BRPeerManagerSnapAutoFetchThroughToScanFrontier(BRPeerManager *manager);
+
 // ----------- end BIP 158 opt-in -----------
 
 // frees memory allocated for manager (call BRPeerManagerDisconnect() first if connected)

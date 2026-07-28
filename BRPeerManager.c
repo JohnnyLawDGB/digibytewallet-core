@@ -4827,6 +4827,37 @@ uint32_t BRPeerManagerGetAutoFetchCFiltersStart(BRPeerManager *manager)
     return height;
 }
 
+uint32_t BRPeerManagerGetAutoFetchCFiltersThrough(BRPeerManager *manager)
+{
+    if (!manager) return 0;
+    pthread_mutex_lock(&manager->lock);
+    uint32_t height = manager->autoFetchCFiltersThrough;
+    pthread_mutex_unlock(&manager->lock);
+    return height;
+}
+
+// ---- Resume cursor reconciliation (paced-convoy fetch, Task 4) -------------
+// See the contract comment on the declaration in BRPeerManager.h. Guarded by
+// RESUME_SNAP_UNFIXED so the host KAT can build the pre-fix shape (the snap
+// compiles to a no-op, cursor stays at birth-1) for its red-before-green gate --
+// same #ifndef-a-fix-flag pattern as CONVOY_NO_B1_DRIVER above.
+void BRPeerManagerSnapAutoFetchThroughToScanFrontier(BRPeerManager *manager)
+{
+    assert(manager != NULL);
+    pthread_mutex_lock(&manager->lock);
+#ifndef RESUME_SNAP_UNFIXED
+    uint32_t lowest = BRCFScanLedgerLowestNeededHeight(&manager->cfLedger);
+    // lowest - 1, NEVER lowest itself -- reqStart is autoFetchCFiltersThrough+1,
+    // so snapping to `lowest` would make the next forward fetch start at
+    // lowest+1 and silently skip height `lowest` forever. Guard lowest==0 (an
+    // unarmed ledger) and never lower the cursor (max).
+    if (lowest > 0 && (lowest - 1) > manager->autoFetchCFiltersThrough) {
+        manager->autoFetchCFiltersThrough = lowest - 1;
+    }
+#endif
+    pthread_mutex_unlock(&manager->lock);
+}
+
 /*
  * The following two methods sync the blockchain beginning from startBlock.
  *

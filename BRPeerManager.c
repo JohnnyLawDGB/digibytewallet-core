@@ -279,6 +279,17 @@ struct BRPeerManagerStruct {
     // backoff reads as BASE, 0 stamp reads as "never kicked" (immediately due).
     time_t   convoyLastHdrKickAt;
     uint32_t convoyHdrKickBackoff;
+    // ...and the header-window verdict at the END of the previous tick, so the
+    // GATED->open transition can be detected. The backoff punishes UNPRODUCTIVE
+    // RE-KICKS, and a gated period contains no re-kicks at all, so it must not
+    // carry a penalty across: a reopen is exactly the event B1.3 exists to serve
+    // (the held continuation has to resume) and is served on the very next tick.
+    // Without this the two predicates drift apart -- CF_CONVOY_HDR_GATED can flip
+    // open->full->open purely from scanFrontier movement (B1.2's floor-snap /
+    // re-anchor) with lastBlock->height never advancing, so the !hdrFrozen reset
+    // never fires and a reopen waits out a stale, pre-gate interval (up to
+    // CF_CONVOY_HDR_REKICK_MAX_SECS). 0 on a calloc'd manager == "was open".
+    uint8_t  convoyHdrWasGated;
     // Lock-free mirrors of the scalar status values the Android UI polls for the
     // sync overlay. Written by the sync/worker threads WHERE THEY ALREADY HOLD
     // manager->lock (via _BRPeerManagerRefreshCachedStatus); read by the JNI status
@@ -911,6 +922,17 @@ static int _cfConvoyCfhGated(BRPeerManager *manager)
 #define CF_CONVOY_HDR_REKICK_DUE(m, backoff) \
     ((m)->convoyLastHdrKickAt == 0 || \
      (time(NULL) - (m)->convoyLastHdrKickAt) >= (time_t)(backoff))
+#endif
+
+// ...and the GATED->open episode reset (see convoyHdrWasGated). Same -D idiom:
+// -DCONVOY_HDR_REKICK_STALE_ACROSS_GATE builds the pre-fix shape (the backoff
+// survives a gated period and a reopen waits it out) with the convoyHdrWasGated
+// tracking still live, so what the host KAT proves red is the RESET, not the
+// transition detection. Never defined in any production build.
+#ifdef CONVOY_HDR_REKICK_STALE_ACROSS_GATE
+#define CF_CONVOY_HDR_REKICK_GATE_RESET 0
+#else
+#define CF_CONVOY_HDR_REKICK_GATE_RESET 1
 #endif
 
 // Recompute the header window ONCE and stamp the verdict onto every connected
@@ -3900,14 +3922,46 @@ void BRPeerManagerKeepAlive(BRPeerManager *manager)
         //        0-header round trips forever. The interval doubles while
         //        unproductive and RESETS on real tip progress below, so an ordinary
         //        descent always pays only BASE.
-        uint32_t hdrTip   = manager->lastBlock ? manager->lastBlock->height : 0;
+        uint32_t hdrTip    = manager->lastBlock ? manager->lastBlock->height : 0;
         int      hdrFrozen = (hdrTip <= manager->convoyLastHdrTip);
+        // ONE evaluation of the window verdict, reused by both the episode reset and
+        // the send condition, so the two can never disagree within a tick. Read AFTER
+        // B1.2 deliberately: a floor-snap/re-anchor there has already moved the scan
+        // frontier, and this must see the post-snap verdict.
+        int      hdrGated  = CF_CONVOY_HDR_GATED(manager);
+
         if (! hdrFrozen) {
             // The continuation chain is demonstrably alive: forget the backoff so the
             // NEXT stall is re-kicked at BASE rather than at the ceiling.
             manager->convoyHdrKickBackoff = CF_CONVOY_HDR_REKICK_BASE_SECS;
         }
-        if (hdrFrozen && ! CF_CONVOY_HDR_GATED(manager) && manager->lastBlock &&
+        // GATED -> OPEN: end of episode (fix round 2). The backoff is a penalty for
+        // UNPRODUCTIVE RE-KICKS, and a gated period issues none, so it can neither
+        // earn one nor carry one across. Crucially this is NOT covered by the
+        // !hdrFrozen reset above: hdrFrozen and hdrGated are INDEPENDENT --
+        // _cfConvoyHdrGated can flip open->full->open purely from scanFrontier
+        // movement (B1.2's floor-snap/re-anchor, or the scan simply falling a full
+        // window behind) with lastBlock->height never advancing, so a genuinely
+        // stalled tip that had already escalated to the ceiling would make the reopen
+        // wait out up to CF_CONVOY_HDR_REKICK_MAX_SECS -- in exactly the resume-a-
+        // held-continuation case B1.3 exists to serve. Clearing the stamp too (rather
+        // than only resetting the backoff) restores the pre-throttle behaviour that a
+        // reopen is served on the VERY NEXT tick.
+        //
+        // NOT A BYPASS: the reopen re-kick immediately re-arms the interval at BASE
+        // and the backoff resumes doubling from there, so a pathological gate flap
+        // costs at most one ~1.2 KB getheaders per full open->gated->open cycle -- and
+        // a cycle requires the header frontier to actually cross CF_CONVOY_WINDOW
+        // (10 000 blocks) in both directions, which cannot happen per-tick. Round-1's
+        // property is untouched: a permanently OPEN window never transitions, so a
+        // permanently frozen tip still decays to the 600 s ceiling.
+        if (CF_CONVOY_HDR_REKICK_GATE_RESET && ! hdrGated && manager->convoyHdrWasGated) {
+            manager->convoyHdrKickBackoff = CF_CONVOY_HDR_REKICK_BASE_SECS;
+            manager->convoyLastHdrKickAt  = 0;   // == "never re-kicked" -> immediately due
+        }
+        manager->convoyHdrWasGated = (uint8_t)(hdrGated ? 1 : 0);
+
+        if (hdrFrozen && ! hdrGated && manager->lastBlock &&
             hdrTip < manager->estimatedHeight) {
             uint32_t backoff = manager->convoyHdrKickBackoff
                                ? manager->convoyHdrKickBackoff : CF_CONVOY_HDR_REKICK_BASE_SECS;

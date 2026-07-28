@@ -139,7 +139,14 @@ Remarks:
    scan-ledger's residual re-request driver already uses (CF_REREQ_BASE_SECS /
    CF_REREQ_BACKOFF_CAP_SECS) -- deliberately not a new mechanism.
 
-   Sequence: 30, 60, 120, 240, 480, 600, 600, ... (reset to 30 on tip progress).
+   Sequence: 30, 60, 120, 240, 480, 600, 600, ... An EPISODE ends -- and the
+   interval resets to 30 -- on either of the two things that mean the accumulated
+   penalty no longer describes reality: real header-tip progress (the chain is
+   alive), or a GATED->open transition (a gated period issues no re-kicks, so it
+   can neither earn a penalty nor carry one across; the reopen is served on the
+   very next tick, which is what B1.3 exists for). Note those two are INDEPENDENT:
+   the window can close and reopen from scanFrontier movement alone, with the
+   header tip never advancing.
 
    TOO SHORT costs bandwidth, and it COMPOUNDS: each injected getheaders is
    answered with a full 2000-header batch, and because count >= 2000 every reply

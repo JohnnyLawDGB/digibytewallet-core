@@ -1246,6 +1246,64 @@ static void _peerRejectedTx(void *info, UInt256 txHash, uint8_t code)
     if (manager->txStatusUpdate) manager->txStatusUpdate(manager->info);
 }
 
+// Warn-level, operator-visible log for the CF-retention memory-ceiling
+// abandonment (scan-floor retention). peer_log needs a peer and debug_log is
+// silent in release; this call site has no peer and the event MUST be visible at
+// WARN level (a real, countable loss — "N blocks abandoned, too deep to retain,
+// rescan to recover"), so it routes straight to the platform logger at WARN
+// (tag "bread", matching peer_log). The host retention KAT pre-#defines
+// CF_RETENTION_WLOG to capture the line and assert it fired (or, for the
+// no-abandon path, assert it did NOT), so the production definition is
+// #ifndef-guarded.
+#ifndef CF_RETENTION_WLOG
+#if defined(__ANDROID__)
+#define CF_RETENTION_WLOG(...) __android_log_print(ANDROID_LOG_WARN, "bread", __VA_ARGS__)
+#elif defined(TARGET_OS_MAC)
+#define CF_RETENTION_WLOG(...) NSLog(__VA_ARGS__)
+#else
+#define CF_RETENTION_WLOG(...) printf(__VA_ARGS__)
+#endif
+#endif
+
+// CF-retention memory ceiling (scan-floor retention, spec Part 3). Bound the
+// retained header span to CF_RETENTION_MAX_SPAN blocks below the chain TIP
+// (lastBlock->height) — anchored to the TIP, NOT cfNext: if header sync races
+// far ahead of the cfheader/cfilter frontier, anchoring to cfNext would let the
+// span grow to (tip-cfNext)+MAX_SPAN, unbounded. If floorH sits deeper than the
+// clamp, abandon ONLY retry-exhausted (gaveUp) heights below the clamp — a
+// still-outstanding (attempts<cap) hole is recoverable and is NEVER abandoned;
+// the span transiently exceeds MAX_SPAN (bounded by the retry window) until that
+// hole resolves or retires to gaveUp — then raise floorH to the new
+// lowest-still-needed height the ledger reports. Per the Part-3b determinism
+// guard, BRCFScanLedgerAbandonGaveUpBelow raises abandonedBelow ONLY to cover
+// gaveUp it actually dropped (highest-dropped+1), never preemptively — so
+// cnt>0 ⟺ abandonedBelow advanced ⟺ this WARN fires. The WARN is therefore
+// "any abandonment is logged": a deep restore whose scan hasn't started (empty
+// outstanding, empty gaveUp below the clamp) drops nothing, raises nothing, and
+// logs nothing (it must NOT silently complete on a raised floor — the app-layer
+// depth gate refuses that restore up front). Abandonment is a VISIBLE,
+// warn-logged event (operator-facing; captured by the host retention KAT).
+static uint32_t _cfApplyRetentionCeiling(BRPeerManager *manager, uint32_t floorH)
+{
+    uint32_t tip = manager->lastBlock ? manager->lastBlock->height : 0;
+    if (tip > CF_RETENTION_MAX_SPAN) {
+        uint32_t clamp = tip - CF_RETENTION_MAX_SPAN;
+        if (floorH < clamp) {
+            uint32_t cnt = 0, lo = 0, hi = 0;
+            uint32_t newFloor = BRCFScanLedgerAbandonGaveUpBelow(&manager->cfLedger, clamp,
+                                                                 &cnt, &lo, &hi);
+            if (cnt > 0) {
+                CF_RETENTION_WLOG("[CF-RETENTION] ABANDONED %u gaveUp header(s) [%u..%u] too deep "
+                                  "to retain (tip=%u max_span=%u); abandonedBelow=%u — rescan to recover",
+                                  cnt, lo, hi, tip, (uint32_t)CF_RETENTION_MAX_SPAN,
+                                  BRCFScanLedgerAbandonedBelow(&manager->cfLedger));
+            }
+            if (newFloor > floorH) floorH = newFloor;
+        }
+    }
+    return floorH;
+}
+
 // reduce memory usage
 // clear the tail that comes after 500 blocks.
 // checkpoints will remain in the blocks-Set, until we are ahead of them.
@@ -1255,19 +1313,36 @@ static void _BRPeerManagerClearMemory(BRPeerManager* manager) {
     size_t count = BRSetCount(manager->blocks);
     size_t i = 0;
 
-    // BIP 158: never prune block headers at/above the compact-filter sync
-    // frontier. The cfheaders driver computes a batch's stop hash by walking
-    // prevBlock links from lastBlock down to that height; if those headers were
-    // freed the chain can never catch up a cfTip deficit (the permanent
-    // "no block hash for height H, deferring" stall). cfFloor tracks cfTip, so
-    // once filters keep pace the retained span collapses back to the normal
-    // tail. Zero in BLOOM_ONLY / no-chain so pruning behaves exactly as before.
+    // BIP 158: never prune block headers the compact-filter SCAN (or its
+    // residual re-request) still needs. The floor tracks the lowest height the
+    // SCAN still needs a header for — NOT the cfHEADER frontier. cfheaders burst
+    // to the tip while the cfilter scan lags at a floor cluster; a floor pinned
+    // to the cfheader frontier prunes the scan-floor headers out from under the
+    // buffer-drain (_cfBufIsReady → BRSetGet NULL) and the residual re-request
+    // (stop-hash → ZERO), the permanent on-device wedge. floorH = min(cfNext,
+    // lowestNeeded) collapses to the old cfNext-144 in steady state (scan caught
+    // up → lowestNeeded == cfNext), so there is no regression; a tip-anchored
+    // ceiling (CF_RETENTION_MAX_SPAN) bounds the span, abandoning only
+    // retry-exhausted holes with a VISIBLE warn-log. Zero in BLOOM_ONLY /
+    // no-chain so pruning behaves exactly as before.
     uint32_t cfFloor = 0;
     if (manager->syncMode != BR_SYNC_MODE_BLOOM_ONLY) {
         if (manager->compactFilterChain) {
             uint32_t cfNext = BRCompactFilterChainNextHeight(manager->compactFilterChain);
+#ifdef RETENTION_UNFIXED
+            // PRE-FIX shape — host-KAT red-before-green ONLY (never defined in a
+            // production build). The floor tracked the cfHEADER frontier, which
+            // races ahead of the cfilter SCAN, so the scan-floor headers got
+            // pruned; this is the wedge the retention KAT reproduces (RED here).
             if (cfNext > CLEAR_MEM_CF_RETENTION_MARGIN) cfFloor = cfNext - CLEAR_MEM_CF_RETENTION_MARGIN;
             else if (cfNext > 0) cfFloor = 1;
+#else
+            uint32_t lowestNeeded = BRCFScanLedgerLowestNeededHeight(&manager->cfLedger);
+            uint32_t floorH = (lowestNeeded < cfNext) ? lowestNeeded : cfNext;   // min(cfNext, lowestNeeded)
+            floorH = _cfApplyRetentionCeiling(manager, floorH);
+            cfFloor = (floorH > CLEAR_MEM_CF_RETENTION_MARGIN) ? floorH - CLEAR_MEM_CF_RETENTION_MARGIN
+                    : (floorH > 0 ? 1 : 0);
+#endif
         }
         else if (manager->autoFetchCFiltersEnabled && manager->autoFetchCFiltersStart > 0) {
             // Bootstrap: the compact-filter chain is created lazily on the FIRST
@@ -1282,8 +1357,21 @@ static void _BRPeerManagerClearMemory(BRPeerManager* manager) {
             // chain exists the cfNext branch above takes over and the retained span
             // collapses to the normal frontier window.
             uint32_t start = manager->autoFetchCFiltersStart;
+#ifdef RETENTION_UNFIXED
             if (start > CLEAR_MEM_CF_RETENTION_MARGIN) cfFloor = start - CLEAR_MEM_CF_RETENTION_MARGIN;
             else cfFloor = 1;
+#else
+            // The ledger is ALWAYS Init'd(start) together with autoFetchCFiltersStart
+            // (every call site sets the two in lockstep), and lowestNeeded only ever
+            // grows from `start`, so min(start, lowestNeeded) == start here — this
+            // retains at/above the armed birth height exactly as before, now also
+            // bounded by the tip-anchored ceiling for an absurdly deep birth height.
+            uint32_t lowestNeeded = BRCFScanLedgerLowestNeededHeight(&manager->cfLedger);
+            uint32_t floorH = (lowestNeeded < start) ? lowestNeeded : start;   // min(start, lowestNeeded)
+            floorH = _cfApplyRetentionCeiling(manager, floorH);
+            cfFloor = (floorH > CLEAR_MEM_CF_RETENTION_MARGIN) ? floorH - CLEAR_MEM_CF_RETENTION_MARGIN
+                    : (floorH > 0 ? 1 : 0);
+#endif
         }
     }
 

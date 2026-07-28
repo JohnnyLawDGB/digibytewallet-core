@@ -627,7 +627,30 @@ uint32_t BRCFScanLedgerAbandonGaveUpBelow(BRCFScanLedger *l, uint32_t clamp,
         l->gaveUpCount -= k;
     }
 
+    // Advance the watermark ONLY to cover heights actually abandoned — to the
+    // highest dropped gaveUp + 1 (`hi + 1`), NEVER preemptively to `target`/
+    // `clamp` (Part 3b determinism guard). Preemptively raising abandonedBelow
+    // past unscanned history would let a deep restore whose scan hasn't started
+    // (empty outstanding, e.g. ClearMemory fired during header sync before the
+    // cfilter scan requests anything) COMPLETE with a WRONG BALANCE — deep history
+    // never scanned, the single worst outcome this codebase can produce. So the
+    // watermark advances IFF gaveUp was dropped (k>0): a caller's WARN on
+    // *outCount>0 is then exactly a WARN on any advance, and "abandonedBelow==0"
+    // is a verified log fact. Every dropped height hi < target ≤ outstanding[0],
+    // so hi+1 ≤ outstanding[0] never advances past a still-outstanding
+    // (recoverable) hole; the `> l->abandonedBelow` test keeps it monotonic.
+#ifdef RETENTION_PREEMPTIVE_ADVANCE
+    // PRE-GUARD shape — host-KAT red-before-green ONLY (never defined in a
+    // production build). Advanced to `target` even when NOTHING was dropped
+    // (k==0), the wrong-balance regression the scan-not-started ceiling KAT
+    // reproduces as RED.
     if (target > l->abandonedBelow) l->abandonedBelow = target;   // monotonic
+#else
+    if (k > 0 && hi + 1 > l->abandonedBelow) l->abandonedBelow = hi + 1;   // monotonic
+    // k == 0 → abandonedBelow unchanged: no preemptive raise. An empty
+    // gaveUp-below-clamp deep restore fails toward loud OOM (refused up front by
+    // the app-layer depth gate), never a silent confident-wrong balance.
+#endif
 
     if (outCount) *outCount = count;
     if (outLo)    *outLo    = lo;

@@ -292,10 +292,17 @@ uint32_t BRCFScanLedgerAbandonedBelow(const BRCFScanLedger *l);
 //     the new watermark) — NOT < clamp. A gaveUp in [target, clamp), i.e. above a
 //     still-outstanding hole, is KEPT: dropping it would lose it silently after a
 //     restart (gone from gaveUp, not below the persisted abandonedBelow watermark).
-//   - Advances abandonedBelow to min(clamp, lowest-still-OUTSTANDING-height): NEVER
-//     past a still-retrying outstanding hole (that hole is recoverable — not
-//     abandoned; only retry-exhausted gaveUp heights are). abandonedBelow only
-//     ever advances (monotonic — a lower clamp never regresses it).
+//   - Advances abandonedBelow ONLY to cover gaveUp ACTUALLY dropped — to the
+//     highest dropped height + 1 (Part 3b determinism guard). If NOTHING is
+//     dropped (empty gaveUp below the clamp) abandonedBelow is UNCHANGED: it is
+//     NEVER raised preemptively. A preemptive raise past unscanned history would
+//     let a deep restore whose scan hasn't started (empty outstanding) COMPLETE
+//     with a WRONG BALANCE. Every dropped height < target = min(clamp,
+//     lowest-still-OUTSTANDING), so highest-dropped+1 never passes a still-
+//     retrying outstanding hole (recoverable — never abandoned). Monotonic (only
+//     ever advances). Consequence: abandonedBelow advances IFF gaveUp was dropped
+//     ⟺ *outCount>0, so the caller's WARN on *outCount>0 is exactly a WARN on any
+//     advance.
 //   - If outCount/outLo/outHi are non-NULL, writes the number of gaveUp heights
 //     abandoned by THIS call and their [lo..hi] range (CF_LEDGER_NO_DROP in each
 //     when none were abandoned) so the caller can warn-log it.

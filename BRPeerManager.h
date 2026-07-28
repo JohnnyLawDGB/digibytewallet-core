@@ -89,6 +89,20 @@ Remarks:
    expands transiently while a large cfTip deficit is being recovered. */
 #define CLEAR_MEM_CF_RETENTION_MARGIN 144
 
+/* CF-retention memory ceiling (scan-floor retention). The retained block-header
+   span is bounded to this many blocks BELOW the chain tip. gaveUp-inclusive
+   retention means a single permanent (retry-exhausted) hole would otherwise pin
+   the retention floor forever — the span is NOT self-bounding — so this ceiling
+   is a ROUTINE bound, not a rare backstop. When the scan floor would sit deeper
+   than the tip minus this span, _BRPeerManagerClearMemory abandons ONLY
+   retry-exhausted (gaveUp) heights below the clamp (NEVER a still-outstanding,
+   recoverable hole) and warn-logs the VISIBLE abandonment. ~6.6 MB at
+   ~220 B/header. #ifndef-guarded so the host retention KAT can -D-override it
+   small to exercise the ceiling without building a 30k-block chain. */
+#ifndef CF_RETENTION_MAX_SPAN
+#define CF_RETENTION_MAX_SPAN 30000
+#endif
+
 /* BIP 158 continuity-failure recovery. If this many DISTINCT peers fail the
    cfheaders continuity check against our current tip since the last successful
    append, our chain is the outlier (it diverged via unverified TOFU) — re-anchor

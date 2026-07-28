@@ -259,6 +259,15 @@ struct BRPeerManagerStruct {
     uint8_t  cfTriedCount;               // when all connected filter peers are in here and
                                          // none answered, the whole set is stalled → drop one
                                          // for a fresh peer (self-heal). Reset on batch advance.
+    // PACED-CONVOY driver B1.3 (spec Part B1 step 3): the block-header tip seen at
+    // the END of the previous KeepAlive tick. The getheaders re-kick fires only
+    // when the header frontier did NOT advance across a whole tick — unlike the
+    // cfheaders half, BRPeerSendGetheaders has no in-flight serialize guard of its
+    // own, so an unconditional per-tick re-issue would duplicate every 2000-header
+    // batch during ordinary open-window sync (~0.44 MB per tick of redundant
+    // traffic on exactly the deep restore the convoy exists to make cheap). 0 on a
+    // calloc'd manager, so the first tick only samples (never re-kicks).
+    uint32_t convoyLastHdrTip;
     // Lock-free mirrors of the scalar status values the Android UI polls for the
     // sync overlay. Written by the sync/worker threads WHERE THEY ALREADY HOLD
     // manager->lock (via _BRPeerManagerRefreshCachedStatus); read by the JNI status
@@ -3724,6 +3733,164 @@ void BRPeerManagerKeepAlive(BRPeerManager *manager)
         manager->cfLedger.lastDriveAt = nowSec;
     }
 #endif // CF_LEDGER_DRIVE_REREQUEST
+
+    // ---- PACED-CONVOY DRIVER B1 (spec Part B1) -----------------------------
+    //
+    // WHY THIS EXISTS AT ALL — read before touching either half. The Part-A gate
+    // suppresses the two TIP-RACING continuations, and suppressing a continuation
+    // REMOVES THE ONLY THING THAT RE-FIRES IT. Worse, the forward getcfilters
+    // auto-fetch has exactly ONE production trigger anywhere in this file: a
+    // cfheaders arrival (_peerRelayedCFHeaders). So the gate alone is a silent
+    // permanent wedge, and this block is its un-suppressor — they ship together.
+    //
+    // The sharpest case is the DRAIN TROUGH: a wallet killed and resumed
+    // mid-descent at the moment the ledger had drained EMPTY — outstanding == 0,
+    // gaveUp == 0 — while the restored cfheader frontier still sits above
+    // scannedThrough+1. There is no hole for the residual driver above (both
+    // NextRerequest and PeekRerequestRange iterate `outstanding` only) and no
+    // cfheaders arrival for the forward fetch. Nothing can create the first
+    // outstanding entry, the scan never advances, the window never re-opens, and
+    // deep history is silently never scanned while the wallet reports itself
+    // progressing. B1.1 below is what breaks that.
+    //
+    // LOCKING: manager->lock is NON-recursive and is HELD here. Every ledger read
+    // below goes through the lock-free ledger-level API (BRCFScanLedger*), never
+    // the public BRPeerManager* accessors, which take this same lock (self-deadlock).
+    //
+    // NO ELIGIBLE PEER == DO NOTHING THIS TICK. Every leg selects its own peer and
+    // silently skips when none is connected; that stall is the connect path's, not
+    // this driver's.
+#ifndef CONVOY_NO_B1_DRIVER
+    if (_cfConvoyScanArmed(manager)) {
+        uint32_t blockTip = manager->lastBlock ? manager->lastBlock->height : 0;
+        uint32_t cfhNext  = manager->compactFilterChain
+                            ? BRCompactFilterChainNextHeight(manager->compactFilterChain) : 0;
+
+        // ---- B1.1: forward cfilter drive (THE load-bearing fix) -------------
+        // Deliberately NOT window-gated: the forward cfilter fetch ADVANCES the
+        // scan frontier the whole convoy is keyed on — gating it would deadlock
+        // the convoy from the other side. Its back-pressure is CF_OUTSTANDING_LOWWATER,
+        // which is orthogonal to the window (spec Part A, "never gated").
+        //
+        // This MIRRORS the caller-side steps of the cfheaders-arrival path in
+        // _peerRelayedCFHeaders (the `autoFetchCFiltersEnabled` block there),
+        // because _BRPeerManagerRequestCFiltersLocked does NEITHER of them
+        // internally — it only resolves the stop hash and sends:
+        //   (1) advance autoFetchCFiltersThrough to reqStop on a REAL send. Omit
+        //       it and this drive re-requests the same batch every 10 s forever.
+        //   (2) BRCFScanLedgerRecordRequested(Dropped) the range. Omit it and the
+        //       in-flight heights are untracked, so _cfLedgerAdvance sails
+        //       scannedThrough PAST an unscanned height — a silent missed receive,
+        //       the exact bug class this subsystem exists to prevent.
+        // Keep the two paths byte-comparable; if one changes, change both.
+        if (cfhNext > 0
+#if CF_LEDGER_DRIVE_REREQUEST
+            && BRCFScanLedgerOutstandingCount(&manager->cfLedger) < CF_OUTSTANDING_LOWWATER
+#endif
+            ) {
+            uint32_t cfhFrontier = cfhNext - 1;   // NextHeight is one PAST the last appended cfheader
+            uint32_t reqStart = manager->autoFetchCFiltersThrough + 1;
+            if (reqStart < manager->autoFetchCFiltersStart) reqStart = manager->autoFetchCFiltersStart;
+            if (reqStart <= cfhFrontier) {        // == "autoFetchCFiltersThrough < cfHeadersFrontier", post-clamp
+                uint32_t reqStop = cfhFrontier;
+                if (reqStop > reqStart + (MAX_CFILTERS_RESULTS - 1)) {
+                    reqStop = reqStart + (MAX_CFILTERS_RESULTS - 1);
+                }
+                // Select with the SAME predicate _BRPeerManagerRequestCFiltersLocked
+                // uses for its own fallback, so the peer recorded in the ledger is
+                // provably the peer the getcfilters went to (the residual driver's
+                // rotate-away logic keys on that record).
+                BRPeer *fp = NULL;
+                for (size_t i = array_count(manager->connectedPeers); i > 0; i--) {
+                    if (_BRPeerManagerPeerCanServeFilters(manager->connectedPeers[i - 1])) {
+                        fp = manager->connectedPeers[i - 1];
+                        break;
+                    }
+                }
+                if (fp) {
+                    size_t n = _BRPeerManagerRequestCFiltersLocked(manager, reqStart, reqStop, fp);
+                    if (n > 0) {
+                        manager->autoFetchCFiltersThrough = reqStop;
+#if CF_LEDGER_DRIVE_REREQUEST
+                        // Never silent about CF_OUTSTANDING_MAX overflow (Phase 2):
+                        // log the dropped-oldest-holes range so a hole caused by
+                        // hitting the hard cap is loud instead of a silent missed-scan.
+                        uint32_t dLo = CF_LEDGER_NO_DROP, dHi = CF_LEDGER_NO_DROP;
+                        int nDropReq = BRCFScanLedgerRecordRequestedDropped(&manager->cfLedger, reqStart, reqStop,
+                                                      fp->address, fp->port, (uint32_t)time(NULL), &dLo, &dHi);
+                        if (nDropReq > 0) {
+                            peer_log(fp, "cf-ledger: OUTSTANDING OVERFLOW — dropped %d oldest holes [%u..%u]",
+                                     nDropReq, dLo, dHi);
+                        }
+#else
+                        BRCFScanLedgerRecordRequested(&manager->cfLedger, reqStart, reqStop,
+                                                      fp->address, fp->port, (uint32_t)time(NULL));
+#endif
+                        peer_log(fp, "paced convoy: forward cfilters [%u..%u] (%zu blocks) — KeepAlive drive "
+                                 "(no cfheaders arrival needed)", reqStart, reqStop, n);
+                    }
+                }
+            }
+        }
+
+        // ---- B1.2: cfheaders advance re-kick --------------------------------
+        // The window predicate is recomputed LIVE (B1.1 above may have moved the
+        // scan frontier's accounting, and the ledger is the single source). The
+        // "more work exists" bound is the BLOCK-HEADER tip, not estimatedHeight:
+        // _BRPeerManagerRequestNextCFHeaders clamps its own batchEnd to
+        // lastBlock->height (so cfheaders can never overtake the header frontier)
+        // and returns early once `next > tip`. cfhNext == 0 means NULL/empty chain,
+        // where the FIRST batch is still owed. No extra throttle is needed or wanted:
+        // that function's cfHeadersRequestedThrough/cfHeadersRequestTime guard
+        // already serializes one batch in flight, so a per-tick call self-no-ops.
+        if (! CF_CONVOY_CFH_GATED(manager) && manager->lastBlock &&
+            (cfhNext == 0 || cfhNext <= blockTip)) {
+            BRPeer *fp = _BRPeerManagerAnyFilterCapablePeer(manager);
+            if (fp) _BRPeerManagerRequestNextCFHeaders(manager, fp, /*isConvoyAdvance=*/1);
+        }
+
+        // ---- B1.3: getheaders advance re-kick -------------------------------
+        // Re-issues the CF-only header continuation BRPeer.c holds while the window
+        // is full. Conditioned on an OBSERVED FROZEN TIP (see convoyLastHdrTip):
+        // BRPeerSendGetheaders has no in-flight guard of its own, and during
+        // ordinary open-window sync BRPeer.c's own continuation is already running,
+        // so an unconditional per-tick re-issue would duplicate every 2000-header
+        // batch. Full exponential locators (same primitive as the orphan re-anchor
+        // and the tip-stall watchdog) so a walk-back is possible, not just a
+        // forward pull. Prefer the download peer; fall back to any live peer, since
+        // a resumed manager can have downloadPeer == NULL while peers are connected.
+        if (! CF_CONVOY_HDR_GATED(manager) && manager->lastBlock &&
+            manager->lastBlock->height < manager->estimatedHeight &&
+            manager->lastBlock->height <= manager->convoyLastHdrTip) {
+            BRPeer *dp = manager->downloadPeer;
+            if (! dp || BRPeerConnectStatus(dp) != BRPeerStatusConnected || ! BRPeerIsSocketOpen(dp)) {
+                dp = NULL;
+                for (size_t i = array_count(manager->connectedPeers); i > 0; i--) {
+                    BRPeer *p = manager->connectedPeers[i - 1];
+                    if (BRPeerConnectStatus(p) != BRPeerStatusConnected) continue;
+                    if (! BRPeerIsSocketOpen(p)) continue;
+                    dp = p;
+                    break;
+                }
+            }
+            if (dp) {
+                UInt256 locators[_BRPeerManagerBlockLocators(manager, NULL, 0)];
+                size_t locatorsCount = _BRPeerManagerBlockLocators(manager, locators,
+                                                                   sizeof(locators)/sizeof(*locators));
+                peer_log(dp, "paced convoy: re-kicking held header continuation from tip %"PRIu32
+                         " (window re-opened, header frontier frozen)", manager->lastBlock->height);
+                BRPeerSendGetheaders(dp, locators, locatorsCount, UINT256_ZERO);
+            }
+        }
+        manager->convoyLastHdrTip = manager->lastBlock ? manager->lastBlock->height : 0;
+
+        // B1.2 can floor-snap/re-anchor (BRCFScanLedgerInit at a new floor +
+        // compactFilterChain freed), which moves the scan frontier and therefore the
+        // HEADER window verdict pushed at the top of this tick. Recompute + re-push
+        // so BRPeer.c's continuation reads this tick's truth, not the pre-drive one.
+        _BRPeerManagerPushConvoyHdrGate(manager);
+    }
+#endif // CONVOY_NO_B1_DRIVER
 
     pthread_mutex_unlock(&manager->lock);
 }

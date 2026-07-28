@@ -1814,9 +1814,35 @@ static void _peerRelayedBlock(void *info, BRMerkleBlock *block)
                 if (b && b->height < b2->height) b2 = BRSetGet(manager->blocks, &b2->prevBlock);
             }
             
+#ifdef REORG_NULLGUARD_UNFIXED
+            // PRE-FIX shape — host-KAT red-before-green ONLY (never defined in a
+            // production build). The join point was assumed resident, so both uses
+            // below dereference `b` unguarded and a pruned join is a SIGSEGV. This
+            // is the shape test_reorg_below_window_no_crash crashes on (== RED).
             peer_log(peer, "reorganizing chain from height %"PRIu32", new height is %"PRIu32, b->height, block->height);
-        
+
             BRWalletSetTxUnconfirmedAfter(manager->wallet, b->height); // mark tx after the join point as unconfirmed
+#else
+            // The paced convoy makes manager->blocks a bounded WINDOW, so the walk
+            // above can exit with b == NULL: the fork's join point may have been
+            // pruned below the retention floor between the fork's first block
+            // arriving and the one that overtakes the main chain. Before the window
+            // existed the join was always resident; now it is not, and dereferencing
+            // b here is a SIGSEGV on a real reorg. No join point means no known
+            // height to roll back to, so the un-confirm is skipped — the longer fork
+            // is still adopted below, which is the safe direction (nothing is lost;
+            // at worst a tx confirmed on the abandoned branch keeps a stale height
+            // until it is re-relayed or the chain is reconciled).
+            if (b) {
+                peer_log(peer, "reorganizing chain from height %"PRIu32", new height is %"PRIu32, b->height, block->height);
+
+                BRWalletSetTxUnconfirmedAfter(manager->wallet, b->height); // mark tx after the join point as unconfirmed
+            }
+            else {
+                peer_log(peer, "reorg fork-join point is no longer in the retained block window — adopting the "
+                         "longer fork at height %"PRIu32" without a confirmation roll-back", block->height);
+            }
+#endif
 
             b = block;
         

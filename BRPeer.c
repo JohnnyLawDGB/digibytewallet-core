@@ -215,6 +215,20 @@ typedef struct {
     volatile double lastRecvTime;
     int sentVerack, gotVerack, sentGetaddr, sentFilter, sentGetdata, sentMempool, sentGetblocks;
     int compactFiltersOnly; // BR_SYNC_MODE_COMPACT_FILTERS_ONLY: pull headers to tip, never getblocks
+    // Paced-convoy fetch gate (spec Part A). Nonzero == the block-header frontier
+    // is already CF_CONVOY_WINDOW blocks ahead of the CF scan frontier, so the
+    // CF-only 2000-header continuation in _BRPeerAcceptHeadersMessage must HOLD
+    // (the headers in the current batch are still processed; only the request for
+    // the NEXT batch is suppressed). That handler runs on this peer's read thread
+    // with only a BRPeerContext -- it cannot dereference the opaque
+    // BRPeerManager -- so the manager recomputes the window under its lock and
+    // PUSHES the verdict here on every block-add and every KeepAlive tick.
+    // volatile: written by the manager thread, read by this peer's read thread,
+    // deliberately WITHOUT locking. A torn/stale read is safe by BOUNDED
+    // OVERSHOOT, not by analogy: a stale-OPEN read permits at most ONE extra
+    // 2000-header continuation (~0.44 MB at ~220 B/header), one-shot and
+    // self-correcting on the next batch, trivial against a 10000-block window.
+    volatile int convoyHdrGated;
     UInt256 lastBlockHash;
     BRMerkleBlock *currentBlock;
     UInt256 *currentBlockTxHashes, *knownBlockHashes, *knownTxHashes;
@@ -619,7 +633,20 @@ static int _BRPeerAcceptHeadersMessage(BRPeer *peer, const uint8_t *msg, size_t 
                 BRSHA256_2(&locators[0], &msg[off + 81*(last - 1)], 80);
                 BRPeerSendGetblocks(peer, locators, 2, UINT256_ZERO);
             }
-            else BRPeerSendGetheaders(peer, locators, 2, UINT256_ZERO);
+            // PACED-CONVOY GATE (spec Part A). This is the unpaced tip-racer: on
+            // any full 2000-header batch the old code immediately asked for the
+            // next one, fast-forwarding to the chain tip and filling
+            // manager->blocks with [birth..tip] long before the compact-filter
+            // scan had processed anything (the deep-restore OOM). Hold the
+            // CONTINUATION while the manager reports the header frontier a full
+            // CF_CONVOY_WINDOW ahead of the scan frontier; the batch already
+            // received is still parsed + relayed below, and the manager's
+            // KeepAlive convoy driver re-issues the continuation once the scan
+            // catches up. Recovery/sync-start getheaders (BRPeerManager's
+            // _peerConnected, orphan re-anchor, tip-stall watchdog) go out
+            // through BRPeerSendGetheaders directly and are NEVER gated.
+            else if (! ctx->convoyHdrGated) BRPeerSendGetheaders(peer, locators, 2, UINT256_ZERO);
+            else peer_log(peer, "paced convoy: holding header continuation (header frontier a full window ahead of the CF scan)");
 
             for (size_t i = 0; r && i < count; i++) {
                 BRMerkleBlock *block = BRMerkleBlockParse(&msg[off + 81*i], 81);
@@ -1558,6 +1585,18 @@ void BRPeerSetEarliestKeyTime(BRPeer *peer, uint32_t earliestKeyTime)
 void BRPeerSetCompactFiltersOnly(BRPeer *peer, int compactFiltersOnly)
 {
     ((BRPeerContext *)peer)->compactFiltersOnly = (compactFiltersOnly) ? 1 : 0;
+}
+
+// Paced-convoy fetch gate: the manager pushes its recomputed header-window
+// verdict here (every block-add + every KeepAlive tick) so
+// _BRPeerAcceptHeadersMessage, which runs on the peer's read thread and has no
+// access to the opaque BRPeerManager, can hold the CF-only header continuation
+// while the block-header frontier is a full CF_CONVOY_WINDOW ahead of the CF
+// scan frontier. Deliberately lock-free; see the field comment for why a stale
+// read is safe (bounded one-batch overshoot).
+void BRPeerSetConvoyHdrGated(BRPeer *peer, int gated)
+{
+    ((BRPeerContext *)peer)->convoyHdrGated = (gated) ? 1 : 0;
 }
 
 // call this when local block height changes (helps detect tarpit nodes)

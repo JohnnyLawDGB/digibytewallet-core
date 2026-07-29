@@ -89,6 +89,130 @@ Remarks:
    expands transiently while a large cfTip deficit is being recovered. */
 #define CLEAR_MEM_CF_RETENTION_MARGIN 144
 
+/* NOTE: there is deliberately NO depth ceiling here. CF_RETENTION_MAX_SPAN used
+   to bound the retained block-header span to a fixed depth below the chain tip
+   and abandon retry-exhausted (gaveUp) heights below the clamp; the app layer
+   read the same constant to REFUSE deep restores up front. Both halves are
+   DELETED (paced-convoy design, KEPT/REMOVED/REPURPOSED): no restore is refused
+   at any depth, because the convoy bounds resident headers to CF_CONVOY_WINDOW
+   at ANY depth. The abandonment VALVE the ceiling doubled as is RETAINED but
+   re-triggered on proven connected-CF-subset refusal (Part B2,
+   BRPeerManagerKeepAlive), not on depth. The retention FLOOR
+   (min(cfNext, LowestNeededHeight) - CLEAR_MEM_CF_RETENTION_MARGIN) is untouched. */
+
+/* PACED-CONVOY B2 -- how many FRESH retry cycles a retry-exhausted (gaveUp) hole
+   is granted against a LIVE CF-peer set before the abandonment valve may abandon
+   it (spec Part C / Part B2). Each cycle is a full re-request backoff schedule
+   (30/60/120/120/120 = 7.5 min) during which the residual driver rotates the hole
+   across every connected CF peer, so 2 cycles is ~15 min of productive rotated
+   retry (~22 min counting the original cycle).
+
+   >= 2 DELIBERATELY, not 1: a single unlucky peer-rotation cycle -- the peer set
+   churning, the fleet momentarily saturated -- must not be able to false-positive
+   into abandoning a height the fleet can actually serve.
+
+   This is an ACCEPTANCE-INFORMED TUNABLE, not a blind constant. It is calibrated
+   on how fast the CONNECTED CF-peer subset rotates through the fleet, and the
+   accepted residual (fleet saturation: the oracle that HAS the filter is at
+   maxconnections, so we never connect to it) is exactly where rotation is
+   SLOWEST. Every abandonment warn-logs its height range: if a height abandons and
+   a later node-reconcile CREDITS it, that is the signal to RAISE this number --
+   not that the valve is broken. */
+#define CF_CONVOY_REARM_MAX 2
+
+/* PACED-CONVOY FETCH WINDOW (spec 2026-07-28-paced-convoy-fetch-design.md,
+   Parts A + C). The maximum number of blocks the block-header frontier
+   (manager->lastBlock->height) and the cfheader frontier
+   (BRCompactFilterChainNextHeight - 1) may lead the CF SCAN frontier
+   (BRCFScanLedgerLowestNeededHeight) by. Beyond it the two TIP-RACING
+   continuations -- BRPeer.c's CF-only 2000-header continuation and
+   _BRPeerManagerRequestNextCFHeaders' clean-append advance -- are suppressed, so
+   the header/cfheader/scan frontiers climb birth->tip as one convoy instead of
+   the headers fast-forwarding to the tip and filling manager->blocks with
+   [birth..tip] before the scan has processed anything (the deep-restore OOM).
+   RECOVERY and SYNC-START sends are NEVER gated -- suppressing one deadlocks the
+   convoy from the other side.
+
+   The value is a floor-derived bound, not a magic number. It must EXCEED all of:
+   (1) the scan lookahead CF_OUTSTANDING_MAX(4096) + MAX_CFILTERS_RESULTS(1000)
+       = 5096 -- a smaller window starves the scan: the forward cfilter fetch can
+       only ask for heights the cfheader frontier already covers, so a window
+       below the in-flight ceiling would throttle the very path that ADVANCES the
+       scan frontier the window is measured from (deadlock from the other side);
+   (2) the cfheader quantum MAX_CFHEADERS_RESULTS(2000) -- below one batch the
+       gate would suppress every cfheaders advance and never re-open;
+   (3) a re-kick-latency margin at DGB's ~15 s blocks -- the window must hold
+       enough headers to keep the scan fed across one CF_CONVOY_HDR_REKICK_BASE_SECS
+       (30 s) re-kick interval, i.e. >= 30 s x the scan's 100 heights/s ceiling.
+   W = 10000 clears (1) by 4904, (2) by 8000, (3) by ~2 orders of magnitude.
+
+   THE THREE CONSEQUENCES OF THE CHOSEN VALUE (state them when changing it):
+   a. MAX RESIDENT BLOCK HEADERS ~= W + CLEAR_MEM_CF_RETENTION_MARGIN = 10144
+      (the retention floor sits 144 below the scan frontier, the header frontier
+      at most W above it), x ~220 B/header ~= 2.2 MB -- FLAT AT ANY RESTORE
+      DEPTH. That is the whole feature: the deep-restore OOM stops existing.
+      (Add the ~2-batch stale-flag overshoot at BRPeer.c:648, ~4000 headers /
+      ~0.88 MB, for the true instantaneous peak: ~14.1k headers / ~3.1 MB.)
+   b. MAX prevBlock WALK DEPTH = W_hdr ~= 10000. Every getcfilters/getcfheaders
+      stop hash resolves by walking down from lastBlock (_BRPeerManagerBlockHashAtHeight,
+      batched at _BRPeerManagerResolveHashesAtHeightsLocked), so the walk is short
+      BY CONSTRUCTION rather than by optimization -- depth-independent, sub-ANR,
+      and it is why no height->hash index is needed (or possible: the reorg path
+      never BRSetRemoves, so an index has no eviction hook).
+   c. SCAN-LOOKAHEAD HEADROOM = W - (CF_OUTSTANDING_MAX + MAX_CFILTERS_RESULTS)
+      = 10000 - 5096 = 4904 blocks of cfheader frontier the scan can consume
+      before the convoy has to re-kick, i.e. ~5 full forward-fetch batches of
+      slack against a stalled header supply. */
+#define CF_CONVOY_WINDOW 10000
+
+/* PACED-CONVOY driver B1.3 -- the getheaders re-kick's RATE LIMIT (spec Part B1
+   step 3). KeepAlive re-issues the header continuation BRPeer.c holds while the
+   window is full; the trigger (a header frontier frozen across a whole ~10 s
+   tick) is necessary but NOT sufficient, because "frozen" cannot distinguish
+   "the continuation was suppressed and nothing is in flight" (re-kick wanted)
+   from "a reply IS in flight and just hasn't been parsed yet" (re-kick harmful).
+   BRPeer.c issues its continuation BEFORE the relay loop, so lastBlock does not
+   move until the whole ~440 KB batch is parsed -- on a slow link that is minutes
+   of "frozen". So the re-kick is additionally rate-limited by an interval that
+   BACKS OFF while unproductive and RESETS the moment the header tip actually
+   advances. Same 'delay = min(BASE << n, CAP), reset on progress' idiom the CF
+   scan-ledger's residual re-request driver already uses (CF_REREQ_BASE_SECS /
+   CF_REREQ_BACKOFF_CAP_SECS) -- deliberately not a new mechanism.
+
+   Sequence: 30, 60, 120, 240, 480, 600, 600, ... An EPISODE ends -- and the
+   interval resets to 30 -- on either of the two things that mean the accumulated
+   penalty no longer describes reality: real header-tip progress (the chain is
+   alive), or a GATED->open transition (a gated period issues no re-kicks, so it
+   can neither earn a penalty nor carry one across; the reopen is served on the
+   very next tick, which is what B1.3 exists for). Note those two are INDEPENDENT:
+   the window can close and reopen from scanFrontier movement alone, with the
+   header tip never advancing.
+
+   TOO SHORT costs bandwidth, and it COMPOUNDS: each injected getheaders is
+   answered with a full 2000-header batch, and because count >= 2000 every reply
+   spawns its OWN independent, lockstep continuation chain that persists until
+   the gate shuts it -- N re-kicks during one slow batch means N x ~2.2 MB of
+   duplicate headers per window-open period, recurring on every re-open of a
+   multi-hour deep restore, amplifying exactly on the slow mobile links the
+   convoy exists to make cheap. It also has a STEADY-STATE leak: estimatedHeight
+   is only ever RAISED, so a peer that advertised a height we never reach leaves
+   lastBlock->height < estimatedHeight forever on a fully-synced wallet (where
+   W_hdr ~ 0, i.e. the window is permanently open) -- at the bare 10 s tick that
+   is a ~1.2 KB full-locator getheaders every 10 s forever (~10 MB/day upstream),
+   each answered with 0 headers. The 600 s ceiling bounds that to ~170 KB/day.
+
+   TOO LONG costs window-reopen recovery latency: after the scan climbs enough to
+   re-open the window, the header frontier stays frozen until the next re-kick is
+   due. BASE is what that path actually pays, because the previous batch landing
+   is itself tip progress and RESETS the backoff -- so an ordinary descent always
+   re-kicks at 30 s, never at the ceiling. At 30 s the header supply is ~4000
+   headers per interval (the M-2 two-batch overshoot: BRPeer.c reads the gate
+   flag one batch stale), i.e. ~133 heights/s, which stays ahead of the scan's
+   ceiling of MAX_CFILTERS_RESULTS(1000) per ~10 s tick == 100 heights/s. So the
+   convoy is never header-starved by this throttle. */
+#define CF_CONVOY_HDR_REKICK_BASE_SECS 30
+#define CF_CONVOY_HDR_REKICK_MAX_SECS  600
+
 /* BIP 158 continuity-failure recovery. If this many DISTINCT peers fail the
    cfheaders continuity check against our current tip since the last successful
    append, our chain is the outlier (it diverged via unverified TOFU) — re-anchor
@@ -331,6 +455,81 @@ int BRPeerManagerCFLedgerRestore(BRPeerManager *manager, const uint8_t *buf, siz
 void BRPeerManagerSetSaveCFLedger(BRPeerManager *manager, void *info,
                                   void (*callback)(void *info, const uint8_t *bytes, size_t len));
 
+// ---- CF scan-frontier + abandonment accessors (paced-convoy fetch, Task 1) -
+// Read-only wrappers around the ledger's CF-retention scan-floor API (see
+// BRCFScanLedger.h "CF-retention scan-floor (Task 1)"). Each takes
+// manager->lock for the duration of the call, same as the Phase 1 accessors
+// above. The paced-convoy fetch gate/driver's fetch frontier is
+// LowestNeededHeight, NOT scannedThrough — LowestNeededHeight folds in the
+// hard abandonedBelow floor, scannedThrough alone does not.
+
+// Lowest height the CF scan still needs a header retained for:
+// max(scannedThrough+1, abandonedBelow). O(1).
+uint32_t BRPeerManagerLowestNeededHeight(BRPeerManager *manager);
+
+// The retention hard-floor watermark: heights below this have been
+// permanently abandoned (too deep to retain) and are never re-requested.
+// MONOTONIC (only ever advances).
+uint32_t BRPeerManagerAbandonedBelow(BRPeerManager *manager);
+
+// Cumulative count of heights abandoned so far: heights in
+// [start .. abandonedBelow-1], i.e. max(abandonedBelow - start, 0).
+size_t BRPeerManagerAbandonedCount(BRPeerManager *manager);
+
+// ---- B2 valve / watchdog ORDERING (paced-convoy fetch, Task 6, spec Part C) -
+//
+// "Is the B2 abandonment valve currently mid-decision on the hole that PINS the
+// scan frontier?" — the signal the Kotlin tip-stall watchdog uses to stand down
+// while the valve does its work, so the two scan-stall watchers do not race
+// (the valve owns a KNOWN gaveUp stall and its re-arm IS productive work, where
+// the watchdog's escalation — an ungated getheaders, then a manager recreate —
+// is pure churn on top of it).
+//
+// PENDING covers BOTH halves of the valve's window, not just the decision instant:
+//   (a) the frontier-pinning hole is PARKED in gaveUp — the valve decides at the
+//       next KeepAlive tick; and
+//   (b) the frontier-pinning hole is OUTSTANDING with rearmCycles > 0 — a
+//       valve-granted RE-ARM CYCLE IS IN FLIGHT (~7.5 min of rotated retry, the
+//       larger half of the window). An ordinary outstanding hole (rearmCycles == 0)
+//       belongs to the residual driver, not the valve, and reads 0.
+//
+// RETURN VALUE — a COUNT, not a boolean, and that is load-bearing:
+//   0  == the valve owns nothing at the scan frontier; nothing pending.
+//   N>0 == the valve is on cycle N of that hole: N == 1 is the ORIGINAL cycle
+//          (exhausted, no re-arm granted yet); N == 2 is the first re-arm cycle
+//          (in flight, or exhausted and being decided); in general
+//          N == rearmCycles + 1, and the valve may abandon once
+//          N == CF_CONVOY_REARM_MAX + 1. Saturating (rearmCycles is a uint8_t
+//          widened to uint32_t), so it never wraps back to 0 and can never be
+//          mistaken for "not pending".
+//
+// WHY A COUNT (do NOT reduce this to a bare boolean — the Task-5 review found the
+// failure it prevents). The valve's per-cycle offersReachedLivePeer latch is
+// cleared by ANY disconnect of the peer stamped on the hole, and a deciding cycle
+// is 5 offers over ~7.5 min. On a churny fleet — canon oracles at maxconnections,
+// errno-101 blips, ~8 peers rotating — EVERY cycle can be tainted, so the valve
+// re-arms INDEFINITELY and this function returns non-zero forever. A consumer
+// that suppresses its watchdog on a bare "pending" would then stand down FOREVER,
+// in exactly the case the backstop exists for. So BOUND THE SUPPRESSION on this
+// value: suppress only while the returned N is within the cycles the valve is
+// actually entitled to (N <= CF_CONVOY_REARM_MAX + 1, i.e. through the deciding
+// cycle); once N exceeds that, the hole is re-arming without converging and MUST
+// be re-exposed to the watchdog. The resulting failure mode is a bounded-memory
+// VISIBLE stall (the convoy gate holds manager->blocks flat at ~W+144), never an
+// OOM and never a silent wrong balance.
+//
+// The pinning-hole predicate is the valve's own (the LOWEST hole of either kind —
+// _cfLedgerAdvance caps scannedThrough at min(outstanding[0], gaveUp[0]) - 1), so a
+// consumer can never defer to a valve decision that is not actually happening: a
+// gaveUp height sitting ABOVE a still-outstanding hole does not pin the frontier,
+// is not the valve's business, and reads 0 here.
+//
+// LOCKING: takes manager->lock, like every other public accessor here. Call it
+// from the JNI layer OUTSIDE any lock — NEVER from in-lock code (KeepAlive,
+// _peerRelayed*, _BRPeerManagerRequestNextCFHeaders); manager->lock is
+// NON-recursive and in-lock callers must read BRCFScanLedgerLowestGaveUp directly.
+uint32_t BRPeerManagerHasPendingAbandonment(BRPeerManager *manager);
+
 // Request cfilters for the inclusive range [startHeight, stopHeight] from
 // any filter-capable peer that is currently connected. Caps the range at
 // MAX_CFILTERS_RESULTS; if the requested range is larger, only the first
@@ -360,6 +559,81 @@ size_t BRPeerManagerRequestCompactFilters(BRPeerManager *manager,
 void BRPeerManagerEnableAutoCompactFilterFetch(BRPeerManager *manager, uint32_t startHeight);
 void BRPeerManagerDisableAutoCompactFilterFetch(BRPeerManager *manager);
 uint32_t BRPeerManagerGetAutoFetchCFiltersStart(BRPeerManager *manager);
+
+// Read back the current forward-fetch cursor (autoFetchCFiltersThrough). Mostly
+// useful for before/after logging around BRPeerManagerSnapAutoFetchThroughToScanFrontier
+// below.
+uint32_t BRPeerManagerGetAutoFetchCFiltersThrough(BRPeerManager *manager);
+
+// ---- Resume cursor reconciliation (paced-convoy fetch, Task 4, spec Part
+// B1-resume) --------------------------------------------------------------
+//
+// On resume, the caller arms auto-fetch via BRPeerManagerEnableAutoCompactFilterFetch
+// (autoFetchCFiltersThrough = birthHeight-1) BEFORE the persisted CF scan ledger
+// is restored (BRPeerManagerCFLedgerRestore), which can set scannedThrough far
+// above birthHeight. Left unreconciled, the very next forward-fetch tick
+// re-requests from birthHeight (reqStart = autoFetchCFiltersThrough+1) --
+// already-scanned history -- and BRCFScanLedgerRecordRequested re-inserts those
+// heights as outstanding, dragging scannedThrough back down: the persisted scan
+// progress is thrown away and the whole birth->tip descent restarts.
+//
+// Call this ONCE, immediately after restoring the ledger, to snap the cursor up
+// to BRCFScanLedgerLowestNeededHeight - 1 (NOT LowestNeededHeight itself --
+// reqStart is autoFetchCFiltersThrough+1, so snapping to LowestNeededHeight would
+// make the next fetch start one height too high and silently skip it forever,
+// the exact bug class this ledger subsystem exists to prevent). Folds in the
+// ledger's abandonedBelow hard floor via LowestNeededHeight, so an abandoned
+// prefix is never re-requested either. A no-op on a not-yet-armed ledger
+// (LowestNeededHeight == 0).
+//
+// ⚠️ IT IS NO LONGER RAISE-ONLY (paced-convoy fix wave, C-1) — do not "restore"
+// that. On a RESUME, BRPeerManagerEnableAutoCompactFilterFetch's resolvability
+// clamp lands on the SAVED-BLOCKS TIP, because a resumed manager's in-memory chain
+// is only the checkpoints plus the persisted
+// [savedTip-(SAVE_BLOCK_COUNT-1) .. savedTip] run, so a deep birth height cannot
+// resolve. (Fix wave R2 lowered that floor from the saved tip itself, where the old
+// FORWARD chaining left it, to savedTip-299 — still ~a full convoy window above a
+// resumed deep descent's frontier, so nothing here changes.) Both `autoFetchCFiltersStart` and the cursor therefore start
+// ~CF_CONVOY_WINDOW ABOVE the restored scan frontier, and every forward-fetch site
+// clamps reqStart UP to autoFetchCFiltersStart — so a raise-only snap could never
+// pull them back down and the next forward request began at the clamped tip, which
+// made _cfLedgerAdvance sail scannedThrough over ~CF_CONVOY_WINDOW never-requested
+// heights with abandonedBelow still 0 (no WARN, no banner, wallet reports Synced).
+// This function therefore now:
+//   1. SURFACES any still-needed history below the in-memory block floor
+//      (BRCFScanLedgerAbandonUnscannableBelow + WARN) — that band is unservable for
+//      the whole session, so it becomes skipped-and-surfaced-and-recoverable
+//      instead of silently skipped;
+//   2. lowers autoFetchCFiltersStart to the frontier and clamps the cursor down to
+//      cfLedger.requestedThrough (a cursor above what was actually requested is
+//      what lets a non-contiguous RecordRequested sail), then raises it to
+//      LowestNeededHeight - 1 as before.
+//
+// LOCKING: unlike the file-static _cfConvoy*/B1-driver helpers (which run INSIDE
+// an already-locked BRPeerManagerKeepAlive pass and must NOT take the lock),
+// this is a public entry point meant to be called from the JNI layer OUTSIDE any
+// lock, so it takes manager->lock itself. Do NOT call it from any already-locked
+// path -- manager->lock is NON-recursive.
+void BRPeerManagerSnapAutoFetchThroughToScanFrontier(BRPeerManager *manager);
+
+// ---- Runtime-readable convoy constants (spec Part C: "ideally runtime-readable")
+//
+// CF_CONVOY_WINDOW and CF_CONVOY_REARM_MAX are consumed on BOTH sides of the JNI
+// boundary: the native gate/valve use them directly, and the Kotlin tip-stall +
+// BIP158 watchdogs need them to decide "the header tip is frozen BY DESIGN"
+// (isConvoyWindowFull) and "the valve still owns this stall" (isConvoySuppressed,
+// bounded at CF_CONVOY_REARM_MAX + 1). Hand-mirroring them in Kotlin is a DRIFT
+// TRAP with teeth, and the spec's own tuning signal tells the operator to raise
+// CF_CONVOY_REARM_MAX here when an abandoned height later reconciles:
+//   * REARM_MAX raised natively only -> Kotlin releases its suppression at 4 while
+//     the valve is legitimately still working cycles 4..N, so the tip-stall
+//     watchdog escalates INTO a productive valve and tier 2 recreates the manager;
+//   * WINDOW lowered natively only -> Kotlin reads "window not full", drops the
+//     tip-frozen conjunct, and arms tier 1/tier 2 during a HEALTHY paced descent.
+// These accessors exist so Kotlin DERIVES both values at runtime and there is no
+// second copy to drift. Pure constant readers: no manager, no lock, safe anywhere.
+uint32_t BRPeerManagerConvoyWindow(void);
+uint32_t BRPeerManagerConvoyRearmMax(void);
 
 // ----------- end BIP 158 opt-in -----------
 

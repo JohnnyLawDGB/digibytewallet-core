@@ -65,18 +65,66 @@ static void _cfLedgerAdvance(BRCFScanLedger *l)
 }
 
 // ---- gaveUp[] helpers (sorted ascending) -----------------------------------
+//
+// gaveUp[] is shadowed by two INDEX-PARALLEL uint8 arrays carrying the B2 valve's
+// per-hole state (gaveUpRearmCycles[] / gaveUpOffersLive[]) across the
+// outstanding→gaveUp→outstanding round trip. All three MUST shift together, so
+// every insert/remove/prefix-drop goes through the three primitives below and
+// nothing else ever memmoves gaveUp[] directly.
 
-// Insert height into gaveUp (sorted, de-duplicated). Returns 1 if present after
-// the call (added or already there), 0 if full (never silently drops — the
-// caller keeps the height in outstanding instead).
-static int _cfLedgerAddGaveUp(BRCFScanLedger *l, uint32_t height)
+// Open a slot at index i (shifting [i..count) up by one). Caller has already
+// verified there is room.
+static void _cfLedgerGaveUpShiftUp(BRCFScanLedger *l, size_t i)
+{
+    size_t n = l->gaveUpCount - i;
+    memmove(&l->gaveUp[i + 1],            &l->gaveUp[i],            n * sizeof(l->gaveUp[0]));
+    memmove(&l->gaveUpRearmCycles[i + 1], &l->gaveUpRearmCycles[i], n * sizeof(l->gaveUpRearmCycles[0]));
+    memmove(&l->gaveUpOffersLive[i + 1],  &l->gaveUpOffersLive[i],  n * sizeof(l->gaveUpOffersLive[0]));
+}
+
+// Remove the entry at index i (shifting (i..count) down by one).
+static void _cfLedgerGaveUpShiftDown(BRCFScanLedger *l, size_t i)
+{
+    size_t n = l->gaveUpCount - i - 1;
+    memmove(&l->gaveUp[i],            &l->gaveUp[i + 1],            n * sizeof(l->gaveUp[0]));
+    memmove(&l->gaveUpRearmCycles[i], &l->gaveUpRearmCycles[i + 1], n * sizeof(l->gaveUpRearmCycles[0]));
+    memmove(&l->gaveUpOffersLive[i],  &l->gaveUpOffersLive[i + 1],  n * sizeof(l->gaveUpOffersLive[0]));
+    l->gaveUpCount--;
+}
+
+// Drop the front k entries (the abandoned prefix).
+static void _cfLedgerGaveUpDropPrefix(BRCFScanLedger *l, size_t k)
+{
+    if (k == 0) return;
+    size_t n = l->gaveUpCount - k;
+    memmove(&l->gaveUp[0],            &l->gaveUp[k],            n * sizeof(l->gaveUp[0]));
+    memmove(&l->gaveUpRearmCycles[0], &l->gaveUpRearmCycles[k], n * sizeof(l->gaveUpRearmCycles[0]));
+    memmove(&l->gaveUpOffersLive[0],  &l->gaveUpOffersLive[k],  n * sizeof(l->gaveUpOffersLive[0]));
+    l->gaveUpCount -= k;
+}
+
+// Insert height into gaveUp (sorted, de-duplicated), parking the retiring hole's
+// B2 valve state alongside it. Returns 1 if present after the call (added or
+// already there), 0 if full (never silently drops — the caller keeps the height
+// in outstanding instead).
+static int _cfLedgerAddGaveUp(BRCFScanLedger *l, uint32_t height,
+                              uint8_t rearmCycles, uint8_t offersLive)
 {
     size_t i = 0;
     while (i < l->gaveUpCount && l->gaveUp[i] < height) i++;
-    if (i < l->gaveUpCount && l->gaveUp[i] == height) return 1; // already present
+    if (i < l->gaveUpCount && l->gaveUp[i] == height) {
+        // Already parked (a defensive double-retire). Keep the STRONGEST evidence:
+        // the highest cycle count seen, and the AND of the latches — a cycle that
+        // was tainted can never be un-tainted by a second retirement.
+        if (rearmCycles > l->gaveUpRearmCycles[i]) l->gaveUpRearmCycles[i] = rearmCycles;
+        if (! offersLive) l->gaveUpOffersLive[i] = 0;
+        return 1;
+    }
     if (l->gaveUpCount >= CF_GAVEUP_MAX) return 0;              // full: caller keeps it outstanding
-    memmove(&l->gaveUp[i + 1], &l->gaveUp[i], (l->gaveUpCount - i) * sizeof(uint32_t));
-    l->gaveUp[i] = height;
+    _cfLedgerGaveUpShiftUp(l, i);
+    l->gaveUp[i]            = height;
+    l->gaveUpRearmCycles[i] = rearmCycles;
+    l->gaveUpOffersLive[i]  = offersLive;
     l->gaveUpCount++;
     return 1;
 }
@@ -85,10 +133,7 @@ static void _cfLedgerRemoveGaveUp(BRCFScanLedger *l, uint32_t height)
 {
     size_t i = 0;
     while (i < l->gaveUpCount && l->gaveUp[i] < height) i++;
-    if (i < l->gaveUpCount && l->gaveUp[i] == height) {
-        memmove(&l->gaveUp[i], &l->gaveUp[i + 1], (l->gaveUpCount - i - 1) * sizeof(uint32_t));
-        l->gaveUpCount--;
-    }
+    if (i < l->gaveUpCount && l->gaveUp[i] == height) _cfLedgerGaveUpShiftDown(l, i);
 }
 
 // ---- filter-byte buffer (§7, header-race hold) -----------------------------
@@ -365,6 +410,10 @@ static uint32_t _cfLedgerInsertOutstanding(BRCFScanLedger *l, uint32_t height,
     l->outstanding[i].requestedAt = now;
     l->outstanding[i].attempts    = 0;
     l->outstanding[i].headerRace  = 0;
+    // A brand-new hole starts its FIRST cycle: no re-arms yet, and no offer has
+    // yet failed to reach a live CF peer (vacuously true, so the latch starts 1).
+    l->outstanding[i].rearmCycles           = 0;
+    l->outstanding[i].offersReachedLivePeer = 1;
     l->outstandingCount++;
     return dropped;
 }
@@ -376,6 +425,12 @@ int BRCFScanLedgerRecordRequestedDropped(BRCFScanLedger *l, uint32_t startH, uin
                                          UInt128 peer, uint16_t port, uint32_t now,
                                          uint32_t *outLow, uint32_t *outHigh)
 {
+    if (stopH < startH) return 0;
+    // Hard floor (Task 1): never record a height below abandonedBelow — it was
+    // abandoned (too deep, header pruned) and must never be re-requested. Clamp
+    // the low end up; a range wholly below the floor is a complete no-op (does
+    // not even touch requestedThrough).
+    if (startH < l->abandonedBelow) startH = l->abandonedBelow;
     if (stopH < startH) return 0;
     int n = 0; uint32_t lo = CF_LEDGER_NO_DROP, hi = 0;
     for (uint32_t h = startH; ; h++) {
@@ -414,6 +469,8 @@ void BRCFScanLedgerMarkEvaluated(BRCFScanLedger *l, uint32_t height)
 
 void BRCFScanLedgerMarkHeaderRace(BRCFScanLedger *l, uint32_t height)
 {
+    // Hard floor (Task 1): a below-floor height was abandoned — never resurrect it.
+    if (height < l->abandonedBelow) return;
     size_t i = _cfLedgerLowerBound(l, height);
     if (i < l->outstandingCount && l->outstanding[i].height == height) {
         l->outstanding[i].headerRace = 1; // keep outstanding, flag the fast retry
@@ -438,6 +495,12 @@ void BRCFScanLedgerReArmPeer(BRCFScanLedger *l, UInt128 peer, uint16_t port)
             l->outstanding[i].peer = UINT128_ZERO; // clear so the driver picks someone else
             l->outstanding[i].port = 0;
             // height + attempts intentionally preserved
+            // B2 valve: this offer was IN FLIGHT to a peer that then vanished, so it
+            // was never actually refused by a live peer — it was merely lost. Taint the
+            // cycle so it can never be the deciding (abandoning) one. Without this a
+            // peer FLAP mid-cycle would look identical to five live refusals, and the
+            // valve would abandon a height the fleet may well still serve.
+            l->outstanding[i].offersReachedLivePeer = 0;
         }
     }
 }
@@ -465,7 +528,13 @@ static uint32_t _cfLedgerRerequestDelay(const BRCFOutstanding *e)
 // no longer offers it; still counted/reported, so nothing is silently lost).
 static int _cfLedgerMoveToGaveUp(BRCFScanLedger *l, size_t i)
 {
-    if (! _cfLedgerAddGaveUp(l, l->outstanding[i].height)) return 0;  // gaveUp full -> keep outstanding
+    // Park the B2 valve state WITH the height — the BRCFOutstanding record is
+    // destroyed by the memmove below, and without the carry the re-arm counter
+    // would restart at 0 on every retirement, so CF_CONVOY_REARM_MAX could never
+    // be reached and the valve would re-arm forever without ever abandoning.
+    if (! _cfLedgerAddGaveUp(l, l->outstanding[i].height,
+                             l->outstanding[i].rearmCycles,
+                             l->outstanding[i].offersReachedLivePeer)) return 0;  // gaveUp full -> keep outstanding
     memmove(&l->outstanding[i], &l->outstanding[i + 1],
             (l->outstandingCount - i - 1) * sizeof(BRCFOutstanding));
     l->outstandingCount--;
@@ -527,6 +596,8 @@ int BRCFScanLedgerNextRerequest(BRCFScanLedger *l, uint32_t now, uint32_t *outHe
 int BRCFScanLedgerPeekRerequestRange(BRCFScanLedger *l, uint32_t now, uint32_t minHeight,
                                      uint32_t *outStart, uint32_t *outStop)
 {
+    // Hard floor (Task 1): never offer a height below abandonedBelow.
+    if (minHeight < l->abandonedBelow) minHeight = l->abandonedBelow;
     size_t start = l->outstandingCount;  // no retire here — that's RetireCapped's job
     for (size_t i = 0; i < l->outstandingCount; i++) {
         if (l->outstanding[i].height < minHeight) continue;  // lower-bound cursor (livelock guard)
@@ -567,11 +638,198 @@ void BRCFScanLedgerCommitRerequest(BRCFScanLedger *l, uint32_t startH, uint32_t 
     }
 }
 
+// ---- B2 abandonment valve primitives (paced-convoy design Part B2) ---------
+
+int BRCFScanLedgerLowestGaveUp(const BRCFScanLedger *l, uint32_t *outHeight,
+                               uint8_t *outRearmCycles, uint8_t *outOffersReachedLivePeer)
+{
+    if (l->gaveUpCount == 0) return 0;
+    if (outHeight)                 *outHeight                 = l->gaveUp[0];
+    if (outRearmCycles)            *outRearmCycles            = l->gaveUpRearmCycles[0];
+    if (outOffersReachedLivePeer)  *outOffersReachedLivePeer  = l->gaveUpOffersLive[0];
+    return 1;
+}
+
+void BRCFScanLedgerMarkOffersMissedLivePeer(BRCFScanLedger *l, uint32_t startH, uint32_t stopH)
+{
+    if (stopH < startH) return;
+    for (size_t i = 0; i < l->outstandingCount; i++) {
+        uint32_t h = l->outstanding[i].height;
+        if (h >= startH && h <= stopH) l->outstanding[i].offersReachedLivePeer = 0;
+    }
+}
+
+int BRCFScanLedgerReArmGaveUp(BRCFScanLedger *l, uint32_t height)
+{
+    // Hard floor: an abandoned height is never resurrected (same rule
+    // RecordRequested/MarkHeaderRace/Peek already enforce).
+    if (height < l->abandonedBelow) return 0;
+
+    size_t g = 0;
+    while (g < l->gaveUpCount && l->gaveUp[g] < height) g++;
+    if (g >= l->gaveUpCount || l->gaveUp[g] != height) return 0;   // not a parked hole
+
+    // Re-arming through a FULL outstanding array would make
+    // _cfLedgerInsertOutstanding evict the lowest-height entry to make room — and
+    // the re-armed hole IS the lowest, so it would evict a *different* real hole
+    // (or itself) silently. Leaving it parked is strictly safer; the valve simply
+    // retries next tick once the outstanding set drains.
+    if (l->outstandingCount >= CF_OUTSTANDING_MAX) return 0;
+
+    // Capture BOTH parked bytes BEFORE the shift below invalidates index g.
+    const uint8_t parkedCycles = l->gaveUpRearmCycles[g];
+    const uint8_t parkedLive   = l->gaveUpOffersLive[g];
+    uint8_t cycles = parkedCycles;
+    if (cycles < 0xFFu) cycles++;      // saturating: never wrap back to 0 (that would reset the proof)
+
+    // Exactly ONE home: leave gaveUp BEFORE entering outstanding, so gaveUp[0] /
+    // gaveUpCount (which the valve's own decision and _cfLedgerAdvance both read)
+    // never describe a hole that is simultaneously being retried.
+    _cfLedgerGaveUpShiftDown(l, g);
+
+    // requestedAt = 0 => elapsed >= any backoff => DUE on this very tick, so the
+    // residual driver can offer it immediately rather than after another delay.
+    _cfLedgerInsertOutstanding(l, height, UINT128_ZERO, 0, 0);
+    size_t i = _cfLedgerLowerBound(l, height);
+    if (i >= l->outstandingCount || l->outstanding[i].height != height) {
+        // Defensive: could not take it back. Re-park it with its state EXACTLY as it
+        // was (the pre-increment cycle count) so nothing is lost and nothing is
+        // spuriously consumed — a hole must never fall out of BOTH lists.
+        _cfLedgerAddGaveUp(l, height, parkedCycles, parkedLive);
+        return 0;
+    }
+    l->outstanding[i].attempts              = 0;   // a FRESH full retry cycle (30/60/120/120/120)
+    l->outstanding[i].headerRace            = 0;
+    l->outstanding[i].rearmCycles           = cycles;
+    l->outstanding[i].offersReachedLivePeer = 1;   // new cycle, not yet tainted
+
+    if (height > l->requestedThrough) l->requestedThrough = height;   // defensive; normally already covered
+    _cfLedgerAdvance(l);   // the height just swapped lists; min(outstanding[0],gaveUp[0]) is unchanged
+    return 1;
+}
+
 // ---- reporters -------------------------------------------------------------
 
 uint32_t BRCFScanLedgerScannedThrough(const BRCFScanLedger *l) { return l->scannedThrough; }
 size_t   BRCFScanLedgerOutstandingCount(const BRCFScanLedger *l) { return l->outstandingCount; }
 size_t   BRCFScanLedgerGaveUpCount(const BRCFScanLedger *l) { return l->gaveUpCount; }
+
+// ---- CF-retention scan-floor (Task 1) --------------------------------------
+
+// max(scannedThrough+1, abandonedBelow). gaveUp-INCLUSIVE by construction — see
+// the header contract (scannedThrough+1 already folds in min(outstanding[0],
+// gaveUp[0]) via _cfLedgerAdvance). Do NOT change to exclude gaveUp.
+uint32_t BRCFScanLedgerLowestNeededHeight(const BRCFScanLedger *l)
+{
+    uint32_t lo = l->scannedThrough + 1;
+    if (l->abandonedBelow > lo) lo = l->abandonedBelow;   // hard floor
+    return lo;
+}
+
+uint32_t BRCFScanLedgerAbandonedBelow(const BRCFScanLedger *l) { return l->abandonedBelow; }
+
+uint32_t BRCFScanLedgerAbandonGaveUpBelow(BRCFScanLedger *l, uint32_t clamp,
+                                          uint32_t *outCount, uint32_t *outLo, uint32_t *outHi)
+{
+    // The new hard floor = min(clamp, lowest-still-OUTSTANDING). NEVER advance past
+    // a still-retrying outstanding hole (recoverable — we do not abandon it), and
+    // never backward (monotonic). outstanding[] is sorted, so outstanding[0] is
+    // the lowest still-retrying hole. Compute this FIRST — it bounds the drop.
+    uint32_t target = clamp;
+    if (l->outstandingCount > 0 && l->outstanding[0].height < target) {
+        target = l->outstanding[0].height;
+    }
+
+    // Drop the retry-exhausted (gaveUp) prefix below `target` — NOT below `clamp`.
+    // abandonedBelow is the SINGLE PERSISTED source of truth for abandonment, and
+    // it only reaches `target`; a gaveUp height in [target, clamp) (i.e. above a
+    // still-outstanding hole) must be KEPT so it survives a restart in the
+    // persisted gaveUp list — dropping it would lose it silently (not in gaveUp,
+    // not below the persisted watermark, never scanned). gaveUp[] is sorted, so
+    // entries < target form a front prefix [0..k). The dropped count + [lo..hi]
+    // range are RETURNED (the pure ledger has no logger) for the caller to warn-log.
+    size_t k = 0;
+    while (k < l->gaveUpCount && l->gaveUp[k] < target) k++;
+    uint32_t count = (uint32_t)k;
+    uint32_t lo = (k > 0) ? l->gaveUp[0]     : CF_LEDGER_NO_DROP;
+    uint32_t hi = (k > 0) ? l->gaveUp[k - 1] : CF_LEDGER_NO_DROP;
+    _cfLedgerGaveUpDropPrefix(l, k);   // shifts gaveUp[] + its two parallel B2 arrays together
+
+    // Advance the watermark ONLY to cover heights actually abandoned — to the
+    // highest dropped gaveUp + 1 (`hi + 1`), NEVER preemptively to `target`/
+    // `clamp` (Part 3b determinism guard). Preemptively raising abandonedBelow
+    // past unscanned history would let a deep restore whose scan hasn't started
+    // (empty outstanding, e.g. ClearMemory fired during header sync before the
+    // cfilter scan requests anything) COMPLETE with a WRONG BALANCE — deep history
+    // never scanned, the single worst outcome this codebase can produce. So the
+    // watermark advances IFF gaveUp was dropped (k>0): a caller's WARN on
+    // *outCount>0 is then exactly a WARN on any advance, and "abandonedBelow==0"
+    // is a verified log fact. Every dropped height hi < target ≤ outstanding[0],
+    // so hi+1 ≤ outstanding[0] never advances past a still-outstanding
+    // (recoverable) hole; the `> l->abandonedBelow` test keeps it monotonic.
+#ifdef DETERMINISM_GUARD_PREEMPTIVE_ADVANCE
+    // PRE-GUARD shape — host-KAT red-before-green ONLY (never defined in a
+    // production build). Advanced to `target` even when NOTHING was dropped
+    // (k==0), the wrong-balance regression test_abandon_guard_no_preemptive_advance
+    // reproduces as RED. (Renamed from RETENTION_PREEMPTIVE_ADVANCE: the tip-anchored
+    // retention CEILING it was originally named for was deleted in paced-convoy
+    // Task 5; what this flag actually toggles is the DETERMINISM GUARD below.)
+    if (target > l->abandonedBelow) l->abandonedBelow = target;   // monotonic
+#else
+    if (k > 0 && hi + 1 > l->abandonedBelow) l->abandonedBelow = hi + 1;   // monotonic
+    // k == 0 → abandonedBelow unchanged: no preemptive raise. An empty
+    // gaveUp-below-clamp deep restore leaves the floor where it is and keeps
+    // retrying under the paced convoy, never a silent confident-wrong balance.
+    // (There is no app-layer depth refusal any more — no restore is refused at
+    // any depth — so this guard is the only thing standing between an unscanned
+    // deep history and a completed-but-wrong balance.)
+#endif
+
+    if (outCount) *outCount = count;
+    if (outLo)    *outLo    = lo;
+    if (outHi)    *outHi    = hi;
+    return BRCFScanLedgerLowestNeededHeight(l);
+}
+
+uint32_t BRCFScanLedgerAbandonUnscannableBelow(BRCFScanLedger *l, uint32_t lo, uint32_t floor,
+                                               uint32_t *outCount)
+{
+    if (outCount) *outCount = 0;
+
+    if (lo == 0 || floor == 0) return BRCFScanLedgerLowestNeededHeight(l);
+    // Heights already below the watermark were surfaced by an earlier call — they
+    // must not be counted (or warned about) twice. Clamping here is what makes the
+    // contract EXACT: *outCount > 0 now holds iff abandonedBelow actually advances,
+    // so a caller's WARN is still precisely a WARN on every advance and nothing else.
+    if (lo < l->abandonedBelow) lo = l->abandonedBelow;
+    // No preemptive raise (same discipline as AbandonGaveUpBelow): a floor at or
+    // below the low edge surfaces nothing, so abandonedBelow must not move and the
+    // caller must not warn.
+    if (lo >= floor) return BRCFScanLedgerLowestNeededHeight(l);
+
+    // Drop the unservable prefix from BOTH hole lists. These heights are below the
+    // block floor: no getcfilters can carry a resolvable stop hash for them and no
+    // cfilter response for them could be evaluated, so leaving them would pin
+    // _cfLedgerAdvance's min(outstanding[0], gaveUp[0]) cap forever — the invisible
+    // permanent pin. Both arrays are sorted ascending, so the entries form a front
+    // prefix.
+    size_t ko = 0;
+    while (ko < l->outstandingCount && l->outstanding[ko].height < floor) ko++;
+    if (ko > 0) {
+        memmove(&l->outstanding[0], &l->outstanding[ko],
+                (l->outstandingCount - ko) * sizeof(BRCFOutstanding));
+        l->outstandingCount -= ko;
+    }
+    size_t kg = 0;
+    while (kg < l->gaveUpCount && l->gaveUp[kg] < floor) kg++;
+    _cfLedgerGaveUpDropPrefix(l, kg);   // shifts gaveUp[] + its two parallel B2 arrays together
+
+    if (floor > l->abandonedBelow) l->abandonedBelow = floor;   // monotonic
+    _cfLedgerAdvance(l);
+
+    if (outCount) *outCount = floor - lo;
+    return BRCFScanLedgerLowestNeededHeight(l);
+}
 
 size_t BRCFScanLedgerHoleRanges(const BRCFScanLedger *l, uint32_t *outStarts, uint32_t *outEnds, size_t cap)
 {
@@ -671,12 +929,63 @@ size_t BRCFScanLedgerTakePending(BRCFScanLedger *l, UInt256 blockHash, UInt256 *
 //
 // Blob layout (little-endian, deterministic so the round-trip is byte-identical):
 //   magic u32 | version u32 | start u32 | scannedThrough u32 | requestedThrough u32
-//   outstandingCount u32 | { height u32, headerRace u8 } * count
-//   gaveUpCount u32 | { height u32 } * count
+//   abandonedBelow u32 (v2+ only)
+//   outstandingCount u32 | { height u32, headerRace u8, rearmCycles u8 (v3+) } * count
+//   gaveUpCount u32 | { height u32, rearmCycles u8, offersLive u8 (v3+) } * count
 // Persisted set only (§5): NOT attempts/timestamps/peers, NOT pending.
+//
+// Versioning:
+//   v1 -> v2 (CF-retention scan-floor Task 1): added abandonedBelow after
+//        requestedThrough (24-byte fixed header -> 28-byte).
+//   v2 -> v3 (paced-convoy Task 5, the B2 valve): added rearmCycles to every
+//        outstanding entry (5 -> 6 bytes each), and BOTH valve bytes to every
+//        gaveUp entry (4 -> 6 bytes each). The fixed header is unchanged at 28.
+// Parse accepts any version in [1..CF_LEDGER_VERSION]; fields a blob predates load
+// as 0 (exactly the v1->v2 shape). Serialize always writes the current layout.
+//
+// Why an OUTSTANDING entry persists rearmCycles but NOT offersReachedLivePeer:
+// the latch describes the cycle that `attempts` counts, and `attempts` is one of
+// the deliberately-unpersisted transients (§5) — Parse starts a fresh cycle, so a
+// restored hole starts untainted (latch 1) and a persisted taint would describe a
+// cycle that no longer exists. Persisting the latch would also break this module's
+// "Serialize -> Parse -> Serialize is byte-identical" property for any tainted
+// entry. rearmCycles is the opposite case and MUST persist: if it reset on every
+// process restart, a wallet backgrounded once per cycle could never reach
+// CF_CONVOY_REARM_MAX and the valve would never fire. A PARKED (gaveUp) hole's
+// cycle is finished, so both of its bytes are a frozen verdict and both persist.
+//
+// Back-compat consequence of a v1/v2 blob loading these as 0: every parked hole
+// simply gets its full CF_CONVOY_REARM_MAX re-arm budget again after the upgrade —
+// generous, never eager. Nothing is abandoned that would not have been.
 
-#define CF_LEDGER_MAGIC   0x43464C31u  // "CFL1"
-#define CF_LEDGER_VERSION 1u
+// EVERY back-compat branch below MUST compare against its OWN numbered constant
+// (CF_LEDGER_VERSION_2 / CF_LEDGER_VERSION_3), NEVER against CF_LEDGER_VERSION.
+// CF_LEDGER_VERSION means "the layout Serialize writes TODAY" and moves on every
+// bump; a branch written as `version >= CF_LEDGER_VERSION` silently changes
+// meaning at the next bump, so every already-shipped blob then takes the NARROWER
+// previous entry stride and mis-parses outstanding[]/gaveUp[] heights. The length
+// checks can still pass (a narrower stride needs FEWER bytes), so the failure is
+// silent, and a garbage gaveUp height feeds the B2 valve, which can raise the
+// MONOTONIC hard floor abandonedBelow to an arbitrary height = a permanent skip
+// of real history. This bit the v2->v3 bump once already (caught in review) and
+// the identical latent form survived one line over on the isV3 branch.
+#define CF_LEDGER_MAGIC     0x43464C31u  // "CFL1"
+#define CF_LEDGER_VERSION_1 1u           // pre-abandonedBelow (24-byte fixed header)
+#define CF_LEDGER_VERSION_2 2u           // adds abandonedBelow (28-byte fixed header)
+#define CF_LEDGER_VERSION_3 3u           // adds the B2 valve bytes per outstanding + gaveUp entry
+// The CURRENT layout. Overridable ONLY so the host KAT can simulate the NEXT
+// version bump (-DCF_LEDGER_VERSION=4u) and prove a v3 blob still takes the v3
+// stride; never overridden in a production build.
+#ifndef CF_LEDGER_VERSION
+#define CF_LEDGER_VERSION   CF_LEDGER_VERSION_3
+#endif
+
+// Per-entry sizes of the CURRENT (v3) layout, and of the pre-v3 layout Parse
+// still accepts.
+#define CF_LEDGER_OUT_ENTRY_V3  (4 + 1 + 1)  // height u32, headerRace u8, rearmCycles u8
+#define CF_LEDGER_OUT_ENTRY_V2  (4 + 1)      // height u32, headerRace u8
+#define CF_LEDGER_GU_ENTRY_V3   (4 + 2)      // height u32, rearmCycles u8, offersLive u8
+#define CF_LEDGER_GU_ENTRY_V2   (4)          // height u32
 
 static void _putU32(uint8_t *p, uint32_t v)
 {
@@ -694,8 +1003,9 @@ static uint32_t _getU32(const uint8_t *p)
 static size_t _cfLedgerSerializedSize(const BRCFScanLedger *l)
 {
     return 4 /*magic*/ + 4 /*version*/ + 4 /*start*/ + 4 /*scanned*/ + 4 /*requested*/
-         + 4 /*outCount*/ + l->outstandingCount * (4 + 1)
-         + 4 /*gaveUpCount*/ + l->gaveUpCount * 4;
+         + 4 /*abandonedBelow (v2)*/
+         + 4 /*outCount*/ + l->outstandingCount * CF_LEDGER_OUT_ENTRY_V3
+         + 4 /*gaveUpCount*/ + l->gaveUpCount * CF_LEDGER_GU_ENTRY_V3;
 }
 
 size_t BRCFScanLedgerSerialize(const BRCFScanLedger *l, uint8_t *buf, size_t buflen)
@@ -709,16 +1019,20 @@ size_t BRCFScanLedgerSerialize(const BRCFScanLedger *l, uint8_t *buf, size_t buf
     _putU32(p, l->start);             p += 4;
     _putU32(p, l->scannedThrough);    p += 4;
     _putU32(p, l->requestedThrough);  p += 4;
+    _putU32(p, l->abandonedBelow);    p += 4;   // v2
 
     _putU32(p, (uint32_t)l->outstandingCount); p += 4;
     for (size_t i = 0; i < l->outstandingCount; i++) {
         _putU32(p, l->outstanding[i].height); p += 4;
         *p++ = l->outstanding[i].headerRace;
+        *p++ = l->outstanding[i].rearmCycles;   // v3 (the latch is a per-cycle transient — see above)
     }
 
     _putU32(p, (uint32_t)l->gaveUpCount); p += 4;
     for (size_t i = 0; i < l->gaveUpCount; i++) {
         _putU32(p, l->gaveUp[i]); p += 4;
+        *p++ = l->gaveUpRearmCycles[i];   // v3
+        *p++ = l->gaveUpOffersLive[i];    // v3
     }
     return need;
 }
@@ -741,35 +1055,77 @@ int BRCFScanLedgerParse(BRCFScanLedger *l, const uint8_t *buf, size_t buflen)
     const uint8_t *p = buf;
     size_t remaining = buflen;
 
-    if (_getU32(p) != CF_LEDGER_MAGIC)   return 0;
-    if (_getU32(p + 4) != CF_LEDGER_VERSION) return 0;
+    if (_getU32(p) != CF_LEDGER_MAGIC) return 0;
+    uint32_t version = _getU32(p + 4);
+    if (version < CF_LEDGER_VERSION_1 || version > CF_LEDGER_VERSION) return 0;
     l->start            = _getU32(p + 8);
     l->scannedThrough   = _getU32(p + 12);
     l->requestedThrough = _getU32(p + 16);
-    uint32_t outCount   = _getU32(p + 20);
-    p += 24; remaining -= 24;
+
+    // v2 added abandonedBelow after requestedThrough (28-byte fixed header). A v1
+    // blob has no such field (24-byte header) → load abandonedBelow = 0 (back-compat).
+    uint32_t outCount;
+    size_t hdr;
+    if (version >= CF_LEDGER_VERSION_2) {
+        if (buflen < 28) return 0;
+        l->abandonedBelow = _getU32(p + 20);
+        outCount          = _getU32(p + 24);
+        hdr = 28;
+    } else {
+        l->abandonedBelow = 0;
+        outCount          = _getU32(p + 20);
+        hdr = 24;
+    }
+    p += hdr; remaining -= hdr;
+
+    // v3 added the two B2 valve bytes to each outstanding and each gaveUp entry.
+    // Same back-compat shape as v1→v2: a pre-v3 blob simply has narrower entries
+    // and the new fields load as 0.
+#ifdef CF_LEDGER_STRIDE_GATE_UNFIXED
+    // PRE-FIX shape — host-KAT red-before-green ONLY (never a production build).
+    // Compares against the CURRENT version instead of v3's own constant, so with
+    // -DCF_LEDGER_VERSION=4u (the simulated next bump) a real v3 blob takes the
+    // NARROW v2 stride and mis-parses, silently.
+    const int      isV3        = (version >= CF_LEDGER_VERSION) ? 1 : 0;
+#else
+    const int      isV3        = (version >= CF_LEDGER_VERSION_3) ? 1 : 0;
+#endif
+    const size_t   outEntry    = isV3 ? CF_LEDGER_OUT_ENTRY_V3 : CF_LEDGER_OUT_ENTRY_V2;
+    const size_t   guEntry     = isV3 ? CF_LEDGER_GU_ENTRY_V3  : CF_LEDGER_GU_ENTRY_V2;
 
     if (outCount > CF_OUTSTANDING_MAX) return 0;
-    if (remaining < (size_t)outCount * (4 + 1) + 4) return 0;
+    if (remaining < (size_t)outCount * outEntry + 4) return 0;
 
     for (uint32_t i = 0; i < outCount; i++) {
         l->outstanding[i].height      = _getU32(p); p += 4;
         l->outstanding[i].headerRace  = *p++;
+        l->outstanding[i].rearmCycles = isV3 ? *p++ : 0;   // v3 (pre-v3 → 0: a full fresh re-arm budget)
         // reset (not persisted, §5): fresh process -> fresh peers
         l->outstanding[i].peer        = UINT128_ZERO;
         l->outstanding[i].port        = 0;
         l->outstanding[i].requestedAt = 0;
         l->outstanding[i].attempts    = 0;
+        // The latch describes the cycle `attempts` counts, and attempts just reset
+        // to 0 — this hole begins a genuinely FRESH cycle, so it begins untainted.
+        // (Carrying a stale taint in would only ever cost an extra ~7.5-min cycle
+        // before the valve could act; it is never the eager direction.)
+        l->outstanding[i].offersReachedLivePeer = 1;
     }
     l->outstandingCount = outCount;
-    remaining -= (size_t)outCount * (4 + 1);
+    remaining -= (size_t)outCount * outEntry;
 
     uint32_t gaveUpCount = _getU32(p); p += 4; remaining -= 4;
     if (gaveUpCount > CF_GAVEUP_MAX) return 0;
-    if (remaining < (size_t)gaveUpCount * 4) return 0;
+    if (remaining < (size_t)gaveUpCount * guEntry) return 0;
 
     for (uint32_t i = 0; i < gaveUpCount; i++) {
         l->gaveUp[i] = _getU32(p); p += 4;
+        // A PARKED hole's cycle is finished, so both bytes are the frozen verdict
+        // of that cycle and are restored faithfully. rearmCycles especially: if it
+        // reset on every process restart, a wallet backgrounded once per cycle
+        // could never reach CF_CONVOY_REARM_MAX and the valve would never fire.
+        l->gaveUpRearmCycles[i] = isV3 ? *p++ : 0;
+        l->gaveUpOffersLive[i]  = isV3 ? *p++ : 0;
     }
     l->gaveUpCount = gaveUpCount;
 

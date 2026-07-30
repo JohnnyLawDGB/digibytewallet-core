@@ -1499,10 +1499,18 @@ static void _BRPeerManagerSurfaceUnscannableLocked(BRPeerManager *manager, uint3
     // Determinism, same shape as the B2 valve: cnt>0 <=> abandonedBelow advanced
     // <=> this WARN. "abandonedBelow == 0" therefore stays a verified log fact.
     if (cnt > 0) {
-        CF_RETENTION_WLOG("[CF-SCAN] ABANDONED %u height(s) [%u..%u] — below the in-memory block floor "
-                          "%u, unscannable this session (%s). Surfaced for recovery "
+        // The CAUSE comes from `why` — do NOT re-assert one in the format string. It
+        // used to read "below the in-memory block floor %u", which was true of the
+        // three original callers and FALSE of the fourth (the B2 valve's capped-and-
+        // un-parkable pin, whose band has nothing to do with the block floor). `floor`
+        // is the new watermark, so it is labelled as exactly that; the number is
+        // unchanged and no caller loses information (each `why` already names its own
+        // cause). The "ABANDONED %u height(s) [%u..%u]" prefix is deliberately
+        // byte-identical — that is what operators and the host KATs key on.
+        CF_RETENTION_WLOG("[CF-SCAN] ABANDONED %u height(s) [%u..%u] — unscannable this session (%s); "
+                          "abandonedBelow=%u. Surfaced for recovery "
                           "(rescan or 'Scan for missing transactions').\n",
-                          cnt, lo, floor - 1, floor, why ? why : "");
+                          cnt, lo, floor - 1, why ? why : "", floor);
     }
 }
 
@@ -3933,6 +3941,50 @@ void BRPeerManagerKeepAlive(BRPeerManager *manager)
         //      actually reached a connected CF peer (the offersReachedLivePeer
         //      latch) AND >= 1 CF peer is connected right now.
         //
+        // ---- F4 Part B: TWO DEFECTS IN THE ABOVE, BOTH FIXED HERE ---------------
+        //
+        // (B-i) THE ARM PREDICATE WAS BLIND TO A CAPPED OUTSTANDING HOLE. It read
+        // "gaveUp[0] < outstanding[0].height", i.e. it treated every outstanding
+        // entry as recoverable-and-being-retried. An outstanding entry at
+        // CF_REREQ_MAX_ATTEMPTS is not: NextRerequest skips it and
+        // PeekRerequestRange never selects it, so no driver will ever offer it
+        // again. It is a parked hole that merely failed to reach gaveUp (because
+        // _cfLedgerMoveToGaveUp found gaveUp full), and it pins the frontier
+        // forever while the valve reads its own predicate as FALSE. That is exactly
+        // the state the frozen-frontier field trace terminated in
+        // (outstanding[0] = F+1 at attempts 5, gaveUp[0] = F+2, gaveUp at its
+        // ceiling). F4 Part A removes the easy route in by sizing CF_GAVEUP_MAX to
+        // CF_OUTSTANDING_MAX; this removes the last one. The valve now asks
+        // BRCFScanLedgerPinningHole for the lowest hole in EITHER list and acts iff
+        // that hole is not OFFERABLE — so a capped outstanding hole and a gaveUp
+        // hole get the same treatment, which is the only honest reading of "no
+        // driver will ever touch this again".
+        //
+        // (B-ii) IT ACTED ON ONE HEIGHT PER CYCLE. Holes arrive in runs — Peek
+        // coalesces up to CF_REREQ_MAX_RANGE (1000) contiguous heights into ONE
+        // getcfilters, and a dead range that size retires as a block. Re-arming and
+        // abandoning ONE height per (1 + CF_CONVOY_REARM_MAX) x 7.5-min sequence
+        // would take ~15 DAYS to clear a 1000-height band: an escape that exists on
+        // paper and not in the field. Both halves now act on the contiguous parked
+        // RUN at the pin, bounded by CF_REREQ_MAX_RANGE — the same unit the driver
+        // already re-requests as one message, so the whole run shares one retry
+        // cycle and one offered-and-refused verdict, and the band clears in one
+        // ~22.5-min sequence. The DECISION is unchanged and still per-run-member:
+        // BRCFScanLedgerAbandonableRunFrom only extends the abandonment run across
+        // heights that individually satisfy rearmCycles >= rearmMax AND
+        // offersReachedLivePeer — the first that does not ends the run and becomes
+        // the next tick's pin.
+        //
+        // THE INVARIANT (outranks liveness, unchanged by any of this): NOTHING here
+        // advances scannedThrough over a height that never received MarkEvaluated.
+        // Both abandonment primitives raise abandonedBelow FIRST and only then let
+        // _cfLedgerAdvance climb, and both report the count so the WARN below is
+        // exactly a WARN on any advance — the band is SURFACED (abandonedBelow →
+        // CfAbandonmentStore → banner → rescan / node-reconcile), never silently
+        // skipped. AbandonGaveUpBelow additionally clamps its target at the lowest
+        // still-OUTSTANDING hole, so it can never pass a height that is still being
+        // retried.
+        //
         // HONEST SCOPE — do NOT widen this claim. What is proven is refusal by the
         // CURRENTLY-CONNECTED CF-peer subset, NOT fleet-wide unservability. Under
         // fleet saturation (a canon oracle that HAS the filter sitting at
@@ -3950,22 +4002,48 @@ void BRPeerManagerKeepAlive(BRPeerManager *manager)
         {
             uint32_t gvH = 0;
             uint8_t  gvCycles = 0, gvOffersLive = 0;
+            int      pinArmed = 0;    // is the pinning hole the valve's business this tick?
+
             // Only the hole that actually PINS the scan frontier is the valve's
             // business. _cfLedgerAdvance caps scannedThrough at
             // min(outstanding[0], gaveUp[0]) - 1, so the pinning hole is exactly the
-            // LOWEST hole of either kind — this asks "is that lowest hole a gaveUp
-            // one?". A gaveUp height sitting ABOVE a still-outstanding (recoverable,
-            // still-retrying) hole is NOT what blocks the convoy, and abandoning it
-            // would drop coverage nothing was waiting on.
+            // LOWEST hole of either kind — and the valve acts iff NO DRIVER WILL EVER
+            // OFFER IT AGAIN (a gaveUp hole, or a capped outstanding one: see F4
+            // Part B-i above). A hole sitting ABOVE a still-retrying one is NOT what
+            // blocks the convoy, and abandoning it would drop coverage nothing was
+            // waiting on.
             //
-            // Deliberately NOT written as `gvH == LowestNeededHeight`: that reads
+            // Deliberately NOT written as `pin == LowestNeededHeight`: that reads
             // scannedThrough, which only ever moves in MarkEvaluated, so a floor gap
             // that has not been evaluated yet (a fresh/resumed scan whose lowest
             // heights were never requested) would leave LowestNeededHeight below the
             // hole and the valve permanently inert — the wedge, back again.
-            if (BRCFScanLedgerLowestGaveUp(&manager->cfLedger, &gvH, &gvCycles, &gvOffersLive) &&
-                (manager->cfLedger.outstandingCount == 0 ||
-                 gvH < manager->cfLedger.outstanding[0].height)) {
+#ifdef CONVOY_B2_ARM_PREDICATE_UNFIXED
+            // RED-before-green shape ONLY (never in a production build): the PRE-F4
+            // predicate. It reads outstanding[0] as recoverable regardless of its
+            // attempt count, so a CAPPED outstanding hole below gaveUp[0] — one no
+            // driver will ever offer again — reads as "being retried" and the valve
+            // stays inert while that hole pins the frontier forever.
+            pinArmed = (BRCFScanLedgerLowestGaveUp(&manager->cfLedger, &gvH, &gvCycles, &gvOffersLive) &&
+                        (manager->cfLedger.outstandingCount == 0 ||
+                         gvH < manager->cfLedger.outstanding[0].height));
+#else
+            {
+                int pinOfferable = 1;
+                pinArmed = BRCFScanLedgerPinningHole(&manager->cfLedger, &gvH, &pinOfferable,
+                                                     &gvCycles, &gvOffersLive) && ! pinOfferable;
+            }
+#endif
+            if (pinArmed) {
+                // Where the pin LIVES decides which abandonment primitive can reach
+                // it. AbandonGaveUpBelow only drops gaveUp entries; a capped
+                // OUTSTANDING pin needs the surfacing path
+                // (_BRPeerManagerSurfaceUnscannableLocked → AbandonUnscannableBelow),
+                // which drops from both lists. Both raise abandonedBelow and WARN, so
+                // either way the band is surfaced, never silently skipped. Read
+                // through the lock-free struct fields — manager->lock is HELD.
+                const int pinInGaveUp = (manager->cfLedger.gaveUpCount > 0 &&
+                                         manager->cfLedger.gaveUp[0] == gvH);
 
                 // Count with the SAME predicate the residual driver's Pass A uses to
                 // pick `chosen`, so "a CF peer is connected" means exactly "the
@@ -3995,21 +4073,50 @@ void BRPeerManagerKeepAlive(BRPeerManager *manager)
 #else
                 const uint32_t rearmMax = CF_CONVOY_REARM_MAX;
 #endif
+#ifdef CONVOY_B2_SINGLE_HEIGHT_STEP
+                // RED-before-green shape ONLY: the PRE-F4 one-height-per-cycle valve.
+                // Correct per height, but ~15 days to clear one CF_REREQ_MAX_RANGE
+                // dead band — an escape that exists on paper only (F4 Part B-ii).
+                const size_t runCap = 1;
+#else
+                const size_t runCap = CF_REREQ_MAX_RANGE;
+#endif
 
                 if (cfPeers > 0) {
                     if (gvCycles >= rearmMax && gvOffersLive) {
                         // ---- ABANDON: offered-and-refused by live CF peers across a
                         // full deciding cycle, with a CF peer connected right now.
-                        uint32_t cnt = 0, lo = 0, hi = 0;
-                        BRCFScanLedgerAbandonGaveUpBelow(&manager->cfLedger, gvH + 1, &cnt, &lo, &hi);
-                        // Determinism guard (retained): abandonedBelow advances IFF
-                        // gaveUp was actually dropped, so cnt>0 <=> advance <=> WARN.
-                        if (cnt > 0) {
-                            CF_RETENTION_WLOG("[CF-SCAN] ABANDONED %u height(s) [%u..%u] — refused by every "
-                                              "connected CF peer across %u re-arm cycle(s) (%d CF peer(s) "
-                                              "connected); abandonedBelow=%u — reconcile or rescan to recover",
-                                              cnt, lo, hi, (unsigned)gvCycles, cfPeers,
-                                              BRCFScanLedgerAbandonedBelow(&manager->cfLedger));
+                        // Extend across the contiguous parked run whose EVERY member
+                        // individually carries the same proof; the first that does not
+                        // ends the run and becomes the next tick's pin.
+                        uint32_t runHi = gvH;
+                        size_t   runN  = BRCFScanLedgerAbandonableRunFrom(&manager->cfLedger, gvH, runCap,
+                                                                          (uint8_t)rearmMax, &runHi);
+                        if (runN > 0) {
+                            uint32_t cnt = 0, lo = 0, hi = 0;
+                            if (pinInGaveUp) {
+                                BRCFScanLedgerAbandonGaveUpBelow(&manager->cfLedger, runHi + 1u,
+                                                                 &cnt, &lo, &hi);
+                                // Determinism guard (retained): abandonedBelow advances IFF
+                                // gaveUp was actually dropped, so cnt>0 <=> advance <=> WARN.
+                                if (cnt > 0) {
+                                    CF_RETENTION_WLOG("[CF-SCAN] ABANDONED %u height(s) [%u..%u] — refused by every "
+                                                      "connected CF peer across %u re-arm cycle(s) (%d CF peer(s) "
+                                                      "connected); abandonedBelow=%u — reconcile or rescan to recover",
+                                                      cnt, lo, hi, (unsigned)gvCycles, cfPeers,
+                                                      BRCFScanLedgerAbandonedBelow(&manager->cfLedger));
+                                }
+                            }
+                            else {
+                                // The capped-OUTSTANDING pin (gaveUp was full when it
+                                // re-exhausted). Same evidence, same surfacing contract —
+                                // abandonedBelow + WARN — via the primitive that can
+                                // actually drop an outstanding entry. It warns internally
+                                // on cnt>0, so the determinism shape is identical.
+                                _BRPeerManagerSurfaceUnscannableLocked(manager, gvH, runHi + 1u,
+                                        "B2: retry-exhausted and un-parkable (gaveUp at its ceiling), "
+                                        "offered and refused by every connected CF peer");
+                            }
                         }
                     }
                     else {
@@ -4017,17 +4124,22 @@ void BRPeerManagerKeepAlive(BRPeerManager *manager)
                         // CURRENT peer set. Also the path a TAINTED deciding cycle
                         // takes (gvOffersLive == 0) — a cycle whose offers did not all
                         // reach a live peer can never be the one that abandons, so the
-                        // hole keeps being worked instead.
-                        if (BRCFScanLedgerReArmGaveUp(&manager->cfLedger, gvH)) {
+                        // hole keeps being worked instead. Run-wide (bounded by
+                        // CF_REREQ_MAX_RANGE) so the whole band shares ONE cycle and
+                        // Peek coalesces it back into ONE getcfilters.
+                        size_t n = BRCFScanLedgerReArmParkedRun(&manager->cfLedger, gvH, runCap);
+                        if (n > 0) {
                             // Peer-less log: passing the bare BR_PEER_NONE sentinel to
                             // peer_log casts it to BRPeerContext* and writes inet_ntop's
                             // host string past the end of the stack temporary (see the
                             // "sync failed — no peers connected" site). Use _peer_log.
-                            _peer_log("cf-ledger: B2 re-armed gaveUp hole %u for a fresh retry cycle "
-                                      "(cycle %u, %d CF peer(s) connected, prev cycle %s)\n",
-                                      gvH, (unsigned)(gvCycles + 1), cfPeers,
+                            _peer_log("cf-ledger: B2 re-armed %zu parked hole(s) from %u for a fresh retry "
+                                      "cycle (cycle %u, %d CF peer(s) connected, prev cycle %s, pin was %s)\n",
+                                      n, gvH, (unsigned)(gvCycles + 1), cfPeers,
                                       gvOffersLive ? "fully offered to live peers"
-                                                   : "TAINTED (an offer missed a live peer)");
+                                                   : "TAINTED (an offer missed a live peer)",
+                                      pinInGaveUp ? "parked in gaveUp"
+                                                  : "CAPPED in outstanding (gaveUp at its ceiling)");
                         }
                     }
                 }

@@ -650,6 +650,144 @@ int BRCFScanLedgerLowestGaveUp(const BRCFScanLedger *l, uint32_t *outHeight,
     return 1;
 }
 
+// Index of `height` in gaveUp[], or gaveUpCount if absent (sorted ascending).
+static size_t _cfLedgerGaveUpIndex(const BRCFScanLedger *l, uint32_t height)
+{
+    size_t i = 0;
+    while (i < l->gaveUpCount && l->gaveUp[i] < height) i++;
+    if (i < l->gaveUpCount && l->gaveUp[i] == height) return i;
+    return l->gaveUpCount;
+}
+
+// Is this outstanding entry PARKED — i.e. capped, so no driver will ever offer it?
+// The single place that definition lives; BRCFScanLedgerNextRerequest's `continue`
+// and BRCFScanLedgerPeekRerequestRange's candidate test are the two drivers it
+// mirrors, and if either cap test ever changes this must change with it.
+static int _cfLedgerOutstandingIsParked(const BRCFOutstanding *e)
+{
+    return e->attempts >= CF_REREQ_MAX_ATTEMPTS;
+}
+
+int BRCFScanLedgerPinningHole(const BRCFScanLedger *l, uint32_t *outHeight, int *outOfferable,
+                              uint8_t *outRearmCycles, uint8_t *outOffersReachedLivePeer)
+{
+    const int haveOut  = (l->outstandingCount > 0);
+    const int haveGave = (l->gaveUpCount > 0);
+    if (! haveOut && ! haveGave) return 0;
+
+    // Both arrays are sorted ascending, so the pin is one of the two fronts. On a
+    // tie the OUTSTANDING record wins (see the header note): the reluctant
+    // direction, since an offerable pin withholds abandonment entirely.
+    const int pinIsOutstanding = haveOut && (! haveGave || l->outstanding[0].height <= l->gaveUp[0]);
+
+    if (pinIsOutstanding) {
+        const BRCFOutstanding *e = &l->outstanding[0];
+        if (outHeight)                *outHeight                = e->height;
+        if (outOfferable)             *outOfferable             = _cfLedgerOutstandingIsParked(e) ? 0 : 1;
+        if (outRearmCycles)           *outRearmCycles           = e->rearmCycles;
+        if (outOffersReachedLivePeer) *outOffersReachedLivePeer = e->offersReachedLivePeer;
+    }
+    else {
+        if (outHeight)                *outHeight                = l->gaveUp[0];
+        if (outOfferable)             *outOfferable             = 0;   // no driver ever offers a gaveUp hole
+        if (outRearmCycles)           *outRearmCycles           = l->gaveUpRearmCycles[0];
+        if (outOffersReachedLivePeer) *outOffersReachedLivePeer = l->gaveUpOffersLive[0];
+    }
+    return 1;
+}
+
+size_t BRCFScanLedgerAbandonableRunFrom(const BRCFScanLedger *l, uint32_t startH, size_t maxRun,
+                                        uint8_t minCycles, uint32_t *outHi)
+{
+    size_t   n  = 0;
+    uint32_t h  = startH;
+    uint32_t hi = startH;
+
+    // Merge-walk both sorted arrays forward once (O(runLen + n)) rather than a
+    // lower-bound search per height: this runs under manager->lock and maxRun can
+    // be CF_REREQ_MAX_RANGE.
+    size_t io = 0, ig = 0;
+    while (io < l->outstandingCount && l->outstanding[io].height < startH) io++;
+    while (ig < l->gaveUpCount      && l->gaveUp[ig]            < startH) ig++;
+
+    while (n < maxRun) {
+        uint8_t cycles, offersLive;
+
+        if (io < l->outstandingCount && l->outstanding[io].height == h) {
+            const BRCFOutstanding *e = &l->outstanding[io];
+            if (! _cfLedgerOutstandingIsParked(e)) break;   // still being retried — not parked
+            cycles = e->rearmCycles; offersLive = e->offersReachedLivePeer;
+            io++;
+            // Defensive: a drifted duplicate in gaveUp must not stall the walk.
+            if (ig < l->gaveUpCount && l->gaveUp[ig] == h) ig++;
+        }
+        else if (ig < l->gaveUpCount && l->gaveUp[ig] == h) {
+            cycles = l->gaveUpRearmCycles[ig]; offersLive = l->gaveUpOffersLive[ig];
+            ig++;
+        }
+        else break;                                        // not a hole at all — run ends
+
+        // The valve's abandon threshold, tested PER MEMBER — a height one cycle short,
+        // or whose deciding cycle was tainted, ENDS the run and becomes the next tick's
+        // pin rather than being carried along by its neighbours' evidence.
+        if (cycles < minCycles || ! offersLive) break;
+
+        n++; hi = h;
+        if (h == UINT32_MAX_VAL) break;                    // no h+1 to walk to
+        h++;
+    }
+
+    if (n > 0 && outHi) *outHi = hi;
+    return n;
+}
+
+size_t BRCFScanLedgerReArmParkedRun(BRCFScanLedger *l, uint32_t startH, size_t maxRun)
+{
+    size_t n = 0;
+
+    for (uint32_t h = startH; n < maxRun; h++) {
+        // Hard floor: an abandoned height is never resurrected (same rule
+        // ReArmGaveUp / RecordRequested / MarkHeaderRace / Peek enforce).
+        if (h < l->abandonedBelow) break;
+
+        // Re-read the arrays every iteration: the previous step mutated BOTH (a
+        // gaveUp removal plus an outstanding insert), so no cached index survives —
+        // hence no merge-walk here (unlike AbandonableRunFrom, which is read-only).
+        // COST, stated: O(maxRun x (outstandingCount + gaveUpCount)) lookups plus one
+        // list-move per gaveUp member, i.e. a few ms at maxRun == CF_REREQ_MAX_RANGE,
+        // under manager->lock. Bounded and rare — the valve re-arms at most once per
+        // exhausted retry cycle (>= 7.5 min), not per KeepAlive tick. This is NOT the
+        // O(chainLen) prevBlock-descent-per-send cost class (F1 / Pass A/B/C): there is
+        // no chain walk here, only array indexing on fixed-size arrays.
+        size_t i = _cfLedgerLowerBound(l, h);
+        if (i < l->outstandingCount && l->outstanding[i].height == h) {
+            BRCFOutstanding *e = &l->outstanding[i];
+            if (! _cfLedgerOutstandingIsParked(e)) break;   // offerable: leave the driver to it
+            // Exactly ReArmGaveUp's state change, minus the list move. peer/port are
+            // cleared so PeekRerequestRange's same-(peer,port) coalescing keeps the
+            // whole re-armed run in ONE getcfilters.
+            e->attempts              = 0;
+            e->requestedAt           = 0;   // elapsed >= any backoff => due on this very tick
+            e->peer                  = UINT128_ZERO;
+            e->port                  = 0;
+            e->headerRace            = 0;
+            if (e->rearmCycles < 0xFFu) e->rearmCycles++;   // saturating: never wrap (that resets the proof)
+            e->offersReachedLivePeer = 1;                   // new cycle, not yet tainted
+            n++;
+        }
+        else if (_cfLedgerGaveUpIndex(l, h) < l->gaveUpCount) {
+            if (! BRCFScanLedgerReArmGaveUp(l, h)) break;   // outstanding full / below the floor
+            n++;
+        }
+        else break;                                          // not a hole — the run ends
+
+        if (h == UINT32_MAX_VAL) break;                      // guards the h++ above
+    }
+
+    if (n > 0) _cfLedgerAdvance(l);   // no-op in practice (the pin did not move), kept for safety
+    return n;
+}
+
 void BRCFScanLedgerMarkOffersMissedLivePeer(BRCFScanLedger *l, uint32_t startH, uint32_t stopH)
 {
     if (stopH < startH) return;

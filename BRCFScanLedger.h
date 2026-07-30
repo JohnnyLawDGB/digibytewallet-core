@@ -73,7 +73,46 @@ extern "C" {
 #define CF_OUTSTANDING_MAX      4096  // hard cap; overflow drops OLDEST (caller LOGWs its height range)
 #define CF_PENDING_CONFIRM_MAX   256  // blocks awaiting header-connect confirmation
 #define CF_PENDING_TX_MAX         32  // wallet txs recorded per pending block (small, capped)
-#define CF_GAVEUP_MAX            512  // heights that exhausted retries — REPORTED, never dropped
+
+// heights that exhausted retries — REPORTED, never dropped.
+//
+// SIZED TO CF_OUTSTANDING_MAX, NOT SMALLER — this is a CORRECTNESS bound, not a
+// footprint knob (F4 Part A). It was 512 while CF_REREQ_MAX_RANGE is 1000, i.e.
+// the ceiling on the parked set was HALF the largest run
+// BRCFScanLedgerPeekRerequestRange can coalesce and offer as one getcfilters. A
+// maximal dead run therefore could never be fully retired: RetireCapped walks
+// `outstanding` from the front, _cfLedgerMoveToGaveUp returns 0 once gaveUp is
+// full, and RetireCapped then KEEPS that entry in `outstanding` — where it is
+// capped, so no driver ever offers it again (NextRerequest's
+// `attempts >= CF_REREQ_MAX_ATTEMPTS` continue; PeekRerequestRange's
+// `attempts < CF_REREQ_MAX_ATTEMPTS` candidate test). 512 heights park, 488 sit
+// in `outstanding` forever, and because _cfLedgerAdvance caps scannedThrough at
+// min(outstanding[0], gaveUp[0]) - 1 they pin the scan frontier — and therefore
+// the whole paced convoy — permanently.
+//
+// The B2 valve cannot rescue that state either: once it re-arms the lowest
+// parked hole, that hole becomes outstanding[0] BELOW gaveUp[0], and when its
+// fresh cycle re-exhausts, gaveUp is full again so it cannot be re-parked. See
+// the arm-predicate discussion in BRPeerManager.c's B2 block for the other half
+// of that fix.
+//
+// So the bound that makes the class structurally impossible is: gaveUp must be
+// able to absorb EVERYTHING outstanding can hold. Any smaller value (even one
+// >= CF_REREQ_MAX_RANGE, e.g. 1024) merely moves the defect further out — 4096
+// dead heights across five runs reproduce it exactly.
+//
+// FOOTPRINT (stated, not buried): the parked entry is 6 bytes — gaveUp[]
+// (uint32_t) + gaveUpRearmCycles[] (uint8_t) + gaveUpOffersLive[] (uint8_t).
+// 512 -> 4096 is +3584 entries = +21,504 bytes ≈ +21 KiB on the single
+// BRPeerManager-embedded ledger, against the ~128 KiB outstanding[] (4096 x
+// sizeof(BRCFOutstanding)) already sitting next to it. Persisted blob (§5) grows
+// by the same 6 bytes per ACTUAL parked height, worst case +21 KiB.
+#ifdef CF_GAVEUP_CEILING_UNFIXED
+// PRE-FIX shape — host-KAT red-before-green ONLY, never a production build.
+#define CF_GAVEUP_MAX            512
+#else
+#define CF_GAVEUP_MAX            CF_OUTSTANDING_MAX
+#endif
 
 // Phase-2 re-request backoff — PINNED 2026-07-25 (§3, §13):
 #define CF_REREQ_HEADERRACE_SECS  10  // header-race first retry — the header connects quickly
@@ -81,6 +120,20 @@ extern "C" {
 #define CF_REREQ_BACKOFF_CAP_SECS 120 // delay = min(BASE << attempts, CAP) → 30/60/120/120/120
 #define CF_REREQ_MAX_ATTEMPTS      5  // per-height cap; on reaching it → gaveUp list (NEVER silent)
 #define CF_REREQ_MAX_RANGE      1000  // == MAX_CFILTERS_RESULTS (BRPeer.h:116) — Peek's coalesced-run cap
+
+// The F4 Part A bound, asserted at COMPILE TIME so a future footprint trim of
+// CF_GAVEUP_MAX cannot silently re-open the "a maximal run can never be fully
+// retired" wedge. Deliberately NOT asserted in the CF_GAVEUP_CEILING_UNFIXED
+// build — that build exists precisely to compile the violating shape for the
+// red-before-green gate.
+#if !defined(CF_GAVEUP_CEILING_UNFIXED) && defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L
+_Static_assert(CF_GAVEUP_MAX >= CF_OUTSTANDING_MAX,
+               "CF_GAVEUP_MAX must absorb everything outstanding[] can hold, else "
+               "BRCFScanLedgerRetireCapped leaves capped heights in outstanding[] where no "
+               "driver offers them and they pin scannedThrough forever (F4 Part A)");
+_Static_assert(CF_GAVEUP_MAX >= CF_REREQ_MAX_RANGE,
+               "CF_GAVEUP_MAX must at minimum absorb one maximal coalesced re-request run");
+#endif
 
 // Phase-2 driver back-pressure (Task 5, BRPeerManagerKeepAlive) — PINNED 2026-07-26:
 // forward auto-fetch pauses once outstandingCount reaches this low-water mark, so a
@@ -324,6 +377,81 @@ int      BRCFScanLedgerReArmGaveUp(BRCFScanLedger *l, uint32_t height);
 // is sorted ascending, so gaveUp[0] is the hole that pins the scan frontier.
 int      BRCFScanLedgerLowestGaveUp(const BRCFScanLedger *l, uint32_t *outHeight,
                                     uint8_t *outRearmCycles, uint8_t *outOffersReachedLivePeer);
+
+// ---- B2 valve: the PINNING hole, whatever list it lives in (F4 Part B) ------
+//
+// WHY LowestGaveUp IS NOT ENOUGH. The valve's job is to unstick the ONE hole that
+// pins the scan frontier — exactly the height _cfLedgerAdvance caps scannedThrough
+// one below, i.e. min(outstanding[0], gaveUp[0]). Its original arm predicate read
+// that as "gaveUp[0] < outstanding[0]", which treats ANY outstanding entry as
+// recoverable-and-being-retried. That is false for a CAPPED one: an outstanding
+// entry at CF_REREQ_MAX_ATTEMPTS is skipped by BRCFScanLedgerNextRerequest (the
+// `attempts >= CF_REREQ_MAX_ATTEMPTS` continue) and never selected by
+// BRCFScanLedgerPeekRerequestRange (whose candidate test requires
+// `attempts < CF_REREQ_MAX_ATTEMPTS`), so NO driver will ever offer it again. It is
+// a PARKED hole that merely failed to reach gaveUp — operationally identical to a
+// gaveUp hole, but invisible to the valve, and it pins the frontier forever.
+//
+// That state is reached whenever _cfLedgerMoveToGaveUp cannot park a capped entry,
+// i.e. gaveUp is full. F4 Part A removes the easy route to it (CF_GAVEUP_MAX now
+// absorbs everything outstanding[] can hold), but not the last one: the valve
+// re-arms gaveUp[0] into outstanding, another height retires into the freed slot,
+// and when the re-armed hole re-exhausts gaveUp is full again — outstanding[0]
+// below gaveUp[0], capped, unofferable, and the old predicate reads FALSE forever.
+// Both halves are needed.
+
+// Describe the hole that PINS the scan frontier: the LOWEST height in
+// outstanding[] ∪ gaveUp[] (both arrays sorted ascending, so this is O(1)).
+// Returns 0 and leaves every output untouched when there is no hole at all.
+//   *outOfferable            1 iff a driver can still OFFER it (an outstanding
+//                            entry under CF_REREQ_MAX_ATTEMPTS); 0 for a gaveUp
+//                            hole AND for a capped outstanding entry.
+//   *outRearmCycles          the pinning hole's B2 re-arm count, read from
+//   *outOffersReachedLivePeer whichever list holds it.
+// A height cannot be in both lists (ReArmGaveUp removes before inserting;
+// MarkEvaluated removes from both), but if bookkeeping ever drifted so that
+// outstanding[0] == gaveUp[0], the OUTSTANDING record wins — the reluctant
+// direction (it can be offerable, which withholds abandonment).
+int      BRCFScanLedgerPinningHole(const BRCFScanLedger *l, uint32_t *outHeight, int *outOfferable,
+                                   uint8_t *outRearmCycles, uint8_t *outOffersReachedLivePeer);
+
+// Length of the contiguous ABANDONABLE run starting at startH inclusive:
+// consecutive heights startH, startH+1, … each of which is
+//   (a) PARKED — either a gaveUp entry or a CAPPED (attempts >=
+//       CF_REREQ_MAX_ATTEMPTS) outstanding entry, i.e. one no driver will offer; AND
+//   (b) at the valve's abandon threshold — rearmCycles >= minCycles AND
+//       offersReachedLivePeer == 1 (the offered-and-refused proof).
+// Stops at the first height that is absent, still offerable, or short of the
+// threshold; at `maxRun` heights; or at UINT32_MAX. Writes the run's high end to
+// *outHi when non-NULL. Returns the run length — 0 iff startH itself does not
+// qualify (then *outHi is untouched).
+//
+// The per-member (b) test is what keeps a run-wide decision from widening the
+// DECISION: a height one cycle short of the threshold, or whose deciding cycle was
+// tainted, ENDS the run and becomes the next tick's pin instead of being carried
+// along by its neighbours' evidence.
+//
+// This is what lets the valve act on a whole coalesced RUN instead of one height
+// per cycle. One height per (1 + CF_CONVOY_REARM_MAX) x 7.5-min cycle would make a
+// CF_REREQ_MAX_RANGE-wide dead band take ~15 DAYS to clear — an escape that exists
+// only on paper. A run-wide decision clears the same band in one 22.5-min sequence,
+// and it matches what the driver already does: PeekRerequestRange coalesces exactly
+// such a run into ONE getcfilters, so the whole run shares one retry cycle and one
+// offered-and-refused verdict.
+size_t   BRCFScanLedgerAbandonableRunFrom(const BRCFScanLedger *l, uint32_t startH, size_t maxRun,
+                                          uint8_t minCycles, uint32_t *outHi);
+
+// Grant a FRESH full retry cycle to every height in the contiguous parked run at
+// startH (bounded by maxRun): attempts = 0 and requestedAt = 0 (immediately due),
+// peer/port cleared (so PeekRerequestRange coalesces the whole run into ONE
+// getcfilters), headerRace = 0, rearmCycles = old + 1 (saturating),
+// offersReachedLivePeer = 1 (a new, so-far-untainted cycle). A gaveUp height moves
+// back into outstanding (BRCFScanLedgerReArmGaveUp); a capped outstanding height
+// gets the identical state change without a list move. Stops at the first height
+// that is not parked, is below abandonedBelow, or cannot be re-armed (outstanding
+// full). Returns the number of heights re-armed — 0 means the valve did nothing,
+// and nothing was lost: every height stays exactly where it was.
+size_t   BRCFScanLedgerReArmParkedRun(BRCFScanLedger *l, uint32_t startH, size_t maxRun);
 
 // Clear the per-cycle offersReachedLivePeer latch on every OUTSTANDING height in
 // [startH..stopH]: a retry offer for those heights did NOT reach a connected

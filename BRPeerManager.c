@@ -241,6 +241,12 @@ struct BRPeerManagerStruct {
     void *saveCFLedgerInfo;
     void (*saveCFLedger)(void *info, const uint8_t *bytes, size_t len);
     BRCFScanLedger cfLedger;
+    // Cached BIP 158 wallet element set, reused across arriving cfilters. Rebuilding it
+    // per filter was 98.8% of the per-filter cost (see _BRPeerManagerFilterElementsLocked).
+    // cfElemsAddrCount is the address count the cache was built from and is the ONLY
+    // validity condition — never a timer.
+    BRWalletFilterElements *cfElems;
+    size_t cfElemsAddrCount;
     int autoFetchCFiltersEnabled;
     uint32_t autoFetchCFiltersStart;     // wallet birth height (inclusive)
     uint32_t autoFetchCFiltersThrough;   // highest height already requested (or
@@ -2587,6 +2593,59 @@ static void _peerRelayedCFHeaders(void *info, uint8_t filterType, UInt256 stopHa
     pthread_mutex_unlock(&manager->lock);
 }
 
+// Returns the wallet's BIP 158 element set, rebuilding it only when the wallet's address
+// set has actually changed. Caller holds manager->lock and MUST NOT free the result — it
+// is owned by the manager and freed in BRPeerManagerFree.
+//
+// Why this exists: BRWalletGetFilterElements enumerates every wallet address and calls
+// BRAddressScriptPubKey twice per address (a sizing pass and a fill pass), each a
+// base58check decode with SHA256d. It was called once per arriving cfilter — "up to 1000
+// per batch, tens of millions across a deep sync", as BRWalletFilterElements.c already
+// notes — which measured 1.90 ms per filter against the real DGB mainnet fixture in this
+// tree, 98.8% of the per-filter cost, i.e. ~45 min of single-core CPU per 1.44M blocks.
+// Cached, the per-filter cost is the GCS match alone (~41 us measured).
+//
+// THE INVALIDATION RULE, and why it is safe. The element set is a pure function of the
+// wallet's address set (BRWalletCopyAllAddrs). Every chain that set is collected from is
+// APPEND-ONLY: addresses are added by BRWalletUnusedAddrs, the pregen helpers and
+// BRWalletAddWatchedAddress, and never removed or rewritten in place. So any change to
+// the set also changes its COUNT, and an unchanged count proves an unchanged set.
+// BRWalletAllAddrsCount is O(1) (a sum of array_count under the leaf wallet->lock).
+//
+// This is deliberately a COUNT probe rather than invalidation at known mutation sites,
+// because the mutations are not all reachable from here. Three matter, and only the probe
+// catches all three:
+//   - a tx registered mid-scan: BRWalletRegisterTransaction extends all six chains, and
+//     the very NEXT filter must already match the newly derived addresses. This is
+//     self-referential — scanning is what grows the set it scans for.
+//   - a receive address handed out on the Receive screen: BRWalletReceiveAddress extends a
+//     chain from the JVM thread, with no peer-manager involvement at all.
+//   - a watched address pinned over JNI, likewise off-thread.
+// Getting this wrong does not degrade gracefully: a stale set means a filter that should
+// have matched does not, the block is never fetched, and the payment is never seen.
+// Silent, permanent, and it is money. Hence a rule that cannot miss a mutation site
+// rather than a list of sites we believe is complete.
+static BRWalletFilterElements *_BRPeerManagerFilterElementsLocked(BRPeerManager *manager)
+{
+    size_t addrCount = BRWalletAllAddrsCount(manager->wallet);
+
+#ifdef CF_ELEMS_CACHE_NOINVALIDATE
+    // NAIVE-CACHE shape — host-KAT red-before-green ONLY (never defined in a production
+    // build). Caches once and never invalidates, so an address derived after the first
+    // filter is never matched: the exact silent missed receive the count rule prevents.
+    if (manager->cfElems) return manager->cfElems;
+#else
+    if (manager->cfElems && manager->cfElemsAddrCount == addrCount) return manager->cfElems;
+#endif
+
+    BRWalletFilterElementsFree(manager->cfElems);   // NULL-safe
+    manager->cfElems = BRWalletGetFilterElements(manager->wallet);
+    // On a build failure leave the count mismatched so the next filter retries rather than
+    // caching "no elements" — matching nothing forever would be a silent missed receive.
+    manager->cfElemsAddrCount = manager->cfElems ? addrCount : 0;
+    return manager->cfElems;
+}
+
 // cfilter response handler. Three jobs:
 //   1. Verify the filter against the chain (catches lying peers).
 //   2. Match the wallet's address set against the decoded filter.
@@ -2654,7 +2713,8 @@ static void _peerRelayedCFilter(void *info, uint8_t filterType, UInt256 blockHas
         return;
     }
 
-    BRWalletFilterElements *fe = BRWalletGetFilterElements(manager->wallet);
+    // Manager-owned cache — do NOT free this (see _BRPeerManagerFilterElementsLocked).
+    BRWalletFilterElements *fe = _BRPeerManagerFilterElementsLocked(manager);
     size_t feCount = (fe ? fe->count : 0);
     int hit = 0;
     if (fe && fe->count > 0) {
@@ -2680,7 +2740,6 @@ static void _peerRelayedCFilter(void *info, uint8_t filterType, UInt256 blockHas
             peer_log(peer, "cfilter:   sample wallet element[0] len=%zu spk=%s", l0, hx);
         }
     }
-    BRWalletFilterElementsFree(fe);
     BRGCSFilterFree(gcs);
 
     if (hit) {
@@ -3785,6 +3844,9 @@ void BRPeerManagerFree(BRPeerManager *manager)
         manager->compactFilterChain = NULL;
     }
     BRCFScanLedgerFree(&manager->cfLedger); // frees any still-buffered raw filter bytes (Phase 2 Task 2)
+    BRWalletFilterElementsFree(manager->cfElems); // NULL-safe; cached BIP 158 element set
+    manager->cfElems = NULL;
+    manager->cfElemsAddrCount = 0;
     pthread_mutex_unlock(&manager->lock);
     pthread_mutex_destroy(&manager->lock);
     free(manager);

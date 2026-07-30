@@ -1023,6 +1023,17 @@ size_t BRWalletAllAddrs(BRWallet *wallet, BRAddress addrs[], size_t addrsCount)
 
 // Single-call snapshot — no window between sizing and filling. See BRWallet.h for the
 // deadlock rationale behind allocating inside the lock.
+size_t BRWalletAllAddrsCount(BRWallet *wallet)
+{
+    size_t n;
+
+    if (! wallet) return 0;
+    pthread_mutex_lock(&wallet->lock);
+    n = _BRWalletCollectAddrsLocked(wallet, NULL, 0, NULL);   // sizing pass only: no encode, no malloc
+    pthread_mutex_unlock(&wallet->lock);
+    return n;
+}
+
 BRAddress *BRWalletCopyAllAddrs(BRWallet *wallet, size_t *countOut, BRWalletAddrOrigins *originsOut)
 {
     BRAddress *addrs = NULL;

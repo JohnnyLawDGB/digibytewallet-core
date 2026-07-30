@@ -86,8 +86,19 @@ Remarks:
    stop height. Without this, pruning frees the deficit region and cfheaders
    stalls forever with "no block hash for height H". In steady state cfTip
    tracks blockTip so the retained span collapses to the normal tail; it only
-   expands transiently while a large cfTip deficit is being recovered. */
-#define CLEAR_MEM_CF_RETENTION_MARGIN 144
+   expands transiently while a large cfTip deficit is being recovered.
+
+   MUST also cover one in-flight cfILTER batch. This margin was sized for the
+   cfheaders driver alone, but the forward cfilter driver walks the same prevBlock
+   links for ITS stop hash, and its cursor legitimately trails the cfheader frontier
+   by up to one batch (MAX_CFILTERS_RESULTS). At 144 the cursor's own headers were
+   pruned while its filters were still outstanding, and because a pruned stop height
+   cannot be resolved the cursor then stopped advancing permanently and silently —
+   reproduced on a fresh wallet, frozen 25,928 blocks short of the tip while the UI
+   still reported Synced. 2048 covers a full 1000-block batch with 2x headroom and
+   also clears the pruner's unconditional ~801-block tail, which is what binds once
+   cfheaders reach the tip. Cost is bounded and trivial: ~2048 x ~224 B ~= 460 KB. */
+#define CLEAR_MEM_CF_RETENTION_MARGIN 2048
 
 /* BIP 158 continuity-failure recovery. If this many DISTINCT peers fail the
    cfheaders continuity check against our current tip since the last successful

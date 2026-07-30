@@ -758,9 +758,13 @@ static void _BRPeerManagerFindPeers(BRPeerManager *manager)
 // _peerRelayedCFHeaders. Definitions live near BRPeerManagerSetCallbacks
 // alongside the rest of the compact-filter helpers.
 static void _BRPeerManagerOnFilterCapablePeerConnected(BRPeerManager *manager, void *peerCbInfo, BRPeer *peer);
+// outStop (may be NULL) receives the stop height ACTUALLY requested, which can be
+// higher than the caller's stopHeight when the range had to be snapped up past a
+// pruned band. Callers that advance a cursor must use it, not their own request
+// range, or they will re-request the unresolvable band forever.
 static size_t _BRPeerManagerRequestCFiltersLocked(BRPeerManager *manager,
                                                   uint32_t startHeight, uint32_t stopHeight,
-                                                  BRPeer *preferred);
+                                                  BRPeer *preferred, uint32_t *outStop);
 static BRPeer *_BRPeerManagerAnyFilterCapablePeer(BRPeerManager *manager);
 static void _BRPeerManagerRequestNextCFHeaders(BRPeerManager *manager, BRPeer *peer);
 static int _BRPeerManagerReanchorAtFloorLocked(BRPeerManager *manager, int force);
@@ -2151,7 +2155,20 @@ static void _BRPeerManagerRequestNextCFHeaders(BRPeerManager *manager, BRPeer *p
     // means the peer we last sent to never answered — rotate away from it below.
     int isTimeoutRetry = (manager->cfHeadersRequestedThrough >= next);
 
-    uint32_t batchEnd = next + (MAX_CFHEADERS_RESULTS - 1);
+    // Advance the cfHEADER frontier in the SAME stride the cfILTER cursor can advance
+    // in, not the larger wire maximum. This is the root cause of the permanent scan
+    // freeze: the forward cfilter driver fires once per cfheaders arrival and requests at
+    // most MAX_CFILTERS_RESULTS blocks, so asking for MAX_CFHEADERS_RESULTS (2000) here
+    // shed ~1000 blocks of lag on EVERY round trip, by construction. The retention floor
+    // is anchored to this frontier (cfNext - CLEAR_MEM_CF_RETENTION_MARGIN), so the lag
+    // eventually put the headers the cursor still needed below the floor; once pruned,
+    // the cursor's stop hash became unresolvable and it stopped advancing for good.
+    // Matching the strides makes the lag non-growing: at most one in-flight batch.
+    // cfheaders are 32 bytes per entry, so halving the batch costs round trips, not
+    // bandwidth, and the cfheaders driver is not the bottleneck.
+    uint32_t cfhBatch = MAX_CFHEADERS_RESULTS;
+    if (cfhBatch > MAX_CFILTERS_RESULTS) cfhBatch = MAX_CFILTERS_RESULTS;
+    uint32_t batchEnd = next + (cfhBatch - 1);
     if (batchEnd > tip) batchEnd = tip;
 
     UInt256 stopHash = _BRPeerManagerBlockHashAtHeight(manager, batchEnd);
@@ -2532,8 +2549,14 @@ static void _peerRelayedCFHeaders(void *info, uint8_t filterType, UInt256 stopHa
             if (reqStop > reqStart + (MAX_CFILTERS_RESULTS - 1)) {
                 reqStop = reqStart + (MAX_CFILTERS_RESULTS - 1);
             }
-            size_t n = _BRPeerManagerRequestCFiltersLocked(manager, reqStart, reqStop, peer);
+            uint32_t sentStop = 0;
+            size_t n = _BRPeerManagerRequestCFiltersLocked(manager, reqStart, reqStop, peer, &sentStop);
             if (n > 0) {
+                // Advance to what was ACTUALLY requested, not to what we asked for: the
+                // request may have been snapped up past a pruned band. Advancing to
+                // reqStop instead would leave the cursor below the resident floor and
+                // re-request the same unresolvable range on every cfheaders arrival.
+                if (sentStop > reqStop) reqStop = sentStop;
                 manager->autoFetchCFiltersThrough = reqStop;
 #if CF_LEDGER_DRIVE_REREQUEST
                 // Never silent about CF_OUTSTANDING_MAX overflow (Phase 2): log the
@@ -3363,7 +3386,7 @@ void BRPeerManagerKeepAlive(BRPeerManager *manager)
             if (! chosen) chosen = any;
             if (! chosen) break; // no CF-capable peer connected at all -- nothing to do this tick
 
-            size_t sent = _BRPeerManagerRequestCFiltersLocked(manager, rs, cap, chosen);
+            size_t sent = _BRPeerManagerRequestCFiltersLocked(manager, rs, cap, chosen, NULL);
             if (sent > 0) {
                 BRCFScanLedgerCommitRerequest(&manager->cfLedger, rs, cap, chosen->address, chosen->port, nowSec);
                 peer_log(chosen, "cf-ledger: re-requested residual holes [%u..%u]", rs, cap);
@@ -4015,8 +4038,9 @@ static int _BRPeerManagerPeerCanServeFilters(BRPeer *p)
 
 static size_t _BRPeerManagerRequestCFiltersLocked(BRPeerManager *manager,
                                                   uint32_t startHeight, uint32_t stopHeight,
-                                                  BRPeer *preferred)
+                                                  BRPeer *preferred, uint32_t *outStop)
 {
+    if (outStop) *outStop = 0;
     if (stopHeight < startHeight) return 0;
     if (manager->syncMode == BR_SYNC_MODE_BLOOM_ONLY) return 0;
 
@@ -4024,7 +4048,75 @@ static size_t _BRPeerManagerRequestCFiltersLocked(BRPeerManager *manager,
     if (stopHeight > cap) stopHeight = cap;
 
     UInt256 stopHash = _BRPeerManagerBlockHashAtHeight(manager, stopHeight);
+
+#ifndef CFILTER_REQUEST_SILENT_STOPHASH_UNFIXED
+    if (UInt256IsZero(stopHash)) {
+        // The stop hash is resolved by walking prevBlock links down from lastBlock, so it
+        // is unresolvable exactly when stopHeight has fallen below the resident block
+        // floor. That happens routinely and by design: _BRPeerManagerClearMemory anchors
+        // its floor to the CFHEADER frontier (cfNext - CLEAR_MEM_CF_RETENTION_MARGIN),
+        // cfheaders advance 2000 per message while this driver advances at most
+        // MAX_CFILTERS_RESULTS per cfheaders arrival, so the filter cursor falls further
+        // behind cfNext on every message until the headers it still needs are pruned.
+        //
+        // This used to be a bare `return 0`. The caller only advances
+        // autoFetchCFiltersThrough when something was sent, so returning 0 froze the
+        // cursor PERMANENTLY — no further getcfilters, ever, not even at the tip, so
+        // incoming transactions stopped being detected. Silently: there was no log line,
+        // and no watchdog reads the scan frontier (deriveSyncFrontier consumes cfTip,
+        // which keeps tracking the tip), so the wallet went on reporting Synced.
+        // Reproduced on a FRESH wallet, API 33: frozen 25,928 blocks short of the tip.
+        //
+        // Forward progress now takes priority over contiguity. Snap the request up to the
+        // resolvable floor so the tip keeps getting covered; the skipped band stays in the
+        // ledger's outstanding set, so it is visible (Network Info) and recoverable
+        // (rescan / node reconcile) instead of being an invisible permanent hole. Losing
+        // tip coverage is strictly worse than a recorded gap: it hides incoming money.
+        uint32_t floorH = _BRPeerManagerBlockFloor(manager);
+
+        if (floorH > startHeight) {
+            // Take a FULL batch from the floor. Do NOT clamp to the caller's stopHeight:
+            // that value is below the floor by construction here (it is what we could not
+            // resolve), so clamping to it yields a 1-height request — measured on device
+            // as "skipping 1999 height(s) ... requesting [H..H]", i.e. skipping 99.95% of
+            // the chain while appearing to progress. The real ceiling is the validated
+            // cfheader frontier: requesting filters above it would leave them unverifiable.
+            uint32_t cfTipH = manager->compactFilterChain
+                              ? BRCompactFilterChainNextHeight(manager->compactFilterChain)
+                              : 0;
+            if (cfTipH > 0) cfTipH -= 1;
+
+            uint32_t snapStop = floorH + (MAX_CFILTERS_RESULTS - 1);
+            if (cfTipH > 0 && snapStop > cfTipH) snapStop = cfTipH;
+            if (snapStop < floorH) snapStop = floorH;
+
+            UInt256 snapHash = _BRPeerManagerBlockHashAtHeight(manager, snapStop);
+            if (! UInt256IsZero(snapHash)) {
+                peer_log(preferred, "cfilters: [%u..%u] is below the resident block floor %u — "
+                         "skipping %u height(s) to keep the tip covered, requesting [%u..%u] "
+                         "(the skipped band stays a recorded hole)",
+                         startHeight, stopHeight, floorH, floorH - startHeight, floorH, snapStop);
+                startHeight = floorH;
+                stopHeight = snapStop;
+                stopHash = snapHash;
+            }
+        }
+    }
+
+    if (UInt256IsZero(stopHash)) {
+        // Never silent: if even the floor could not be resolved we make no progress this
+        // round, but say so, because this is the shape of the permanent freeze.
+        peer_log(preferred, "cfilters: cannot resolve a stop hash for [%u..%u] (resident floor %u, "
+                 "lastBlock %u) — no filters requested this round",
+                 startHeight, stopHeight, _BRPeerManagerBlockFloor(manager),
+                 manager->lastBlock ? manager->lastBlock->height : 0);
+        return 0;
+    }
+#else
+    // PRE-FIX shape — host-KAT red-before-green ONLY (never defined in a production
+    // build). A bare, silent return that freezes the cursor forever.
     if (UInt256IsZero(stopHash)) return 0;
+#endif
 
     uint8_t filterType = manager->compactFilterChain
                          ? BRCompactFilterChainType(manager->compactFilterChain)
@@ -4048,6 +4140,7 @@ static size_t _BRPeerManagerRequestCFiltersLocked(BRPeerManager *manager,
     if (!target) return 0;
 
     BRPeerSendGetCFilters(target, filterType, startHeight, stopHash);
+    if (outStop) *outStop = stopHeight;
     return stopHeight - startHeight + 1;
 }
 
@@ -4056,7 +4149,7 @@ size_t BRPeerManagerRequestCompactFilters(BRPeerManager *manager,
 {
     if (!manager) return 0;
     pthread_mutex_lock(&manager->lock);
-    size_t n = _BRPeerManagerRequestCFiltersLocked(manager, startHeight, stopHeight, NULL);
+    size_t n = _BRPeerManagerRequestCFiltersLocked(manager, startHeight, stopHeight, NULL, NULL);
     pthread_mutex_unlock(&manager->lock);
     return n;
 }

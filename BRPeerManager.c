@@ -298,6 +298,28 @@ struct BRPeerManagerStruct {
     // never fires and a reopen waits out a stale, pre-gate interval (up to
     // CF_CONVOY_HDR_REKICK_MAX_SECS). 0 on a calloc'd manager == "was open".
     uint8_t  convoyHdrWasGated;
+    // ---- F1: memoized resident block FLOOR ---------------------------------
+    // _BRPeerManagerBlockFloor is an O(chainLen) prevBlock descent. The
+    // getcfilters start-height clamp (F1, in
+    // _BRPeerManagerRequestCFiltersWithStopHashLocked) needs the floor once per
+    // SEND, and the residual driver sends up to CF_REREQ_BATCH_PER_TICK (64)
+    // ranges per tick — 64 full descents under the NON-recursive manager->lock
+    // would re-introduce exactly the under-the-lock walk cost the Pass A/B/C
+    // restructure was built to remove (the raised-floor ANR class). So the floor
+    // is memoized against a key that CHANGES on every mutation of the chain view
+    // that could move it: the `blocks` set identity + cardinality, and lastBlock's
+    // identity + height. Every mutator of manager->blocks either adds or removes
+    // (so cardinality moves) and every prune (_BRPeerManagerClearMemory) runs only
+    // from the _peerRelayedBlock branch that has just moved lastBlock, so a stale
+    // hit is not reachable — and _BRPeerManagerClearMemory additionally
+    // invalidates explicitly. floorMemoValid == 0 on a calloc'd manager, so the
+    // first read always walks. Guarded by manager->lock like the rest of these.
+    uint8_t  floorMemoValid;
+    BRSet   *floorMemoBlocks;
+    size_t   floorMemoBlockCount;
+    BRMerkleBlock *floorMemoTip;
+    uint32_t floorMemoTipHeight;
+    uint32_t floorMemoFloor;
     // Lock-free mirrors of the scalar status values the Android UI polls for the
     // sync overlay. Written by the sync/worker threads WHERE THEY ALREADY HOLD
     // manager->lock (via _BRPeerManagerRefreshCachedStatus); read by the JNI status
@@ -823,6 +845,12 @@ static int _BRPeerManagerReanchorAtFloorLocked(BRPeerManager *manager, int force
 // BRPeerManagerKeepAlive's residual re-request driver can both use it.
 static int _BRPeerManagerPeerCanServeFilters(BRPeer *p);
 static uint32_t _BRPeerManagerBlockFloor(BRPeerManager *manager);
+#ifdef CF_KAT_COUNT_FLOOR_WALKS
+// Host-KAT-only: counts actual _BRPeerManagerBlockFloor descents so the KAT can
+// assert the F1 clamp costs ONE walk per tick, not one per send. Never defined in
+// any production build (and never read by production code).
+static unsigned long _cfBlockFloorWalks = 0;
+#endif
 static int _BRPeerManagerConnectedFilterPeerCount(BRPeerManager *manager); // defined below; used by the cfheaders stall-drop floor guard
 static void _BRPeerManagerProbeOtherFilterPeersForCFHeaders(BRPeerManager *manager, BRPeer *current,
                                                             uint8_t filterType, uint32_t startHeight,
@@ -1506,6 +1534,13 @@ static void _BRPeerManagerClearMemory(BRPeerManager* manager) {
     UInt256 prevHash;
     size_t count = BRSetCount(manager->blocks);
     size_t i = 0;
+
+    // F1: this function is the one thing that RAISES the resident block floor, so
+    // drop the memo unconditionally here. (The memo key would catch it anyway —
+    // pruning changes BRSetCount — but a floor cache whose only defence is a
+    // derived key is one refactor away from being stale, and a stale-HIGH floor
+    // would over-clamp getcfilters.)
+    manager->floorMemoValid = 0;
 
     // BIP 158: never prune block headers the compact-filter SCAN (or its
     // residual re-request) still needs. The floor tracks the lowest height the
@@ -4805,12 +4840,45 @@ static uint32_t _BRPeerManagerBlockFloor(BRPeerManager *manager)
 {
     BRMerkleBlock *b = manager->lastBlock;
     if (!b) return 0;
+#ifdef CF_KAT_COUNT_FLOOR_WALKS
+    // Host-KAT-only walk counter (never defined in any production build). The
+    // memo below exists to keep this at ONE walk per changed chain view; a gate
+    // that cannot see the walk COUNT could not tell a memo from 64 descents, and
+    // "walk cost invisible at test scale" is how a perf regression ships green.
+    _cfBlockFloorWalks++;
+#endif
     for (;;) {
         BRMerkleBlock *prev = BRSetGet(manager->blocks, &b->prevBlock);
         if (!prev) break;
         b = prev;
     }
     return b->height;
+}
+
+// F1: _BRPeerManagerBlockFloor, memoized for as long as the chain view that
+// determines it is unchanged. See the floorMemo* field comments in
+// BRPeerManagerStruct for the invalidation argument. Caller must hold
+// manager->lock (it reads/writes the memo fields and walks manager->blocks).
+static uint32_t _BRPeerManagerBlockFloorCached(BRPeerManager *manager)
+{
+    BRMerkleBlock *tip = manager->lastBlock;
+    if (! tip) return 0;                       // no chain: nothing to clamp against
+    size_t n = BRSetCount(manager->blocks);
+    if (manager->floorMemoValid &&
+        manager->floorMemoBlocks     == manager->blocks &&
+        manager->floorMemoBlockCount == n &&
+        manager->floorMemoTip        == tip &&
+        manager->floorMemoTipHeight  == tip->height) {
+        return manager->floorMemoFloor;
+    }
+    uint32_t floorH = _BRPeerManagerBlockFloor(manager);
+    manager->floorMemoBlocks     = manager->blocks;
+    manager->floorMemoBlockCount = n;
+    manager->floorMemoTip        = tip;
+    manager->floorMemoTipHeight  = tip->height;
+    manager->floorMemoFloor      = floorH;
+    manager->floorMemoValid      = 1;
+    return floorH;
 }
 
 // Re-anchor the compact-filter chain at the current block floor when cfTip has
@@ -5129,6 +5197,58 @@ static size_t _BRPeerManagerRequestCFiltersWithStopHashLocked(BRPeerManager *man
     assert(stopHeight <= startHeight + (MAX_CFILTERS_RESULTS - 1));
 
     if (UInt256IsZero(stopHash)) return 0;   // stop height not in the in-memory window -> don't send (as before)
+
+#ifndef CF_REQ_FLOOR_UNFIXED
+    // ---- F1: NEVER ASK BELOW OUR OWN RESIDENT BLOCK FLOOR --------------------
+    //
+    // The getcfilters STOP is a hash, so an unresolvable stop is already refused
+    // above. But startHeight goes on the wire as a BARE INTEGER, and nothing here
+    // checked it against the in-memory block window. So a range that STRADDLES the
+    // floor (start below it, stop above it) was sent verbatim: the stop resolved,
+    // the send went out, and the peer honestly answered with filters for heights
+    // whose HEADERS WE NO LONGER HOLD. _peerRelayedCFilter's BRSetGet then misses,
+    // the arrival takes the "header-race hole ... left outstanding" branch and the
+    // bytes are BUFFERED — against the 256 KiB budget, evicting live buffered
+    // filters — where they can never drain, because the block they need is gone.
+    // We asked for something we had already made ourselves unable to use.
+    //
+    // Clamping start UP to the floor keeps the servable part of the range on the
+    // wire (never suppress the whole send: that would strand the heights we CAN
+    // still serve) and drops only the part we could not have evaluated anyway. If
+    // the ENTIRE range is below the floor there is nothing askable — return 0, the
+    // same "nothing went on the wire" answer the unresolvable-stop refusal gives,
+    // so Pass C's else-branch taints the retry cycle (MarkOffersMissedLivePeer)
+    // instead of burning an attempt on an offer that never happened.
+    //
+    // THIS IS NOT AN ESCAPE VALVE AND MUST NOT BECOME ONE. It changes what we ASK
+    // for; it does not advance any cursor and does not touch cfLedger. Heights
+    // below the floor stay outstanding and remain owned by the paths that surface
+    // them (_BRPeerManagerSurfaceUnscannableLocked → abandonedBelow + WARN).
+    // Nothing here may ever mark them scanned.
+    //
+    // Cost: _BRPeerManagerBlockFloorCached, so a 64-range residual tick pays ONE
+    // O(chainLen) descent, not 64 (see the floorMemo* fields).
+#ifdef CF_REQ_FLOOR_NO_MEMO
+    // Un-memoized shape, built ONLY by the host KAT's walk-cost red-before-green
+    // gate (never defined in a production build): one full O(chainLen) descent PER
+    // SEND, which is what the memo exists to prevent. The clamp itself is
+    // unchanged, so what that build proves red is the MEMO, not the arithmetic.
+    uint32_t reqFloor = _BRPeerManagerBlockFloor(manager);
+#else
+    uint32_t reqFloor = _BRPeerManagerBlockFloorCached(manager);
+#endif
+    if (reqFloor > 0 && startHeight < reqFloor) {
+        // Whole range below the floor -> nothing askable. DEFENSIVE, not reachable
+        // through today's callers: both of them resolve stopHash by descending from
+        // lastBlock, so a stop hash that RESOLVED is at/above the floor by
+        // construction and a fully-sub-floor range is already refused by the
+        // UInt256IsZero check above. This exists because the caller SUPPLIES the
+        // hash here — a future caller with its own hash source must not be able to
+        // slip a wholly-unservable send through.
+        if (stopHeight < reqFloor) return 0;
+        startHeight = reqFloor;
+    }
+#endif
 
     uint8_t filterType = manager->compactFilterChain
                          ? BRCompactFilterChainType(manager->compactFilterChain)

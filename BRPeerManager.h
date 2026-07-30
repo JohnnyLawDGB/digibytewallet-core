@@ -31,6 +31,14 @@
 #include "BRWallet.h"
 #include "BRChainParams.h"
 #include "BRCompactFilterChain.h"
+// Both are already unconditional includes of BRPeerManager.c; hoisted to the
+// header so the CROSS-MODULE CONSTANT-RELATION SWEEP below can assert the
+// relations that span them (CF ledger bounds vs the paced-convoy window vs the
+// BIP157 wire limits in BRPeer.h vs the GCS size cap). BRCFScanLedger.h also
+// provides the CF_STATIC_ASSERT spelling used there. Both are pure headers
+// (stdint/stddef/BRInt.h only), so this adds no dependency weight.
+#include "BRCFScanLedger.h"
+#include "BRGCSFilter.h"
 #include <stddef.h>
 #include <inttypes.h>
 
@@ -227,7 +235,181 @@ Remarks:
    rotation; keep at least this many so the keepalive can grow the pool instead of
    racing the shredder. */
 #define CF_MIN_FILTER_PEERS 2
-    
+
+/* ---- CROSS-MODULE CONSTANT-RELATION SWEEP ---------------------------------
+ *
+ * The companion to the intra-module sweep in BRCFScanLedger.h; read the "WHY
+ * THIS BLOCK EXISTS" note there first. These are the relations that span
+ * headers — the CF scan ledger's bounds against the BIP157 wire limits
+ * (BRPeer.h), the paced-convoy window against both, and the filter buffer
+ * against the GCS size cap (BRGCSFilter.h) — so none of them could be asserted
+ * inside the pure ledger header. Same rule: every assertion states WHAT BREAKS.
+ *
+ * The paced-convoy window's three derivation floors were written out in prose at
+ * the CF_CONVOY_WINDOW define above ("It must EXCEED all of: (1)... (2)... (3)...")
+ * and enforced by nothing. Prose is exactly what F4 had.
+ *
+ * One relation here is same-header rather than cross-module (the ClearMemory
+ * trio). It lives in this block anyway: the value of a sweep is that it is in ONE
+ * place a reader can audit, and the memory-ceiling constants belong beside the
+ * convoy window they now share a job with.
+ */
+
+/* --- the ClearMemory trio: trigger vs retained tail ---
+ * CLEAR_MEM_BLOCKS_COUNT_TAIL_LEN is DERIVED (TRIGGER - SAVE_BLOCK_COUNT - RESERVE),
+ * and _BRPeerManagerClearMemory walks (TRIGGER - TAIL_LEN) blocks DOWN from lastBlock
+ * before freeing anything below that point.
+ * BREAKS: if SAVE_BLOCK_COUNT + RESERVE reaches TRIGGER, TAIL_LEN is <= 0 and the
+ * walk bound (TRIGGER - TAIL_LEN) becomes >= TRIGGER — i.e. at least as many blocks
+ * as the trigger count itself. The walk runs off the bottom of the resident chain,
+ * blockPtr comes back NULL, the `if (blockPtr)` guard skips the free, and ClearMemory
+ * is a PERMANENT NO-OP: manager->blocks grows without bound. That matters more now
+ * than it used to, because the paced convoy's flat-footprint guarantee is a bound on
+ * the FETCH side only — this function is the one thing that actually frees, and it is
+ * also what enforces the CF retention floor. The header's own remark ("TAIL_LEN is at
+ * least the SAVE_BLOCK_COUNT plus a reserve of CLEAR_MEM_BLOCKS_RESERVE_COUNT
+ * blocks") states the relation in prose and enforces nothing — F4's exact shape. */
+CF_STATIC_ASSERT(SAVE_BLOCK_COUNT + CLEAR_MEM_BLOCKS_RESERVE_COUNT < CLEAR_MEM_BLOCKS_COUNT_TRIGGER,
+               "CLEAR_MEM_BLOCKS_COUNT_TAIL_LEN must stay positive, else _BRPeerManagerClearMemory's "
+               "walk-down bound exceeds the resident chain, the free is skipped, and block-header "
+               "pruning silently stops happening at all");
+
+/* --- the residual re-request run vs what one getcfilters can carry ---
+ * BREAKS: BRCFScanLedgerPeekRerequestRange coalesces a run of up to
+ * CF_REREQ_MAX_RANGE heights and the residual driver sends it as ONE getcfilters
+ * whose stop is a HASH resolved at the run's top height. If the run can exceed
+ * one wire window, the range that goes out spans more heights than the message
+ * may request, and _BRPeerManagerRequestCFiltersWithStopHashLocked's own
+ * `assert(stopHeight <= startHeight + (MAX_CFILTERS_RESULTS - 1))` fires — or, in
+ * an NDEBUG production build where that assert is compiled out, the stop HASH
+ * belongs to a different height than the peer's stop, i.e. the silent
+ * wrong-range fetch the single-descent resolver design explicitly exists to make
+ * impossible. Either way BRCFScanLedgerCommitRerequest bumps `attempts` for the
+ * whole coalesced range while only part of it was actually asked for, so the tail
+ * burns its retry budget un-offered and is abandoned. (`==` is the tuned choice;
+ * `<=` is the correctness bound — a smaller RANGE only coalesces less.) */
+CF_STATIC_ASSERT(CF_REREQ_MAX_RANGE <= MAX_CFILTERS_RESULTS,
+               "a coalesced re-request run must fit ONE getcfilters, else the pre-resolved stop "
+               "hash names a different height than the wire stop (silent wrong-range fetch) and "
+               "the run's tail burns attempts un-offered");
+
+/* --- forward-fetch back-pressure headroom ---
+ * BREAKS: the forward auto-fetch gate tests `outstandingCount < CF_OUTSTANDING_LOWWATER`
+ * and then requests up to MAX_CFILTERS_RESULTS heights in one batch, so the post-batch
+ * peak is (LOWWATER - 1) + MAX_CFILTERS_RESULTS. If that exceeds CF_OUTSTANDING_MAX,
+ * _cfLedgerInsertOutstanding takes its overflow branch mid-batch and DROPS THE OLDEST
+ * outstanding heights — heights that were requested and never evaluated leave the
+ * ledger, so _cfLedgerAdvance stops seeing them as holes and scannedThrough advances
+ * over them. That is the STANDING INVARIANT broken by arithmetic: no code path decided
+ * to give up on those heights, the two caps just did not add up. This is the relation
+ * the LOWWATER comment asserts in prose ("Left with headroom under the hard cap so
+ * eviction should never actually trigger in practice"). */
+CF_STATIC_ASSERT(CF_OUTSTANDING_LOWWATER + MAX_CFILTERS_RESULTS <= CF_OUTSTANDING_MAX + 1u,
+               "back-pressure low-water plus one forward batch must fit under CF_OUTSTANDING_MAX, "
+               "else a single batch overflows outstanding[] and evicts unevaluated heights out "
+               "from under scannedThrough");
+
+/* --- paced-convoy window, derivation floor (1): the scan lookahead ---
+ * BREAKS (verbatim from the CF_CONVOY_WINDOW comment): a smaller window starves the
+ * scan — the forward cfilter fetch can only ask for heights the cfheader frontier
+ * already covers, so a window below the in-flight ceiling throttles the very path that
+ * ADVANCES the scan frontier the window is measured from. The convoy deadlocks from the
+ * other side: gate shut because the scan is behind, scan behind because the gate is shut. */
+CF_STATIC_ASSERT(CF_CONVOY_WINDOW > CF_OUTSTANDING_MAX + MAX_CFILTERS_RESULTS,
+               "CF_CONVOY_WINDOW must exceed the CF scan's in-flight ceiling "
+               "(CF_OUTSTANDING_MAX + MAX_CFILTERS_RESULTS), else the gate throttles the only "
+               "path that advances the scan frontier it is measured from — convoy deadlock");
+
+/* --- paced-convoy window, derivation floor (2): the cfheader quantum ---
+ * BREAKS: cfheaders arrive in batches of up to MAX_CFHEADERS_RESULTS. With a window
+ * narrower than one batch, a single clean append pushes the cfheader frontier past the
+ * window in one step, the gate shuts, and it can only re-open when the SCAN frontier
+ * climbs — which needs cfheaders. Every cfheaders advance is suppressed and the gate
+ * never re-opens. */
+CF_STATIC_ASSERT(CF_CONVOY_WINDOW > MAX_CFHEADERS_RESULTS,
+               "CF_CONVOY_WINDOW must exceed one cfheaders batch (MAX_CFHEADERS_RESULTS), else "
+               "one clean append shuts the gate permanently");
+
+/* --- paced-convoy window, derivation floor (3): re-kick latency margin ---
+ * BREAKS: while the window is full BRPeer.c HOLDS its header continuation, and the only
+ * thing that re-issues it is KeepAlive's B1.3 re-kick, no oftener than
+ * CF_CONVOY_HDR_REKICK_BASE_SECS. The window must therefore hold enough headers to keep
+ * the scan fed across one whole re-kick interval; below that the scan drains the resident
+ * headers, idles waiting for the re-kick, and the convoy descends at the re-kick's rate
+ * instead of the fetch's — turning a bounded-memory feature into a bounded-THROUGHPUT one
+ * (a multi-hour deep restore becomes multi-day).
+ *
+ * The scan's ceiling is MAX_CFILTERS_RESULTS heights per KeepAlive tick, and the tick
+ * period is a Kotlin-side literal (SyncService.kt, `delay(10_000L)`) that C cannot see —
+ * hence the 10 below. CAVEAT, stated rather than hidden: this assertion pins the C half
+ * only. Shortening the Kotlin tick raises the scan's heights/s ceiling and TIGHTENS this
+ * floor without this assertion noticing. It is a one-directional guard, not a complete one. */
+CF_STATIC_ASSERT(CF_CONVOY_WINDOW >= CF_CONVOY_HDR_REKICK_BASE_SECS * (MAX_CFILTERS_RESULTS / 10u),
+               "CF_CONVOY_WINDOW must hold at least one re-kick interval's worth of scan supply "
+               "(REKICK_BASE_SECS x MAX_CFILTERS_RESULTS per 10s tick), else the convoy descends "
+               "at the re-kick's rate instead of the fetch's");
+
+/* --- re-kick backoff: ceiling vs base ---
+ * BREAKS: the escalation is `backoff = (backoff >= MAX/2) ? MAX : backoff * 2`, starting at
+ * BASE. With MAX < BASE the very first send clamps the interval DOWN to MAX, so the ceiling
+ * becomes a floor-breaker: re-kicks fire more often than BASE forever. That is the expensive
+ * direction — each injected getheaders is answered with a full 2000-header batch that spawns
+ * its own lockstep continuation chain, so the CF_CONVOY_HDR_REKICK_BASE_SECS comment's
+ * "N re-kicks during one slow batch means N x ~2.2 MB of duplicate headers" compounds on
+ * exactly the slow mobile links the convoy exists to make cheap. */
+CF_STATIC_ASSERT(CF_CONVOY_HDR_REKICK_MAX_SECS >= CF_CONVOY_HDR_REKICK_BASE_SECS,
+               "the re-kick backoff CEILING must not sit below its BASE, else the first "
+               "escalation clamps the interval DOWN and re-kicks fire faster than BASE forever");
+
+/* --- retention margin vs the convoy window ---
+ * These are the two terms of the resident-header span: the header frontier rides at most
+ * CF_CONVOY_WINDOW above the CF scan frontier, and _BRPeerManagerClearMemory's floor sits
+ * CLEAR_MEM_CF_RETENTION_MARGIN below it, so resident headers ~= W + MARGIN.
+ * BREAKS: both headline guarantees of the paced convoy are stated in terms of W —
+ * consequence (a) "MAX RESIDENT BLOCK HEADERS ~= W + MARGIN ... ~2.2 MB, FLAT AT ANY RESTORE
+ * DEPTH" (the deep-restore OOM fix itself) and consequence (b) "MAX prevBlock WALK DEPTH
+ * ~= W" (the sub-ANR, index-free hash resolution). If MARGIN is not the small correction
+ * term, both are actually governed by a constant sized for a completely different job
+ * (keeping ~one DigiShield window of headers alive so cfheaders can walk prevBlock links
+ * back to its next batch's stop), and W could be tuned to no effect while the real
+ * footprint and the real walk depth stayed put.
+ * This one is a GUARANTEE/footprint relation, not a correctness one — said plainly so
+ * nobody reads it as stronger than it is. */
+CF_STATIC_ASSERT(CLEAR_MEM_CF_RETENTION_MARGIN < CF_CONVOY_WINDOW,
+               "CLEAR_MEM_CF_RETENTION_MARGIN must stay the small correction term under "
+               "CF_CONVOY_WINDOW, else the resident-header footprint and the prevBlock walk "
+               "depth are set by the retention margin and both paced-convoy guarantees are "
+               "governed by a constant sized for neither");
+
+/* --- B2 re-arm budget vs the field that carries it ---
+ * BREAKS: BRCFOutstanding.rearmCycles / BRCFScanLedger.gaveUpRearmCycles[] are uint8_t and
+ * SATURATE at 0xFF (BRCFScanLedger.c, `if (e->rearmCycles < 0xFFu) e->rearmCycles++`). The
+ * valve abandons only when `rearmCycles >= CF_CONVOY_REARM_MAX`, so a budget the field
+ * cannot represent is never reached: the valve re-arms the pinning hole forever and NEVER
+ * abandons, which is the permanent convoy wedge the valve exists to prevent. Same shape as
+ * the CF_REREQ_MAX_ATTEMPTS/uint8_t relation in BRCFScanLedger.h — a constant outgrowing the
+ * field width, which is how F4's ceiling defect would come back. */
+CF_STATIC_ASSERT(CF_CONVOY_REARM_MAX <= 255,
+               "CF_CONVOY_REARM_MAX must fit the uint8_t rearmCycles counters (which saturate at "
+               "0xFF), else the B2 valve's abandon threshold is unreachable and it re-arms the "
+               "pinning hole forever");
+
+/* --- filter buffer budget vs a WIRE-LEGAL filter ---
+ * BREAKS at <= BR_GCS_MAX_ENCODED_SIZE: BRPeer.c's cfilter parser accepts any encoded filter
+ * up to BR_GCS_MAX_ENCODED_SIZE, but BRCFScanLedgerBufferFilter refuses outright
+ * (`if (len > CF_FILTER_BUFFER_MAX_BYTES) return 0`) anything bigger than the whole budget.
+ * A wire-legal filter we already received and validated could then not be buffered at all,
+ * so the header-race fast path silently stops covering the largest filters and those heights
+ * can only heal through the slower re-request schedule.
+ * BREAKS at <= 2x: the insert-path eviction loop is `while (bufferedBytes + len >= MAX_BYTES
+ * && filterBufCount > 0)`, so with room for only one maximal filter every insert evicts the
+ * previous one — two concurrently header-raced large filters thrash instead of both waiting
+ * for their headers. 2x is the honest minimum for the buffer to be a buffer. */
+CF_STATIC_ASSERT(CF_FILTER_BUFFER_MAX_BYTES > 2u * BR_GCS_MAX_ENCODED_SIZE,
+               "the filter buffer must hold at least two wire-legal (BR_GCS_MAX_ENCODED_SIZE) "
+               "filters, else BufferFilter refuses the largest legal filters outright / evicts "
+               "the previous one on every insert");
+
 /* Readability constants */
 #define ADD_TO_SAVED_BLOCKS 0
 #define REPLACE_SAVED_BLOCKS 1

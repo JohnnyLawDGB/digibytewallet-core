@@ -69,6 +69,42 @@ extern "C" {
 // with "nothing dropped".
 #define CF_LEDGER_NO_DROP 0xFFFFFFFFu
 
+// ---- CF_STATIC_ASSERT ------------------------------------------------------
+// One portable spelling for every compile-time constant-relation assertion in
+// the CF stack (this header and BRPeerManager.h). Factored out because the
+// relations are swept, not one-off: each one wrapped in its own
+// `#if defined(__STDC_VERSION__) && ...` was unreadable, and an unreadable
+// assertion is one a future footprint trim deletes instead of satisfying.
+//
+// Toolchain reality this has to survive:
+//   - Both the host KATs (clang, no -std -> gnu17) and the Android NDK build
+//     (clang, no -std in native/CMakeLists.txt -> gnu17) report
+//     __STDC_VERSION__ == 201710L, so the C11 form IS compiled and evaluated
+//     in every shipped build. These are not documentation-only.
+//   - The other two branches are BELT-AND-BRACES, and MEASURED to be
+//     unreachable today rather than assumed to matter: both headers carry
+//     `extern "C"` blocks, which invites a C++ TU, and both nominally support
+//     older C — but including either one from C++ or under -std=c89 already
+//     fails in BRInt.h (a C++-illegal anonymous-union compound literal at
+//     BRInt.h:250; `inline` unknown under c89 at BRInt.h:63) long before
+//     reaching these macros. So the C11 branch is the ONLY one this codebase
+//     actually compiles; the other two exist so that whoever fixes BRInt.h
+//     does not also have to fix this.
+//     The fallback is a repeatable extern DECLARATION, not an empty expansion:
+//     every use site is written `CF_STATIC_ASSERT(...);`, and an empty expansion
+//     would leave a stray file-scope `;` (a C89 constraint violation), i.e. the
+//     graceful-degradation path would itself break the build it exists to save.
+//     Re-declaring the same extern with the same type is legal and harmless.
+#ifndef CF_STATIC_ASSERT
+#if defined(__cplusplus)
+#define CF_STATIC_ASSERT(cond, msg) static_assert(cond, msg)
+#elif defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L
+#define CF_STATIC_ASSERT(cond, msg) _Static_assert(cond, msg)
+#else
+#define CF_STATIC_ASSERT(cond, msg) extern char cf_static_assert_unenforced_pre_c11
+#endif
+#endif
+
 // ---- Bounds & pinned constants (§3) ----------------------------------------
 #define CF_OUTSTANDING_MAX      4096  // hard cap; overflow drops OLDEST (caller LOGWs its height range)
 #define CF_PENDING_CONFIRM_MAX   256  // blocks awaiting header-connect confirmation
@@ -126,12 +162,12 @@ extern "C" {
 // retired" wedge. Deliberately NOT asserted in the CF_GAVEUP_CEILING_UNFIXED
 // build — that build exists precisely to compile the violating shape for the
 // red-before-green gate.
-#if !defined(CF_GAVEUP_CEILING_UNFIXED) && defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L
-_Static_assert(CF_GAVEUP_MAX >= CF_OUTSTANDING_MAX,
+#ifndef CF_GAVEUP_CEILING_UNFIXED
+CF_STATIC_ASSERT(CF_GAVEUP_MAX >= CF_OUTSTANDING_MAX,
                "CF_GAVEUP_MAX must absorb everything outstanding[] can hold, else "
                "BRCFScanLedgerRetireCapped leaves capped heights in outstanding[] where no "
                "driver offers them and they pin scannedThrough forever (F4 Part A)");
-_Static_assert(CF_GAVEUP_MAX >= CF_REREQ_MAX_RANGE,
+CF_STATIC_ASSERT(CF_GAVEUP_MAX >= CF_REREQ_MAX_RANGE,
                "CF_GAVEUP_MAX must at minimum absorb one maximal coalesced re-request run");
 #endif
 
@@ -164,6 +200,145 @@ _Static_assert(CF_GAVEUP_MAX >= CF_REREQ_MAX_RANGE,
 // min), so a legitimately-slow header still drains before age-out, and well
 // below the retention margin.
 #define CF_FILTER_BUF_MAX_AGE_SECS 900
+
+// ---- CONSTANT-RELATION SWEEP (intra-module) --------------------------------
+//
+// WHY THIS BLOCK EXISTS. F4 was not "a constant was too small". It was a PAIR of
+// constants (CF_GAVEUP_MAX, CF_REREQ_MAX_RANGE) bounding the same quantity from
+// opposite sides with NOTHING tying them together, so a footprint-motivated
+// choice of one silently broke a correctness property of the other, and the
+// breakage was only observable as a wedged wallet in the field months later.
+// Every relation the code below actually depends on is therefore asserted at
+// COMPILE TIME here. The rule for this block:
+//
+//   an assertion whose comment does not say WHAT BREAKS is noise — delete it
+//   rather than leave a reader guessing whether it is load-bearing.
+//
+// Relations that span module boundaries (the CF ledger vs the wire limits in
+// BRPeer.h, the paced-convoy window in BRPeerManager.h, the GCS size cap in
+// BRGCSFilter.h) are asserted in BRPeerManager.h instead — this header is PURE
+// (BRInt.h only, see the file comment) and stays that way. See the
+// "CROSS-MODULE CONSTANT-RELATION SWEEP" block there.
+//
+// The two CF_GAVEUP_MAX relations are asserted above, at the define they
+// constrain, because that define carries the F4 narrative.
+
+// --- back-pressure low-water vs the hard cap ---
+// BREAKS: with LOWWATER >= CF_OUTSTANDING_MAX the forward-fetch back-pressure gate
+// (BRPeerManager.c, `OutstandingCount(&cfLedger) < CF_OUTSTANDING_LOWWATER`) never
+// closes before the hard cap, so _cfLedgerInsertOutstanding starts taking its
+// overflow branch and DROPS THE OLDEST outstanding height to make room. That
+// height leaves the ledger entirely, so _cfLedgerAdvance no longer sees a hole
+// there and scannedThrough sails over a height that never received
+// MarkEvaluated — the STANDING INVARIANT, violated by arithmetic rather than by a
+// code path. (The caller LOGWs the dropped range, so it is not literally silent;
+// the cursor still advances, which is the prohibited part.)
+CF_STATIC_ASSERT(CF_OUTSTANDING_LOWWATER < CF_OUTSTANDING_MAX,
+               "CF_OUTSTANDING_LOWWATER must leave headroom under CF_OUTSTANDING_MAX, else "
+               "forward-fetch back-pressure never engages and outstanding[] silently evicts "
+               "unevaluated heights out from under scannedThrough");
+
+// BREAKS: at 0 the same gate is never satisfied, so the forward cfilter fetch never
+// runs at all — the scan frontier never advances, the paced convoy never opens, and
+// a fresh sync wedges at the birth height forever.
+CF_STATIC_ASSERT(CF_OUTSTANDING_LOWWATER > 0,
+               "CF_OUTSTANDING_LOWWATER == 0 disables forward cfilter auto-fetch entirely "
+               "(the gate is `outstandingCount < LOWWATER`) — permanent sync wedge");
+
+// --- the re-request backoff schedule vs its attempt cap ---
+// _cfLedgerRerequestDelay is `d = BASE; for (k < attempts) { d <<= 1; if (d >= CAP)
+// { d = CAP; break; } }`, i.e. min(BASE << attempts, CAP) -> 30/60/120/120/120.
+//
+// BREAKS (CAP < BASE): the very first delay is already clamped to CAP, so the
+// schedule is a FLAT CAP and the documented 7.5-minute cycle is fiction. Everything
+// calibrated on that cycle length silently shifts with it: CF_CONVOY_REARM_MAX's
+// "~15 min of productive rotated retry" (BRPeerManager.h), the age-out margin
+// asserted just below, and the B2 valve's whole "offered and refused across N full
+// cycles" claim.
+CF_STATIC_ASSERT(CF_REREQ_BACKOFF_CAP_SECS >= CF_REREQ_BASE_SECS,
+               "CF_REREQ_BACKOFF_CAP_SECS below CF_REREQ_BASE_SECS clamps the FIRST retry, "
+               "collapsing min(BASE<<n, CAP) to a flat CAP and invalidating every timing "
+               "derived from the 30/60/120/120/120 schedule");
+
+// BREAKS: the header-race short-circuit exists precisely to retry SOONER than the
+// ordinary schedule (the block header connects within seconds, so the buffered
+// filter can be drained almost immediately). If it is longer, the common
+// self-healing case waits longer than a hard drop and the special case is worse
+// than not having it.
+CF_STATIC_ASSERT(CF_REREQ_HEADERRACE_SECS <= CF_REREQ_BASE_SECS,
+               "the header-race retry must be SHORTER than the base delay — that is the only "
+               "reason CF_REREQ_HEADERRACE_SECS exists");
+
+// BREAKS: the loop shifts `d <<= 1` BEFORE testing `d >= CAP`, so a cap above half
+// the uint32 range lets the shift WRAP. The delay collapses to a tiny value, the
+// driver turns into a retry storm that burns all CF_REREQ_MAX_ATTEMPTS in seconds,
+// and the height is retired to gaveUp and handed to the abandonment valve having
+// never had a real retry window.
+CF_STATIC_ASSERT(CF_REREQ_BACKOFF_CAP_SECS <= 0xFFFFFFFFu / 2u,
+               "CF_REREQ_BACKOFF_CAP_SECS above UINT32_MAX/2 lets _cfLedgerRerequestDelay's "
+               "`d <<= 1` wrap before the cap test, collapsing the backoff to a retry storm");
+
+// BREAKS: at 0 a freshly inserted hole (attempts == 0) already satisfies
+// `attempts >= CF_REREQ_MAX_ATTEMPTS`, so it is PARKED AT BIRTH —
+// BRCFScanLedgerNextRerequest `continue`s it, BRCFScanLedgerPeekRerequestRange
+// never selects it as a candidate, and BRCFScanLedgerRetireCapped moves it straight
+// to gaveUp. No height is ever re-requested even once; every hole goes to the
+// abandonment valve.
+CF_STATIC_ASSERT(CF_REREQ_MAX_ATTEMPTS >= 1,
+               "CF_REREQ_MAX_ATTEMPTS == 0 parks every hole at birth — nothing is ever "
+               "re-requested and every hole is handed to the abandonment valve");
+
+// BREAKS: BRCFOutstanding.attempts is a uint8_t, incremented (BRCFScanLedger.c
+// `e->attempts++`) with no saturation guard because the `attempts >= MAX` tests are
+// supposed to stop it first. Above 255 those tests can never be true: attempts
+// wraps 255 -> 0, RetireCapped becomes a permanent no-op, nothing ever reaches
+// gaveUp, the B2 valve (which acts on the parked/gaveUp pin) never fires — and the
+// scan frontier pins on a hole that is retried forever. The exact F4 failure shape
+// (a hole that can never retire) reintroduced through a field width instead of an
+// array bound.
+CF_STATIC_ASSERT(CF_REREQ_MAX_ATTEMPTS <= 255,
+               "CF_REREQ_MAX_ATTEMPTS must fit BRCFOutstanding.attempts (uint8_t) — a cap the "
+               "field cannot represent makes RetireCapped a no-op and pins the scan frontier "
+               "on an eternally-retried hole");
+
+// --- filter-buffer age-out vs the retry schedule it must outlive ---
+// BREAKS: BRCFScanLedgerEvictAgedFilters frees a buffered header-race filter's bytes
+// once firstAt is older than this. If the age-out can fire while that height's retry
+// schedule is still running, the bytes we already hold are discarded mid-schedule and
+// the height must be re-fetched from the wire instead of drained locally — and if its
+// header still has not connected it re-buffers and re-ages, so a BACKSTOP becomes a
+// work-discarding loop on exactly the slow-header case the buffer exists to cover.
+// CF_REREQ_MAX_ATTEMPTS * CF_REREQ_BACKOFF_CAP_SECS is a deliberately CONSERVATIVE
+// (constant-expression) upper bound on the schedule: the true wall time is smaller
+// because the early attempts pay BASE << n < CAP (30+60+120+120+120 = 450 today, vs
+// the 600 asserted here).
+CF_STATIC_ASSERT(CF_REREQ_MAX_ATTEMPTS * CF_REREQ_BACKOFF_CAP_SECS < CF_FILTER_BUF_MAX_AGE_SECS,
+               "CF_FILTER_BUF_MAX_AGE_SECS must outlast a full re-request schedule, else the "
+               "byte-reclamation backstop discards buffered filters while their own retry "
+               "cycle is still running");
+
+// --- filter buffer: byte budget vs slot backstop ---
+// The design (see the two defines above) is: eviction is BYTE-driven; the slot array
+// is a fixed-capacity backstop against a pathological run of many tiny filters.
+// BREAKS: with fewer budget bytes than slots, the byte budget binds before the slot
+// array can ever fill even for 1-byte filters, so CF_FILTER_BUF_SLOTS is unreachable
+// dead code AND the array's memory (SLOTS x sizeof(ptr)) is provisioned for a state
+// that cannot occur — the stated division of labour is inverted, and a future reader
+// tuning "the" cap tunes the wrong one. (This is the weak half of the pair; the
+// load-bearing half — the budget vs a WIRE-LEGAL filter size — needs
+// BR_GCS_MAX_ENCODED_SIZE and is asserted in BRPeerManager.h.)
+CF_STATIC_ASSERT(CF_FILTER_BUFFER_MAX_BYTES >= CF_FILTER_BUF_SLOTS,
+               "the filter buffer's byte budget must exceed its slot count (>= 1 byte per "
+               "slot), else the slot backstop is unreachable and the byte cap is the only "
+               "real bound — inverting the documented byte-budgeted design");
+
+// BREAKS: BRCFScanLedgerBufferFilter's de-dup path evicts
+// `while (bufferedBytes >= MAX_BYTES && filterBufCount > 1)` — it deliberately keeps
+// the entry it just updated. With a single slot that guard can never evict, so
+// bufferedBytes can settle at or above the byte cap and stay there.
+CF_STATIC_ASSERT(CF_FILTER_BUF_SLOTS >= 2,
+               "CF_FILTER_BUF_SLOTS must be >= 2: BufferFilter's de-dup eviction loop stops at "
+               "filterBufCount > 1, so a 1-slot buffer can never come back under the byte cap");
 
 // ---- Records ---------------------------------------------------------------
 

@@ -246,7 +246,9 @@ struct BRPeerManagerStruct {
     // cfElemsAddrCount is the address count the cache was built from and is the ONLY
     // validity condition — never a timer.
     BRWalletFilterElements *cfElems;
-    size_t cfElemsAddrCount;
+    uint64_t cfElemsAddrGen;      // wallet's address-set generation the cache was built from
+    size_t cfElemsAddrCount;      // ...and its address count (defence-in-depth)
+    int cfElemsIsTestnet;         // ...and the network, which changes the encoded BYTES
     int autoFetchCFiltersEnabled;
     uint32_t autoFetchCFiltersStart;     // wallet birth height (inclusive)
     uint32_t autoFetchCFiltersThrough;   // highest height already requested (or
@@ -2605,16 +2607,35 @@ static void _peerRelayedCFHeaders(void *info, uint8_t filterType, UInt256 stopHa
 // tree, 98.8% of the per-filter cost, i.e. ~45 min of single-core CPU per 1.44M blocks.
 // Cached, the per-filter cost is the GCS match alone (~41 us measured).
 //
-// THE INVALIDATION RULE, and why it is safe. The element set is a pure function of the
-// wallet's address set (BRWalletCopyAllAddrs). Every chain that set is collected from is
-// APPEND-ONLY: addresses are added by BRWalletUnusedAddrs, the pregen helpers and
-// BRWalletAddWatchedAddress, and never removed or rewritten in place. So any change to
-// the set also changes its COUNT, and an unchanged count proves an unchanged set.
-// BRWalletAllAddrsCount is O(1) (a sum of array_count under the leaf wallet->lock).
+// THE INVALIDATION RULE. The element BYTES are a function of (address strings, network) —
+// NOT of the address set alone: BRAddressScriptPubKey encodes per BRNetworkIsTestnet().
+// So the cache key is a three-field tuple, all cheap, all compared before every use:
 //
-// This is deliberately a COUNT probe rather than invalidation at known mutation sites,
-// because the mutations are not all reachable from here. Three matter, and only the probe
-// catches all three:
+//   addrGen   monotonic, process-global, bumped at every append to an enumerated chain and
+//             at wallet construction. Catches appends AND a change of WALLET — which a
+//             count cannot see, because two different seeds yield identical address counts
+//             with fully disjoint sets (measured: 1045 == 1045, 0 shared) — and being
+//             process-global it is immune to malloc reusing the same chunk.
+//   addrCount defence-in-depth. If a future author adds a chain mutation and forgets to
+//             bump addrGen, the count still catches it, so a missed bump degrades to a
+//             weaker check instead of to silent fund loss.
+//   isTestnet a free global read. Without it a network switch leaves gen and count
+//             unchanged while changing the elements — measured: count 645 -> 645,
+//             elements 645 -> 0. The PARTIAL-drop variant is the dangerous one: some
+//             addresses stop encoding while others still do, so the set stays non-empty
+//             and the build-failure retry below never fires. Silent and permanent.
+//
+// gen and count are read in ONE lock hold (BRWalletAddrSetKey) because read separately they
+// could straddle an append and yield a pair that never existed.
+//
+// The key is read BEFORE the rebuild and the PRE-build value is stamped. That looks like a
+// bug and is load-bearing: because gen and count are monotonic, an append racing the build
+// leaves the stamped key mismatched, so the next filter rebuilds. Stamping a post-build
+// value could swallow that append. Do not "fix" the ordering.
+//
+// This is deliberately a probe rather than invalidation at known mutation sites, because the
+// mutations are not all reachable from here. Three matter, and only a probe catches all
+// three:
 //   - a tx registered mid-scan: BRWalletRegisterTransaction extends all six chains, and
 //     the very NEXT filter must already match the newly derived addresses. This is
 //     self-referential — scanning is what grows the set it scans for.
@@ -2627,22 +2648,39 @@ static void _peerRelayedCFHeaders(void *info, uint8_t filterType, UInt256 stopHa
 // rather than a list of sites we believe is complete.
 static BRWalletFilterElements *_BRPeerManagerFilterElementsLocked(BRPeerManager *manager)
 {
-    size_t addrCount = BRWalletAllAddrsCount(manager->wallet);
+    uint64_t addrGen = 0;
+    size_t addrCount = 0;
+    int isTestnet;
+
+    BRWalletAddrSetKey(manager->wallet, &addrGen, &addrCount);
+    isTestnet = BRNetworkIsTestnet() ? 1 : 0;
 
 #ifdef CF_ELEMS_CACHE_NOINVALIDATE
     // NAIVE-CACHE shape — host-KAT red-before-green ONLY (never defined in a production
-    // build). Caches once and never invalidates, so an address derived after the first
-    // filter is never matched: the exact silent missed receive the count rule prevents.
+    // build). Caches once and never invalidates, so an address added after the first filter
+    // is never matched: the exact silent missed receive this rule prevents.
     if (manager->cfElems) return manager->cfElems;
-#else
+#elif defined(CF_ELEMS_CACHE_COUNT_ONLY)
+    // COUNT-ONLY shape — host-KAT red-before-green ONLY. Keys on the address count alone,
+    // which is UNSOUND: it misses a network switch (elements re-encode with gen and count
+    // unchanged) and misses a wallet swap (disjoint sets, identical counts).
     if (manager->cfElems && manager->cfElemsAddrCount == addrCount) return manager->cfElems;
+#else
+    if (manager->cfElems &&
+        manager->cfElemsAddrGen == addrGen &&
+        manager->cfElemsAddrCount == addrCount &&
+        manager->cfElemsIsTestnet == isTestnet) return manager->cfElems;
 #endif
 
     BRWalletFilterElementsFree(manager->cfElems);   // NULL-safe
     manager->cfElems = BRWalletGetFilterElements(manager->wallet);
-    // On a build failure leave the count mismatched so the next filter retries rather than
+    // On a build failure leave the key mismatched so the next filter retries rather than
     // caching "no elements" — matching nothing forever would be a silent missed receive.
+    // (Note this only saves the TOTAL-drop case; the partial-drop case is why isTestnet is
+    // part of the key rather than relying on this.)
+    manager->cfElemsAddrGen   = manager->cfElems ? addrGen : 0;
     manager->cfElemsAddrCount = manager->cfElems ? addrCount : 0;
+    manager->cfElemsIsTestnet = isTestnet;
     return manager->cfElems;
 }
 
@@ -3846,6 +3884,7 @@ void BRPeerManagerFree(BRPeerManager *manager)
     BRCFScanLedgerFree(&manager->cfLedger); // frees any still-buffered raw filter bytes (Phase 2 Task 2)
     BRWalletFilterElementsFree(manager->cfElems); // NULL-safe; cached BIP 158 element set
     manager->cfElems = NULL;
+    manager->cfElemsAddrGen = 0;
     manager->cfElemsAddrCount = 0;
     pthread_mutex_unlock(&manager->lock);
     pthread_mutex_destroy(&manager->lock);

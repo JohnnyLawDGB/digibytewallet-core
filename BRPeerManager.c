@@ -2796,6 +2796,27 @@ static void _peerRelayedCFilter(void *info, uint8_t filterType, UInt256 blockHas
         return;
     }
 
+    // Account for the ARRIVAL here — after the "is this even our filter type" guard, and
+    // BEFORE every other exit from this function. This handler has five exits: wrong
+    // chain/type (above, not a response to anything we asked for), unknown/pruned block,
+    // cfheader verify failure, filter parse failure, and success. The last four are all a
+    // peer ANSWERING a height we requested, and all four used to return without releasing
+    // the in-flight slot, because the decrement sat at the bottom past them.
+    //
+    // That leaked a slot per unevaluatable filter, and those are not rare: 367 to 1,741 per
+    // run in measured syncs. The in-flight window therefore never drained, every window
+    // eventually looked stalled to the drive's timeout, and once a retire was wired to rewind
+    // the cursor it re-requested ranges that were arriving perfectly well — 10 rewinds and 17
+    // give-ups in nine minutes, with throughput collapsing.
+    //
+    // Placed on this single line rather than repeated at each exit so a future exit added
+    // below cannot forget it.
+    if (manager->cfFiltersInFlight > 0) manager->cfFiltersInFlight--;
+    // Any answer is progress: the retire must mean "nothing has arrived for a while", not
+    // "this window has been open a while". A full window is ~2.6 MB of filters and can
+    // legitimately outlive the timeout while it is still being delivered.
+    manager->cfFiltersWindowStart = time(NULL);
+
     BRMerkleBlock *b = BRSetGet(manager->blocks, &blockHash);
     if (!b) {
         peer_log(peer, "cfilter: unknown block %s, dropping", log_u256_hex_encode(blockHash));
@@ -2889,7 +2910,6 @@ static void _peerRelayedCFilter(void *info, uint8_t filterType, UInt256 blockHas
     // the pipeline pulls itself along on filter arrivals instead of waiting for the next
     // cfheaders message. Without this the whole pipeline stalls whenever the cfheaders peer
     // goes quiet.
-    if (manager->cfFiltersInFlight > 0) manager->cfFiltersInFlight--;
     _BRPeerManagerDriveCFiltersLocked(manager, peer);
 
     pthread_mutex_unlock(&manager->lock);

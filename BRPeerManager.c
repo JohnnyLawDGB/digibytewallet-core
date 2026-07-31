@@ -246,6 +246,11 @@ struct BRPeerManagerStruct {
     // cfElemsAddrCount is the address count the cache was built from and is the ONLY
     // validity condition — never a timer.
     BRWalletFilterElements *cfElems;
+    // Self-clocked cfilter drive: how many blocks are requested-but-unanswered, and when
+    // the current window opened. Deliberately NOT a ledger predicate — the ledger is
+    // observe-only here, and its accounting goes lossy once it saturates.
+    uint32_t cfFiltersInFlight;
+    time_t   cfFiltersWindowStart;
     uint64_t cfElemsAddrGen;      // wallet's address-set generation the cache was built from
     size_t cfElemsAddrCount;      // ...and its address count (defence-in-depth)
     int cfElemsIsTestnet;         // ...and the network, which changes the encoded BYTES
@@ -780,6 +785,7 @@ static int _BRPeerManagerReanchorAtFloorLocked(BRPeerManager *manager, int force
 // buffered-drain trampolines (_cfBufEval, above BRPeerManagerKeepAlive) and
 // BRPeerManagerKeepAlive's residual re-request driver can both use it.
 static int _BRPeerManagerPeerCanServeFilters(BRPeer *p);
+static void _BRPeerManagerDriveCFiltersLocked(BRPeerManager *manager, BRPeer *preferred);
 static uint32_t _BRPeerManagerBlockFloor(BRPeerManager *manager);
 static int _BRPeerManagerConnectedFilterPeerCount(BRPeerManager *manager); // defined below; used by the cfheaders stall-drop floor guard
 static void _BRPeerManagerProbeOtherFilterPeersForCFHeaders(BRPeerManager *manager, BRPeer *current,
@@ -1942,6 +1948,16 @@ BRPeerManager *BRPeerManagerNewEx(const BRChainParams *params, BRWallet *wallet,
     assert(wallet != NULL);
     assert(blocks != NULL || blocksCount == 0);
     assert(peers != NULL || peersCount == 0);
+    // Born in the LIVE mode, not calloc's zero. BR_SYNC_MODE_BLOOM_ONLY is 0 for ABI
+    // reasons, but BIP37 was excised in v4.0.0, so zero is a DEAD mode: a manager left in it
+    // dials peers it can never CF-sync, times them out and penalizes each one, and wedges at
+    // 0 peers until the process restarts (see the note at jni_peer.c's SetSyncMode call,
+    // which is a shipped instance of exactly that). Every CF path also silently no-ops in
+    // BLOOM_ONLY, so a missed SetSyncMode turns the whole compact-filter pipeline off
+    // quietly rather than loudly. The JNI bridge re-applies the real mode on every manager
+    // creation and that stays the source of truth; this only removes the dead-by-default
+    // state so a caller that forgets degrades to "works" instead of "wedged".
+    manager->syncMode = BR_SYNC_MODE_COMPACT_FILTERS_ONLY;
     manager->params = params;
     manager->wallet = wallet;
     manager->earliestKeyTime = earliestKeyTime;
@@ -2118,6 +2134,17 @@ static void _BRPeerManagerDropStalledFilterPeer(BRPeerManager *manager)
 // If an in-flight cfheaders request gets no response within this many seconds
 // (peer dropped, slow link), the serialization guard releases so another peer
 // can retry the same batch.
+// Self-clocked cfilter drive. MAX_INFLIGHT must be at least one full cfheaders batch
+// (MAX_CFHEADERS_RESULTS) so a single cfheaders arrival can always be covered without the
+// cursor falling behind — that shortfall is what used to grow unboundedly and freeze the
+// scan. It is also kept at/below the ledger's outstanding capacity so the observe-only
+// accounting stays intact rather than going lossy at saturation.
+#define CF_FILTERS_MAX_INFLIGHT 2000u
+// A window nobody answers must not wedge the driver forever. Generous relative to a normal
+// batch round trip; the cursor has already advanced past the range, so the unanswered
+// heights remain recorded ledger holes rather than being retried indefinitely.
+#define CF_FILTERS_WINDOW_TIMEOUT_SECS 30
+
 #define CF_HEADERS_REQUEST_TIMEOUT_SECS 5
 // Tor circuits are slow to establish and high-latency; a 5s timeout mis-punishes
 // a good-but-slow filter peer, churning peer rotation and forcing expensive
@@ -2174,9 +2201,13 @@ static void _BRPeerManagerRequestNextCFHeaders(BRPeerManager *manager, BRPeer *p
     // Matching the strides makes the lag non-growing: at most one in-flight batch.
     // cfheaders are 32 bytes per entry, so halving the batch costs round trips, not
     // bandwidth, and the cfheaders driver is not the bottleneck.
-    uint32_t cfhBatch = MAX_CFHEADERS_RESULTS;
-    if (cfhBatch > MAX_CFILTERS_RESULTS) cfhBatch = MAX_CFILTERS_RESULTS;
-    uint32_t batchEnd = next + (cfhBatch - 1);
+    // Full wire batch again. Capping this to MAX_CFILTERS_RESULTS was the stopgap that
+    // stopped the cursor falling behind while forward fetching was clocked by, and limited
+    // to, one batch per cfheaders arrival. _BRPeerManagerDriveCFiltersLocked now loops to
+    // the validated frontier and is driven from three events, so it absorbs a full 2000
+    // -header advance (CF_FILTERS_MAX_INFLIGHT >= MAX_CFHEADERS_RESULTS by construction) and
+    // the stopgap would only be halving cfheaders throughput for nothing.
+    uint32_t batchEnd = next + (MAX_CFHEADERS_RESULTS - 1);
     if (batchEnd > tip) batchEnd = tip;
 
     UInt256 stopHash = _BRPeerManagerBlockHashAtHeight(manager, batchEnd);
@@ -2534,58 +2565,11 @@ static void _peerRelayedCFHeaders(void *info, uint8_t filterType, UInt256 stopHa
         }
     }
 
-    // Auto-fetch cfilters for the newly validated range, capped at the spec
-    // MAX_CFILTERS_RESULTS. The driver requests one batch per cfheaders
-    // arrival; consecutive cfheaders responses advance the cursor through
-    // the chain until it catches up to the block tip.
-    //
-    // Phase 2 back-pressure: once the ledger's outstanding set reaches
-    // CF_OUTSTANDING_LOWWATER, pause forward auto-fetch so a stalled/slow
-    // filter peer can't keep growing outstanding toward CF_OUTSTANDING_MAX
-    // (which would start silently evicting the oldest holes). The residual
-    // re-request driver (BRPeerManagerKeepAlive) keeps working the existing
-    // backlog down in the meantime.
-    if (manager->autoFetchCFiltersEnabled
-#if CF_LEDGER_DRIVE_REREQUEST
-        && BRCFScanLedgerOutstandingCount(&manager->cfLedger) < CF_OUTSTANDING_LOWWATER
-#endif
-        ) {
-        uint32_t reqStart = manager->autoFetchCFiltersThrough + 1;
-        if (reqStart < manager->autoFetchCFiltersStart) reqStart = manager->autoFetchCFiltersStart;
-        if (reqStart <= chainTip) {
-            uint32_t reqStop = chainTip;
-            if (reqStop > reqStart + (MAX_CFILTERS_RESULTS - 1)) {
-                reqStop = reqStart + (MAX_CFILTERS_RESULTS - 1);
-            }
-            uint32_t sentStop = 0;
-            size_t n = _BRPeerManagerRequestCFiltersLocked(manager, reqStart, reqStop, peer, &sentStop);
-            if (n > 0) {
-                // Advance to what was ACTUALLY requested, not to what we asked for: the
-                // request may have been snapped up past a pruned band. Advancing to
-                // reqStop instead would leave the cursor below the resident floor and
-                // re-request the same unresolvable range on every cfheaders arrival.
-                if (sentStop > reqStop) reqStop = sentStop;
-                manager->autoFetchCFiltersThrough = reqStop;
-#if CF_LEDGER_DRIVE_REREQUEST
-                // Never silent about CF_OUTSTANDING_MAX overflow (Phase 2): log the
-                // dropped-oldest-holes range so a hole caused by hitting the hard cap
-                // is loud instead of a silent missed-scan.
-                uint32_t dLo = CF_LEDGER_NO_DROP, dHi = CF_LEDGER_NO_DROP;
-                int nDropReq = BRCFScanLedgerRecordRequestedDropped(&manager->cfLedger, reqStart, reqStop,
-                                              peer->address, peer->port, (uint32_t)time(NULL), &dLo, &dHi);
-                if (nDropReq > 0) {
-                    peer_log(peer, "cf-ledger: OUTSTANDING OVERFLOW — dropped %d oldest holes [%u..%u]",
-                             nDropReq, dLo, dHi);
-                }
-#else
-                BRCFScanLedgerRecordRequested(&manager->cfLedger, reqStart, reqStop,
-                                              peer->address, peer->port, (uint32_t)time(NULL));
-#endif
-                peer_log(peer, "cfilters: auto-requested [%u..%u] (%zu blocks)",
-                         reqStart, reqStop, n);
-            }
-        }
-    }
+    // Forward cfilter fetch. One call; the drive loops until the cursor reaches the
+    // validated cfheader frontier or the in-flight window fills. It is also driven from
+    // every cfilter arrival and from KeepAlive, so the pipeline is not clocked by this
+    // event alone (see _BRPeerManagerDriveCFiltersLocked).
+    _BRPeerManagerDriveCFiltersLocked(manager, peer);
 
     // Request the next batch if still behind the local block tip.
     _BRPeerManagerRequestNextCFHeaders(manager, peer);
@@ -2593,6 +2577,114 @@ static void _peerRelayedCFHeaders(void *info, uint8_t filterType, UInt256 stopHa
     // between blocks (cfheaders can climb faster than new blocks arrive).
     _BRPeerManagerRefreshCachedStatus(manager);
     pthread_mutex_unlock(&manager->lock);
+}
+
+// Drives forward cfilter fetching until the cursor reaches the validated cfheader
+// frontier or the in-flight window is full. Caller holds manager->lock.
+//
+// WHY THIS IS A LOOP, AND WHY IT IS CALLED FROM THREE PLACES. Forward fetching used to
+// happen at exactly ONE site — inline in _peerRelayedCFHeaders — issuing at most one batch
+// per cfheaders arrival. That made the whole filter pipeline clocked by cfheaders alone, so
+// when a peer stopped answering getcfheaders the filters stopped too, even though the peer
+// loop was healthy and block headers kept arriving. Observed on device: cfilters stopped
+// dead while headers advanced 23,739,000 -> 23,740,500 in 23 s, and the cfheaders driver sat
+// on an unanswered request for minutes. Being clocked by a single upstream event is the
+// defect; this is now driven by cfheaders arrival, by every cfilter arrival, and by the
+// KeepAlive tick, so no single silent peer can stall it.
+//
+// The in-flight bound is a COUNT OF BLOCKS with a TIME-based retire, deliberately not a
+// ledger predicate: the ledger is observe-only at this revision and its accounting goes
+// lossy at saturation, so gating on it would couple liveness to diagnostics. A window that
+// is never answered retires after CF_FILTERS_WINDOW_TIMEOUT_SECS so a silent peer cannot
+// wedge the driver; the cursor has already advanced past that range, so the unanswered
+// heights stay recorded as ledger holes rather than being retried forever.
+static void _BRPeerManagerDriveCFiltersLocked(BRPeerManager *manager, BRPeer *preferred)
+{
+    if (! manager->autoFetchCFiltersEnabled) return;
+    if (manager->syncMode == BR_SYNC_MODE_BLOOM_ONLY) return;
+
+    time_t now = time(NULL);
+
+    // Retire a stale window FIRST, before any early return. Its whole purpose is to stop a
+    // never-answered batch wedging the driver, so it must not be conditional on the filter
+    // chain existing — a re-anchor that drops the chain while a window is in flight would
+    // otherwise leave the count stuck at its old value forever.
+    if (manager->cfFiltersInFlight > 0 &&
+        (now - manager->cfFiltersWindowStart) >= CF_FILTERS_WINDOW_TIMEOUT_SECS) {
+        // NB: `preferred` is NULL on the KeepAlive backstop path, and peer_log dereferences
+        // its peer (BRPeerHost + ->port). Every log in this function must handle that.
+        if (preferred) {
+            peer_log(preferred, "cfilters: retiring a %u-block in-flight window unanswered after %llds",
+                     manager->cfFiltersInFlight, (long long)(now - manager->cfFiltersWindowStart));
+        }
+        else {
+            debug_log("cfilters: retiring a %u-block in-flight window unanswered after %llds\n",
+                      manager->cfFiltersInFlight, (long long)(now - manager->cfFiltersWindowStart));
+        }
+        manager->cfFiltersInFlight = 0;
+    }
+
+    if (! manager->compactFilterChain) return;
+
+    uint32_t cfNext = BRCompactFilterChainNextHeight(manager->compactFilterChain);
+    if (cfNext == 0) return;
+
+    uint32_t cfTip = cfNext - 1;   // highest height with a VALIDATED filter header
+
+    while (manager->cfFiltersInFlight < CF_FILTERS_MAX_INFLIGHT) {
+        uint32_t reqStart = manager->autoFetchCFiltersThrough + 1;
+        if (reqStart < manager->autoFetchCFiltersStart) reqStart = manager->autoFetchCFiltersStart;
+        if (reqStart > cfTip) break;                      // caught up to the validated frontier
+
+        uint32_t reqStop = cfTip;
+        if (reqStop > reqStart + (MAX_CFILTERS_RESULTS - 1)) {
+            reqStop = reqStart + (MAX_CFILTERS_RESULTS - 1);
+        }
+
+        uint32_t sentStop = 0;
+        size_t n = _BRPeerManagerRequestCFiltersLocked(manager, reqStart, reqStop, preferred, &sentStop);
+        if (n == 0) break;   // no eligible peer, or unresolvable — that path logs its own reason
+
+        // Advance to what was ACTUALLY requested: the range may have been snapped up past a
+        // pruned band. Advancing to reqStop would leave the cursor below the resident floor
+        // and re-request the same unresolvable range forever.
+        if (sentStop > reqStop) reqStop = sentStop;
+        manager->autoFetchCFiltersThrough = reqStop;
+
+#if CF_LEDGER_DRIVE_REREQUEST
+        uint32_t dLo = CF_LEDGER_NO_DROP, dHi = CF_LEDGER_NO_DROP;
+        int nDropReq = BRCFScanLedgerRecordRequestedDropped(&manager->cfLedger, reqStart, reqStop,
+                                      preferred ? preferred->address : UINT128_ZERO,
+                                      preferred ? preferred->port : 0,
+                                      (uint32_t)now, &dLo, &dHi);
+        if (nDropReq > 0) {
+            if (preferred) {
+                peer_log(preferred, "cf-ledger: OUTSTANDING OVERFLOW — dropped %d oldest holes [%u..%u]",
+                         nDropReq, dLo, dHi);
+            }
+            else {
+                debug_log("cf-ledger: OUTSTANDING OVERFLOW — dropped %d oldest holes [%u..%u]\n",
+                          nDropReq, dLo, dHi);
+            }
+        }
+#else
+        BRCFScanLedgerRecordRequested(&manager->cfLedger, reqStart, reqStop,
+                                      preferred ? preferred->address : UINT128_ZERO,
+                                      preferred ? preferred->port : 0, (uint32_t)now);
+#endif
+
+        if (manager->cfFiltersInFlight == 0) manager->cfFiltersWindowStart = now;
+        manager->cfFiltersInFlight += (uint32_t)n;
+
+        if (preferred) {
+            peer_log(preferred, "cfilters: auto-requested [%u..%u] (%zu blocks, %u in flight)",
+                     reqStart, reqStop, n, manager->cfFiltersInFlight);
+        }
+        else {
+            debug_log("cfilters: auto-requested [%u..%u] (%zu blocks, %u in flight)\n",
+                      reqStart, reqStop, n, manager->cfFiltersInFlight);
+        }
+    }
 }
 
 // Returns the wallet's BIP 158 element set, rebuilding it only when the wallet's address
@@ -2792,6 +2884,13 @@ static void _peerRelayedCFilter(void *info, uint8_t filterType, UInt256 blockHas
     // The cfilter was evaluated (matched above or cleanly missed) — remove this
     // height from the ledger's outstanding set and advance scannedThrough.
     BRCFScanLedgerMarkEvaluated(&manager->cfLedger, b->height);
+
+    // This response retires one block of the in-flight window and re-clocks the drive, so
+    // the pipeline pulls itself along on filter arrivals instead of waiting for the next
+    // cfheaders message. Without this the whole pipeline stalls whenever the cfheaders peer
+    // goes quiet.
+    if (manager->cfFiltersInFlight > 0) manager->cfFiltersInFlight--;
+    _BRPeerManagerDriveCFiltersLocked(manager, peer);
 
     pthread_mutex_unlock(&manager->lock);
 }
@@ -3354,6 +3453,14 @@ void BRPeerManagerKeepAlive(BRPeerManager *manager)
 {
     assert(manager != NULL);
     pthread_mutex_lock(&manager->lock);
+
+    // Liveness backstop for the cfilter pipeline. cfheaders arrivals and cfilter arrivals
+    // normally clock the drive; this tick is what guarantees it restarts when BOTH have
+    // gone quiet — a silent peer, a retired in-flight window, or a filter batch that was
+    // simply never answered. Cheap: it returns immediately once the cursor has caught up to
+    // the validated cfheader frontier. Passing NULL lets the request path pick any eligible
+    // filter peer rather than pinning the choice to whoever spoke last.
+    _BRPeerManagerDriveCFiltersLocked(manager, NULL);
 
     struct timeval tv;
     gettimeofday(&tv, NULL);
@@ -4193,10 +4300,19 @@ static size_t _BRPeerManagerRequestCFiltersLocked(BRPeerManager *manager,
 
             UInt256 snapHash = _BRPeerManagerBlockHashAtHeight(manager, snapStop);
             if (! UInt256IsZero(snapHash)) {
-                peer_log(preferred, "cfilters: [%u..%u] is below the resident block floor %u — "
-                         "skipping %u height(s) to keep the tip covered, requesting [%u..%u] "
-                         "(the skipped band stays a recorded hole)",
-                         startHeight, stopHeight, floorH, floorH - startHeight, floorH, snapStop);
+                // preferred may be NULL (KeepAlive backstop / the public request entry point),
+                // and peer_log dereferences it.
+                if (preferred) {
+                    peer_log(preferred, "cfilters: [%u..%u] is below the resident block floor %u — "
+                             "skipping %u height(s) to keep the tip covered, requesting [%u..%u] "
+                             "(the skipped band stays a recorded hole)",
+                             startHeight, stopHeight, floorH, floorH - startHeight, floorH, snapStop);
+                }
+                else {
+                    debug_log("cfilters: [%u..%u] is below the resident block floor %u — skipping %u "
+                              "height(s) to keep the tip covered, requesting [%u..%u]\n",
+                              startHeight, stopHeight, floorH, floorH - startHeight, floorH, snapStop);
+                }
                 startHeight = floorH;
                 stopHeight = snapStop;
                 stopHash = snapHash;
@@ -4207,10 +4323,18 @@ static size_t _BRPeerManagerRequestCFiltersLocked(BRPeerManager *manager,
     if (UInt256IsZero(stopHash)) {
         // Never silent: if even the floor could not be resolved we make no progress this
         // round, but say so, because this is the shape of the permanent freeze.
-        peer_log(preferred, "cfilters: cannot resolve a stop hash for [%u..%u] (resident floor %u, "
-                 "lastBlock %u) — no filters requested this round",
-                 startHeight, stopHeight, _BRPeerManagerBlockFloor(manager),
-                 manager->lastBlock ? manager->lastBlock->height : 0);
+        if (preferred) {
+            peer_log(preferred, "cfilters: cannot resolve a stop hash for [%u..%u] (resident floor %u, "
+                     "lastBlock %u) — no filters requested this round",
+                     startHeight, stopHeight, _BRPeerManagerBlockFloor(manager),
+                     manager->lastBlock ? manager->lastBlock->height : 0);
+        }
+        else {
+            debug_log("cfilters: cannot resolve a stop hash for [%u..%u] (resident floor %u, "
+                      "lastBlock %u) — no filters requested this round\n",
+                      startHeight, stopHeight, _BRPeerManagerBlockFloor(manager),
+                      manager->lastBlock ? manager->lastBlock->height : 0);
+        }
         return 0;
     }
 #else
@@ -4231,6 +4355,23 @@ static size_t _BRPeerManagerRequestCFiltersLocked(BRPeerManager *manager,
     // Fall back to the first LIVE (socket-open) filter peer, skipping zombies.
     BRPeer *target = _BRPeerManagerPeerCanServeFilters(preferred) ? preferred : NULL;
     if (!target) {
+        // Prefer a peer that is NOT servicing the in-flight cfheaders request. A bulk
+        // cfilter burst shares that peer's socket, and the cfheaders driver times its
+        // response out after CF_REQUEST_TIMEOUT_SECS (5 s) — so head-of-line blocking it
+        // trips rotation and, after a full rotation, _BRPeerManagerDropStalledFilterPeer.
+        // That is peer churn caused by our own throughput, which is exactly what the
+        // self-clocked drive would otherwise make worse.
+        for (size_t i = array_count(manager->connectedPeers); i > 0; i--) {
+            BRPeer *p = manager->connectedPeers[i - 1];
+            if (! _BRPeerManagerPeerCanServeFilters(p)) continue;
+            if (! UInt128IsZero(manager->cfHeadersPeerAddr) &&
+                UInt128Eq(p->address, manager->cfHeadersPeerAddr)) continue;   // busy with cfheaders
+            target = p;
+            break;
+        }
+    }
+    if (!target) {
+        // Second pass without the exclusion: one filter peer is better than none.
         for (size_t i = array_count(manager->connectedPeers); i > 0; i--) {
             BRPeer *p = manager->connectedPeers[i - 1];
             if (! _BRPeerManagerPeerCanServeFilters(p)) continue;

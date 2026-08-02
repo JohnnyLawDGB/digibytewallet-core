@@ -22,6 +22,7 @@
 //  OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 //  THE SOFTWARE.
 
+#include <arpa/inet.h>   // inet_ntop for IPv6-correct peer logging
 #include "BRPeerManager.h"
 #include "BRSet.h"
 #include "BRArray.h"
@@ -64,6 +65,16 @@
 // ring buffer, not persisted across process restarts.
 #define PEER_PENALTY_MAX     32
 #define PEER_PENALTY_SECONDS (10*60) // 10 min; a genuinely-behind node is skipped this long
+// Short cooldown applied after ANY disconnect, INCLUDING a clean one (error == 0).
+// _peerDisconnected only removes a peer from the pool when error != 0, so a clean
+// disconnect left it immediately re-dialable and the next connect pass picked it
+// straight back up. Measured on a Note 8, 2026-08-02, one fresh-wallet run:
+// 12,677 connect attempts / 12,670 disconnects against only 8 connect errors, i.e.
+// the churn was almost entirely self-inflicted redialling, not peers refusing us.
+// Deliberately far shorter than PEER_PENALTY_SECONDS: a peer that merely dropped has
+// done nothing wrong and must come back quickly. This only stops the redial storm.
+// After this change the same window measured 884 attempts / 878 disconnects (~14x less).
+#define PEER_REDIAL_COOLDOWN_SECONDS 30
 
 #define genesis_block_hash(params) UInt256Reverse((params)->checkpoints[0].hash)
 
@@ -1036,11 +1047,13 @@ static void _BRPeerManagerPushConvoyHdrGate(BRPeerManager *manager)
 // above). If (addr, port) is already on the list its window is refreshed;
 // otherwise it's inserted at penaltyCount % PEER_PENALTY_MAX (oldest entry
 // evicted once the buffer wraps). Caller holds manager->lock.
-static void _penalize(BRPeerManager *manager, UInt128 addr, uint16_t port, time_t now)
+static void _penalizeFor(BRPeerManager *manager, UInt128 addr, uint16_t port, time_t now, time_t secs)
 {
     for (size_t i = 0; i < manager->penaltyCount && i < PEER_PENALTY_MAX; i++) {
         if (manager->penaltyPort[i] == port && UInt128Eq(manager->penaltyAddr[i], addr)) {
-            manager->penaltyUntil[i] = now + PEER_PENALTY_SECONDS;
+            // Never SHORTEN an existing penalty: a 10-minute "node isn't synced" ban must
+            // not be downgraded to a 30-second redial cooldown by a later clean disconnect.
+            if (now + secs > manager->penaltyUntil[i]) manager->penaltyUntil[i] = now + secs;
             return;
         }
     }
@@ -1048,8 +1061,13 @@ static void _penalize(BRPeerManager *manager, UInt128 addr, uint16_t port, time_
     size_t idx = manager->penaltyCount % PEER_PENALTY_MAX;
     manager->penaltyAddr[idx] = addr;
     manager->penaltyPort[idx] = port;
-    manager->penaltyUntil[idx] = now + PEER_PENALTY_SECONDS;
+    manager->penaltyUntil[idx] = now + secs;
     manager->penaltyCount++;
+}
+
+static void _penalize(BRPeerManager *manager, UInt128 addr, uint16_t port, time_t now)
+{
+    _penalizeFor(manager, addr, port, now, PEER_PENALTY_SECONDS);
 }
 
 // Record that `peer` answered a compact-filter request (positive served signal).
@@ -1223,6 +1241,12 @@ static void _peerDisconnected(void *info, int error)
                                    array_count(manager->connectedPeers) == 1)) txError = ETIMEDOUT;
     }
     
+    // REDIAL COOLDOWN — every disconnect, clean or not. Only the `error` branch above
+    // removes a peer from the pool, so a clean disconnect (error == 0) left it instantly
+    // re-dialable. _penalizeFor never shortens an existing entry, so this cannot downgrade
+    // a 10-minute "not synced" ban.
+    _penalizeFor(manager, peer->address, peer->port, time(NULL), PEER_REDIAL_COOLDOWN_SECONDS);
+
     for (size_t i = array_count(manager->txRelays); i > 0; i--) {
         peerList = &manager->txRelays[i - 1];
 
@@ -3860,10 +3884,31 @@ void BRPeerManagerConnect(BRPeerManager *manager)
                 // candidate-array element that write lands in the NEXT array slot,
                 // corrupting peers[k+1]'s address (and compounding down the loop). Format
                 // the IPv4 octets from a LOCAL copy instead so the log is memory-safe.
+                // Render IPv4 and IPv6 candidates CORRECTLY. This printed
+                // address.u32[3] as four octets unconditionally, so every NATIVE IPv6
+                // peer showed as its interface-identifier tail — commonly "0.0.0.1".
+                // Ten distinct IPv6 peers rendered as that same string, which reads like
+                // one malformed entry being dialled hundreds of times; it sent a whole
+                // investigation after a peer that did not exist (2026-08-02, Note 8).
+                //
+                // Formatted from a LOCAL copy, never peer_log()/BRPeerHost() on a bare
+                // manager->peers element: BRPeerHost casts to BRPeerContext* and writes
+                // into ctx->host, which on a bare BRPeer lands in the NEXT array slot and
+                // corrupts peers[k+1]'s address.
                 {
-                    const uint8_t *ip = (const uint8_t *)&manager->peers[k].address.u32[3];
-                    _peer_log("%u.%u.%u.%u:%"PRIu16" BIP158: connecting filter-capable peer first\n",
-                              ip[0], ip[1], ip[2], ip[3], manager->peers[k].port);
+                    const UInt128 a = manager->peers[k].address;
+                    const uint16_t prt = manager->peers[k].port;
+                    if (a.u64[0] == 0 && a.u16[4] == 0 && a.u16[5] == 0xffff) {
+                        const uint8_t *ip = (const uint8_t *)&a.u32[3];
+                        _peer_log("%u.%u.%u.%u:%"PRIu16" BIP158: connecting filter-capable peer first\n",
+                                  ip[0], ip[1], ip[2], ip[3], prt);
+                    }
+                    else {
+                        char h[INET6_ADDRSTRLEN] = "";
+                        inet_ntop(AF_INET6, &a, h, sizeof(h));
+                        _peer_log("[%s]:%"PRIu16" BIP158: connecting filter-capable peer first\n",
+                                  h[0] ? h : "?", prt);
+                    }
                 }
                 _BRPeerManagerBeginConnect(manager, &manager->peers[k]);
             }

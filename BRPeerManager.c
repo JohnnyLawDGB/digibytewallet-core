@@ -362,6 +362,20 @@ struct BRPeerManagerStruct {
     // 0 = no such observation (always walk). Reset whenever a walk DOES free.
     uint32_t         clearMemNoopFloor;
 
+    // cfFloor at which the last FULL descent actually ran. The no-op memo above cannot
+    // help once CF_RETENTION_SPAN_MAX binds -- the floor then rises by 1 per block-add,
+    // so `cfFloor <= clearMemNoopFloor` is false forever AND each freed block resets the
+    // memo. This defers the next descent until the floor has moved CLEAR_MEM_PRUNE_STRIDE,
+    // turning O(resident)-per-block into O(resident)/STRIDE. 0 = never descended yet.
+    uint32_t         lastPruneFloor;
+
+#ifdef CF_PRUNE_INSTRUMENT
+    // Host-KAT only (never defined in a production build): counts what the amortisation
+    // is supposed to reduce, so the gate can assert on WORK rather than on wall clock.
+    uint64_t         pruneDescents;   // full descents entered
+    uint64_t         pruneSetGets;    // BRSetGet calls inside the descent loop
+#endif
+
 #ifdef CF_RECV_DIAG
     // ---- RECEIVE-PATH ACCOUNTING (diagnostic build only) ---------------------
     // Stage 0 proved the NETWORK is not the problem: a bare socket gets 1000/1000
@@ -1725,6 +1739,27 @@ static void _BRPeerManagerClearMemory(BRPeerManager* manager) {
     // the block set, so the resident floor is unchanged and its memo stays valid.
     if (manager->clearMemNoopFloor != 0 && cfFloor <= manager->clearMemNoopFloor) return;
 
+    // ---- AMORTISE THE DESCENT (the short-circuit above CANNOT cover this) ----------
+    //
+    // Once CF_RETENTION_SPAN_MAX binds, cfFloor becomes `tip - 150000` and rises by ONE
+    // on every block-add. That defeats the memo above twice: `cfFloor <= clearMemNoopFloor`
+    // is never true again, and freeing the single block that just dropped below the floor
+    // sets clearMemNoopFloor = 0 anyway. Every block-add then pays a FULL O(resident)
+    // descent to free ONE block. Measured on device: 77 ms/header, one core pegged, and
+    // because the descent holds manager->lock it starves BRPeerManagerKeepAlive -- so the
+    // residual re-request driver never runs, outstanding heights are never retried, the
+    // scan frontier never advances, and the clamp keeps binding. Self-sustaining wedge.
+    //
+    // Deferring costs at most CLEAR_MEM_PRUNE_STRIDE extra resident blocks (~459 KB) and
+    // is safe in BOTH directions: a lower resident floor makes MORE heights requestable,
+    // never fewer. Guarded on cfFloor > 0 so a mode with no CF floor (cfFloor == 0) keeps
+    // pruning on the old schedule instead of latching shut -- an unguarded compare would
+    // make `0 < lastPruneFloor + STRIDE` true forever and leak the whole chain.
+#ifndef PRUNE_STRIDE_UNFIXED   // host-KAT red arm compiles the amortisation OUT
+    if (cfFloor > 0 && manager->lastPruneFloor != 0 &&
+        cfFloor < manager->lastPruneFloor + CLEAR_MEM_PRUNE_STRIDE) return;
+#endif
+
     // F1: from here on this function CAN raise the resident block floor, so drop the
     // memo. Moved below the short-circuit deliberately: a skipped call touches nothing,
     // and invalidating there would force a full O(chain) floor recompute on the next
@@ -1741,12 +1776,18 @@ static void _BRPeerManagerClearMemory(BRPeerManager* manager) {
 
         if (blockPtr) {
             prevHash = blockPtr->prevBlock;
+#ifdef CF_PRUNE_INSTRUMENT
+            manager->pruneDescents++;
+#endif
 
             // clear the tail
             while (blockPtr && !UInt256IsZero(prevHash)) {
 
                 // get the block
                 blockPtr = BRSetGet(manager->blocks, &prevHash);
+#ifdef CF_PRUNE_INSTRUMENT
+                manager->pruneSetGets++;
+#endif
                 if (!blockPtr) break;
 
                 // get previous hash
@@ -1770,6 +1811,14 @@ static void _BRPeerManagerClearMemory(BRPeerManager* manager) {
             }
 
             size_t after = BRSetCount(manager->blocks);
+
+            // We paid for a full descent at this floor. Record it whether or not anything
+            // was freed: the cost we are amortising is the WALK, not the freeing. (The
+            // clearMemNoopFloor memo below answers a different question -- "can any floor
+            // <= F free anything" -- and is reset the moment a walk frees, which is exactly
+            // why it cannot bound the clamped regime on its own.)
+            manager->lastPruneFloor = cfFloor;
+
             if (after < count) {
                 // Freed something: the floor moved, so any earlier no-op observation is
                 // stale and the next call must walk again.

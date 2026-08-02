@@ -130,6 +130,33 @@ Remarks:
    the tip, and a clamp near the window would skip that history on every first run. */
 #define CF_RETENTION_SPAN_MAX 150000u
 
+/* How far the retention floor must RISE before _BRPeerManagerClearMemory pays for another
+   full descent of the resident block set.
+
+   WHY THIS EXISTS (measured on a Note 8, 2026-08-02, deep restore from height 22,650,000).
+   Once CF_RETENTION_SPAN_MAX binds, the floor becomes `tip - 150000`, so it rises by ONE on
+   every block-add. That defeats the O(1) no-op short-circuit twice over: the memo is keyed on
+   `cfFloor <= clearMemNoopFloor`, which a strictly-rising floor never satisfies, and freeing
+   even one block resets the memo to 0. The result is a FULL descent of the ~150,000-block
+   resident set per block-add, to free the single block that just dropped below the floor.
+
+   That is not merely wasteful, it is self-sustaining. Measured: ~149,198 BRSetGet per header
+   against a ~28.8 MB working set (vs 2 MB of L2 on a Kryo 280) = 74.6 ms/header predicted,
+   77 ms/header observed, one core pegged at 100%. The descent holds manager->lock, so
+   BRPeerManagerKeepAlive cannot tick; the residual re-request driver never runs; outstanding
+   heights are never retried; the scan frontier never advances; the clamp keeps binding. The
+   device logged "keepalive stale: no tick in 80s" four times and abandoned 18,549 heights.
+   Header throughput collapsed from 108,696/s to 13/s -- a factor of 8,361.
+
+   Amortising is sound because the ONLY cost of deferring is that at most this many blocks
+   stay resident past the floor (~2048 x 224 B ~= 459 KB, against a 34 MB budget), and a LOWER
+   resident floor is strictly safer for coverage: it makes MORE heights requestable, never
+   fewer. Correctness never depended on pruning promptly -- only on pruning eventually.
+
+   Not 1000: three unrelated constants in this project already sit at 1000 and a collision
+   there once let a dead band eat real work. */
+#define CLEAR_MEM_PRUNE_STRIDE 2048u
+
 /* How far the forward cfilter CURSOR may run ahead of the SCAN FRONTIER.
 
    The convoy paces the header and cfheader frontiers against the scan frontier, but nothing

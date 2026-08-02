@@ -63,7 +63,17 @@
 // the same still-behind peer every connect pass -- observed live as one
 // peer dialed 122x in a tight loop while the wallet held 0 peers. Fixed-size
 // ring buffer, not persisted across process restarts.
-#define PEER_PENALTY_MAX     32
+//
+// SIZED FOR THE REAL WORKING SET (raised 32 -> 256, 2026-08-02). 32 was far below the
+// number of distinct peers that pass through this table in normal operation, and the
+// insert policy evicted the OLDEST INSERT unconditionally, so a live 10-minute
+// "doesn't support SPV mode" ban was routinely thrown out by an unrelated 30-second
+// redial cooldown. Measured on a Note 8 during a deep restore: 41 distinct non-SPV
+// peers producing 3,520 disconnects in about ONE MINUTE (~86 redials each), which
+// consumed every connection slot. Adding PEER_REDIAL_COOLDOWN_SECONDS on every clean
+// disconnect (same day) made it worse by pumping evictions with short-lived entries.
+// 256 entries x (16 + 2 + 8) B ~= 6.6 KB -- irrelevant next to the churn it prevents.
+#define PEER_PENALTY_MAX     256
 #define PEER_PENALTY_SECONDS (10*60) // 10 min; a genuinely-behind node is skipped this long
 // Short cooldown applied after ANY disconnect, INCLUDING a clean one (error == 0).
 // _peerDisconnected only removes a peer from the pool when error != 0, so a clean
@@ -419,9 +429,11 @@ struct BRPeerManagerStruct {
     // a (still CF_CONTINUITY_REANCHOR_MAX-bounded) re-anchor.
     uint8_t  cfSingleDisagreeRounds;
     // Session-scoped re-dial penalty (churn fix, see PEER_PENALTY_* above).
-    // Ring buffer: penaltyCount only ever grows (mod PEER_PENALTY_MAX indexing
-    // on insert), never shrinks -- entries just age out via BRPeerPenaltyContains'
-    // until-vs-now check. Zero-initialized by BRPeerManagerNewEx's calloc.
+    // penaltyCount only ever grows and is CLAMPED to PEER_PENALTY_MAX by every reader
+    // (both BRPeerPenaltyContains call sites pass `min(penaltyCount, PEER_PENALTY_MAX)`;
+    // that helper does no bounds checking of its own). Entries age out via its
+    // until-vs-now check. Once full, inserts evict by EXPIRY, not insertion order --
+    // see _penalizeFor. Zero-initialized by BRPeerManagerNewEx's calloc.
     UInt128  penaltyAddr[PEER_PENALTY_MAX];
     uint16_t penaltyPort[PEER_PENALTY_MAX];
     time_t   penaltyUntil[PEER_PENALTY_MAX];
@@ -1072,10 +1084,43 @@ static void _penalizeFor(BRPeerManager *manager, UInt128 addr, uint16_t port, ti
         }
     }
 
-    size_t idx = manager->penaltyCount % PEER_PENALTY_MAX;
-    manager->penaltyAddr[idx] = addr;
-    manager->penaltyPort[idx] = port;
-    manager->penaltyUntil[idx] = now + secs;
+    // Not full yet: append.
+    if (manager->penaltyCount < PEER_PENALTY_MAX) {
+        size_t idx = manager->penaltyCount;
+        manager->penaltyAddr[idx] = addr;
+        manager->penaltyPort[idx] = port;
+        manager->penaltyUntil[idx] = now + secs;
+        manager->penaltyCount++;
+        return;
+    }
+
+#ifndef PENALTY_EVICT_UNFIXED   // host-KAT red arm keeps the old oldest-insert ring
+    // FULL: evict by EXPIRY, never by insertion order.
+    //
+    // The old policy was `idx = penaltyCount % PEER_PENALTY_MAX` — overwrite the oldest
+    // INSERT. That silently discarded whatever happened to be oldest, including a live
+    // 10-minute "doesn't support SPV mode" ban, in favour of an unrelated 30-second
+    // redial cooldown. The evicted peer became instantly re-dialable, reconnected, was
+    // rejected again, and re-penalised — evicting someone else in turn. Measured: 41
+    // distinct peers, 3,520 disconnects in ~1 minute, every connection slot consumed.
+    //
+    // Prefer an ALREADY-EXPIRED slot (free real estate). Otherwise take the soonest to
+    // expire, and only if the newcomer actually outlives it — a 30s cooldown must never
+    // be able to displace a ban with minutes left to run. If it cannot, we simply drop
+    // the new penalty: failing to cool down one peer for 30s is strictly less harmful
+    // than un-banning a node we already know is unusable.
+    size_t victim = 0;
+    for (size_t i = 1; i < PEER_PENALTY_MAX; i++) {
+        if (manager->penaltyUntil[i] < manager->penaltyUntil[victim]) victim = i;
+    }
+    if (manager->penaltyUntil[victim] > now && manager->penaltyUntil[victim] >= now + secs) return;
+#else
+    size_t victim = manager->penaltyCount % PEER_PENALTY_MAX;
+#endif
+
+    manager->penaltyAddr[victim] = addr;
+    manager->penaltyPort[victim] = port;
+    manager->penaltyUntil[victim] = now + secs;
     manager->penaltyCount++;
 }
 

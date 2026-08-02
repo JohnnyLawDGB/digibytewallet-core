@@ -241,6 +241,14 @@ struct BRPeerManagerStruct {
     void *saveCFLedgerInfo;
     void (*saveCFLedger)(void *info, const uint8_t *bytes, size_t len);
     BRCFScanLedger cfLedger;
+    // Cached BIP 158 wallet element set, reused across arriving cfilters. Rebuilding it
+    // per filter was 98.8% of the per-filter cost (see _BRPeerManagerFilterElementsLocked).
+    // cfElemsAddrCount is the address count the cache was built from and is the ONLY
+    // validity condition — never a timer.
+    BRWalletFilterElements *cfElems;
+    uint64_t cfElemsAddrGen;      // wallet's address-set generation the cache was built from
+    size_t cfElemsAddrCount;      // ...and its address count (defence-in-depth)
+    int cfElemsIsTestnet;         // ...and the network, which changes the encoded BYTES
     int autoFetchCFiltersEnabled;
     uint32_t autoFetchCFiltersStart;     // wallet birth height (inclusive)
     uint32_t autoFetchCFiltersThrough;   // highest height already requested (or
@@ -334,6 +342,14 @@ struct BRPeerManagerStruct {
     _Atomic uint32_t cachedCFTip;
     _Atomic int      cachedPeerCount;
     uint32_t         lastSpanClampLog;   // rate-limits the retention-span-clamp WARN
+
+    // Highest cfFloor at which a FULL descent found nothing to free. Blocks are only
+    // ever appended at the TIP, so the resident bottom never grows downward, and a
+    // block can only BECOME prunable when cfFloor RISES above it. So if we already
+    // walked the whole chain at floor F and freed nothing, any later call with
+    // cfFloor <= F cannot free anything either and the walk can be skipped outright.
+    // 0 = no such observation (always walk). Reset whenever a walk DOES free.
+    uint32_t         clearMemNoopFloor;
 
 #ifdef CF_RECV_DIAG
     // ---- RECEIVE-PATH ACCOUNTING (diagnostic build only) ---------------------
@@ -1574,13 +1590,6 @@ static void _BRPeerManagerClearMemory(BRPeerManager* manager) {
     size_t count = BRSetCount(manager->blocks);
     size_t i = 0;
 
-    // F1: this function is the one thing that RAISES the resident block floor, so
-    // drop the memo unconditionally here. (The memo key would catch it anyway —
-    // pruning changes BRSetCount — but a floor cache whose only defence is a
-    // derived key is one refactor away from being stale, and a stale-HIGH floor
-    // would over-clamp getcfilters.)
-    manager->floorMemoValid = 0;
-
     // BIP 158: never prune block headers the compact-filter SCAN (or its
     // residual re-request) still needs. The floor tracks the lowest height the
     // SCAN still needs a header for — NOT the cfHEADER frontier. cfheaders burst
@@ -1674,6 +1683,33 @@ static void _BRPeerManagerClearMemory(BRPeerManager* manager) {
     }
 #endif
 
+    // ---- O(1) NO-OP SHORT-CIRCUIT ------------------------------------------------
+    //
+    // This runs on EVERY block-add. The descent below skips (continue) every block at
+    // or above cfFloor, so when the whole resident chain sits above the floor it walks
+    // the entire set and frees NOTHING. Measured on a Note 8, fresh wallet: ~20,800
+    // BRSetGet lookups per block, forever, with `[MEMORY]: Blocks reduced from 20586 to
+    // 20586` repeating — pure cost, under manager->lock, on the hot path.
+    //
+    // Sound because prunability is MONOTONE IN cfFloor: blocks are only ever appended
+    // at the tip (a reorg replaces the tip, it does not extend the chain downward), so
+    // the resident bottom cannot move down, and a block can only become prunable when
+    // cfFloor rises above it. Having walked the whole chain at floor F and freed
+    // nothing, no floor <= F can free anything.
+    //
+    // Deliberately does NOT invalidate floorMemoValid: skipping means we did not touch
+    // the block set, so the resident floor is unchanged and its memo stays valid.
+    if (manager->clearMemNoopFloor != 0 && cfFloor <= manager->clearMemNoopFloor) return;
+
+    // F1: from here on this function CAN raise the resident block floor, so drop the
+    // memo. Moved below the short-circuit deliberately: a skipped call touches nothing,
+    // and invalidating there would force a full O(chain) floor recompute on the next
+    // reader — re-introducing on the read side exactly the per-block walk the
+    // short-circuit just removed. (The memo key would catch a change anyway, but a
+    // floor cache whose only defence is a derived key is one refactor away from being
+    // stale, and a stale-HIGH floor would over-clamp getcfilters.)
+    manager->floorMemoValid = 0;
+
     if (count >= CLEAR_MEM_BLOCKS_COUNT_TRIGGER) {
         // find the tail
         while (blockPtr && i++ <= (CLEAR_MEM_BLOCKS_COUNT_TRIGGER - CLEAR_MEM_BLOCKS_COUNT_TAIL_LEN))
@@ -1709,7 +1745,18 @@ static void _BRPeerManagerClearMemory(BRPeerManager* manager) {
                 }
             }
 
-            debug_log("[MEMORY]: Blocks reduced from %ld to %ld blocks\n", count, BRSetCount(manager->blocks));
+            size_t after = BRSetCount(manager->blocks);
+            if (after < count) {
+                // Freed something: the floor moved, so any earlier no-op observation is
+                // stale and the next call must walk again.
+                manager->clearMemNoopFloor = 0;
+                debug_log("[MEMORY]: Blocks reduced from %ld to %ld blocks\n", count, after);
+            }
+            else {
+                // Full descent, nothing prunable at this floor. Remember it so the next
+                // block-add costs one comparison instead of another full walk.
+                manager->clearMemNoopFloor = cfFloor;
+            }
         }
     }
 }
@@ -3154,6 +3201,95 @@ static void _peerRelayedCFHeaders(void *info, uint8_t filterType, UInt256 stopHa
     pthread_mutex_unlock(&manager->lock);
 }
 
+// Returns the wallet's BIP 158 element set, rebuilding it only when the wallet's address
+// set has actually changed. Caller holds manager->lock and MUST NOT free the result — it
+// is owned by the manager and freed in BRPeerManagerFree.
+//
+// Why this exists: BRWalletGetFilterElements enumerates every wallet address and calls
+// BRAddressScriptPubKey twice per address (a sizing pass and a fill pass), each a
+// base58check decode with SHA256d. It was called once per arriving cfilter — "up to 1000
+// per batch, tens of millions across a deep sync", as BRWalletFilterElements.c already
+// notes — which measured 1.90 ms per filter against the real DGB mainnet fixture in this
+// tree, 98.8% of the per-filter cost, i.e. ~45 min of single-core CPU per 1.44M blocks.
+// Cached, the per-filter cost is the GCS match alone (~41 us measured).
+//
+// THE INVALIDATION RULE. The element BYTES are a function of (address strings, network) —
+// NOT of the address set alone: BRAddressScriptPubKey encodes per BRNetworkIsTestnet().
+// So the cache key is a three-field tuple, all cheap, all compared before every use:
+//
+//   addrGen   monotonic, process-global, bumped at every append to an enumerated chain and
+//             at wallet construction. Catches appends AND a change of WALLET — which a
+//             count cannot see, because two different seeds yield identical address counts
+//             with fully disjoint sets (measured: 1045 == 1045, 0 shared) — and being
+//             process-global it is immune to malloc reusing the same chunk.
+//   addrCount defence-in-depth. If a future author adds a chain mutation and forgets to
+//             bump addrGen, the count still catches it, so a missed bump degrades to a
+//             weaker check instead of to silent fund loss.
+//   isTestnet a free global read. Without it a network switch leaves gen and count
+//             unchanged while changing the elements — measured: count 645 -> 645,
+//             elements 645 -> 0. The PARTIAL-drop variant is the dangerous one: some
+//             addresses stop encoding while others still do, so the set stays non-empty
+//             and the build-failure retry below never fires. Silent and permanent.
+//
+// gen and count are read in ONE lock hold (BRWalletAddrSetKey) because read separately they
+// could straddle an append and yield a pair that never existed.
+//
+// The key is read BEFORE the rebuild and the PRE-build value is stamped. That looks like a
+// bug and is load-bearing: because gen and count are monotonic, an append racing the build
+// leaves the stamped key mismatched, so the next filter rebuilds. Stamping a post-build
+// value could swallow that append. Do not "fix" the ordering.
+//
+// This is deliberately a probe rather than invalidation at known mutation sites, because the
+// mutations are not all reachable from here. Three matter, and only a probe catches all
+// three:
+//   - a tx registered mid-scan: BRWalletRegisterTransaction extends all six chains, and
+//     the very NEXT filter must already match the newly derived addresses. This is
+//     self-referential — scanning is what grows the set it scans for.
+//   - a receive address handed out on the Receive screen: BRWalletReceiveAddress extends a
+//     chain from the JVM thread, with no peer-manager involvement at all.
+//   - a watched address pinned over JNI, likewise off-thread.
+// Getting this wrong does not degrade gracefully: a stale set means a filter that should
+// have matched does not, the block is never fetched, and the payment is never seen.
+// Silent, permanent, and it is money. Hence a rule that cannot miss a mutation site
+// rather than a list of sites we believe is complete.
+static BRWalletFilterElements *_BRPeerManagerFilterElementsLocked(BRPeerManager *manager)
+{
+    uint64_t addrGen = 0;
+    size_t addrCount = 0;
+    int isTestnet;
+
+    BRWalletAddrSetKey(manager->wallet, &addrGen, &addrCount);
+    isTestnet = BRNetworkIsTestnet() ? 1 : 0;
+
+#ifdef CF_ELEMS_CACHE_NOINVALIDATE
+    // NAIVE-CACHE shape — host-KAT red-before-green ONLY (never defined in a production
+    // build). Caches once and never invalidates, so an address added after the first filter
+    // is never matched: the exact silent missed receive this rule prevents.
+    if (manager->cfElems) return manager->cfElems;
+#elif defined(CF_ELEMS_CACHE_COUNT_ONLY)
+    // COUNT-ONLY shape — host-KAT red-before-green ONLY. Keys on the address count alone,
+    // which is UNSOUND: it misses a network switch (elements re-encode with gen and count
+    // unchanged) and misses a wallet swap (disjoint sets, identical counts).
+    if (manager->cfElems && manager->cfElemsAddrCount == addrCount) return manager->cfElems;
+#else
+    if (manager->cfElems &&
+        manager->cfElemsAddrGen == addrGen &&
+        manager->cfElemsAddrCount == addrCount &&
+        manager->cfElemsIsTestnet == isTestnet) return manager->cfElems;
+#endif
+
+    BRWalletFilterElementsFree(manager->cfElems);   // NULL-safe
+    manager->cfElems = BRWalletGetFilterElements(manager->wallet);
+    // On a build failure leave the key mismatched so the next filter retries rather than
+    // caching "no elements" — matching nothing forever would be a silent missed receive.
+    // (Note this only saves the TOTAL-drop case; the partial-drop case is why isTestnet is
+    // part of the key rather than relying on this.)
+    manager->cfElemsAddrGen   = manager->cfElems ? addrGen : 0;
+    manager->cfElemsAddrCount = manager->cfElems ? addrCount : 0;
+    manager->cfElemsIsTestnet = isTestnet;
+    return manager->cfElems;
+}
+
 // cfilter response handler. Three jobs:
 //   1. Verify the filter against the chain (catches lying peers).
 //   2. Match the wallet's address set against the decoded filter.
@@ -3308,7 +3444,12 @@ static void _peerRelayedCFilter(void *info, uint8_t filterType, UInt256 blockHas
 #ifdef CF_RECV_DIAG
     uint64_t _tEval0 = _cfNowNanos();
 #endif
-    BRWalletFilterElements *fe = BRWalletGetFilterElements(manager->wallet);
+    // CACHED, MANAGER-OWNED. Rebuilding this per filter was ~98.8% of the per-filter
+    // cost: a full address-set copy plus two BRAddressScriptPubKey passes over ~645
+    // addresses, twice, with two allocations — every arrival. Keyed on
+    // (addrGen, addrCount, isTestnet); see _BRPeerManagerFilterElementsLocked.
+    // DO NOT FREE: the manager owns it and reuses it across arrivals.
+    BRWalletFilterElements *fe = _BRPeerManagerFilterElementsLocked(manager);
     size_t feCount = (fe ? fe->count : 0);
     int hit = 0;
     if (fe && fe->count > 0) {
@@ -3334,7 +3475,8 @@ static void _peerRelayedCFilter(void *info, uint8_t filterType, UInt256 blockHas
             peer_log(peer, "cfilter:   sample wallet element[0] len=%zu spk=%s", l0, hx);
         }
     }
-    BRWalletFilterElementsFree(fe);
+    // NOTE: fe is the manager-owned cache — freeing it here would dangle
+    // manager->cfElems and the NEXT arrival would use-after-free it.
     BRGCSFilterFree(gcs);
 #ifdef CF_RECV_DIAG
     manager->cfEvalNanos += (_cfNowNanos() - _tEval0);
@@ -5209,6 +5351,10 @@ void BRPeerManagerFree(BRPeerManager *manager)
         manager->compactFilterChain = NULL;
     }
     BRCFScanLedgerFree(&manager->cfLedger); // frees any still-buffered raw filter bytes (Phase 2 Task 2)
+    BRWalletFilterElementsFree(manager->cfElems); // NULL-safe; cached BIP 158 element set
+    manager->cfElems = NULL;
+    manager->cfElemsAddrGen = 0;
+    manager->cfElemsAddrCount = 0;
     pthread_mutex_unlock(&manager->lock);
     pthread_mutex_destroy(&manager->lock);
     free(manager);

@@ -47,6 +47,11 @@ struct BRWalletStruct {
     BRMasterPubKey masterPubKey;
     BRAddress *internalChain, *externalChain;
     BRAddress *internalChainSegwit, *externalChainSegwit;
+    // Monotonic stamp for "the enumerated address set changed". Sourced from a
+    // process-global counter so a REPLACEMENT wallet can never collide with a
+    // predecessor's value, even if malloc hands back the same chunk. See
+    // BRWalletAddrSetKey.
+    uint64_t addrGen;
     // Legacy key support: populated by BRWalletNewDual for recovery scanning of old m/0H addresses
     BRMasterPubKey legacyPubKey;
     int hasLegacyKey;
@@ -181,6 +186,28 @@ static int _BRWalletContainsTx(BRWallet *wallet, const BRTransaction *tx)
 //    
 //    return r;
 //}
+
+// Process-global, monotonic, never reused. Stamped into wallet->addrGen at construction
+// and re-stamped on every append to an enumerated address chain, so a cached derivative of
+// the address set (see the compact-filter element cache in BRPeerManager) can detect a
+// change with one comparison — including a change of WALLET, which a count cannot see: two
+// different seeds produce identical address counts with fully disjoint address sets
+// (measured: 1045 == 1045, 0 shared).
+//
+// Guarded by its own leaf mutex rather than wallet->lock: the bump sites already hold
+// wallet->lock, and taking it here would be a recursive acquire.
+static pthread_mutex_t g_addrGenLock = PTHREAD_MUTEX_INITIALIZER;
+static uint64_t g_addrGenCounter = 0;
+
+static uint64_t _brNextAddrGen(void)
+{
+    uint64_t g;
+
+    pthread_mutex_lock(&g_addrGenLock);
+    g = ++g_addrGenCounter;
+    pthread_mutex_unlock(&g_addrGenLock);
+    return g;
+}
 
 static void _BRWalletUpdateBalance(BRWallet *wallet)
 {
@@ -350,6 +377,7 @@ BRWallet *BRWalletNew(BRTransaction *transactions[], size_t txCount, BRMasterPub
     array_new(wallet->transactions, txCount + 100);
     wallet->feePerKb = DEFAULT_FEE_PER_KB;
     wallet->masterPubKey = mpk;
+    wallet->addrGen = _brNextAddrGen();   // distinct from every prior wallet in this process
     array_new(wallet->internalChain, 50);
     array_new(wallet->externalChain, 50);
     array_new(wallet->internalChainSegwit, 50);
@@ -429,6 +457,7 @@ static void _BRWalletPregenLegacyChain(BRWallet *wallet, BRAddress **addrChainPt
                 BRAddressEq(&address, &BR_ADDRESS_NONE)) break;
         }
         array_add(addrChain, address);
+        wallet->addrGen = _brNextAddrGen();   // enumerated address set changed
     }
     // Add to allAddrs only AFTER the array has reached its final size. array_add()
     // above reallocs the chain when it grows past its initial capacity (50); with
@@ -686,6 +715,7 @@ size_t BRWalletUnusedAddrs(BRWallet *wallet, BRAddress addrs[], uint32_t gapLimi
         }
         
         array_add(addrChain, address);
+        wallet->addrGen = _brNextAddrGen();   // enumerated address set changed
         count++;
         
         // Address is already used
@@ -1023,6 +1053,32 @@ size_t BRWalletAllAddrs(BRWallet *wallet, BRAddress addrs[], size_t addrsCount)
 
 // Single-call snapshot — no window between sizing and filling. See BRWallet.h for the
 // deadlock rationale behind allocating inside the lock.
+size_t BRWalletAllAddrsCount(BRWallet *wallet)
+{
+    size_t n;
+
+    if (! wallet) return 0;
+    pthread_mutex_lock(&wallet->lock);
+    n = _BRWalletCollectAddrsLocked(wallet, NULL, 0, NULL);   // sizing pass only: no encode, no malloc
+    pthread_mutex_unlock(&wallet->lock);
+    return n;
+}
+
+void BRWalletAddrSetKey(BRWallet *wallet, uint64_t *outGen, size_t *outCount)
+{
+    if (outGen) *outGen = 0;
+    if (outCount) *outCount = 0;
+    if (! wallet) return;
+
+    // BOTH fields under ONE hold: read separately they could straddle an append and
+    // produce a pair that never actually existed, which is exactly the stale-key hazard
+    // this accessor is meant to close.
+    pthread_mutex_lock(&wallet->lock);
+    if (outGen) *outGen = wallet->addrGen;
+    if (outCount) *outCount = _BRWalletCollectAddrsLocked(wallet, NULL, 0, NULL);
+    pthread_mutex_unlock(&wallet->lock);
+}
+
 BRAddress *BRWalletCopyAllAddrs(BRWallet *wallet, size_t *countOut, BRWalletAddrOrigins *originsOut)
 {
     BRAddress *addrs = NULL;
@@ -1151,6 +1207,7 @@ void BRWalletAddWatchedAddress(BRWallet *wallet, const char *addr)
         BRAddress a = BR_ADDRESS_NONE;
         strncpy(a.s, addr, sizeof(a.s) - 1);
         array_add(wallet->watchedAddrs, a);   // plain array; no &array[i] stored anywhere
+        wallet->addrGen = _brNextAddrGen();   // enumerated address set changed
     }
     pthread_mutex_unlock(&wallet->lock);
 }

@@ -60,8 +60,47 @@ extern "C" {
 // NOTE: this gate is a CALLER guard. BRCFScanLedgerNextRerequest (the Phase-2
 // driver logic) is ALWAYS compiled so it stays unit-testable; production simply
 // does not invoke it while the gate is 0.
+// SHIPPING AT 0 (Phase 1, observe-only) — deliberately, not by oversight. Phase 2
+// was armed here before it had ever shipped, and the back-pressure half of it is
+// unsafe against this core's retention predicate:
+//
+//   _BRPeerManagerClearMemory anchors its retention floor to the CFHEADER frontier
+//   (cfNext - CLEAR_MEM_CF_RETENTION_MARGIN, BRPeerManager.c). cfheaders advance
+//   2000 per message and are requested unconditionally, while cfilters are
+//   requested <=1000 per batch and arrive one message at a time, so a single
+//   cfheaders append can put an entire in-flight filter batch below the floor —
+//   the margin is 144, less than one batch. Those block headers are then freed
+//   while their cfilters are still outstanding.
+//
+//   Such a height can never leave `outstanding`: both MarkEvaluated sites require
+//   a resident header, and the residual re-request cannot even SEND, because its
+//   stop hash is resolved by walking prevBlock links through manager->blocks and
+//   that walk dies in the pruned gap. sent == 0 means CommitRerequest never runs,
+//   so attempts never increment and RetireCapped never retires it.
+//
+//   Phase 2's back-pressure gate pauses forward auto-fetch while outstanding >=
+//   CF_OUTSTANDING_LOWWATER (3072) on the premise that the residual driver drains
+//   the backlog. For pruned heights that premise is false, and the count only ever
+//   grows — so on a restore of any real depth forward cfilter fetch eventually
+//   pauses FOREVER: no new filters, so no new transactions detected, while headers
+//   and cfheaders keep advancing and the UI still reports Synced.
+//
+// At 0 the ledger still records requested heights and marks them evaluated on
+// arrival (see the #else in _peerRelayedCFHeaders' auto-fetch block), so holes stay
+// visible on the Network Info screen — the observability win is kept and only the
+// behaviour change is dropped. A pruned-before-scanned filter is dropped with a log
+// line, which is exactly what the last shipped release (v4.0.23) already did.
+//
+// Re-arm this to 1 together with the paced-convoy + scan-frontier-anchored
+// retention pair, which removes the pruning race the back-pressure premise needs.
+// Arming it WITHOUT that pair is the regression described above. The scan-frontier
+// retention fix must not be cherry-picked alone either: it retains every header from
+// the scan frontier to the tip, and only the convoy bounds that span.
+//
+// KATs pass -DCF_LEDGER_DRIVE_REREQUEST=1 explicitly, so Phase-2 logic stays fully
+// covered by the host suite while production runs at 0.
 #ifndef CF_LEDGER_DRIVE_REREQUEST
-#define CF_LEDGER_DRIVE_REREQUEST 1   // Phase 2: driver ARMED (buffer-drain + residual re-request + back-pressure). -D wins for KATs.
+#define CF_LEDGER_DRIVE_REREQUEST 0   // Phase 1: observe only. -D wins for KATs.
 #endif
 
 // Sentinel: "no height was evicted" — returned by the overflow-drop-reporting

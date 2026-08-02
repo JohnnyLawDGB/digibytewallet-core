@@ -2001,7 +2001,10 @@ static void _peerRelayedBlock(void *info, BRMerkleBlock *block)
         while (b && b->height > block->height)
             b = BRSetGet(manager->blocks, &b->prevBlock); // is block in main chain?
         
-        if (BRMerkleBlockEq(b, block)) { // if it's not on a fork, set block heights for its transactions
+        // b == NULL means the walk ran off the bottom of the resident set (see the
+        // same guard in _peerRelayedBlockTxns): we cannot prove `block` is on the main
+        // chain, so skip the height stamping rather than deref NULL in BRMerkleBlockEq.
+        if (b && BRMerkleBlockEq(b, block)) { // if it's not on a fork, set block heights for its transactions
             if (txCount > 0) _BRPeerManagerUpdateTx(manager, txHashes, txCount, block->height, txTime);
             if (block->height == manager->lastBlock->height) manager->lastBlock = block;
         }
@@ -2186,10 +2189,30 @@ static void _peerRelayedBlockTxns(void *info, UInt256 blockHash, const UInt256 t
     b2 = manager->lastBlock;
     while (b2 && b2->height > b->height) b2 = BRSetGet(manager->blocks, &b2->prevBlock); // is block in main chain?
 
+#ifdef RELAYEDBLOCKTXNS_MAINCHAIN_NULLGUARD_UNFIXED
+    // PRE-FIX shape — host-KAT red-before-green ONLY (never defined in a production
+    // build). b2 was assumed resident, so BRMerkleBlockEq derefs NULL. This is the
+    // shape test4 in cf_confirm_kat crashes on (== RED).
     if (! BRMerkleBlockEq(b2, b)) { // block is on a fork, not the main chain; don't confirm against it
         pthread_mutex_unlock(&manager->lock);
         return;
     }
+#else
+    // b2 == NULL means the walk ran off the bottom of the resident block set before
+    // reaching b's height: b is below everything we still hold, so we cannot prove it
+    // is on the main chain. BRPeerManagerNewEx seeds every hardcoded checkpoint as a
+    // stub into manager->blocks and never sets prevBlock, so each stub terminates the
+    // walk at the zero hash while sitting millions of blocks below the retained
+    // window — and this handler is not request-gated, so any peer we dial can name
+    // one in an unsolicited "block" message. BRMerkleBlockEq (BRMerkleBlock.h) derefs
+    // BOTH arguments, so reaching it with a NULL b2 is a remote NULL-deref crash.
+    // Unprovable-main-chain is exactly as unconfirmable as on-a-fork, so both take
+    // the same bail-out.
+    if (! b2 || ! BRMerkleBlockEq(b2, b)) { // on a fork, or below the resident set; don't confirm against it
+        pthread_mutex_unlock(&manager->lock);
+        return;
+    }
+#endif
 
     UInt256 *walletHashes = malloc(txCount*sizeof(*walletHashes));
     size_t walletCount = 0;

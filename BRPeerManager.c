@@ -350,6 +350,19 @@ struct BRPeerManagerStruct {
     uint32_t cfExitVerifyFail; // filter hash != cfheader chain
     uint32_t cfExitParseFail;  // GCS parse failed
     uint32_t cfExitEvaluated;  // reached MarkEvaluated (the only good outcome)
+
+    // ---- TIMING (CF_RECV_DIAG): where does the wall clock actually go? -------
+    // The network hands us 1000 filters in 0.2s (measured, bare socket) but the
+    // wallet processes ~28/s. This splits that gap three ways so the fix is aimed
+    // at the real constraint rather than at the network:
+    //   lockWait  - blocked on manager->lock (contention with KeepAlive/block-add)
+    //   evalNanos - inside the GCS build+match against the wallet element set
+    //   gapNanos  - wall clock BETWEEN arrivals (idle => we are network-bound)
+    uint64_t cfLockWaitNanos;
+    uint64_t cfEvalNanos;
+    uint64_t cfGapNanos;
+    uint64_t cfLastArrivalNanos;
+    uint32_t cfTimedSamples;
 #endif
     _Atomic int      cachedHasDownloadPeer;
     _Atomic int      cachedSyncMode;
@@ -3148,14 +3161,33 @@ static void _peerRelayedCFHeaders(void *info, uint8_t filterType, UInt256 stopHa
 //      The block message handler in BRPeer.c walks the txs and dispatches
 //      each via the existing relayedTx callback, which is wired to
 //      BRWalletRegisterTransaction. Idempotent on duplicate registers.
+#ifdef CF_RECV_DIAG
+static uint64_t _cfNowNanos(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
+#endif
+
 static void _peerRelayedCFilter(void *info, uint8_t filterType, UInt256 blockHash,
                                 const uint8_t *encoded, size_t encodedLen)
 {
     BRPeer *peer = ((BRPeerCallbackInfo *)info)->peer;
     BRPeerManager *manager = ((BRPeerCallbackInfo *)info)->manager;
 
+#ifdef CF_RECV_DIAG
+    uint64_t _tPre = _cfNowNanos();
+#endif
     pthread_mutex_lock(&manager->lock);
 #ifdef CF_RECV_DIAG
+    {
+        uint64_t _tPost = _cfNowNanos();
+        manager->cfLockWaitNanos += (_tPost - _tPre);
+        if (manager->cfLastArrivalNanos) manager->cfGapNanos += (_tPre - manager->cfLastArrivalNanos);
+        manager->cfLastArrivalNanos = _tPre;
+        manager->cfTimedSamples++;
+    }
     manager->cfRecvTotal++;
 #endif
     if (!manager->compactFilterChain ||
@@ -3273,6 +3305,9 @@ static void _peerRelayedCFilter(void *info, uint8_t filterType, UInt256 blockHas
         return;
     }
 
+#ifdef CF_RECV_DIAG
+    uint64_t _tEval0 = _cfNowNanos();
+#endif
     BRWalletFilterElements *fe = BRWalletGetFilterElements(manager->wallet);
     size_t feCount = (fe ? fe->count : 0);
     int hit = 0;
@@ -3301,6 +3336,9 @@ static void _peerRelayedCFilter(void *info, uint8_t filterType, UInt256 blockHas
     }
     BRWalletFilterElementsFree(fe);
     BRGCSFilterFree(gcs);
+#ifdef CF_RECV_DIAG
+    manager->cfEvalNanos += (_cfNowNanos() - _tEval0);
+#endif
 
     if (hit) {
         peer_log(peer, "cfilter: MATCH on block %s @ height %u, requesting full block",
@@ -3908,6 +3946,22 @@ void BRPeerManagerKeepAlive(BRPeerManager *manager)
                   manager->cfExitNoChain, manager->cfExitUnknownBuf,
                   manager->cfExitUnknownDrop, manager->cfExitVerifyFail,
                   manager->cfExitParseFail, (int)manager->cfRecvTotal - (int)acc);
+        // WHERE THE WALL CLOCK GOES. gap dominating => we are NETWORK/idle bound and
+        // the constraint is upstream of this function. lock dominating => contention
+        // with KeepAlive / block-add is throttling the drain. eval dominating => the
+        // GCS match against the wallet element set is the constraint.
+        if (manager->cfTimedSamples > 0) {
+            uint32_t n = manager->cfTimedSamples;
+            debug_log("[CF-TIME] n=%u | lockWait=%llu us/filter | eval=%llu us/filter | "
+                      "gapBetweenArrivals=%llu us/filter | totals(ms) lock=%llu eval=%llu gap=%llu\n",
+                      n,
+                      (unsigned long long)(manager->cfLockWaitNanos / n / 1000),
+                      (unsigned long long)(manager->cfEvalNanos     / n / 1000),
+                      (unsigned long long)(manager->cfGapNanos      / n / 1000),
+                      (unsigned long long)(manager->cfLockWaitNanos / 1000000),
+                      (unsigned long long)(manager->cfEvalNanos     / 1000000),
+                      (unsigned long long)(manager->cfGapNanos      / 1000000));
+        }
     }
 #endif
 

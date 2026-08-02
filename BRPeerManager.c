@@ -333,6 +333,24 @@ struct BRPeerManagerStruct {
     _Atomic uint32_t cachedSyncStartHeight;
     _Atomic uint32_t cachedCFTip;
     _Atomic int      cachedPeerCount;
+    uint32_t         lastSpanClampLog;   // rate-limits the retention-span-clamp WARN
+
+#ifdef CF_RECV_DIAG
+    // ---- RECEIVE-PATH ACCOUNTING (diagnostic build only) ---------------------
+    // Stage 0 proved the NETWORK is not the problem: a bare socket gets 1000/1000
+    // filters from these same peers in 0.2-1.3s, while the wallet credits ~30% of
+    // what it asks for. So the loss is between recv() and MarkEvaluated. The
+    // existing [CF-ARR] diag is WINDOWED on the pin, so it cannot see the bulk.
+    // These are unconditional. INVARIANT: recvTotal == sum(every exit below).
+    // Any drift means an exit path exists that this accounting does not know about.
+    uint32_t cfRecvTotal;      // entered _peerRelayedCFilter
+    uint32_t cfExitNoChain;    // no compactFilterChain / filter-type mismatch  (SILENT before this)
+    uint32_t cfExitUnknownBuf; // block unknown, raw bytes buffered for later drain
+    uint32_t cfExitUnknownDrop;// block unknown, buffer REFUSED the bytes (lost)
+    uint32_t cfExitVerifyFail; // filter hash != cfheader chain
+    uint32_t cfExitParseFail;  // GCS parse failed
+    uint32_t cfExitEvaluated;  // reached MarkEvaluated (the only good outcome)
+#endif
     _Atomic int      cachedHasDownloadPeer;
     _Atomic int      cachedSyncMode;
     // Distinct peers that failed the cfheaders continuity check since the last
@@ -1610,6 +1628,38 @@ static void _BRPeerManagerClearMemory(BRPeerManager* manager) {
 #endif
         }
     }
+
+#ifndef CF_RETENTION_NO_SPAN_CLAMP
+    // Make the retained span UNCONDITIONALLY bounded. The floor above is anchored to the
+    // SCAN (min(cfNext, lowestNeeded) - margin), which is correct, but its bound is
+    // conditional on the convoy keeping the frontiers within a window of that scan. A frozen
+    // scan frontier freezes the floor with it, and then every header from there to the tip is
+    // retained without limit — measured at 145,894 resident with the pruner freeing nothing.
+    //
+    // Clamping the FLOOR UP (never down) can only ever retain LESS, so this cannot resurrect
+    // the pruning wedge the scan anchor fixed: it only refuses to hold an unbounded span.
+    // Heights that fall below the clamped floor become unrequestable and are reported by the
+    // existing surfacing path rather than skipped silently.
+    if (manager->lastBlock && manager->lastBlock->height > CF_RETENTION_SPAN_MAX) {
+        uint32_t spanFloor = manager->lastBlock->height - CF_RETENTION_SPAN_MAX;
+        if (cfFloor < spanFloor) {
+            // Rate-limited: once the clamp binds it binds on EVERY block-add, and this is a
+            // WARN. Log only when the clamped floor has moved materially since the last line,
+            // so the condition stays visible without flooding logd (which this project has
+            // already had starve out its own diagnostics once).
+            if (spanFloor >= manager->lastSpanClampLog + CLEAR_MEM_BLOCKS_COUNT_TRIGGER ||
+                manager->lastSpanClampLog == 0) {
+                CF_RETENTION_WLOG("[CF-SCAN] retention span clamped: floor %u -> %u (tip %u, cap %u) — "
+                                  "the scan frontier is too far behind to retain every header; "
+                                  "heights below the new floor are surfaced, not silently skipped",
+                                  cfFloor, spanFloor, manager->lastBlock->height,
+                                  (unsigned)CF_RETENTION_SPAN_MAX);
+                manager->lastSpanClampLog = spanFloor;
+            }
+            cfFloor = spanFloor;
+        }
+    }
+#endif
 
     if (count >= CLEAR_MEM_BLOCKS_COUNT_TRIGGER) {
         // find the tail
@@ -3105,13 +3155,53 @@ static void _peerRelayedCFilter(void *info, uint8_t filterType, UInt256 blockHas
     BRPeerManager *manager = ((BRPeerCallbackInfo *)info)->manager;
 
     pthread_mutex_lock(&manager->lock);
+#ifdef CF_RECV_DIAG
+    manager->cfRecvTotal++;
+#endif
     if (!manager->compactFilterChain ||
         filterType != BRCompactFilterChainType(manager->compactFilterChain)) {
+#ifdef CF_RECV_DIAG
+        // Previously a wholly SILENT drop — no log, no counter. A filter arriving
+        // while the chain is NULL (fresh arm, manager recreate, mid re-anchor) or
+        // for a mismatched type vanished without trace.
+        manager->cfExitNoChain++;
+#endif
         pthread_mutex_unlock(&manager->lock);
         return;
     }
 
+#ifdef CF_PIN_DIAG
+    // ---- ARRIVAL-SIDE DIAGNOSTIC (never a production build) --------------------------
+    // The send side is now fully accounted for; what stays dark is the path from "a cfilter
+    // arrived" to MarkEvaluated. This tags every filter landing in the PIN's window and
+    // names which of the five exits it takes, so a height that is requested, arrives, and
+    // still never advances the frontier is no longer invisible.
+    uint32_t arrPinH = 0; int arrPinOfferable = 1;
+    uint8_t  arrCyc = 0, arrLive = 0;
+    int      arrHavePin = BRCFScanLedgerPinningHole(&manager->cfLedger, &arrPinH,
+                                                    &arrPinOfferable, &arrCyc, &arrLive);
+    int      arrInWindow = 0;   // decided once the height is known (or not)
+#endif
+
     BRMerkleBlock *b = BRSetGet(manager->blocks, &blockHash);
+
+#ifdef CF_PIN_DIAG
+    if (arrHavePin) {
+        if (b && b->height != BLOCK_UNKNOWN_HEIGHT) {
+            arrInWindow = (b->height >= arrPinH && b->height < arrPinH + CF_REREQ_MAX_RANGE);
+            if (arrInWindow) {
+                debug_log("[CF-ARR] h=%u pin=%u ARRIVED len=%zu — block resolved\n",
+                          b->height, arrPinH, encodedLen);
+            }
+        }
+        else {
+            // Height unknown: cannot tell if it is the pin's, but this IS the
+            // "unknown block, dropping" class, so count it against the pin window.
+            debug_log("[CF-ARR] pin=%u ARRIVED but BLOCK UNRESOLVED (hash %s) — buffered/dropped, "
+                      "no MarkEvaluated possible\n", arrPinH, log_u256_hex_encode(blockHash));
+        }
+    }
+#endif
     if (!b) {
         peer_log(peer, "cfilter: unknown block %s, dropping", log_u256_hex_encode(blockHash));
         // Observe-only (Phase 1): the height stays outstanding in the ledger (we do
@@ -3123,18 +3213,37 @@ static void _peerRelayedCFilter(void *info, uint8_t filterType, UInt256 blockHas
         // buffered-drain (BRPeerManagerKeepAlive) can evaluate it the moment the
         // block header AND cfheader both connect, instead of relying solely on the
         // slower residual re-request path for what is usually just a brief race.
-        if (! BRCFScanLedgerBufferFilter(&manager->cfLedger, blockHash, encoded, encodedLen, (uint32_t)time(NULL)))
-            ; /* too big / not stored — height stays outstanding for the residual re-request path */
+        if (! BRCFScanLedgerBufferFilter(&manager->cfLedger, blockHash, encoded, encodedLen, (uint32_t)time(NULL))) {
+            /* too big / not stored — height stays outstanding for the residual re-request path */
+#ifdef CF_RECV_DIAG
+            manager->cfExitUnknownDrop++;   /* buffer REFUSED the bytes: they are lost */
+#endif
+        }
+        else {
+#ifdef CF_RECV_DIAG
+            manager->cfExitUnknownBuf++;    /* held for the buffered-drain path */
+#endif
+        }
+#else
+#ifdef CF_RECV_DIAG
+        manager->cfExitUnknownDrop++;
+#endif
 #endif
         pthread_mutex_unlock(&manager->lock);
         return;
     }
 
     if (!BRCompactFilterChainVerifyFilter(manager->compactFilterChain, b->height, encoded, encodedLen)) {
+#ifdef CF_PIN_DIAG
+        if (arrInWindow) debug_log("[CF-ARR] h=%u EXIT=verify_fail (chain mismatch) — no MarkEvaluated\n", b->height);
+#endif
         peer_log(peer, "cfilter: filter for block %s does not match chain — misbehavin'",
                  log_u256_hex_encode(blockHash));
         _BRPeerManagerPeerMisbehavin(manager, peer);
         // Observe-only (Phase 1): height left outstanding (not MarkEvaluated).
+#ifdef CF_RECV_DIAG
+        manager->cfExitVerifyFail++;   /* filter hash != cfheader chain */
+#endif
         peer_log(peer, "cf-ledger: hole @ %u reason=verify_fail — left outstanding (scannedThrough=%u, outstanding=%zu)",
                  b->height, BRCFScanLedgerScannedThrough(&manager->cfLedger),
                  BRCFScanLedgerOutstandingCount(&manager->cfLedger));
@@ -3148,9 +3257,15 @@ static void _peerRelayedCFilter(void *info, uint8_t filterType, UInt256 blockHas
 
     BRGCSFilter *gcs = BRGCSFilterBasicParse(encoded, encodedLen, blockHash);
     if (!gcs) {
+#ifdef CF_PIN_DIAG
+        if (arrInWindow) debug_log("[CF-ARR] h=%u EXIT=parse_fail — no MarkEvaluated\n", b->height);
+#endif
         peer_log(peer, "cfilter: failed to parse filter for block %s",
                  log_u256_hex_encode(blockHash));
         // Observe-only (Phase 1): height left outstanding (not MarkEvaluated).
+#ifdef CF_RECV_DIAG
+        manager->cfExitParseFail++;   /* GCS parse failed */
+#endif
         peer_log(peer, "cf-ledger: hole @ %u reason=parse_fail — left outstanding (scannedThrough=%u, outstanding=%zu)",
                  b->height, BRCFScanLedgerScannedThrough(&manager->cfLedger),
                  BRCFScanLedgerOutstandingCount(&manager->cfLedger));
@@ -3198,6 +3313,15 @@ static void _peerRelayedCFilter(void *info, uint8_t filterType, UInt256 blockHas
 
     // The cfilter was evaluated (matched above or cleanly missed) — remove this
     // height from the ledger's outstanding set and advance scannedThrough.
+#ifdef CF_PIN_DIAG
+    if (arrInWindow) {
+        debug_log("[CF-ARR] h=%u EXIT=evaluated (hit=%d) — MarkEvaluated, scannedThrough %u -> ?\n",
+                  b->height, hit, BRCFScanLedgerScannedThrough(&manager->cfLedger));
+    }
+#endif
+#ifdef CF_RECV_DIAG
+    manager->cfExitEvaluated++;   /* the only good outcome */
+#endif
     BRCFScanLedgerMarkEvaluated(&manager->cfLedger, b->height);
 
     pthread_mutex_unlock(&manager->lock);
@@ -3766,6 +3890,27 @@ void BRPeerManagerKeepAlive(BRPeerManager *manager)
     assert(manager != NULL);
     pthread_mutex_lock(&manager->lock);
 
+#ifdef CF_RECV_DIAG
+    // ---- RECEIVE-PATH LEDGER (diagnostic build only) -------------------------
+    // recvTotal is every cfilter that reached _peerRelayedCFilter. The exits below
+    // must sum to it exactly; `unaccounted` being non-zero means a drop path exists
+    // that this instrumentation does not know about, which is itself the finding.
+    //
+    // Compare recvTotal against the peer-side "got cfilter" log count: a shortfall
+    // there means the loss is BELOW the manager (socket read / dispatch), not here.
+    {
+        uint32_t acc = manager->cfExitNoChain + manager->cfExitUnknownBuf +
+                       manager->cfExitUnknownDrop + manager->cfExitVerifyFail +
+                       manager->cfExitParseFail + manager->cfExitEvaluated;
+        debug_log("[CF-RECV] recv=%u evaluated=%u | noChain=%u unknownBuf=%u unknownDrop=%u "
+                  "verifyFail=%u parseFail=%u | unaccounted=%d\n",
+                  manager->cfRecvTotal, manager->cfExitEvaluated,
+                  manager->cfExitNoChain, manager->cfExitUnknownBuf,
+                  manager->cfExitUnknownDrop, manager->cfExitVerifyFail,
+                  manager->cfExitParseFail, (int)manager->cfRecvTotal - (int)acc);
+    }
+#endif
+
     struct timeval tv;
     gettimeofday(&tv, NULL);
     double t0 = tv.tv_sec + (double)tv.tv_usec/1000000;
@@ -4190,10 +4335,55 @@ void BRPeerManagerKeepAlive(BRPeerManager *manager)
         size_t nCollected = 0;
 
         uint32_t tipH = manager->lastBlock ? manager->lastBlock->height : 0, minH = 0;
+
+#ifdef CF_PIN_DIAG
+        // ---- DIAGNOSTIC ONLY (never a production build): why is the PIN not sent? -----
+        // The B2 valve arms only on a PARKED pin, parked means attempts >= MAX, and attempts
+        // only advance on a SEND that reaches the wire. So a pin that can never be sent can
+        // never park and the valve is permanently inert. This dumps the pin's full state and
+        // is followed by a marker in Pass A recording whether Peek actually offered it, which
+        // together name which of the six skip reasons applies.
+        uint32_t diagPinH = 0; int diagPinOfferable = 1;
+        uint8_t  diagCycles = 0, diagOffersLive = 0;
+        int      diagHavePin = BRCFScanLedgerPinningHole(&manager->cfLedger, &diagPinH,
+                                                         &diagPinOfferable, &diagCycles, &diagOffersLive);
+        if (diagHavePin) {
+            const BRCFOutstanding *pe = NULL;
+            for (size_t i = 0; i < manager->cfLedger.outstandingCount; i++) {
+                if (manager->cfLedger.outstanding[i].height == diagPinH) { pe = &manager->cfLedger.outstanding[i]; break; }
+            }
+            int inGaveUp = (manager->cfLedger.gaveUpCount > 0 && manager->cfLedger.gaveUp[0] == diagPinH);
+            uint32_t floorH = _BRPeerManagerBlockFloor(manager);
+            UInt256  pinHash = _BRPeerManagerBlockHashAtHeight(manager, diagPinH);
+            int cfp = 0;
+            for (size_t i = array_count(manager->connectedPeers); i > 0; i--) {
+                if (_BRPeerManagerPeerCanServeFilters(manager->connectedPeers[i - 1])) cfp++;
+            }
+            debug_log("[CF-PIN] h=%u where=%s offerable=%d attempts=%u/%u cycles=%u offersLive=%u "
+                      "due=%d(reqAt=%u now=%u) blockFloor=%u belowFloor=%d hashResolvable=%d "
+                      "cfPeers=%d tip=%u scanned=%u outstanding=%zu gaveUp=%zu\n",
+                      diagPinH, inGaveUp ? "gaveUp" : (pe ? "outstanding" : "NEITHER"),
+                      diagPinOfferable,
+                      (unsigned)(pe ? pe->attempts : 0), (unsigned)CF_REREQ_MAX_ATTEMPTS,
+                      (unsigned)diagCycles, (unsigned)diagOffersLive,
+                      pe ? (int)(nowSec >= pe->requestedAt) : -1,
+                      (unsigned)(pe ? pe->requestedAt : 0), (unsigned)nowSec,
+                      floorH, (int)(diagPinH < floorH), (int)(! UInt256IsZero(pinHash)),
+                      cfp, tipH,
+                      BRCFScanLedgerScannedThrough(&manager->cfLedger),
+                      BRCFScanLedgerOutstandingCount(&manager->cfLedger),
+                      BRCFScanLedgerGaveUpCount(&manager->cfLedger));
+        }
+        int diagPinOffered = 0;
+#endif
+
         // ---- Pass A: collect (no resolve, no send, no commit) ----
         for (unsigned n = 0; n < CF_REREQ_BATCH_PER_TICK; n++) {
             uint32_t rs = 0, re = 0;
             if (! BRCFScanLedgerPeekRerequestRange(&manager->cfLedger, nowSec, minH, &rs, &re)) break;
+#ifdef CF_PIN_DIAG
+            if (diagHavePin && rs <= diagPinH && diagPinH <= re) diagPinOffered = 1;
+#endif
 
             // Reverse-map suppressor: rs's canonical block is currently buffered
             // (in-flight via the buffer-drain path) -- skip past just rs so the
@@ -4203,10 +4393,20 @@ void BRPeerManagerKeepAlive(BRPeerManager *manager)
             // fetch -- deliberately NOT prevented here (no per-candidate walk).
             int rsInFlight = 0;
             for (size_t i = 0; i < nSkip; i++) { if (skipHeights[i] == rs) { rsInFlight = 1; break; } }
-            if (rsInFlight) { minH = rs + 1; continue; }
+            if (rsInFlight) {
+#ifdef CF_PIN_DIAG
+                if (diagHavePin && rs == diagPinH) debug_log("[CF-PIN] skip=reverse-map-suppressed h=%u\n", rs);
+#endif
+                minH = rs + 1; continue;
+            }
 
             uint32_t cap = (re <= tipH) ? re : tipH;
-            if (cap < rs) { minH = re + 1; continue; }  // whole offered run is beyond the tip -- skip past it
+            if (cap < rs) {
+#ifdef CF_PIN_DIAG
+                if (diagHavePin && rs == diagPinH) debug_log("[CF-PIN] skip=beyond-tip h=%u re=%u tip=%u\n", rs, re, tipH);
+#endif
+                minH = re + 1; continue;   // whole offered run is beyond the tip -- skip past it
+            }
 
             // Rotate away from whichever peer this hole's lowest height was last
             // sent to (if any) -- same "don't re-dial the peer that just dropped
@@ -4248,6 +4448,13 @@ void BRPeerManagerKeepAlive(BRPeerManager *manager)
             minH = re + 1;
         }
 
+#ifdef CF_PIN_DIAG
+        if (diagHavePin && ! diagPinOffered) {
+            debug_log("[CF-PIN] NOT OFFERED by Peek this tick (h=%u) — Peek skipped it: not due, "
+                      "attempts>=MAX, or not a candidate\n", diagPinH);
+        }
+#endif
+
         // ---- Pass B: resolve every collected stop height in ONE descent ----
         // The getcfilters wire message carries startHeight as an integer and the
         // STOP as a hash, so only the cap heights need resolving (resolving the
@@ -4287,6 +4494,13 @@ void BRPeerManagerKeepAlive(BRPeerManager *manager)
                 // No attempt was burned, but the retry opportunity passed WITHOUT
                 // reaching a live CF peer -- taint the cycle for the same reason as
                 // the no-peer break in Pass A.
+#ifdef CF_PIN_DIAG
+                if (diagHavePin && rs <= diagPinH && diagPinH <= cap) {
+                    debug_log("[CF-PIN] send FAILED for range [%u..%u] containing pin %u — "
+                              "stopHashResolved=%d\n", rs, cap, diagPinH,
+                              (int)(! UInt256IsZero(stopHashes[c])));
+                }
+#endif
                 BRCFScanLedgerMarkOffersMissedLivePeer(&manager->cfLedger, rs, cap);
             }
         }
@@ -4351,6 +4565,44 @@ void BRPeerManagerKeepAlive(BRPeerManager *manager)
 #endif
             ) {
             uint32_t cfhFrontier = cfhNext - 1;   // NextHeight is one PAST the last appended cfheader
+
+            // ---- REMOVED: the forward-gap gate (CF_FORWARD_GAP_MAX) ------------------
+            //
+            // It used to hold the forward fetch whenever the cursor led scannedThrough by
+            // >= 2 * MAX_CFILTERS_RESULTS, on the theory that the budget was better spent
+            // letting the residual driver close the contiguous prefix (measured: 89.3% of
+            // arrivals landing outside the pinning hole's window).
+            //
+            // Its comment claimed "Not a deadlock: if the prefix is genuinely unservable the
+            // B2 valve raises abandonedBelow, which reopens this gate." That is FALSE when
+            // the pin is not yet PARKED. Reproduced on a Note 8, 2026-08-02, fresh wallet:
+            //
+            //   cf-ledger: scannedThrough=23899999 outstanding=2000 gaveUp=0 pending=0
+            //   paced convoy: holding forward cfilters — cursor 23901999 is 2000 ahead of
+            //                 the scan frontier 23899999 (cap 2000)
+            //
+            // Height 23,900,000 (the filter-chain anchor) was never served by any peer, so
+            // scannedThrough could not advance; the gap sat at EXACTLY the cap, so the gate
+            // held; the valve never armed because `attempts` stayed at 2/5 and gaveUp was
+            // empty. Ten minutes, 733 filters delivered, frontier moved zero blocks. The
+            // escape the comment relied on requires the valve to have PARKED the pin first,
+            // which the gate itself helps prevent by starving the drive.
+            //
+            // AND IT WAS REDUNDANT. Back-pressure on a runaway cursor already exists two
+            // lines above, in the forward driver's own precondition:
+            //     BRCFScanLedgerOutstandingCount(&manager->cfLedger) < CF_OUTSTANDING_LOWWATER
+            // That brake keys on the OUTSTANDING COUNT, which drains on every arrival, so it
+            // always releases itself. The gate keyed on the SCAN FRONTIER, which can freeze —
+            // and a frozen frontier latches it shut permanently. Same goal, but one is
+            // self-releasing and the other is not. Measured on the Note 8 after removal:
+            // outstanding oscillated 2716 -> 3328 -> 3050 -> 3729 around LOWWATER (3072)
+            // while the frontier climbed ~580 blocks/min, i.e. the surviving brake does the
+            // job the gate was added for.
+            //
+            // The waste it targeted is real but self-correcting; this converted it into a
+            // hard stop. If a cursor brake is ever wanted again, key it on something that
+            // drains (outstanding count, in-flight bytes) — never on the frontier.
+
             uint32_t reqStart = manager->autoFetchCFiltersThrough + 1;
             if (reqStart < manager->autoFetchCFiltersStart) reqStart = manager->autoFetchCFiltersStart;
             if (reqStart <= cfhFrontier) {        // == "autoFetchCFiltersThrough < cfHeadersFrontier", post-clamp
@@ -5456,10 +5708,18 @@ void BRPeerManagerEnableAutoCompactFilterFetch(BRPeerManager *manager, uint32_t 
 
     manager->autoFetchCFiltersEnabled = 1;
     manager->autoFetchCFiltersStart = startHeight;
+
     // Reset cursor to (start - 1) so the first cfheaders batch covering the
     // range immediately triggers a cfilter fetch at startHeight.
     manager->autoFetchCFiltersThrough = (startHeight > 0) ? startHeight - 1 : 0;
     // Rebuild the CF scan-completeness ledger at the same floor (Phase 1: observe-only).
+    //
+    // NOTE (2026-08-02, Note 8): do NOT "fix" a stalled scan by arming at startHeight + 1.
+    // The anchor height looked unservable for 10 minutes (4 requests, 0 answers) but was
+    // DELIVERED on the 5th attempt; the frontier then unstuck on its own with no
+    // abandonment. The stall was the forward-gap gate freezing the drive while the
+    // residual driver slowly retried, not anything special about the anchor. Skipping it
+    // would silently drop a height the wallet does scan.
     BRCFScanLedgerInit(&manager->cfLedger, startHeight);
 #if CF_LEDGER_DRIVE_REREQUEST
     // Explicit/defensive (Task 5 EDIT 4): re-arm must not carry stale buffered raw

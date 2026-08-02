@@ -97,6 +97,60 @@ Remarks:
    expands transiently while a large cfTip deficit is being recovered. */
 #define CLEAR_MEM_CF_RETENTION_MARGIN 144
 
+/* HARD BOUND on how far below the tip block headers are retained.
+
+   The convoy's retention floor is min(cfNext, LowestNeededHeight) - margin, i.e. it is
+   anchored to the SCAN. That is correct, and it is exactly what stops the scan-floor headers
+   being pruned out from under the buffer-drain and the residual re-request. But its bound
+   is CONDITIONAL: the convoy's own note says the span is "flat at any restore depth" BECAUSE
+   the header/cfheader frontiers are paced to within CF_CONVOY_WINDOW of the scan frontier.
+   If the scan frontier stops moving, that premise fails and the floor stops rising with it,
+   so every header from the frozen frontier to the tip must be retained — without limit.
+
+   MEASURED, this is not theoretical: with the scan frozen at 23,683,999 and the block tip at
+   23,806,540, manager->blocks reached 145,894 entries (~33 MB) and _BRPeerManagerClearMemory
+   logged "Blocks reduced from 145894 to 145894" — running every block-add and freeing
+   nothing. That is the OOM the convoy exists to prevent, reached THROUGH the convoy's own
+   honest anchor, and it feeds back: the bigger the retained set, the less headroom the loop
+   that would unfreeze the scan has.
+
+   This clamp makes the bound UNCONDITIONAL. It is a backstop, not a tuning knob: in healthy
+   convoy operation the span is ~CF_CONVOY_WINDOW (10k) and this never binds. It is sized well
+   above the worst overshoot actually observed (~122k, the F1 header-overshoot regime) so it
+   does not bind on a merely-degraded sync, and it is finite so a wedged one cannot grow
+   without limit. 150,000 headers x ~224 B all-in ~= 34 MB.
+
+   When it DOES bind the floor rises above what the scan still wants, those heights become
+   unrequestable, and the existing surfacing path (snap-up / C-1 -> abandonedBelow -> banner)
+   reports them. That is a visible, recoverable gap instead of an unbounded allocation — the
+   same priority the rest of this file takes: never silent, never fatal.
+
+   Do NOT shrink this toward CF_CONVOY_WINDOW to "tighten" it. A fresh install legitimately
+   starts its scan at the newest hardcoded checkpoint, hundreds of thousands of blocks below
+   the tip, and a clamp near the window would skip that history on every first run. */
+#define CF_RETENTION_SPAN_MAX 150000u
+
+/* How far the forward cfilter CURSOR may run ahead of the SCAN FRONTIER.
+
+   The convoy paces the header and cfheader frontiers against the scan frontier, but nothing
+   paced the cfilter cursor against it: B1.1 always fetches from autoFetchCFiltersThrough+1
+   upward and never consults scannedThrough. The residual driver does work the frontier
+   lowest-first, but its heights sit on a 30-120 s backoff while the cursor advances a full
+   MAX_CFILTERS_RESULTS batch every ~10 s KeepAlive tick, so the cursor always outruns it.
+
+   MEASURED consequence on a fresh wallet: requests were landing 2,000-11,000 blocks ABOVE the
+   pin, and of 6,487 cfilters received, 5,791 (89.3%) were outside the pinning hole's window.
+   Every one of them evaluated successfully — and bought nothing, because scannedThrough only
+   advances across the CONTIGUOUS prefix at the bottom. 6,487 successful evaluations moved the
+   frontier 622 blocks. Meanwhile the starved prefix heights timed out and parked, driving
+   outstanding to ~3,900 and gaveUp to ~3,500 and handing the B2 valve a band it should never
+   have had to abandon.
+
+   Two batches of headroom: enough to keep the pipeline full (a batch in flight while the next
+   is being evaluated), small enough that the frontier is what the fetch budget is spent on.
+   This does NOT stop forward progress when the prefix is genuinely dead — the B2 valve raises
+   abandonedBelow, which raises the frontier, which reopens this gate. */
+
 /* NOTE: there is deliberately NO depth ceiling here. CF_RETENTION_MAX_SPAN used
    to bound the retained block-header span to a fixed depth below the chain tip
    and abandon retry-exhausted (gaveUp) heights below the clamp; the app layer

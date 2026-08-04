@@ -233,6 +233,20 @@ typedef struct {
     BRMerkleBlock *currentBlock;
     UInt256 *currentBlockTxHashes, *knownBlockHashes, *knownTxHashes;
     BRSet *knownTxHashSet;
+    // Guards knownTxHashes AND knownTxHashSet as one unit -- they are only meaningful together,
+    // since the set holds interior pointers INTO the array, so any realloc of the array
+    // invalidates every entry in the set.
+    //
+    // Same hazard as pongLock below, but hotter and reachable with no user action at all:
+    // _BRPeerManagerLoadMempools (BRPeerManager.c:803) walks EVERY connected peer and mutates
+    // their contexts from ONE peer's thread, and it re-fires on every tip block (~15s on DGB).
+    // The JNI broadcast thread reaches the same code via BRPeerManagerPublishTx. Meanwhile each
+    // peer's own read thread walks these in _BRPeerAcceptInvMessage, which never takes
+    // manager->lock. knownTxHashes is also never trimmed (contrast knownBlockHashes, trimmed
+    // below), so it grows unboundedly and keeps hitting realloc.
+    //
+    // LEAF LOCK -- never held across ctx->hasTx or any socket send.
+    pthread_mutex_t txHashLock;
     volatile int socket;
     void *info;
     void (*connected)(void *info);
@@ -347,24 +361,84 @@ inline static int _BRPeerIsIPv4(const BRPeer *peer)
     return (peer->address.u64[0] == 0 && peer->address.u16[4] == 0 && peer->address.u16[5] == 0xffff);
 }
 
-static void _BRPeerAddKnownTxHashes(const BRPeer *peer, const UInt256 txHashes[], size_t txCount)
+// RED ARM SEAM for cf_peer_txhash_race_kat -- see the PONG_LOCK seam above for why this is an
+// #ifdef rather than something a -D could shadow.
+#ifdef TXHASH_LOCK_UNFIXED
+#define TXHASH_LOCK(c)    ((void)0)
+#define TXHASH_UNLOCK(c)  ((void)0)
+#else
+#define TXHASH_LOCK(c)    pthread_mutex_lock(&(c)->txHashLock)
+#define TXHASH_UNLOCK(c)  pthread_mutex_unlock(&(c)->txHashLock)
+#endif
+
+// Is this hash already in the peer's known-tx set?
+//
+// LEAF LOCK -- the caller must invoke ctx->hasTx (which re-enters BRPeerManager and takes
+// manager->lock) only AFTER this returns. _BRPeerManagerLoadMempools runs the other direction,
+// manager->lock -> BRPeerSendInv -> txHashLock, so holding txHashLock across the callback would
+// invert the order and deadlock.
+static int _BRPeerKnowsTxHash(BRPeerContext *ctx, const UInt256 *hash)
+{
+    int known;
+
+    TXHASH_LOCK(ctx);
+    known = BRSetContains(ctx->knownTxHashSet, hash);
+    TXHASH_UNLOCK(ctx);
+    return known;
+}
+
+// Add the hashes this peer does not already know.
+//
+// If `added` is non-NULL it receives the hashes ACTUALLY added (the caller must size it for at
+// least txCount) and *addedCount receives how many. That exists so BRPeerSendInv can build its
+// message from its OWN copy instead of indexing ctx->knownTxHashes after the lock is dropped --
+// removing the cross-thread dereference outright rather than merely serializing it.
+//
+// The whole body runs under txHashLock. It calls nothing that re-enters the manager and touches
+// no socket, so it is a clean leaf.
+//
+// THE BUG THIS REPLACES. The previous version snapshotted `UInt256 *knownTxHashes =
+// ctx->knownTxHashes` on entry and, after array_add() reallocated, compared the field against
+// that snapshot to detect the move. Single-threaded that is correct. Concurrently it is worse
+// than nothing: another thread's realloc frees the snapshot, and this one then WRITES THE STALE
+// POINTER BACK into ctx->knownTxHashes and rebuilds knownTxHashSet out of interior pointers into
+// freed memory -- every later BRSetContains dereferences them. Operating on the field directly
+// under the lock removes the snapshot, and with it the whole failure mode.
+static void _BRPeerAddKnownTxHashesInternal(const BRPeer *peer, const UInt256 txHashes[], size_t txCount,
+                                            UInt256 *added, size_t *addedCount)
 {
     BRPeerContext *ctx = (BRPeerContext *)peer;
-    UInt256 *knownTxHashes = ctx->knownTxHashes;
-    size_t i, j;
-    
+    size_t i, j, n = 0;
+
+    TXHASH_LOCK(ctx);
+
     for (i = 0; i < txCount; i++) {
-        if (! BRSetContains(ctx->knownTxHashSet, &txHashes[i])) {
-            array_add(knownTxHashes, txHashes[i]);
-            
-            if (ctx->knownTxHashes != knownTxHashes) { // check if knownTxHashes was moved to a new memory location
-                ctx->knownTxHashes = knownTxHashes;
-                BRSetClear(ctx->knownTxHashSet);
-                for (j = array_count(knownTxHashes); j > 0; j--) BRSetAdd(ctx->knownTxHashSet, &knownTxHashes[j - 1]);
+        if (BRSetContains(ctx->knownTxHashSet, &txHashes[i])) continue;
+
+        const UInt256 *before = ctx->knownTxHashes;
+
+        array_add(ctx->knownTxHashes, txHashes[i]);
+
+        if (ctx->knownTxHashes != before) { // array_add reallocated: every set entry now dangles
+            BRSetClear(ctx->knownTxHashSet);
+            for (j = array_count(ctx->knownTxHashes); j > 0; j--) {
+                BRSetAdd(ctx->knownTxHashSet, &ctx->knownTxHashes[j - 1]);
             }
-            else BRSetAdd(ctx->knownTxHashSet, &knownTxHashes[array_count(knownTxHashes) - 1]);
         }
+        else BRSetAdd(ctx->knownTxHashSet, &ctx->knownTxHashes[array_count(ctx->knownTxHashes) - 1]);
+
+        if (added) added[n] = txHashes[i];
+        n++;
     }
+
+    TXHASH_UNLOCK(ctx);
+
+    if (addedCount) *addedCount = n;
+}
+
+static void _BRPeerAddKnownTxHashes(const BRPeer *peer, const UInt256 txHashes[], size_t txCount)
+{
+    _BRPeerAddKnownTxHashesInternal(peer, txHashes, txCount, NULL, NULL);
 }
 
 static void _BRPeerDidConnect(BRPeer *peer)
@@ -598,7 +672,9 @@ static int _BRPeerAcceptInvMessage(BRPeer *peer, const uint8_t *msg, size_t msgL
             for (i = 0, j = 0; i < txCount; i++) {
                 hash = UInt256Get(transactions[i]);
                 
-                if (BRSetContains(ctx->knownTxHashSet, &hash)) {
+                // Membership is tested under txHashLock; hasTx is invoked AFTER it is released,
+                // because that callback re-enters BRPeerManager and takes manager->lock.
+                if (_BRPeerKnowsTxHash(ctx, &hash)) {
                     if (ctx->hasTx) ctx->hasTx(ctx->info, hash);
                 }
                 else txHashes[j++] = hash;
@@ -1595,6 +1671,7 @@ BRPeer *BRPeerNew(uint32_t magicNumber)
     array_new(ctx->currentBlockTxHashes, 10);
     array_new(ctx->knownTxHashes, 10);
     ctx->knownTxHashSet = BRSetNew(BRTransactionHash, BRTransactionEq, 10);
+    pthread_mutex_init(&ctx->txHashLock, NULL);
     array_new(ctx->pongInfo, 10);
     array_new(ctx->pongCallback, 10);
     pthread_mutex_init(&ctx->pongLock, NULL);
@@ -2046,25 +2123,35 @@ void BRPeerSendGetblocks(BRPeer *peer, const UInt256 locators[], size_t locators
 
 void BRPeerSendInv(BRPeer *peer, const UInt256 txHashes[], size_t txCount)
 {
-    BRPeerContext *ctx = (BRPeerContext *)peer;
-    size_t knownCount = array_count(ctx->knownTxHashes);
+    size_t addedCount = 0;
 
-    _BRPeerAddKnownTxHashes(peer, txHashes, txCount);
-    txCount = array_count(ctx->knownTxHashes) - knownCount;
+    if (txCount == 0) return;
 
-    if (txCount > 0) {
-        size_t i, off = 0, msgLen = BRVarIntSize(txCount) + (sizeof(uint32_t) + sizeof(*txHashes))*txCount;
+    // Take a COPY of what was actually added, rather than the old
+    // count-before / count-after / index-into-ctx->knownTxHashes dance. That dance read
+    // array_count twice and then indexed the array a third time, all unsynchronized: a
+    // concurrent _BRPeerAddKnownTxHashes on another thread could realloc the buffer between any
+    // two of those steps, so the message was built out of a freed allocation. Reached constantly
+    // via _BRPeerManagerLoadMempools, which walks EVERY connected peer from one peer's thread.
+    UInt256 added[txCount];
+
+    _BRPeerAddKnownTxHashesInternal(peer, txHashes, txCount, added, &addedCount);
+
+    if (addedCount > 0) {
+        size_t i, off = 0;
+        size_t msgLen = BRVarIntSize(addedCount) + (sizeof(uint32_t) + sizeof(*txHashes))*addedCount;
         uint8_t msg[msgLen];
-        
-        off += BRVarIntSet(&msg[off], (off <= msgLen ? msgLen - off : 0), txCount);
-        
-        for (i = 0; i < txCount; i++) {
+
+        off += BRVarIntSet(&msg[off], (off <= msgLen ? msgLen - off : 0), addedCount);
+
+        for (i = 0; i < addedCount; i++) {
             UInt32SetLE(&msg[off], inv_tx);
             off += sizeof(uint32_t);
-            UInt256Set(&msg[off], ctx->knownTxHashes[knownCount + i]);
+            UInt256Set(&msg[off], added[i]);
             off += sizeof(UInt256);
         }
 
+        // Outside the lock: this can block on the socket for up to MESSAGE_TIMEOUT.
         BRPeerSendMessage(peer, msg, off, MSG_INV);
     }
 }
@@ -2267,6 +2354,7 @@ void BRPeerFree(BRPeer *peer)
     if (ctx->knownBlockHashes) array_free(ctx->knownBlockHashes);
     if (ctx->knownTxHashes) array_free(ctx->knownTxHashes);
     if (ctx->knownTxHashSet) BRSetFree(ctx->knownTxHashSet);
+    pthread_mutex_destroy(&ctx->txHashLock);
     // Reached from _peerDisconnected on the peer thread itself, AFTER the teardown drain
     // above and after the peer has been removed from manager->connectedPeers under
     // manager->lock -- so no other thread can still be inside a push/pop here.

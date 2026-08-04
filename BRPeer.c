@@ -258,10 +258,85 @@ typedef struct {
                              const UInt256 *filterHeaders, size_t count);
     void **volatile pongInfo;
     void (**volatile pongCallback)(void *info, int success);
+    // Serializes the two arrays above. `volatile` was the previous defence and it is not
+    // one: these are array_* buffers whose BASE POINTER MOVES on growth (array_add ->
+    // array_set_capacity -> realloc) and whose element count lives in a header at [-1].
+    // They are appended from the manager/keepalive thread (BRPeerSendPing,
+    // BRPeerSendPingProbe) and drained from the peer thread (pong handling at
+    // _BRPeerAcceptPongMessage, and the disconnect teardown loop in _peerThreadRoutine).
+    // An unsynchronized array_add can therefore realloc the buffer out from under
+    // array_rm's shift loop -- and that loop re-reads array_count() on EVERY iteration,
+    // so a count read from freed or half-updated memory walks it straight off the end of
+    // the mapping. That is the 2026-08-03 19:45 SIGSEGV (BRPeer.c:1487, fault addr
+    // page-aligned, ~235k bogus element count in the loop registers), and the same
+    // corruption explains the three allocator-side deaths that day (ifree, tcache flush,
+    // __fortify_fatal).
+    //
+    // LEAF LOCK -- never held across a callback invocation. Pong callbacks re-enter
+    // BRPeerManager and take manager->lock, while BRPeerSendPing is itself reached WITH
+    // manager->lock held; holding this across a call-out would invert the order and
+    // deadlock. Every drain site pops under the lock, releases, THEN calls.
+    pthread_mutex_t pongLock;
     void *volatile mempoolInfo;
     void (*volatile mempoolCallback)(void *info, int success);
     pthread_t thread;
 } BRPeerContext;
+
+// RED ARM SEAM. -DPONG_LOCK_UNFIXED compiles the lock out, restoring the exact unsynchronized
+// shape that crashed, so cf_peer_pong_race_kat can prove it fails BEFORE the fix. Guarded with
+// #ifndef and given its own name so a -D on the command line actually reaches it -- a plain
+// #define in a header silently wins over -D, which has burned this repo before.
+#ifdef PONG_LOCK_UNFIXED
+#define PONG_LOCK(c)    ((void)0)
+#define PONG_UNLOCK(c)  ((void)0)
+#else
+#define PONG_LOCK(c)    pthread_mutex_lock(&(c)->pongLock)
+#define PONG_UNLOCK(c)  pthread_mutex_unlock(&(c)->pongLock)
+#endif
+
+// Number of pings still awaiting a pong. Snapshot only -- the caller must not act on it
+// as if it were still true, which is why the pop below re-checks under the same lock.
+static size_t _BRPeerPongPending(BRPeerContext *ctx)
+{
+    size_t n;
+
+    PONG_LOCK(ctx);
+    n = array_count(ctx->pongCallback);
+    PONG_UNLOCK(ctx);
+    return n;
+}
+
+// Pop the oldest queued pong callback. Returns 0 when the queue is empty. The callback is
+// deliberately NOT invoked here: see the pongLock comment -- callers invoke it after the
+// lock is released.
+static int _BRPeerPongPop(BRPeerContext *ctx, void (**cb)(void *, int), void **cbInfo)
+{
+    int got = 0;
+
+    PONG_LOCK(ctx);
+
+    if (array_count(ctx->pongCallback) > 0) {
+        *cb = ctx->pongCallback[0];
+        *cbInfo = (array_count(ctx->pongInfo) > 0) ? ctx->pongInfo[0] : NULL;
+        array_rm(ctx->pongCallback, 0);
+        if (array_count(ctx->pongInfo) > 0) array_rm(ctx->pongInfo, 0);
+        got = 1;
+    }
+
+    PONG_UNLOCK(ctx);
+    return got;
+}
+
+// Append a pending pong callback. The two arrays are indexed in lockstep by every reader,
+// so they must grow as one atomic step -- a drain that observed pongCallback grown but
+// pongInfo not yet would read a stale/absent info pointer.
+static void _BRPeerPongPush(BRPeerContext *ctx, void *info, void (*cb)(void *, int))
+{
+    PONG_LOCK(ctx);
+    array_add(ctx->pongInfo, info);
+    array_add(ctx->pongCallback, cb);
+    PONG_UNLOCK(ctx);
+}
 
 void BRPeerSendVersionMessage(BRPeer *peer);
 void BRPeerSendVerackMessage(BRPeer *peer);
@@ -831,7 +906,7 @@ static int _BRPeerAcceptPongMessage(BRPeer *peer, const uint8_t *msg, size_t msg
         peer_log(peer, "pong message has wrong nonce: %"PRIu64", expected: %"PRIu64, UInt64GetLE(msg), ctx->nonce);
         r = 0;
     }
-    else if (array_count(ctx->pongCallback) == 0) {
+    else if (_BRPeerPongPending(ctx) == 0) {
         peer_log(peer, "got unexpected pong");
         r = 0;
     }
@@ -847,13 +922,16 @@ static int _BRPeerAcceptPongMessage(BRPeer *peer, const uint8_t *msg, size_t msg
         }
         else peer_log(peer, "got pong");
 
-        if (array_count(ctx->pongCallback) > 0) {
-            void (*pongCallback)(void *, int) = ctx->pongCallback[0];
-            void *pongInfo = ctx->pongInfo[0];
+        // Pop under the lock, invoke outside it -- pongCallback re-enters BRPeerManager
+        // and takes manager->lock, so holding pongLock across the call would invert the
+        // lock order against BRPeerSendPing (reached with manager->lock already held).
+        {
+            void (*pongCallback)(void *, int) = NULL;
+            void *pongInfo = NULL;
 
-            array_rm(ctx->pongCallback, 0);
-            array_rm(ctx->pongInfo, 0);
-            if (pongCallback) pongCallback(pongInfo, 1);
+            if (_BRPeerPongPop(ctx, &pongCallback, &pongInfo) && pongCallback) {
+                pongCallback(pongInfo, 1);
+            }
         }
     }
     
@@ -1480,13 +1558,18 @@ static void *_peerThreadRoutine(void *arg)
     if (socket >= 0) close(socket);
     peer_log(peer, "disconnected");
     
-    while (array_count(ctx->pongCallback) > 0) {
-        void (*pongCallback)(void *, int) = ctx->pongCallback[0];
-        void *pongInfo = ctx->pongInfo[0];
-        
-        array_rm(ctx->pongCallback, 0);
-        array_rm(ctx->pongInfo, 0);
-        if (pongCallback) pongCallback(pongInfo, 0);
+    // THE 2026-08-03 CRASH SITE. Unsynchronized, this loop read array_count() out of a
+    // buffer the keepalive thread had just realloc'd away and shifted ~235k elements off
+    // the end of the mapping. Pop under the lock, invoke outside it.
+    {
+        void (*pongCallback)(void *, int) = NULL;
+        void *pongInfo = NULL;
+
+        while (_BRPeerPongPop(ctx, &pongCallback, &pongInfo)) {
+            if (pongCallback) pongCallback(pongInfo, 0);
+            pongCallback = NULL;
+            pongInfo = NULL;
+        }
     }
 
     if (ctx->mempoolCallback) ctx->mempoolCallback(ctx->mempoolInfo, 0);
@@ -1514,6 +1597,7 @@ BRPeer *BRPeerNew(uint32_t magicNumber)
     ctx->knownTxHashSet = BRSetNew(BRTransactionHash, BRTransactionEq, 10);
     array_new(ctx->pongInfo, 10);
     array_new(ctx->pongCallback, 10);
+    pthread_mutex_init(&ctx->pongLock, NULL);
     ctx->pingTime = DBL_MAX;
     ctx->mempoolTime = DBL_MAX;
     ctx->disconnectTime = DBL_MAX;
@@ -2075,8 +2159,7 @@ void BRPeerSendPing(BRPeer *peer, void *info, void (*pongCallback)(void *info, i
 
     gettimeofday(&tv, NULL);
     ctx->startTime = tv.tv_sec + (double)tv.tv_usec/1000000;
-    array_add(ctx->pongInfo, info);
-    array_add(ctx->pongCallback, pongCallback);
+    _BRPeerPongPush(ctx, info, pongCallback);
     UInt64SetLE(msg, ctx->nonce);
     BRPeerSendMessage(peer, msg, sizeof(msg), MSG_PING);
 }
@@ -2093,8 +2176,7 @@ void BRPeerSendPingProbe(BRPeer *peer, void *info, void (*pongCallback)(void *in
 
     gettimeofday(&tv, NULL);
     ctx->startTime = tv.tv_sec + (double)tv.tv_usec/1000000;
-    array_add(ctx->pongInfo, info);
-    array_add(ctx->pongCallback, pongCallback);
+    _BRPeerPongPush(ctx, info, pongCallback);
     UInt64SetLE(msg, ctx->nonce);
     _BRPeerSendMessageTimeout(peer, msg, sizeof(msg), MSG_PING, KEEPALIVE_SEND_TIMEOUT);
 }
@@ -2185,8 +2267,12 @@ void BRPeerFree(BRPeer *peer)
     if (ctx->knownBlockHashes) array_free(ctx->knownBlockHashes);
     if (ctx->knownTxHashes) array_free(ctx->knownTxHashes);
     if (ctx->knownTxHashSet) BRSetFree(ctx->knownTxHashSet);
+    // Reached from _peerDisconnected on the peer thread itself, AFTER the teardown drain
+    // above and after the peer has been removed from manager->connectedPeers under
+    // manager->lock -- so no other thread can still be inside a push/pop here.
     if (ctx->pongInfo) array_free(ctx->pongInfo);
     if (ctx->pongCallback) array_free(ctx->pongCallback);
+    pthread_mutex_destroy(&ctx->pongLock);
     free(ctx);
 }
 

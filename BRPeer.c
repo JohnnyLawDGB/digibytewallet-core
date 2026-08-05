@@ -43,6 +43,7 @@
 #include <errno.h>
 #include <netdb.h>
 #include <sys/socket.h>
+#include <poll.h>
 #include <sys/time.h>
 #include <netinet/in.h> 
 #include <arpa/inet.h>
@@ -1371,12 +1372,61 @@ static int _BRPeerAcceptMessage(BRPeer *peer, const uint8_t *msg, size_t msgLen,
     return r;
 }
 
+// Wait for an in-progress connect() to complete, bounded by `timeout` seconds.
+// Contract is select()'s: >0 ready, 0 timed out, -1 error with errno set.
+//
+// poll(), NOT select(). select() reports readiness through fd_set, a fixed-size BITMAP indexed by
+// descriptor number, and FD_SET() on a descriptor >= FD_SETSIZE (1024) is undefined behaviour.
+// Android's FORTIFY catches it and calls __fortify_fatal, so the wallet ABORTS. Observed twice on
+// a Note 8 (2026-08-03 06:28 and 2026-08-04 07:54), both tombstones reading
+// abort <- __fortify_fatal <- __FD_SET_chk <- _BRPeerOpenSocket.
+//
+// The trap is that this fires at descriptor NUMBER 1024 while the process rlimit is 32768, so the
+// app dies from descriptor pressure long before the OS would ever return EMFILE — there is no
+// warning, just an abort. poll() takes an explicit array and has no such ceiling, which makes the
+// abort structurally impossible instead of merely rarer. (What was PUSHING the numbers that high
+// is a separate socket-lifetime defect; this makes the symptom unreachable either way.)
+//
+// EINTR is retried rather than reported. select() did not do this and would surface a benign
+// signal as a connect failure, evicting a perfectly good peer.
+static int _BRPeerWaitConnect(int socket, double timeout)
+{
+#ifdef FDSET_UNFIXED
+    // RED ARM ONLY (peer_fdset_overflow_kat) — never defined in a production build. The exact
+    // pre-fix shape: an fd_set is a 1024-bit bitmap, so FD_SET on a descriptor >= FD_SETSIZE
+    // writes past the end of this stack object.
+    struct timeval tv;
+    fd_set fds;
+
+    tv.tv_sec = (time_t)timeout;
+    tv.tv_usec = (long)(timeout * 1000000) % 1000000;
+    FD_ZERO(&fds);
+    FD_SET(socket, &fds);
+    return select(socket + 1, NULL, &fds, NULL, &tv);
+#else
+    struct pollfd pfd;
+    int ms, n;
+
+    if (socket < 0) { errno = EBADF; return -1; }
+
+    pfd.fd = socket;
+    pfd.events = POLLOUT;
+    ms = (timeout > 0.0) ? (int)(timeout * 1000.0) : 0;
+
+    do {
+        pfd.revents = 0;
+        n = poll(&pfd, 1, ms);
+    } while (n < 0 && errno == EINTR);
+
+    return n;
+#endif
+}
+
 static int _BRPeerOpenSocket(BRPeer *peer, int domain, double timeout, int *error)
 {
     BRPeerContext *ctx = (BRPeerContext *)peer;
     struct sockaddr_storage addr;
-    struct timeval tv;
-    fd_set fds;
+    struct timeval tv;   // still used for SO_RCVTIMEO/SO_SNDTIMEO below
     socklen_t addrLen, optLen;
     int count, arg = 0, err = 0, on = 1, r = 1;
 
@@ -1446,11 +1496,7 @@ static int _BRPeerOpenSocket(BRPeer *peer, int domain, double timeout, int *erro
                 if (err == EINPROGRESS) {
                     err = 0;
                     optLen = sizeof(err);
-                    tv.tv_sec = timeout;
-                    tv.tv_usec = (long)(timeout * 1000000) % 1000000;
-                    FD_ZERO(&fds);
-                    FD_SET(ctx->socket, &fds);
-                    count = select(ctx->socket + 1, NULL, &fds, NULL, &tv);
+                    count = _BRPeerWaitConnect(ctx->socket, timeout);
 
                     if (count <= 0 || getsockopt(ctx->socket, SOL_SOCKET, SO_ERROR, &err, &optLen) < 0 || err) {
                         if (count == 0) err = ETIMEDOUT;
@@ -1494,11 +1540,7 @@ static int _BRPeerOpenSocket(BRPeer *peer, int domain, double timeout, int *erro
             if (err == EINPROGRESS) {
                 err = 0;
                 optLen = sizeof(err);
-                tv.tv_sec = timeout;
-                tv.tv_usec = (long)(timeout*1000000) % 1000000;
-                FD_ZERO(&fds);
-                FD_SET(ctx->socket, &fds);
-                count = select(ctx->socket + 1, NULL, &fds, NULL, &tv);
+                count = _BRPeerWaitConnect(ctx->socket, timeout);
 
                 if (count <= 0 || getsockopt(ctx->socket, SOL_SOCKET, SO_ERROR, &err, &optLen) < 0 || err) {
                     if (count == 0) err = ETIMEDOUT;

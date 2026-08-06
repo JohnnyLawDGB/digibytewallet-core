@@ -343,6 +343,13 @@ struct BRPeerManagerStruct {
     // hit is not reachable — and _BRPeerManagerClearMemory additionally
     // invalidates explicitly. floorMemoValid == 0 on a calloc'd manager, so the
     // first read always walks. Guarded by manager->lock like the rest of these.
+    // Lock-hold profiler state (see MGR_LOCK/MGR_UNLOCK). manager->lock is initialized with NULL
+    // attributes, i.e. NON-RECURSIVE, so exactly one holder exists at a time and a single
+    // timestamp cannot be clobbered by nesting.
+    double      lockHeldSinceMs;
+    const char *lockHolderFn;
+    int         lockHolderLine;
+
     uint8_t  floorMemoValid;
     BRSet   *floorMemoBlocks;
     size_t   floorMemoBlockCount;
@@ -378,6 +385,23 @@ struct BRPeerManagerStruct {
     // memo. This defers the next descent until the floor has moved CLEAR_MEM_PRUNE_STRIDE,
     // turning O(resident)-per-block into O(resident)/STRIDE. 0 = never descended yet.
     uint32_t         lastPruneFloor;
+
+    // Convoy header-hold bookkeeping (CF_CONVOY_HOLD_MAX_SECS).
+    //
+    // KEYED ON (addr, port), NOT ON THE BRPeer POINTER. An earlier version of this held a
+    // raw BRPeer* "identity token, never dereferenced" and argued a stale pointer could only
+    // FAIL the equality test and so only shorten a hold. That is wrong in the direction that
+    // matters: peers are individually calloc'd (BRPeer.c:1506) and freed (BRPeer.c:2190) at
+    // the same size class, and _peerDisconnected never cleared this field, so the very next
+    // BRPeerNew commonly gets the dead peer's chunk back. The NEW peer then compares EQUAL to
+    // the dead one, inherits its already-expired hold clock, is never refreshed, and self-kills
+    // 20 s after election -- silently restoring the exact churn this cap exists to stop.
+    // (addr, port) cannot alias that way: a different remote node has a different key, and the
+    // SAME node reconnecting inheriting its clock is correct — a node must not escape the cap
+    // by reconnecting.
+    UInt128          convoyHoldAddr;
+    uint16_t         convoyHoldPort;
+    time_t           convoyHoldSince;
 
 #ifdef CF_PRUNE_INSTRUMENT
     // Host-KAT only (never defined in a production build): counts what the amortisation
@@ -451,6 +475,111 @@ struct BRPeerManagerStruct {
     size_t   cfServedCount;
     pthread_mutex_t lock;
 };
+
+// ---- LOCK-HOLD PROFILER ------------------------------------------------------------------
+//
+// manager->lock serializes the entire peer manager. While it is held, every peer thread, the
+// keepalive, and the CF scan driver are stopped. A hold measured in SECONDS is therefore never
+// acceptable, and one measured in MINUTES is an outage.
+//
+// Measured on a Note 8, 2026-08-05: the lock was held CONTINUOUSLY FOR 43 MINUTES while a single
+// thread burned 915 seconds of user CPU and 93 of the process's 103 threads sat in futex behind
+// it. ASan was silent throughout, so it is not corruption — it is an algorithmic hold. Two
+// suspects (_BRPeerManagerClearMemory, _BRPeerManagerBlockFloor) were instrumented individually
+// first and BOTH came back clean, which is why this now wraps the lock itself: guessing at
+// candidate functions one at a time is exactly the treadmill this is meant to end.
+//
+// Not behind a debug flag, and not sampled. Cost is one gettimeofday per acquire/release against
+// a threshold healthy code never approaches, and the whole reason that hold went unexplained for
+// two days is that nothing measured it.
+//
+// SAFE BECAUSE THE LOCK IS NON-RECURSIVE (pthread_mutex_init(..., NULL) at BRPeerManagerNew): one
+// holder at a time, so the single timestamp cannot be clobbered by nesting.
+#ifndef CF_SLOW_PHASE_MS
+#define CF_SLOW_PHASE_MS 2000.0
+#endif
+
+// Its OWN log channel, deliberately NOT CF_RETENTION_WLOG. The host KATs hijack that macro to
+// count warnings and assert the count — cf_scan_ledger_drive_kat does
+// check(g_wlogCount == wlogBefore, "no ABANDONED warn-log on the clean retain path"). Routing
+// profiler output through it made a timing-dependent line increment a counter the ledger tests
+// treat as semantic, and that KAT went red. A diagnostic must never share a channel whose
+// silence other tests assert.
+#ifndef CF_SLOW_WLOG
+#if defined(__ANDROID__)
+#define CF_SLOW_WLOG(...) __android_log_print(ANDROID_LOG_WARN, "bread", __VA_ARGS__)
+#elif defined(TARGET_OS_MAC)
+#define CF_SLOW_WLOG(...) NSLog(__VA_ARGS__)
+#else
+#define CF_SLOW_WLOG(...) do { fprintf(stderr, __VA_ARGS__); fputc('\n', stderr); } while (0)
+#endif
+#endif
+
+static inline double _cfNowMs(void)
+{
+    struct timeval _tv;
+    gettimeofday(&_tv, NULL);
+    return (double)_tv.tv_sec * 1000.0 + (double)_tv.tv_usec / 1000.0;
+}
+
+// Holder identity lives in FILE-STATIC ATOMICS, not in the manager struct, for one reason: the
+// whole point is to read it from a thread that is BLOCKED and cannot take the lock — and, since
+// the guard that normally protects g_peerManager is exactly the thing that is stuck, it must also
+// be readable WITHOUT touching the manager pointer at all. A global cannot dangle.
+//
+// Non-recursive lock + one manager in practice, so a single slot is accurate. Reads are racy by
+// construction; that is fine for a diagnostic, and the function pointer is always a __func__
+// string literal in static storage, so it is never a dangling read.
+static _Atomic double       g_lockHeldSinceMs = 0.0;
+static const char * _Atomic g_lockHolderFn    = NULL;
+static _Atomic int          g_lockHolderLine  = 0;
+
+// Milliseconds the peer-manager lock has been held right now, 0 if free. Takes NO lock.
+double BRPeerManagerLockHeldMs(const char **outFn, int *outLine)
+{
+    double since = atomic_load_explicit(&g_lockHeldSinceMs, memory_order_relaxed);
+    if (outFn)   *outFn   = atomic_load_explicit(&g_lockHolderFn, memory_order_relaxed);
+    if (outLine) *outLine = atomic_load_explicit(&g_lockHolderLine, memory_order_relaxed);
+    if (since <= 0.0) return 0.0;
+    return _cfNowMs() - since;
+}
+
+#define MGR_LOCK(m)                                                                          \
+    do {                                                                                     \
+        pthread_mutex_lock(&(m)->lock);                                                      \
+        atomic_store_explicit(&g_lockHeldSinceMs, _cfNowMs(), memory_order_relaxed);         \
+        atomic_store_explicit(&g_lockHolderFn, __func__, memory_order_relaxed);              \
+        atomic_store_explicit(&g_lockHolderLine, __LINE__, memory_order_relaxed);            \
+        (m)->lockHeldSinceMs = _cfNowMs();                                                   \
+        (m)->lockHolderFn    = __func__;                                                     \
+        (m)->lockHolderLine  = __LINE__;                                                     \
+    } while (0)
+
+#define MGR_UNLOCK(m)                                                                        \
+    do {                                                                                     \
+        double      _held = _cfNowMs() - (m)->lockHeldSinceMs;                               \
+        const char *_fn   = (m)->lockHolderFn;                                               \
+        int         _ln   = (m)->lockHolderLine;                                             \
+        (m)->lockHeldSinceMs = 0.0;                                                          \
+        atomic_store_explicit(&g_lockHeldSinceMs, 0.0, memory_order_relaxed);                \
+        pthread_mutex_unlock(&(m)->lock);                                                    \
+        if (_held >= CF_SLOW_PHASE_MS) {                                                     \
+            CF_SLOW_WLOG("[CF-SLOW] manager->lock held %.1fs — acquired at %s:%d, released "  \
+                         "at %s:%d", _held / 1000.0, _fn ? _fn : "?", _ln, __func__,          \
+                         __LINE__);                                                          \
+        }                                                                                    \
+    } while (0)
+
+// Phase timer for a specific span INSIDE a critical section, when knowing which lock holder is
+// slow is not enough and the sub-phase matters.
+#define CF_PHASE_START(v) double v = _cfNowMs()
+#define CF_PHASE_END(v, name, fmt, ...)                                                      \
+    do {                                                                                     \
+        double _el = _cfNowMs() - (v);                                                       \
+        if (_el >= CF_SLOW_PHASE_MS) {                                                       \
+            CF_SLOW_WLOG("[CF-SLOW] %s took %.1fs — " fmt, (name), _el / 1000.0, __VA_ARGS__); \
+        }                                                                                    \
+    } while (0)
 
 // Snapshot the scalar status values the Android UI polls into the lock-free atomic
 // mirrors. MUST be called with manager->lock held (so lastBlock / compactFilterChain
@@ -578,9 +707,9 @@ int BRPeerManagerAddPeer(BRPeerManager *manager, UInt128 address, uint16_t port,
 {
     assert(manager != NULL);
     BRPeer peer = (BRPeer){ address, port, services, (uint64_t)time(NULL), 0 };
-    pthread_mutex_lock(&manager->lock);
+    MGR_LOCK(manager);
     size_t added = _BRPeerManagerAddPeer(manager, &peer);
-    pthread_mutex_unlock(&manager->lock);
+    MGR_UNLOCK(manager);
     return (int)added;
 }
 
@@ -646,7 +775,7 @@ static void _requestUnrelayedTxGetdataDone(void *info, int success)
     size_t count = 0;
 
     free(info);
-    pthread_mutex_lock(&manager->lock);
+    MGR_LOCK(manager);
     if (success) peer->flags |= PEER_FLAG_SYNCED;
     
     for (size_t i = array_count(manager->connectedPeers); i > 0; i--) {
@@ -704,7 +833,7 @@ static void _requestUnrelayedTxGetdataDone(void *info, int success)
         }
     }
 
-    pthread_mutex_unlock(&manager->lock);
+    MGR_UNLOCK(manager);
 }
 
 static void _BRPeerManagerRequestUnrelayedTx(BRPeerManager *manager, BRPeer *peer)
@@ -759,7 +888,7 @@ static void _mempoolDone(void *info, int success)
     
     if (success) {
         peer_log(peer, "mempool request finished");
-        pthread_mutex_lock(&manager->lock);
+        MGR_LOCK(manager);
         if (manager->syncStartHeight > 0) {
             peer_log(peer, "sync succeeded");
             syncFinished = 1;
@@ -768,7 +897,7 @@ static void _mempoolDone(void *info, int success)
 
         _BRPeerManagerRequestUnrelayedTx(manager, peer);
         BRPeerSendGetaddr(peer); // request a list of other bitcoin peers
-        pthread_mutex_unlock(&manager->lock);
+        MGR_UNLOCK(manager);
         if (manager->txStatusUpdate) manager->txStatusUpdate(manager->info);
         if (syncFinished && manager->syncStopped) manager->syncStopped(manager->info, 0);
     }
@@ -837,7 +966,7 @@ static void *_findPeersThreadRoutine(void *arg)
     pthread_cleanup_push(manager->threadCleanup, manager->info);
     addrList = _addressLookup(((BRFindPeersInfo *)arg)->hostname);
     free(arg);
-    pthread_mutex_lock(&manager->lock);
+    MGR_LOCK(manager);
     
     for (addr = addrList; addr && ! UInt128IsZero(*addr); addr++) {
         age = 24*60*60 + BRRand(2*24*60*60); // add between 1 and 3 days
@@ -846,7 +975,7 @@ static void *_findPeersThreadRoutine(void *arg)
     }
 
     manager->dnsThreadCount--;
-    pthread_mutex_unlock(&manager->lock);
+    MGR_UNLOCK(manager);
     if (addrList) free(addrList);
     pthread_cleanup_pop(1);
     return NULL;
@@ -890,9 +1019,9 @@ static void _BRPeerManagerFindPeers(BRPeerManager *manager)
         ts.tv_nsec = 1;
 
         do {
-            pthread_mutex_unlock(&manager->lock);
+            MGR_UNLOCK(manager);
             nanosleep(&ts, NULL); // pthread_yield() isn't POSIX standard :(
-            pthread_mutex_lock(&manager->lock);
+            MGR_LOCK(manager);
         } while (manager->dnsThreadCount > 0 && array_count(manager->peers) < PEER_MAX_CONNECTIONS);
     
         qsort(manager->peers, array_count(manager->peers), sizeof(*manager->peers), _peerTimestampCompare);
@@ -1061,12 +1190,109 @@ static int _cfConvoyCfhGated(BRPeerManager *manager)
 // can read it lock-free. Called on every block-add and every KeepAlive tick;
 // deliberately no locking on the peer side -- see BRPeerSetConvoyHdrGated.
 // Caller must hold manager->lock.
+// True while any published tx still owns a callback. BRPeer's `disconnectTime` is ONE
+// field (BRPeer.c:207) shared by the SYNC deadline and the tx-PUBLISH deadline (armed at
+// _BRPeerManagerPublishTx), so anything that moves it must not silently swallow a publish
+// timeout. _BRPeerManagerSyncStopped open-codes this same loop; kept separate here rather
+// than refactoring that one, to keep this change's blast radius to the new call site.
+static int _BRPeerManagerHasPendingPublish(BRPeerManager *manager)
+{
+    for (size_t i = array_count(manager->publishedTx); i > 0; i--) {
+        if (manager->publishedTx[i - 1].callback != NULL) return 1;
+    }
+    return 0;
+}
+
 static void _BRPeerManagerPushConvoyHdrGate(BRPeerManager *manager)
 {
     int gated = CF_CONVOY_HDR_GATED(manager);
     for (size_t i = array_count(manager->connectedPeers); i > 0; i--) {
         BRPeerSetConvoyHdrGated(manager->connectedPeers[i - 1], gated);
     }
+
+#ifndef CONVOY_HOLD_SELFKILL_UNFIXED
+    // ---- THE CONVOY MUST NOT KILL THE PEER IT JUST SILENCED --------------------
+    //
+    // MEASURED (Note 8, 2026-08-02, deep restore): the gate shuts here at :2056, and
+    // BRPeer.c:649 then deliberately sends no continuation -- but :2076 re-armed a
+    // 20 s PROTOCOL_TIMEOUT on the SAME relayed blocks, and that deadline is ABSOLUTE
+    // (BRPeer.c:1403 compares it against wall clock; inbound traffic only refreshes
+    // lastRecvTime at :1402). So 20 s after we choose silence, our own download peer
+    // is disconnected with ETIMEDOUT -> downloadPeer = NULL (:1319) -> reconnect ->
+    // handshake -> election -> ANOTHER un-paced full-locator getheaders -> another
+    // 20,000 headers. connectFailureCount is reset at :2078 so MAX_CONNECT_FAILURES
+    // never trips. That loop is where C ~ 3.55 comes from: 16 elections / 33
+    // handshakes, and it is the gate manufacturing the very chains it exists to stop.
+    //
+    // The deadline means "we ASKED and got nothing". While the gate holds we did not
+    // ask, so the peer is not late -- it is obeying us. REFRESH the deadline rather
+    // than cancelling it:
+    //   * refresh, not cancel, so it stays ARMED -- if the hold lifts and the peer
+    //     then goes genuinely silent, it still fires within PROTOCOL_TIMEOUT. A
+    //     cancel here would leave only the 90 s inbound-idle reaper (:4302), which a
+    //     live-but-unhelpful peer defeats by sending pings.
+    //   * this runs on every block-add AND both ends of the ~10 s KeepAlive tick
+    //     (the three _BRPeerManagerPushConvoyHdrGate call sites) vs a 20 s deadline.
+    //     NOTE there are NO block-adds during a hold, so the KeepAlive sites are the
+    //     ones that carry it. If the heartbeat itself stops (KeepAlive starved),
+    //     behaviour degrades to exactly TODAY'S -- never to a new wedge.
+    //   * guarded on pending publish: refreshing would otherwise postpone a tx
+    //     publish timeout indefinitely, and unlike the per-block re-arm in
+    //     _peerRelayedBlock (which only fires while blocks are arriving) a hold can
+    //     last a long time.
+    //
+    // HONEST SCOPE, from review: while `gated` holds, the ~10 s refresh against a 20 s
+    // deadline means this deadline can never fire. So DURING a hold this is operationally
+    // a cancel, and the two guards below are what keep it from being the unbounded cancel
+    // that an earlier design was refuted for:
+    //
+    //   (1) AGREE WITH THE IDLE REAPER, don't race it. KeepAlive pushes the gate, then
+    //       runs the 90 s inbound-idle reaper (BRPeerScheduleDisconnect(p, 0)), then
+    //       pushes the gate AGAIN at the end of the tick. disconnectTime is one
+    //       last-write-wins double, so an unconditional refresh in that second push
+    //       REVERTS the reaper's verdict for the download peer -- and the peer's read
+    //       thread only samples the field about once a second (1 s SO_RCVTIMEO), so the
+    //       reap would survive only by winning a millisecond-wide race. Testing the same
+    //       lastRecvTime predicate the reaper uses makes the two agree by construction.
+    //   (2) BOUND THE HOLD. `gated` is a pure function of the SCAN frontier, so a frozen
+    //       frontier is a permanent hold, and an indefinitely refreshed deadline makes a
+    //       ping-answering-but-useless download peer immortal (idle reaper defeated by
+    //       pings, socket open so no read-loop reap, stalled-filter drop only targets the
+    //       cfheaders peer). CF_CONVOY_HOLD_MAX_SECS lets exactly one real timeout through
+    //       per cap period. Wall clock always advances, so unlike a frontier-keyed brake
+    //       this can never latch shut.
+    if (! gated || ! manager->downloadPeer) {
+        manager->convoyHoldAddr = UINT128_ZERO;
+        manager->convoyHoldPort = 0;
+        manager->convoyHoldSince = 0;
+    }
+    // START THE CLOCK on `convoyHoldSince == 0`, not on the (addr, port) key. The key's
+    // cleared state is (0, 0), which a peer whose port is genuinely 0 compares EQUAL to --
+    // so keying the restart on identity alone left the clock at 0, and the refresh's own
+    // `convoyHoldSince != 0` test then failed forever: the hold never engaged at all. A
+    // wall-clock second is never legitimately 0, so it is the safe sentinel.
+    else if (manager->convoyHoldSince == 0 ||
+             manager->convoyHoldPort != manager->downloadPeer->port ||
+             ! UInt128Eq(manager->convoyHoldAddr, manager->downloadPeer->address)) {
+        manager->convoyHoldAddr  = manager->downloadPeer->address;
+        manager->convoyHoldPort  = manager->downloadPeer->port;
+        manager->convoyHoldSince = time(NULL);
+    }
+
+    if (gated && manager->downloadPeer &&
+        BRPeerConnectStatus(manager->downloadPeer) == BRPeerStatusConnected &&
+        ! _BRPeerManagerHasPendingPublish(manager)) {
+        struct timeval htv;
+        gettimeofday(&htv, NULL);
+        double hnow = htv.tv_sec + (double)htv.tv_usec/1000000;
+
+        if (hnow - BRPeerLastRecvTime(manager->downloadPeer) <= PEER_INBOUND_IDLE_LIMIT &&
+            manager->convoyHoldSince != 0 &&
+            (time(NULL) - manager->convoyHoldSince) <= CF_CONVOY_HOLD_MAX_SECS) {
+            BRPeerScheduleDisconnect(manager->downloadPeer, PROTOCOL_TIMEOUT);
+        }
+    }
+#endif
 }
 
 // Ring-buffer insert/refresh for the churn-fix penalty set (see PEER_PENALTY_*
@@ -1163,7 +1389,7 @@ static void _peerConnected(void *info)
     BRPeerCallbackInfo *peerInfo;
     time_t now = time(NULL);
     
-    pthread_mutex_lock(&manager->lock);
+    MGR_LOCK(manager);
     if (peer->timestamp > now + 2*60*60 || peer->timestamp < now - 2*60*60) peer->timestamp = now; // sanity check
     
     // TODO: XXX does this work with 0.11 pruned nodes?
@@ -1267,7 +1493,7 @@ static void _peerConnected(void *info)
     // Refresh peer-count/downloadPeer mirrors so the connect-phase overlay shows the
     // live peer count before the first block arrives.
     _BRPeerManagerRefreshCachedStatus(manager);
-    pthread_mutex_unlock(&manager->lock);
+    MGR_UNLOCK(manager);
 }
 
 static void _peerDisconnected(void *info, int error)
@@ -1279,7 +1505,7 @@ static void _peerDisconnected(void *info, int error)
     size_t txCount = 0;
     
     //free(info);
-    pthread_mutex_lock(&manager->lock);
+    MGR_LOCK(manager);
 
     void *txInfo[array_count(manager->publishedTx)];
     void (*txCallback[array_count(manager->publishedTx)])(void *, int);
@@ -1359,7 +1585,7 @@ static void _peerDisconnected(void *info, int error)
     // Peer left connectedPeers (and possibly was the downloadPeer) — refresh the
     // mirrors so the overlay's peer count reflects the drop without taking the lock.
     _BRPeerManagerRefreshCachedStatus(manager);
-    pthread_mutex_unlock(&manager->lock);
+    MGR_UNLOCK(manager);
 
     for (size_t i = 0; i < txCount; i++) {
         txCallback[i](txInfo[i], txError);
@@ -1377,7 +1603,7 @@ static void _peerRelayedPeers(void *info, const BRPeer peers[], size_t peersCoun
     BRPeerManager *manager = ((BRPeerCallbackInfo *)info)->manager;
     time_t now = time(NULL);
 
-    pthread_mutex_lock(&manager->lock);
+    MGR_LOCK(manager);
     peer_log(peer, "relayed %zu peer(s)", peersCount);
 
     // Retain any peer usable for the current sync mode: compact-filter (0x40) peers
@@ -1405,7 +1631,7 @@ static void _peerRelayedPeers(void *info, const BRPeer peers[], size_t peersCoun
     BRPeer save[peersCount];
 
     for (size_t i = 0; i < peersCount; i++) save[i] = manager->peers[i];
-    pthread_mutex_unlock(&manager->lock);
+    MGR_UNLOCK(manager);
     
     // peer relaying is complete when we receive <1000
     if (peersCount > 1 && peersCount < 1000 &&
@@ -1421,7 +1647,7 @@ static void _peerRelayedTx(void *info, BRTransaction *tx)
     int isWalletTx = 0, hasPendingCallbacks = 0;
     size_t relayCount = 0;
     
-    pthread_mutex_lock(&manager->lock);
+    MGR_LOCK(manager);
     peer_log(peer, "relayed tx: %s", u256hex(tx->txHash));
     
     for (size_t i = array_count(manager->publishedTx); i > 0; i--) { // see if tx is in list of published tx
@@ -1484,7 +1710,7 @@ static void _peerRelayedTx(void *info, BRTransaction *tx)
         _BRPeerManagerUpdateTx(manager, &tx->txHash, 1, TX_UNCONFIRMED, (uint32_t)time(NULL));
     }
     
-    pthread_mutex_unlock(&manager->lock);
+    MGR_UNLOCK(manager);
     if (txCallback) txCallback(txInfo, 0);
 }
 
@@ -1498,7 +1724,7 @@ static void _peerHasTx(void *info, UInt256 txHash)
     int isWalletTx = 0, hasPendingCallbacks = 0;
     size_t relayCount = 0;
     
-    pthread_mutex_lock(&manager->lock);
+    MGR_LOCK(manager);
     tx = BRWalletTransactionForHash(manager->wallet, txHash);
     peer_log(peer, "has tx: %s", u256hex(txHash));
 
@@ -1540,7 +1766,7 @@ static void _peerHasTx(void *info, UInt256 txHash)
         _BRTxPeerListRemovePeer(manager->txRequests, txHash, peer);
     }
     
-    pthread_mutex_unlock(&manager->lock);
+    MGR_UNLOCK(manager);
     if (txCallback) txCallback(txInfo, 0);
 }
 
@@ -1550,7 +1776,7 @@ static void _peerRejectedTx(void *info, UInt256 txHash, uint8_t code)
     BRPeerManager *manager = ((BRPeerCallbackInfo *)info)->manager;
     BRTransaction *tx, *t;
 
-    pthread_mutex_lock(&manager->lock);
+    MGR_LOCK(manager);
     peer_log(peer, "rejected tx: %s", u256hex(txHash));
     tx = BRWalletTransactionForHash(manager->wallet, txHash);
     _BRTxPeerListRemovePeer(manager->txRequests, txHash, peer);
@@ -1574,7 +1800,7 @@ static void _peerRejectedTx(void *info, UInt256 txHash, uint8_t code)
         }
     }
 
-    pthread_mutex_unlock(&manager->lock);
+    MGR_UNLOCK(manager);
     if (manager->txStatusUpdate) manager->txStatusUpdate(manager->info);
 }
 
@@ -1672,6 +1898,7 @@ static void _BRPeerManagerClearMemory(BRPeerManager* manager) {
     UInt256 prevHash;
     size_t count = BRSetCount(manager->blocks);
     size_t i = 0;
+    CF_PHASE_START(_phaseT0);
 
     // BIP 158: never prune block headers the compact-filter SCAN (or its
     // residual re-request) still needs. The floor tracks the lowest height the
@@ -1847,11 +2074,6 @@ static void _BRPeerManagerClearMemory(BRPeerManager* manager) {
 
                 // remove the current block
                 if (BRSetRemove(manager->blocks, blockPtr)) {
-#ifdef CHECKPOINT_ALIAS_UNFIXED
-                    // RED ARM ONLY (checkpoint_alias_uaf_kat) — never defined in a production
-                    // build. The pre-fix shape: free unconditionally, leaving checkpoints dangling.
-                    BRMerkleBlockFree(blockPtr);
-#else
                     // DO NOT free a block manager->checkpoints also holds. BRPeerManagerNewEx adds
                     // the SAME BRMerkleBlock* to both sets (the BRSetAdd pair after
                     // BRMerkleBlockNew), but only manager->blocks governs its lifetime here.
@@ -1865,15 +2087,19 @@ static void _BRPeerManagerClearMemory(BRPeerManager* manager) {
                     // header then calls BRSetGet(manager->checkpoints, block) and _BRBlockHeightEq
                     // dereferences ->height on freed memory.
                     //
-                    // ASan on-device 2026-08-06, FRESH install, 3 minutes into first sync:
+                    // ASan on-device 2026-08-06, full stack:
                     //   _peerThreadRoutine -> _BRPeerAcceptMessage -> _BRPeerAcceptHeadersMessage
                     //   -> _peerRelayedBlock -> _BRPeerManagerVerifyBlock (:2114) -> BRSetGet
                     //   -> _BRBlockHeightEq (:227)   heap-use-after-free
-                    // NOT restore-specific: ordinary header processing, every user.
                     //
                     // POINTER IDENTITY, not BRSetGet equality: checkpoints is keyed by
                     // _BRBlockHeightEq, so a lookup can return a DIFFERENT block that merely shares
                     // this height. Only the very same object must be spared.
+#ifdef CHECKPOINT_ALIAS_UNFIXED
+                    // RED ARM ONLY (checkpoint_alias_uaf_kat) — never defined in a production
+                    // build. The pre-fix shape: free unconditionally, leaving checkpoints dangling.
+                    BRMerkleBlockFree(blockPtr);
+#else
                     if (BRSetGet(manager->checkpoints, blockPtr) != blockPtr) {
                         // free the actual memory
                         BRMerkleBlockFree(blockPtr);
@@ -1907,6 +2133,10 @@ static void _BRPeerManagerClearMemory(BRPeerManager* manager) {
             }
         }
     }
+
+    CF_PHASE_END(_phaseT0, "ClearMemory", "resident=%zu cfFloor=%u tip=%u",
+                 BRSetCount(manager->blocks), cfFloor,
+                 manager->lastBlock ? manager->lastBlock->height : 0);
 }
 
 static int _BRPeerManagerVerifyBlock(BRPeerManager *manager, BRMerkleBlock *block, BRMerkleBlock *prev, BRPeer *peer)
@@ -2002,7 +2232,7 @@ static void _peerRelayedBlock(void *info, BRMerkleBlock *block)
     assert(txHashes != NULL);
     txCount = BRMerkleBlockTxHashes(block, txHashes, txCount);
     
-    pthread_mutex_lock(&manager->lock);
+    MGR_LOCK(manager);
     prev = BRSetGet(manager->blocks, &block->prevBlock);
 
     if (prev) {
@@ -2269,7 +2499,7 @@ static void _peerRelayedBlock(void *info, BRMerkleBlock *block)
         saveBuf = _serializeSavedBlocks(saveBlocks, i, &saveLen); // malloc'd under the lock
     }
 
-    pthread_mutex_unlock(&manager->lock);
+    MGR_UNLOCK(manager);
 
     /* Hand the immutable BYTES to the (lock-free) JNI upcall, then free them. */
     if (saveBuf) {
@@ -2297,7 +2527,7 @@ static void _peerRelayedBlockTxns(void *info, UInt256 blockHash, const UInt256 t
 
     if (txCount == 0) return;
 
-    pthread_mutex_lock(&manager->lock);
+    MGR_LOCK(manager);
     b = BRSetGet(manager->blocks, &blockHash);
 
     if (! b) { // header not synced yet; the block will be re-requested/re-relayed once it is
@@ -2306,7 +2536,7 @@ static void _peerRelayedBlockTxns(void *info, UInt256 blockHash, const UInt256 t
         BRCFScanLedgerRecordPending(&manager->cfLedger, blockHash, txHashes, txCount, (uint32_t)time(NULL));
         debug_log("cf-ledger: pending-confirm hole — recorded %zu wallet tx(s) for not-yet-connected block %s\n",
                   txCount, log_u256_hex_encode(blockHash));
-        pthread_mutex_unlock(&manager->lock);
+        MGR_UNLOCK(manager);
         return;
     }
 
@@ -2318,7 +2548,7 @@ static void _peerRelayedBlockTxns(void *info, UInt256 blockHash, const UInt256 t
     // build). b2 was assumed resident, so BRMerkleBlockEq derefs NULL. This is the
     // shape test4 in cf_confirm_kat crashes on (== RED).
     if (! BRMerkleBlockEq(b2, b)) { // block is on a fork, not the main chain; don't confirm against it
-        pthread_mutex_unlock(&manager->lock);
+        MGR_UNLOCK(manager);
         return;
     }
 #else
@@ -2333,7 +2563,7 @@ static void _peerRelayedBlockTxns(void *info, UInt256 blockHash, const UInt256 t
     // Unprovable-main-chain is exactly as unconfirmable as on-a-fork, so both take
     // the same bail-out.
     if (! b2 || ! BRMerkleBlockEq(b2, b)) { // on a fork, or below the resident set; don't confirm against it
-        pthread_mutex_unlock(&manager->lock);
+        MGR_UNLOCK(manager);
         return;
     }
 #endif
@@ -2353,7 +2583,7 @@ static void _peerRelayedBlockTxns(void *info, UInt256 blockHash, const UInt256 t
     }
 
     free(walletHashes);
-    pthread_mutex_unlock(&manager->lock);
+    MGR_UNLOCK(manager);
 
     // notify outside the lock, matching _peerRelayedBlock's txStatusUpdate call below
     if (confirmed && manager->txStatusUpdate) manager->txStatusUpdate(manager->info);
@@ -2371,7 +2601,7 @@ static void _peerRelayedBlockInv(void *info, UInt256 blockHash)
     BRPeer *peer = ((BRPeerCallbackInfo *)info)->peer;
     BRPeerManager *manager = ((BRPeerCallbackInfo *)info)->manager;
 
-    pthread_mutex_lock(&manager->lock);
+    MGR_LOCK(manager);
 
     // PACED-CONVOY GATE, getheaders half (spec Part A). This is the second
     // tip-racing continuation: every block inv pulls headers from our tip, so on
@@ -2393,7 +2623,7 @@ static void _peerRelayedBlockInv(void *info, UInt256 blockHash)
         BRPeerSendGetheaders(peer, locators, count, UINT256_ZERO);
     }
 
-    pthread_mutex_unlock(&manager->lock);
+    MGR_UNLOCK(manager);
 }
 
 static void _peerDataNotfound(void *info, const UInt256 txHashes[], size_t txCount,
@@ -2402,14 +2632,14 @@ static void _peerDataNotfound(void *info, const UInt256 txHashes[], size_t txCou
     BRPeer *peer = ((BRPeerCallbackInfo *)info)->peer;
     BRPeerManager *manager = ((BRPeerCallbackInfo *)info)->manager;
 
-    pthread_mutex_lock(&manager->lock);
+    MGR_LOCK(manager);
 
     for (size_t i = 0; i < txCount; i++) {
         _BRTxPeerListRemovePeer(manager->txRelays, txHashes[i], peer);
         _BRTxPeerListRemovePeer(manager->txRequests, txHashes[i], peer);
     }
 
-    pthread_mutex_unlock(&manager->lock);
+    MGR_UNLOCK(manager);
 }
 
 static void _peerSetFeePerKb(void *info, uint64_t feePerKb)
@@ -2418,7 +2648,7 @@ static void _peerSetFeePerKb(void *info, uint64_t feePerKb)
     BRPeerManager *manager = ((BRPeerCallbackInfo *)info)->manager;
     uint64_t maxFeePerKb = 0, secondFeePerKb = 0;
     
-    pthread_mutex_lock(&manager->lock);
+    MGR_LOCK(manager);
     
     for (size_t i = array_count(manager->connectedPeers); i > 0; i--) { // find second highest fee rate
         p = manager->connectedPeers[i - 1];
@@ -2432,7 +2662,7 @@ static void _peerSetFeePerKb(void *info, uint64_t feePerKb)
         BRWalletSetFeePerKb(manager->wallet, secondFeePerKb*3/2);
     }
 
-    pthread_mutex_unlock(&manager->lock);
+    MGR_UNLOCK(manager);
 }
 
 //static void _peerRequestedTxPingDone(void *info, int success)
@@ -2442,14 +2672,14 @@ static void _peerSetFeePerKb(void *info, uint64_t feePerKb)
 //    UInt256 txHash = ((BRPeerCallbackInfo *)info)->hash;
 //
 //    free(info);
-//    pthread_mutex_lock(&manager->lock);
+//    MGR_LOCK(manager);
 //
 //    if (success && ! _BRTxPeerListHasPeer(manager->txRequests, txHash, peer)) {
 //        _BRTxPeerListAddPeer(&manager->txRequests, txHash, peer);
 //        BRPeerSendGetdata(peer, &txHash, 1, NULL, 0); // check if peer will relay the transaction back
 //    }
 //    
-//    pthread_mutex_unlock(&manager->lock);
+//    MGR_UNLOCK(manager);
 //}
 
 static BRTransaction *_peerRequestedTx(void *info, UInt256 txHash)
@@ -2462,7 +2692,7 @@ static BRTransaction *_peerRequestedTx(void *info, UInt256 txHash)
     void (*txCallback)(void *, int) = NULL;
     int hasPendingCallbacks = 0, error = 0;
 
-    pthread_mutex_lock(&manager->lock);
+    MGR_LOCK(manager);
 
     for (size_t i = array_count(manager->publishedTx); i > 0; i--) {
         if (UInt256Eq(manager->publishedTxHashes[i - 1], txHash)) {
@@ -2502,7 +2732,7 @@ static BRTransaction *_peerRequestedTx(void *info, UInt256 txHash)
 //    pingInfo->manager = manager;
 //    pingInfo->hash = txHash;
 //    BRPeerSendPing(peer, pingInfo, _peerRequestedTxPingDone);
-    pthread_mutex_unlock(&manager->lock);
+    MGR_UNLOCK(manager);
     if (txCallback) txCallback(txInfo, error);
     return tx;
 }
@@ -2518,9 +2748,9 @@ static void _peerThreadCleanup(void *info)
 {
     BRPeerManager *manager = ((BRPeerCallbackInfo *)info)->manager;
 
-    pthread_mutex_lock(&manager->lock);
+    MGR_LOCK(manager);
     manager->peerThreadCount--;
-    pthread_mutex_unlock(&manager->lock);
+    MGR_UNLOCK(manager);
     
     free(info);
     if (manager->threadCleanup) manager->threadCleanup(manager->info);
@@ -3117,7 +3347,7 @@ static void _peerRelayedCFHeaders(void *info, uint8_t filterType, UInt256 stopHa
     BRPeer *peer = ((BRPeerCallbackInfo *)info)->peer;
     BRPeerManager *manager = ((BRPeerCallbackInfo *)info)->manager;
 
-    pthread_mutex_lock(&manager->lock);
+    MGR_LOCK(manager);
 
     // Height-alignment guard. Compute the block height this batch claims to cover
     // (stop height − count + 1) and compare it to where our chain expects the next
@@ -3145,7 +3375,7 @@ static void _peerRelayedCFHeaders(void *info, uint8_t filterType, UInt256 stopHa
                 // set, treating it as a timeout-retry, and rotating the SAME
                 // (unservable) batch forever.
                 manager->cfHeadersRequestedThrough = 0;
-                pthread_mutex_unlock(&manager->lock);
+                MGR_UNLOCK(manager);
                 return;
             }
         }
@@ -3165,7 +3395,7 @@ static void _peerRelayedCFHeaders(void *info, uint8_t filterType, UInt256 stopHa
     if (filterType != BRCompactFilterChainType(manager->compactFilterChain)) {
         peer_log(peer, "cfheaders: ignoring filter type %u (chain type %u)",
                  (unsigned)filterType, (unsigned)BRCompactFilterChainType(manager->compactFilterChain));
-        pthread_mutex_unlock(&manager->lock);
+        MGR_UNLOCK(manager);
         return;
     }
 
@@ -3237,7 +3467,7 @@ static void _peerRelayedCFHeaders(void *info, uint8_t filterType, UInt256 stopHa
                      "re-anchoring (attempt %u/%u)",
                      manager->cfDisagreedCount, manager->cfReanchorCount, CF_CONTINUITY_REANCHOR_MAX);
             _BRPeerManagerReanchorAtFloorLocked(manager, 1);
-            pthread_mutex_unlock(&manager->lock);
+            MGR_UNLOCK(manager);
             return;
         }
 
@@ -3261,7 +3491,7 @@ static void _peerRelayedCFHeaders(void *info, uint8_t filterType, UInt256 stopHa
                          manager->cfSingleDisagreeRounds,
                          manager->cfReanchorCount, CF_CONTINUITY_REANCHOR_MAX);
                 _BRPeerManagerReanchorAtFloorLocked(manager, 1);
-                pthread_mutex_unlock(&manager->lock);
+                MGR_UNLOCK(manager);
                 return;
             }
         } else {
@@ -3274,7 +3504,7 @@ static void _peerRelayedCFHeaders(void *info, uint8_t filterType, UInt256 stopHa
         peer_log(peer, "cfheaders: continuity mismatch (%u/%u disagree, reanchors %u/%u) — not appending",
                  manager->cfDisagreedCount, CF_CONTINUITY_REANCHOR_K,
                  manager->cfReanchorCount, CF_CONTINUITY_REANCHOR_MAX);
-        pthread_mutex_unlock(&manager->lock);
+        MGR_UNLOCK(manager);
         return;
     }
 
@@ -3369,7 +3599,7 @@ static void _peerRelayedCFHeaders(void *info, uint8_t filterType, UInt256 stopHa
     // cfheaders advanced — refresh cachedCFTip so the watchdog/overlay see progress
     // between blocks (cfheaders can climb faster than new blocks arrive).
     _BRPeerManagerRefreshCachedStatus(manager);
-    pthread_mutex_unlock(&manager->lock);
+    MGR_UNLOCK(manager);
 }
 
 // Returns the wallet's BIP 158 element set, rebuilding it only when the wallet's address
@@ -3486,7 +3716,7 @@ static void _peerRelayedCFilter(void *info, uint8_t filterType, UInt256 blockHas
 #ifdef CF_RECV_DIAG
     uint64_t _tPre = _cfNowNanos();
 #endif
-    pthread_mutex_lock(&manager->lock);
+    MGR_LOCK(manager);
 #ifdef CF_RECV_DIAG
     {
         uint64_t _tPost = _cfNowNanos();
@@ -3505,7 +3735,7 @@ static void _peerRelayedCFilter(void *info, uint8_t filterType, UInt256 blockHas
         // for a mismatched type vanished without trace.
         manager->cfExitNoChain++;
 #endif
-        pthread_mutex_unlock(&manager->lock);
+        MGR_UNLOCK(manager);
         return;
     }
 
@@ -3568,7 +3798,7 @@ static void _peerRelayedCFilter(void *info, uint8_t filterType, UInt256 blockHas
         manager->cfExitUnknownDrop++;
 #endif
 #endif
-        pthread_mutex_unlock(&manager->lock);
+        MGR_UNLOCK(manager);
         return;
     }
 
@@ -3586,7 +3816,7 @@ static void _peerRelayedCFilter(void *info, uint8_t filterType, UInt256 blockHas
         peer_log(peer, "cf-ledger: hole @ %u reason=verify_fail — left outstanding (scannedThrough=%u, outstanding=%zu)",
                  b->height, BRCFScanLedgerScannedThrough(&manager->cfLedger),
                  BRCFScanLedgerOutstandingCount(&manager->cfLedger));
-        pthread_mutex_unlock(&manager->lock);
+        MGR_UNLOCK(manager);
         return;
     }
 
@@ -3608,7 +3838,7 @@ static void _peerRelayedCFilter(void *info, uint8_t filterType, UInt256 blockHas
         peer_log(peer, "cf-ledger: hole @ %u reason=parse_fail — left outstanding (scannedThrough=%u, outstanding=%zu)",
                  b->height, BRCFScanLedgerScannedThrough(&manager->cfLedger),
                  BRCFScanLedgerOutstandingCount(&manager->cfLedger));
-        pthread_mutex_unlock(&manager->lock);
+        MGR_UNLOCK(manager);
         return;
     }
 
@@ -3675,7 +3905,7 @@ static void _peerRelayedCFilter(void *info, uint8_t filterType, UInt256 blockHas
 #endif
     BRCFScanLedgerMarkEvaluated(&manager->cfLedger, b->height);
 
-    pthread_mutex_unlock(&manager->lock);
+    MGR_UNLOCK(manager);
 }
 
 // B2 stub: cfcheckpt is informational at the moment. C1+ may use checkpoints
@@ -3749,11 +3979,11 @@ void BRPeerManagerSetFixedPeer(BRPeerManager *manager, UInt128 address, uint16_t
 {
     assert(manager != NULL);
     BRPeerManagerDisconnect(manager);
-    pthread_mutex_lock(&manager->lock);
+    MGR_LOCK(manager);
     manager->maxConnectCount = UInt128IsZero(address) ? PEER_MAX_CONNECTIONS : 1;
     manager->fixedPeer = ((BRPeer) { address, port, 0, 0, 0 });
     array_clear(manager->peers);
-    pthread_mutex_unlock(&manager->lock);
+    MGR_UNLOCK(manager);
 }
 
 // Dynamically set the target connection count (demand-side load-spread): the wallet holds the
@@ -3767,7 +3997,7 @@ void BRPeerManagerSetMaxConnectCount(BRPeerManager *manager, size_t count)
 {
     assert(manager != NULL);
     if (count < 1) count = 1;
-    pthread_mutex_lock(&manager->lock);
+    MGR_LOCK(manager);
     size_t prev = manager->maxConnectCount;
     manager->maxConnectCount = count;
     if (count < prev) {
@@ -3782,7 +4012,7 @@ void BRPeerManagerSetMaxConnectCount(BRPeerManager *manager, size_t count)
             keeping--;
         }
     }
-    pthread_mutex_unlock(&manager->lock);
+    MGR_UNLOCK(manager);
     if (count > prev) BRPeerManagerConnect(manager);                  // fell behind — top back up
 }
 
@@ -3792,7 +4022,7 @@ BRPeerStatus BRPeerManagerConnectStatus(BRPeerManager *manager)
     BRPeerStatus status = BRPeerStatusDisconnected;
     
     assert(manager != NULL);
-    pthread_mutex_lock(&manager->lock);
+    MGR_LOCK(manager);
     if (manager->isConnected != 0) status = BRPeerStatusConnected;
 
     for (size_t i = array_count(manager->connectedPeers); i > 0 && status == BRPeerStatusDisconnected; i--) {
@@ -3800,7 +4030,7 @@ BRPeerStatus BRPeerManagerConnectStatus(BRPeerManager *manager)
         status = BRPeerStatusConnecting;
     }
 
-    pthread_mutex_unlock(&manager->lock);
+    MGR_UNLOCK(manager);
     return status;
 }
 
@@ -3810,11 +4040,11 @@ BRPeerStatus BRPeerManagerConnectStatus(BRPeerManager *manager)
 void BRPeerManagerSetPinnedPeer(BRPeerManager *manager, UInt128 addr, uint16_t port, int exclusive)
 {
     assert(manager != NULL);
-    pthread_mutex_lock(&manager->lock);
+    MGR_LOCK(manager);
     manager->pinnedAddr = addr;
     manager->pinnedPort = port;
     manager->pinnedExclusive = exclusive ? 1 : 0;
-    pthread_mutex_unlock(&manager->lock);
+    MGR_UNLOCK(manager);
 }
 
 // Clear any pinned own-node (reverts to normal dial/eviction behavior). Takes
@@ -3822,11 +4052,11 @@ void BRPeerManagerSetPinnedPeer(BRPeerManager *manager, UInt128 addr, uint16_t p
 void BRPeerManagerClearPinnedPeer(BRPeerManager *manager)
 {
     assert(manager != NULL);
-    pthread_mutex_lock(&manager->lock);
+    MGR_LOCK(manager);
     manager->pinnedAddr = UINT128_ZERO;
     manager->pinnedPort = 0;
     manager->pinnedExclusive = 0;
-    pthread_mutex_unlock(&manager->lock);
+    MGR_UNLOCK(manager);
 }
 
 // Compact-filter status of the peer at addr:port for the own-node connectivity UI:
@@ -3838,7 +4068,7 @@ int BRPeerManagerCompactFilterPeerStatus(BRPeerManager *manager, UInt128 addr, u
 {
     assert(manager != NULL);
     int inPool = 0, connected = 0, served = 0;
-    pthread_mutex_lock(&manager->lock);
+    MGR_LOCK(manager);
     for (size_t i = 0; i < array_count(manager->peers); i++) {
         if (! UInt128Eq(manager->peers[i].address, addr) || manager->peers[i].port != port) continue;
         inPool = 1; break;
@@ -3850,7 +4080,7 @@ int BRPeerManagerCompactFilterPeerStatus(BRPeerManager *manager, UInt128 addr, u
         break;
     }
     served = _cfServedContains(manager, addr, port);
-    pthread_mutex_unlock(&manager->lock);
+    MGR_UNLOCK(manager);
     return BRComputeCFPeerStatus(inPool, connected, served);
 }
 
@@ -3876,9 +4106,9 @@ static void _BRPeerManagerBeginConnect(BRPeerManager *manager, const BRPeer *tmp
     BRPeerConnect(info->peer);
 
     if (BRPeerConnectStatus(info->peer) == BRPeerStatusDisconnected) {
-        pthread_mutex_unlock(&manager->lock);
+        MGR_UNLOCK(manager);
         _peerDisconnected(info, ENOTCONN);
-        pthread_mutex_lock(&manager->lock);
+        MGR_LOCK(manager);
         manager->peerThreadCount--;
     }
 }
@@ -3926,15 +4156,15 @@ static size_t _BRPeerManagerCountLiveFilterPeers(BRPeerManager *manager)
 void BRPeerManagerConnect(BRPeerManager *manager)
 {
     assert(manager != NULL);
-    pthread_mutex_lock(&manager->lock);
+    MGR_LOCK(manager);
     if (manager->connectFailureCount >= MAX_CONNECT_FAILURES) manager->connectFailureCount = 0; //this is a manual retry
     
     if ((! manager->downloadPeer || manager->lastBlock->height < manager->estimatedHeight) &&
         manager->syncStartHeight == 0) {
         manager->syncStartHeight = manager->lastBlock->height + 1;
-        pthread_mutex_unlock(&manager->lock);
+        MGR_UNLOCK(manager);
         if (manager->syncStarted) manager->syncStarted(manager->info);
-        pthread_mutex_lock(&manager->lock);
+        MGR_LOCK(manager);
     }
     
     for (size_t i = array_count(manager->connectedPeers); i > 0; i--) {
@@ -4142,9 +4372,9 @@ void BRPeerManagerConnect(BRPeerManager *manager)
                 BRPeerConnect(info->peer);
                 
                 if (BRPeerConnectStatus(info->peer) == BRPeerStatusDisconnected) {
-                    pthread_mutex_unlock(&manager->lock);
+                    MGR_UNLOCK(manager);
                     _peerDisconnected(info, ENOTCONN);
-                    pthread_mutex_lock(&manager->lock);
+                    MGR_LOCK(manager);
                     manager->peerThreadCount--;
                 }
             }
@@ -4159,10 +4389,10 @@ void BRPeerManagerConnect(BRPeerManager *manager)
         // past the bare sentinel (OOB). Use the peer-less _peer_log.
         _peer_log("sync failed — no peers connected\n");
         _BRPeerManagerSyncStopped(manager);
-        pthread_mutex_unlock(&manager->lock);
+        MGR_UNLOCK(manager);
         if (manager->syncStopped) manager->syncStopped(manager->info, ENETUNREACH);
     }
-    else pthread_mutex_unlock(&manager->lock);
+    else MGR_UNLOCK(manager);
 }
 
 // Send a keepalive PING to every connected peer. Bloom sync keeps its single download peer hot
@@ -4260,7 +4490,7 @@ static int _cfBufEval(void *vctx, uint32_t height, UInt256 blockHash, const uint
 void BRPeerManagerKeepAlive(BRPeerManager *manager)
 {
     assert(manager != NULL);
-    pthread_mutex_lock(&manager->lock);
+    MGR_LOCK(manager);
 
 #ifdef CF_RECV_DIAG
     // ---- RECEIVE-PATH LEDGER (diagnostic build only) -------------------------
@@ -5157,7 +5387,53 @@ void BRPeerManagerKeepAlive(BRPeerManager *manager)
     }
 #endif // CONVOY_NO_B1_DRIVER
 
-    pthread_mutex_unlock(&manager->lock);
+#ifdef CF_AGE_DIAG
+    // ---- WHY IS `outstanding` PINNED NEAR ITS CEILING? (diagnostic build only) ----
+    //
+    // Measured 2026-08-03, armed Phase-2 deep restore: outstanding sat at 3300-4044
+    // against CF_OUTSTANDING_MAX 4096, so the forward back-pressure gates
+    // (BRCFScanLedgerOutstandingCount < CF_OUTSTANDING_LOWWATER, which exist ONLY when
+    // armed) stayed shut and only 49 getcfilters went out in 10 minutes -- scan rate
+    // 1418 blk/min against ~5250 blk/min of headers.
+    //
+    // TWO EXPLANATIONS, OPPOSITE FIXES, and the logs cannot tell them apart:
+    //   (A) the entries are mostly YOUNG -- a normal in-flight pipeline that is simply
+    //       deeper than a 4096 buffer. Fix: bigger buffer / paced issuance.
+    //   (B) the entries are mostly OLD -- heights stuck mid-ladder occupying slots for
+    //       the full 30/60/120/120/120 = 7.5 min. Fix: the retry ladder, not the buffer.
+    // Guessing between them is how four designs died this session. So: measure.
+    //
+    // Buckets are age since the LAST request (requestedAt, unix secs), plus the attempts
+    // histogram, which separates "waiting on a first answer" from "deep in the ladder".
+    {
+        BRCFScanLedger *_l = &manager->cfLedger;
+        time_t _now = time(NULL);
+        unsigned _a5 = 0, _a30 = 0, _a120 = 0, _a300 = 0, _aOld = 0, _aNever = 0;
+        unsigned _att[CF_REREQ_MAX_ATTEMPTS + 1];
+        memset(_att, 0, sizeof(_att));
+        for (size_t _i = 0; _i < _l->outstandingCount; _i++) {
+            uint8_t _n = _l->outstanding[_i].attempts;
+            if (_n <= CF_REREQ_MAX_ATTEMPTS) _att[_n]++;
+            uint32_t _ra = _l->outstanding[_i].requestedAt;
+            if (_ra == 0) { _aNever++; continue; }
+            long _age = (long)_now - (long)_ra;
+            if (_age < 5)        _a5++;
+            else if (_age < 30)  _a30++;
+            else if (_age < 120) _a120++;
+            else if (_age < 300) _a300++;
+            else                 _aOld++;
+        }
+        _peer_log("[CF-AGE] outstanding=%zu (max %u, lowwater %u) | age: <5s=%u <30s=%u "
+                  "<2m=%u <5m=%u older=%u never-requested=%u | attempts: 0=%u 1=%u 2=%u "
+                  "3=%u 4=%u 5=%u\n",
+                  _l->outstandingCount, (unsigned)CF_OUTSTANDING_MAX,
+                  (unsigned)CF_OUTSTANDING_LOWWATER,
+                  _a5, _a30, _a120, _a300, _aOld, _aNever,
+                  _att[0], _att[1], _att[2], _att[3], _att[4], _att[5]);
+    }
+#endif // CF_AGE_DIAG
+
+    MGR_UNLOCK(manager);
 }
 
 void BRPeerManagerDisconnect(BRPeerManager *manager)
@@ -5167,7 +5443,7 @@ void BRPeerManagerDisconnect(BRPeerManager *manager)
     BRPeer *p;
     
     assert(manager != NULL);
-    pthread_mutex_lock(&manager->lock);
+    MGR_LOCK(manager);
     
     // prevent new peers from being spawned
     maxConnectCount = manager->maxConnectCount;
@@ -5182,21 +5458,21 @@ void BRPeerManagerDisconnect(BRPeerManager *manager)
     
     peerThreadCount = manager->peerThreadCount;
     dnsThreadCount = manager->dnsThreadCount;
-    pthread_mutex_unlock(&manager->lock);
+    MGR_UNLOCK(manager);
     ts.tv_sec = 0;
     ts.tv_nsec = 1;
     
     while (peerThreadCount > 0 || dnsThreadCount > 0) {
         nanosleep(&ts, NULL); // pthread_yield() isn't POSIX standard :(
-        pthread_mutex_lock(&manager->lock);
+        MGR_LOCK(manager);
         peerThreadCount = manager->peerThreadCount;
         dnsThreadCount = manager->dnsThreadCount;
-        pthread_mutex_unlock(&manager->lock);
+        MGR_UNLOCK(manager);
     }
     
-    pthread_mutex_lock(&manager->lock);
+    MGR_LOCK(manager);
     manager->maxConnectCount = maxConnectCount;
-    pthread_mutex_unlock(&manager->lock);
+    MGR_UNLOCK(manager);
 }
 
 // rescans blocks and transactions after earliestKeyTime (a new random download peer is also selected due to the
@@ -5204,7 +5480,7 @@ void BRPeerManagerDisconnect(BRPeerManager *manager)
 void BRPeerManagerRescan(BRPeerManager *manager)
 {
     assert(manager != NULL);
-    pthread_mutex_lock(&manager->lock);
+    MGR_LOCK(manager);
     
     if (manager->isConnected) {
         // start the chain download from the most recent checkpoint that's at least a week older than earliestKeyTime
@@ -5236,10 +5512,10 @@ void BRPeerManagerRescan(BRPeerManager *manager)
         }
 
         manager->syncStartHeight = 0; // a syncStartHeight of 0 indicates that syncing hasn't started yet
-        pthread_mutex_unlock(&manager->lock);
+        MGR_UNLOCK(manager);
         BRPeerManagerConnect(manager);
     }
-    else pthread_mutex_unlock(&manager->lock);
+    else MGR_UNLOCK(manager);
 }
 
 // the (unverified) best block height reported by connected peers
@@ -5308,14 +5584,14 @@ size_t BRPeerManagerPeerCount(BRPeerManager *manager)
 const char *BRPeerManagerDownloadPeerName(BRPeerManager *manager)
 {
     assert(manager != NULL);
-    pthread_mutex_lock(&manager->lock);
+    MGR_LOCK(manager);
 
     if (manager->downloadPeer) {
         sprintf(manager->downloadPeerName, "%s:%d", BRPeerHost(manager->downloadPeer), manager->downloadPeer->port);
     }
     else manager->downloadPeerName[0] = '\0';
     
-    pthread_mutex_unlock(&manager->lock);
+    MGR_UNLOCK(manager);
     return manager->downloadPeerName;
 }
 
@@ -5325,30 +5601,30 @@ static void _publishTxInvDone(void *info, int success)
     BRPeerManager *manager = ((BRPeerCallbackInfo *)info)->manager;
     
     free(info);
-    pthread_mutex_lock(&manager->lock);
+    MGR_LOCK(manager);
     _BRPeerManagerRequestUnrelayedTx(manager, peer);
-    pthread_mutex_unlock(&manager->lock);
+    MGR_UNLOCK(manager);
 }
 
 // publishes tx to bitcoin network (do not call BRTransactionFree() on tx afterward)
 void BRPeerManagerSetDandelionEnabled(BRPeerManager *manager, int enabled)
 {
     assert(manager != NULL);
-    pthread_mutex_lock(&manager->lock);
+    MGR_LOCK(manager);
     manager->dandelionEnabled = (enabled != 0);
-    pthread_mutex_unlock(&manager->lock);
+    MGR_UNLOCK(manager);
 }
 
 void BRPeerManagerAddDandelionPeer(BRPeerManager *manager, UInt128 address)
 {
     assert(manager != NULL);
-    pthread_mutex_lock(&manager->lock);
+    MGR_LOCK(manager);
     int known = 0;
     for (size_t i = array_count(manager->dandelionPeers); i > 0; i--) {
         if (UInt128Eq(manager->dandelionPeers[i - 1], address)) { known = 1; break; }
     }
     if (! known) array_add(manager->dandelionPeers, address);
-    pthread_mutex_unlock(&manager->lock);
+    MGR_UNLOCK(manager);
 }
 
 // caller must hold manager->lock
@@ -5374,9 +5650,9 @@ static BRPeer *_BRPeerManagerAnyDandelionPeer(BRPeerManager *manager)
 int BRPeerManagerHasDandelionPeer(BRPeerManager *manager)
 {
     assert(manager != NULL);
-    pthread_mutex_lock(&manager->lock);
+    MGR_LOCK(manager);
     int r = manager->dandelionEnabled && _BRPeerManagerAnyDandelionPeer(manager) != NULL;
-    pthread_mutex_unlock(&manager->lock);
+    MGR_UNLOCK(manager);
     return r;
 }
 
@@ -5385,12 +5661,12 @@ int BRPeerManagerStemPublishTx(BRPeerManager *manager, BRTransaction *tx, void *
 {
     assert(manager != NULL && tx != NULL);
     if (! BRTransactionIsSigned(tx)) return 0;   // let the flood path report EINVAL
-    pthread_mutex_lock(&manager->lock);
+    MGR_LOCK(manager);
 
-    if (! manager->isConnected) { pthread_mutex_unlock(&manager->lock); return 0; }
+    if (! manager->isConnected) { MGR_UNLOCK(manager); return 0; }
 
     BRPeer *stem = manager->dandelionEnabled ? _BRPeerManagerAnyDandelionPeer(manager) : NULL;
-    if (! stem) { pthread_mutex_unlock(&manager->lock); return 0; }   // caller floods instead
+    if (! stem) { MGR_UNLOCK(manager); return 0; }   // caller floods instead
 
     tx->is_dandelion = 1;
     tx->timestamp = (uint32_t)time(NULL);
@@ -5404,14 +5680,14 @@ int BRPeerManagerStemPublishTx(BRPeerManager *manager, BRTransaction *tx, void *
     BRPeerSendPing(stem, peerInfo, _publishTxInvDone);  // ping→pong confirms the inv was sent
 
     peer_log(stem, "dandelion: stem-submitted tx %s to single peer", u256hex(tx->txHash));
-    pthread_mutex_unlock(&manager->lock);
+    MGR_UNLOCK(manager);
     return 1;
 }
 
 void BRPeerManagerFluffTx(BRPeerManager *manager, UInt256 txHash)
 {
     assert(manager != NULL);
-    pthread_mutex_lock(&manager->lock);
+    MGR_LOCK(manager);
 
     BRTransaction *tx = NULL;
     for (size_t i = array_count(manager->publishedTx); i > 0; i--) {
@@ -5419,7 +5695,7 @@ void BRPeerManagerFluffTx(BRPeerManager *manager, UInt256 txHash)
             tx = manager->publishedTx[i - 1].tx; break;
         }
     }
-    if (! tx) { pthread_mutex_unlock(&manager->lock); return; }
+    if (! tx) { MGR_UNLOCK(manager); return; }
     tx->is_dandelion = 0;   // fluff: a normal tx from here on
 
     for (size_t i = array_count(manager->connectedPeers); i > 0; i--) {
@@ -5437,7 +5713,7 @@ void BRPeerManagerFluffTx(BRPeerManager *manager, UInt256 txHash)
     // inet_ntop's host string past the end of the ~40-byte stack temporary — a stack
     // buffer overflow (-fstack-protector abort). Use the peer-less _peer_log.
     _peer_log("dandelion: embargo fluff — flooded tx %s to all peers\n", u256hex(txHash));
-    pthread_mutex_unlock(&manager->lock);
+    MGR_UNLOCK(manager);
 }
 
 void BRPeerManagerPublishTx(BRPeerManager *manager, BRTransaction *tx, void *info,
@@ -5445,10 +5721,10 @@ void BRPeerManagerPublishTx(BRPeerManager *manager, BRTransaction *tx, void *inf
 {
     assert(manager != NULL);
     assert(tx != NULL && BRTransactionIsSigned(tx));
-    if (tx) pthread_mutex_lock(&manager->lock);
+    if (tx) MGR_LOCK(manager);
     
     if (tx && ! BRTransactionIsSigned(tx)) {
-        pthread_mutex_unlock(&manager->lock);
+        MGR_UNLOCK(manager);
         BRTransactionFree(tx);
         tx = NULL;
         if (callback) callback(info, EINVAL); // transaction not signed
@@ -5456,7 +5732,7 @@ void BRPeerManagerPublishTx(BRPeerManager *manager, BRTransaction *tx, void *inf
     else if (tx && ! manager->isConnected) {
         int connectFailureCount = manager->connectFailureCount;
 
-        pthread_mutex_unlock(&manager->lock);
+        MGR_UNLOCK(manager);
 
         if (connectFailureCount >= MAX_CONNECT_FAILURES ||
             (manager->networkIsReachable && ! manager->networkIsReachable(manager->info))) {
@@ -5464,7 +5740,7 @@ void BRPeerManagerPublishTx(BRPeerManager *manager, BRTransaction *tx, void *inf
             tx = NULL;
             if (callback) callback(info, ENOTCONN); // not connected to bitcoin network
         }
-        else pthread_mutex_lock(&manager->lock);
+        else MGR_LOCK(manager);
     }
     
     if (tx) {
@@ -5495,7 +5771,7 @@ void BRPeerManagerPublishTx(BRPeerManager *manager, BRTransaction *tx, void *inf
             }
         }
 
-        pthread_mutex_unlock(&manager->lock);
+        MGR_UNLOCK(manager);
     }
 }
 
@@ -5506,7 +5782,7 @@ size_t BRPeerManagerRelayCount(BRPeerManager *manager, UInt256 txHash)
 
     assert(manager != NULL);
     assert(! UInt256IsZero(txHash));
-    pthread_mutex_lock(&manager->lock);
+    MGR_LOCK(manager);
     
     for (size_t i = array_count(manager->txRelays); i > 0; i--) {
         if (! UInt256Eq(manager->txRelays[i - 1].txHash, txHash)) continue;
@@ -5514,7 +5790,7 @@ size_t BRPeerManagerRelayCount(BRPeerManager *manager, UInt256 txHash)
         break;
     }
     
-    pthread_mutex_unlock(&manager->lock);
+    MGR_UNLOCK(manager);
     return count;
 }
 
@@ -5522,7 +5798,7 @@ size_t BRPeerManagerRelayCount(BRPeerManager *manager, UInt256 txHash)
 void BRPeerManagerFree(BRPeerManager *manager)
 {
     assert(manager != NULL);
-    pthread_mutex_lock(&manager->lock);
+    MGR_LOCK(manager);
     array_free(manager->peers);
     for (size_t i = array_count(manager->connectedPeers); i > 0; i--) BRPeerFree(manager->connectedPeers[i - 1]);
     array_free(manager->connectedPeers);
@@ -5547,7 +5823,7 @@ void BRPeerManagerFree(BRPeerManager *manager)
     manager->cfElems = NULL;
     manager->cfElemsAddrGen = 0;
     manager->cfElemsAddrCount = 0;
-    pthread_mutex_unlock(&manager->lock);
+    MGR_UNLOCK(manager);
     pthread_mutex_destroy(&manager->lock);
     free(manager);
 }
@@ -5557,10 +5833,10 @@ void BRPeerManagerFree(BRPeerManager *manager)
 void BRPeerManagerSetSyncMode(BRPeerManager *manager, BRSyncMode mode)
 {
     assert(manager != NULL);
-    pthread_mutex_lock(&manager->lock);
+    MGR_LOCK(manager);
     manager->syncMode = mode;
     _BRPeerManagerRefreshCachedStatus(manager);
-    pthread_mutex_unlock(&manager->lock);
+    MGR_UNLOCK(manager);
 }
 
 BRSyncMode BRPeerManagerGetSyncMode(BRPeerManager *manager)
@@ -5595,6 +5871,8 @@ uint32_t BRPeerManagerCFChainTipHeight(BRPeerManager *manager)
 static uint32_t _BRPeerManagerBlockFloor(BRPeerManager *manager)
 {
     BRMerkleBlock *b = manager->lastBlock;
+    CF_PHASE_START(_floorT0);
+    size_t _floorSteps = 0;
     if (!b) return 0;
 #ifdef CF_KAT_COUNT_FLOOR_WALKS
     // Host-KAT-only walk counter (never defined in any production build). The
@@ -5607,7 +5885,14 @@ static uint32_t _BRPeerManagerBlockFloor(BRPeerManager *manager)
         BRMerkleBlock *prev = BRSetGet(manager->blocks, &b->prevBlock);
         if (!prev) break;
         b = prev;
+        _floorSteps++;
     }
+    // This descent is O(resident) and runs with manager->lock HELD. The memo above cannot
+    // absorb it during active sync — its key includes the resident block COUNT, which changes on
+    // every block-add — and three call sites (:3071, :4492, :4869) skip the memo entirely. Log
+    // the step count alongside the time so a slow walk is distinguishable from a slow machine.
+    CF_PHASE_END(_floorT0, "BlockFloor descent", "steps=%zu resident=%zu floor=%u",
+                 _floorSteps, BRSetCount(manager->blocks), b->height);
     return b->height;
 }
 
@@ -5627,6 +5912,10 @@ static uint32_t _BRPeerManagerBlockFloorCached(BRPeerManager *manager)
         manager->floorMemoTipHeight  == tip->height) {
         return manager->floorMemoFloor;
     }
+    // MEMO MISS. The key includes floorMemoBlockCount, and the resident count changes on EVERY
+    // block-add — so during active sync this memo can essentially never hit. The walk itself is
+    // instrumented (see _BRPeerManagerBlockFloor), which also covers the THREE call sites that
+    // bypass this wrapper entirely (:3071, :4492, :4869) and pay a full descent every time.
     uint32_t floorH = _BRPeerManagerBlockFloor(manager);
     manager->floorMemoBlocks     = manager->blocks;
     manager->floorMemoBlockCount = n;
@@ -5713,9 +6002,9 @@ static int _BRPeerManagerReanchorAtFloorLocked(BRPeerManager *manager, int force
 int BRPeerManagerReanchorCompactFilterChainAtFloor(BRPeerManager *manager)
 {
     assert(manager != NULL);
-    pthread_mutex_lock(&manager->lock);
+    MGR_LOCK(manager);
     int r = _BRPeerManagerReanchorAtFloorLocked(manager, 0);
-    pthread_mutex_unlock(&manager->lock);
+    MGR_UNLOCK(manager);
     return r;
 }
 
@@ -5733,7 +6022,7 @@ int BRPeerManagerReanchorCompactFilterChainAtFloor(BRPeerManager *manager)
 int BRPeerManagerRerequestHeadersFromTip(BRPeerManager *manager)
 {
     assert(manager != NULL);
-    pthread_mutex_lock(&manager->lock);
+    MGR_LOCK(manager);
     int sent = 0;
     if (manager->isConnected && array_count(manager->connectedPeers) > 0) {
         UInt256 locators[_BRPeerManagerBlockLocators(manager, NULL, 0)];
@@ -5749,19 +6038,19 @@ int BRPeerManagerRerequestHeadersFromTip(BRPeerManager *manager)
             _peer_log("tip-stall: re-requested headers (full locator) from %d peer(s)\n", sent);
         }
     }
-    pthread_mutex_unlock(&manager->lock);
+    MGR_UNLOCK(manager);
     return sent;
 }
 
 void BRPeerManagerSetCompactFilterChain(BRPeerManager *manager, BRCompactFilterChain *chain)
 {
     assert(manager != NULL);
-    pthread_mutex_lock(&manager->lock);
+    MGR_LOCK(manager);
     if (manager->compactFilterChain && manager->compactFilterChain != chain) {
         BRCompactFilterChainFree(manager->compactFilterChain);
     }
     manager->compactFilterChain = chain;
-    pthread_mutex_unlock(&manager->lock);
+    MGR_UNLOCK(manager);
 }
 
 const BRCompactFilterChain *BRPeerManagerGetCompactFilterChain(BRPeerManager *manager)
@@ -5778,10 +6067,10 @@ void BRPeerManagerSetSaveFilterHeaders(BRPeerManager *manager, void *info,
                                                                   const BRCompactFilterChain *chain))
 {
     assert(manager != NULL);
-    pthread_mutex_lock(&manager->lock);
+    MGR_LOCK(manager);
     manager->saveFilterHeadersInfo = info;
     manager->saveFilterHeaders = saveFilterHeaders;
-    pthread_mutex_unlock(&manager->lock);
+    MGR_UNLOCK(manager);
 }
 
 // ---- CF scan-completeness ledger accessors (Phase 1: guarded reads) --------
@@ -5792,38 +6081,38 @@ void BRPeerManagerCFLedgerCounts(BRPeerManager *manager, uint32_t *scannedThroug
                                  uint32_t *gaveUp, uint32_t *pending)
 {
     assert(manager != NULL);
-    pthread_mutex_lock(&manager->lock);
+    MGR_LOCK(manager);
     if (scannedThrough) *scannedThrough = BRCFScanLedgerScannedThrough(&manager->cfLedger);
     if (outstanding)    *outstanding    = (uint32_t)BRCFScanLedgerOutstandingCount(&manager->cfLedger);
     if (gaveUp)         *gaveUp         = (uint32_t)BRCFScanLedgerGaveUpCount(&manager->cfLedger);
     if (pending)        *pending        = (uint32_t)manager->cfLedger.pendingCount;
-    pthread_mutex_unlock(&manager->lock);
+    MGR_UNLOCK(manager);
 }
 
 size_t BRPeerManagerCFLedgerHoleRanges(BRPeerManager *manager, uint32_t *outStarts, uint32_t *outEnds, size_t cap)
 {
     assert(manager != NULL);
-    pthread_mutex_lock(&manager->lock);
+    MGR_LOCK(manager);
     size_t n = BRCFScanLedgerHoleRanges(&manager->cfLedger, outStarts, outEnds, cap);
-    pthread_mutex_unlock(&manager->lock);
+    MGR_UNLOCK(manager);
     return n;
 }
 
 size_t BRPeerManagerCFLedgerSerialize(BRPeerManager *manager, uint8_t *buf, size_t buflen)
 {
     assert(manager != NULL);
-    pthread_mutex_lock(&manager->lock);
+    MGR_LOCK(manager);
     size_t n = BRCFScanLedgerSerialize(&manager->cfLedger, buf, buflen);
-    pthread_mutex_unlock(&manager->lock);
+    MGR_UNLOCK(manager);
     return n;
 }
 
 int BRPeerManagerCFLedgerRestore(BRPeerManager *manager, const uint8_t *buf, size_t buflen)
 {
     assert(manager != NULL);
-    pthread_mutex_lock(&manager->lock);
+    MGR_LOCK(manager);
     int ok = BRCFScanLedgerParse(&manager->cfLedger, buf, buflen);
-    pthread_mutex_unlock(&manager->lock);
+    MGR_UNLOCK(manager);
     return ok;
 }
 
@@ -5835,28 +6124,28 @@ int BRPeerManagerCFLedgerRestore(BRPeerManager *manager, const uint8_t *buf, siz
 uint32_t BRPeerManagerLowestNeededHeight(BRPeerManager *manager)
 {
     assert(manager != NULL);
-    pthread_mutex_lock(&manager->lock);
+    MGR_LOCK(manager);
     uint32_t h = BRCFScanLedgerLowestNeededHeight(&manager->cfLedger);
-    pthread_mutex_unlock(&manager->lock);
+    MGR_UNLOCK(manager);
     return h;
 }
 
 uint32_t BRPeerManagerAbandonedBelow(BRPeerManager *manager)
 {
     assert(manager != NULL);
-    pthread_mutex_lock(&manager->lock);
+    MGR_LOCK(manager);
     uint32_t h = BRCFScanLedgerAbandonedBelow(&manager->cfLedger);
-    pthread_mutex_unlock(&manager->lock);
+    MGR_UNLOCK(manager);
     return h;
 }
 
 size_t BRPeerManagerAbandonedCount(BRPeerManager *manager)
 {
     assert(manager != NULL);
-    pthread_mutex_lock(&manager->lock);
+    MGR_LOCK(manager);
     uint32_t start = manager->cfLedger.start;
     uint32_t abandonedBelow = manager->cfLedger.abandonedBelow;
-    pthread_mutex_unlock(&manager->lock);
+    MGR_UNLOCK(manager);
     return (abandonedBelow > start) ? (size_t)(abandonedBelow - start) : 0;
 }
 
@@ -5887,7 +6176,7 @@ size_t BRPeerManagerAbandonedCount(BRPeerManager *manager)
 uint32_t BRPeerManagerHasPendingAbandonment(BRPeerManager *manager)
 {
     assert(manager != NULL);
-    pthread_mutex_lock(&manager->lock);
+    MGR_LOCK(manager);
 
     const BRCFScanLedger *l = &manager->cfLedger;
     uint32_t gvH = 0, pending = 0;
@@ -5906,7 +6195,7 @@ uint32_t BRPeerManagerHasPendingAbandonment(BRPeerManager *manager)
         pending = (uint32_t)outCycles + 1;   // (b) a valve-granted re-arm cycle in flight
     }
 
-    pthread_mutex_unlock(&manager->lock);
+    MGR_UNLOCK(manager);
     return pending;
 }
 
@@ -5914,10 +6203,10 @@ void BRPeerManagerSetSaveCFLedger(BRPeerManager *manager, void *info,
                                   void (*callback)(void *info, const uint8_t *bytes, size_t len))
 {
     assert(manager != NULL);
-    pthread_mutex_lock(&manager->lock);
+    MGR_LOCK(manager);
     manager->saveCFLedgerInfo = info;
     manager->saveCFLedger = callback;
-    pthread_mutex_unlock(&manager->lock);
+    MGR_UNLOCK(manager);
 }
 
 // Lock-held internal helper. Caller must hold manager->lock. Returns the
@@ -6053,16 +6342,16 @@ size_t BRPeerManagerRequestCompactFilters(BRPeerManager *manager,
                                           uint32_t startHeight, uint32_t stopHeight)
 {
     if (!manager) return 0;
-    pthread_mutex_lock(&manager->lock);
+    MGR_LOCK(manager);
     size_t n = _BRPeerManagerRequestCFiltersLocked(manager, startHeight, stopHeight, NULL);
-    pthread_mutex_unlock(&manager->lock);
+    MGR_UNLOCK(manager);
     return n;
 }
 
 void BRPeerManagerEnableAutoCompactFilterFetch(BRPeerManager *manager, uint32_t startHeight)
 {
     assert(manager != NULL);
-    pthread_mutex_lock(&manager->lock);
+    MGR_LOCK(manager);
 
     // Remember what the APP asked for, before the clamp below can move it. On a
     // RESUME the clamp lands on the saved-blocks tip (see C-1), so a ledger that is
@@ -6118,13 +6407,13 @@ void BRPeerManagerEnableAutoCompactFilterFetch(BRPeerManager *manager, uint32_t 
     // filter bytes from before this (re-)enable — Init already frees them internally.
     BRCFScanLedgerClearFilterBuffer(&manager->cfLedger);
 #endif
-    pthread_mutex_unlock(&manager->lock);
+    MGR_UNLOCK(manager);
 }
 
 void BRPeerManagerDisableAutoCompactFilterFetch(BRPeerManager *manager)
 {
     assert(manager != NULL);
-    pthread_mutex_lock(&manager->lock);
+    MGR_LOCK(manager);
     manager->autoFetchCFiltersEnabled = 0;
     manager->autoFetchCFiltersStart = 0;
     manager->autoFetchCFiltersThrough = 0;
@@ -6135,7 +6424,7 @@ void BRPeerManagerDisableAutoCompactFilterFetch(BRPeerManager *manager)
     // BRCFScanLedgerInit, so this is the only place that clears them here.
     BRCFScanLedgerClearFilterBuffer(&manager->cfLedger);
 #endif
-    pthread_mutex_unlock(&manager->lock);
+    MGR_UNLOCK(manager);
 }
 
 // Runtime-readable convoy constants — see the contract in BRPeerManager.h. The
@@ -6147,18 +6436,18 @@ uint32_t BRPeerManagerConvoyRearmMax(void) { return (uint32_t)CF_CONVOY_REARM_MA
 uint32_t BRPeerManagerGetAutoFetchCFiltersStart(BRPeerManager *manager)
 {
     if (!manager) return 0;
-    pthread_mutex_lock(&manager->lock);
+    MGR_LOCK(manager);
     uint32_t height = manager->autoFetchCFiltersStart;
-    pthread_mutex_unlock(&manager->lock);
+    MGR_UNLOCK(manager);
     return height;
 }
 
 uint32_t BRPeerManagerGetAutoFetchCFiltersThrough(BRPeerManager *manager)
 {
     if (!manager) return 0;
-    pthread_mutex_lock(&manager->lock);
+    MGR_LOCK(manager);
     uint32_t height = manager->autoFetchCFiltersThrough;
-    pthread_mutex_unlock(&manager->lock);
+    MGR_UNLOCK(manager);
     return height;
 }
 
@@ -6170,7 +6459,7 @@ uint32_t BRPeerManagerGetAutoFetchCFiltersThrough(BRPeerManager *manager)
 void BRPeerManagerSnapAutoFetchThroughToScanFrontier(BRPeerManager *manager)
 {
     assert(manager != NULL);
-    pthread_mutex_lock(&manager->lock);
+    MGR_LOCK(manager);
 #ifndef RESUME_SNAP_UNFIXED
 
     // ---- C-1 STEP 1: surface anything the resumed manager can never scan -----
@@ -6242,7 +6531,7 @@ void BRPeerManagerSnapAutoFetchThroughToScanFrontier(BRPeerManager *manager)
         }
     }
 #endif
-    pthread_mutex_unlock(&manager->lock);
+    MGR_UNLOCK(manager);
 }
 
 /*

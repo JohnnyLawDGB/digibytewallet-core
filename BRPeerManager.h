@@ -157,6 +157,33 @@ Remarks:
    there once let a dead band eat real work. */
 #define CLEAR_MEM_PRUNE_STRIDE 2048u
 
+/* HARD CAP on how long the convoy may keep a download peer alive through a header hold.
+
+   While the header gate is shut the wallet deliberately stops asking its download peer for
+   anything, so the 20 s PROTOCOL_TIMEOUT — which means "we asked and got nothing" — is
+   semantically wrong and kills the peer we just silenced (the measured C~3.55 churn loop).
+   _BRPeerManagerPushConvoyHdrGate therefore refreshes that deadline while holding.
+
+   But `gated` is a pure function of the SCAN frontier (_cfConvoyHdrGated), and nothing the
+   download peer does can lift it. A frozen scan frontier is therefore a PERMANENT hold, and an
+   indefinitely-refreshed deadline makes a merely-unhelpful peer immortal: the 90 s inbound-idle
+   reaper is defeated by pings, the socket stays open so the read loop never reaps, and the
+   stalled-filter-peer drop only ever targets the cfheaders peer. Nothing else would replace it.
+
+   This cap lets exactly ONE real PROTOCOL_TIMEOUT through per cap period, so a download peer
+   that is not actually helping is always replaced in bounded time — and the fresh connect that
+   follows re-kicks the CF driver via _BRPeerManagerOnFilterCapablePeerConnected, which matters
+   because CF_LEDGER_DRIVE_REREQUEST is 0 in production and B1.3 has never been observed to fire.
+
+   Sized against the churn it replaces: the self-kill loop deposed a peer every ~20-30 s (16
+   elections across 33 handshakes, measured). At 300 s that becomes ~1 election per 5 minutes,
+   which takes C from ~3.55 to ~1.05 while keeping a bounded escape.
+
+   THIS IS A WALL-CLOCK CAP, NOT A FRONTIER-KEYED RELEASE. It cannot latch shut the way the
+   forward-gap gate did (see the post-mortem at the CF_OUTSTANDING_LOWWATER brake): time always
+   advances, so this always releases. */
+#define CF_CONVOY_HOLD_MAX_SECS 300
+
 /* How far the forward cfilter CURSOR may run ahead of the SCAN FRONTIER.
 
    The convoy paces the header and cfheader frontiers against the scan frontier, but nothing
@@ -583,6 +610,17 @@ void BRPeerManagerDisconnect(BRPeerManager *manager);
 // send a keepalive ping to every connected peer so idle CF filter-peer connections don't get
 // dropped by the remote node / NAT inactivity timeout (call periodically, e.g. every ~10-20s)
 void BRPeerManagerKeepAlive(BRPeerManager *manager);
+
+// How long the peer-manager lock has been held RIGHT NOW, in milliseconds (0 if free), plus the
+// function and line that acquired it. Takes NO lock and does not dereference the manager — it
+// reads file-static atomics — precisely so a thread BLOCKED on that lock, or a JNI caller whose
+// PEER_GUARD is itself stuck behind it, can still report WHO is holding it.
+//
+// Exists because the release-time profiler ([CF-SLOW]) is blind to the case that actually matters:
+// a lock that is NEVER RELEASED prints nothing at all. Measured on a Note 8 across three separate
+// runs — holds of 40+ minutes, one thread burning CPU, 93 of 103 threads queued behind it, and not
+// a single [CF-SLOW] line, because the hold never ended.
+double BRPeerManagerLockHeldMs(const char **outFn, int *outLine);
 
 // rescans blocks and transactions after earliestKeyTime (a new random download peer is also selected due to the
 // possibility that a malicious node might lie by omitting transactions that match the bloom filter)

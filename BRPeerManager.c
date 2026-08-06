@@ -5459,10 +5459,51 @@ void BRPeerManagerDisconnect(BRPeerManager *manager)
     peerThreadCount = manager->peerThreadCount;
     dnsThreadCount = manager->dnsThreadCount;
     MGR_UNLOCK(manager);
+    // BOUNDED WAIT. This loop previously had NO exit condition -- it spun until the counts hit
+    // zero, on a ONE-NANOSECOND nanosleep, i.e. a busy-wait re-acquiring manager->lock thousands
+    // of times a second.
+    //
+    // That is fatal because of WHO CALLS IT: startSync runs BRPeerManagerDisconnect +
+    // BRPeerManagerFree while holding PEER_GUARD, the global JNI mutex every bridge entry point
+    // needs. If a peer thread never decrements peerThreadCount, this spins forever with that
+    // guard held and the ENTIRE wallet stops -- keepalive, CF scan, status reads, all of it.
+    // Measured on a Note 8, 2026-08-06:
+    //
+    //     07:57:45  startSync: recreating peer manager
+    //     08:02:53  PEER_GUARD=308.7s startSync:762    <- still climbing, never released
+    //
+    // ...while peer threads were STILL RELAYING BLOCKS (#23012500, #23036000) five minutes in,
+    // so the count was never going to reach zero. One thread had burned ~900s of CPU in this
+    // spin and 93 of 103 threads sat queued behind the guard. The wallet also never persisted
+    // its CF ledger while wedged, so the NEXT launch abandoned 333,701 blocks from the birth
+    // height instead of resuming.
+    //
+    // A teardown that cannot complete must not be able to hold the process hostage. Give up
+    // after PEER_DISCONNECT_WAIT_SECS and say so with the counts, so the underlying
+    // "thread never exits" defect stays visible instead of being silently absorbed.
+    //
+    // 1 ms rather than 1 ns: the old value turned this into a lock-contention generator that
+    // starved the very threads it was waiting on.
     ts.tv_sec = 0;
-    ts.tv_nsec = 1;
-    
+    ts.tv_nsec = 1000000; // 1 ms
+
+    double _discStart = _cfNowMs();
     while (peerThreadCount > 0 || dnsThreadCount > 0) {
+#ifdef DISCONNECT_WAIT_UNBOUNDED
+        // RED ARM ONLY (peer_disconnect_bounded_kat) — never defined in a production build.
+        // Restores the pre-fix shape: no deadline, so a thread that never exits hangs here
+        // forever with PEER_GUARD held by the caller.
+        if (0) {
+#else
+        if (_cfNowMs() - _discStart >= (double)PEER_DISCONNECT_WAIT_SECS * 1000.0) {
+#endif
+            CF_SLOW_WLOG("[CF-SLOW] BRPeerManagerDisconnect gave up after %us waiting for %zu "
+                         "peer thread(s) and %zu dns thread(s) to exit — proceeding rather than "
+                         "holding the peer-manager guard forever",
+                         (unsigned)PEER_DISCONNECT_WAIT_SECS,
+                         (size_t)peerThreadCount, (size_t)dnsThreadCount);
+            break;
+        }
         nanosleep(&ts, NULL); // pthread_yield() isn't POSIX standard :(
         MGR_LOCK(manager);
         peerThreadCount = manager->peerThreadCount;

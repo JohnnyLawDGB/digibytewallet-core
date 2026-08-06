@@ -155,6 +155,18 @@ Remarks:
 
    Not 1000: three unrelated constants in this project already sit at 1000 and a collision
    there once let a dead band eat real work. */
+// How long BRPeerManagerDisconnect waits for peer/dns threads to exit before proceeding anyway.
+//
+// This wait was UNBOUNDED, and it runs while startSync holds PEER_GUARD -- the global JNI mutex
+// every bridge entry point needs. A peer thread that never decrements peerThreadCount therefore
+// wedged the whole wallet indefinitely (measured: 308s and climbing, peers still relaying blocks,
+// 93 of 103 threads queued, CF ledger never persisted). Teardown must be allowed to fail rather
+// than hold the process hostage.
+//
+// 5s is generous for a thread that is genuinely winding down (they exit in milliseconds once the
+// socket closes) and short enough that a user-visible stall stays a stall, not an outage.
+#define PEER_DISCONNECT_WAIT_SECS 5u
+
 #define CLEAR_MEM_PRUNE_STRIDE 2048u
 
 /* HARD CAP on how long the convoy may keep a download peer alive through a header hold.

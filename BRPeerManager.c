@@ -2370,6 +2370,33 @@ static void _peerRelayedBlock(void *info, BRMerkleBlock *block)
             // remove the block from orphans, if it exists
             if (BRSetGet(manager->orphans, b) == b) BRSetRemove(manager->orphans, b);
             if (manager->lastOrphan == b) manager->lastOrphan = NULL;
+
+            // ...and re-point lastBlock, for exactly the same reason lastOrphan is cleared above.
+            //
+            // `b` is the DISPLACED block that BRSetAdd evicted — a previously-resident header with
+            // this same hash. manager->lastBlock may still point at it, and freeing it below then
+            // leaves lastBlock dangling. Every later deref is a use-after-free:
+            // `manager->lastBlock->height` a few lines up at the height-stamping branch, the fork
+            // comparisons below it, and _BRPeerManagerBlockFloor's prevBlock descent.
+            //
+            // `block` is the identical header by hash (that is why BRSetAdd displaced `b`) and is
+            // the copy now resident in manager->blocks, so it is the correct replacement rather
+            // than a NULL that would strand the chain tip.
+            //
+            // Note this is the ONLY free in _peerRelayedBlock that does not null its pointer: the
+            // other four all do `BRMerkleBlockFree(block); block = NULL;`, which is why the reads
+            // further down are guarded by `if (block && ...)`. This one had no such guard.
+            //
+            // ASan on-device 2026-08-06, alloc _BRPeerAcceptHeadersMessage:804 -> free here ->
+            // read in the same headers message. Also drop the floor memo, which caches lastBlock
+            // as floorMemoTip and would otherwise key off a freed pointer.
+            if (manager->lastBlock == b) {
+                manager->lastBlock = block;
+                manager->floorMemoValid = 0;
+            }
+            if (manager->floorMemoTip == b) manager->floorMemoValid = 0;
+            if (manager->startSyncFrom == b) manager->startSyncFrom = block;
+
             BRMerkleBlockFree(b);
         }
     }

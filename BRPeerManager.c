@@ -1847,8 +1847,38 @@ static void _BRPeerManagerClearMemory(BRPeerManager* manager) {
 
                 // remove the current block
                 if (BRSetRemove(manager->blocks, blockPtr)) {
-                    // free the actual memory
+#ifdef CHECKPOINT_ALIAS_UNFIXED
+                    // RED ARM ONLY (checkpoint_alias_uaf_kat) — never defined in a production
+                    // build. The pre-fix shape: free unconditionally, leaving checkpoints dangling.
                     BRMerkleBlockFree(blockPtr);
+#else
+                    // DO NOT free a block manager->checkpoints also holds. BRPeerManagerNewEx adds
+                    // the SAME BRMerkleBlock* to both sets (the BRSetAdd pair after
+                    // BRMerkleBlockNew), but only manager->blocks governs its lifetime here.
+                    //
+                    // The comment above this function records the original assumption --
+                    // "checkpoints will remain in the blocks-Set, until we are ahead of them" --
+                    // true while pruning trailed the chain tip. It is FALSE under CF-era pruning:
+                    // the floor is anchored to the compact-filter SCAN frontier, so once the scan
+                    // advances past a checkpoint height that checkpoint block is pruned and freed,
+                    // leaving manager->checkpoints holding a dangling pointer. The next relayed
+                    // header then calls BRSetGet(manager->checkpoints, block) and _BRBlockHeightEq
+                    // dereferences ->height on freed memory.
+                    //
+                    // ASan on-device 2026-08-06, FRESH install, 3 minutes into first sync:
+                    //   _peerThreadRoutine -> _BRPeerAcceptMessage -> _BRPeerAcceptHeadersMessage
+                    //   -> _peerRelayedBlock -> _BRPeerManagerVerifyBlock (:2114) -> BRSetGet
+                    //   -> _BRBlockHeightEq (:227)   heap-use-after-free
+                    // NOT restore-specific: ordinary header processing, every user.
+                    //
+                    // POINTER IDENTITY, not BRSetGet equality: checkpoints is keyed by
+                    // _BRBlockHeightEq, so a lookup can return a DIFFERENT block that merely shares
+                    // this height. Only the very same object must be spared.
+                    if (BRSetGet(manager->checkpoints, blockPtr) != blockPtr) {
+                        // free the actual memory
+                        BRMerkleBlockFree(blockPtr);
+                    }
+#endif
                 } else {
                     // nothing to remove
                     break;

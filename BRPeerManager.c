@@ -5466,7 +5466,20 @@ void BRPeerManagerKeepAlive(BRPeerManager *manager)
 void BRPeerManagerDisconnect(BRPeerManager *manager)
 {
     struct timespec ts;
-    size_t peerThreadCount, dnsThreadCount, maxConnectCount;
+    // SIGNED, matching the struct fields (BRPeerManagerStruct declares peerThreadCount,
+    // dnsThreadCount and maxConnectCount as `int`). These were `size_t` locals, which turned a
+    // transient NEGATIVE count into an infinite wait: copying int -1 into a size_t yields
+    // 18,446,744,073,709,551,615, so `peerThreadCount > 0` is true forever and this function
+    // never returns — while startSync holds PEER_GUARD, wedging the whole wallet.
+    //
+    // A negative count is reachable. There are five decrement sites, and the one below at the
+    // "waiting for network" branch decrements on the ASSUMPTION that a Connecting peer's thread
+    // will not also decrement on its way out. If it does, the count goes to -1. One double
+    // decrement is enough to hang the process permanently.
+    //
+    // The bounded wait added alongside this makes the hang survivable; signed types make it
+    // unreachable by this route. Both are wanted: the bound is containment, this is the fix.
+    int peerThreadCount, dnsThreadCount, maxConnectCount;
     BRPeer *p;
     
     assert(manager != NULL);
@@ -5480,9 +5493,21 @@ void BRPeerManagerDisconnect(BRPeerManager *manager)
         p = manager->connectedPeers[i - 1];
         manager->connectFailureCount = MAX_CONNECT_FAILURES; // prevent futher automatic reconnect attempts
         BRPeerDisconnect(p);
-        if (BRPeerConnectStatus(p) == BRPeerStatusConnecting) manager->peerThreadCount--; // waiting for network
+        // "Waiting for network": a peer still in Connecting has a thread parked in connect(), which
+        // this pre-decrement assumes will not decrement itself on the way out. If that assumption
+        // is ever wrong the count goes negative — historically an infinite wait, because the loop
+        // below read it through a size_t local. Clamped so the count can never go below zero
+        // regardless of who else decrements.
+        if (BRPeerConnectStatus(p) == BRPeerStatusConnecting && manager->peerThreadCount > 0) {
+            manager->peerThreadCount--;
+        }
     }
-    
+
+    // Defensive: if any other path has already driven these negative, treat them as drained rather
+    // than waiting on a count that can never be satisfied.
+    if (manager->peerThreadCount < 0) manager->peerThreadCount = 0;
+    if (manager->dnsThreadCount < 0)  manager->dnsThreadCount = 0;
+
     peerThreadCount = manager->peerThreadCount;
     dnsThreadCount = manager->dnsThreadCount;
     MGR_UNLOCK(manager);
@@ -5524,11 +5549,28 @@ void BRPeerManagerDisconnect(BRPeerManager *manager)
 #else
         if (_cfNowMs() - _discStart >= (double)PEER_DISCONNECT_WAIT_SECS * 1000.0) {
 #endif
-            CF_SLOW_WLOG("[CF-SLOW] BRPeerManagerDisconnect gave up after %us waiting for %zu "
-                         "peer thread(s) and %zu dns thread(s) to exit — proceeding rather than "
+            CF_SLOW_WLOG("[CF-SLOW] BRPeerManagerDisconnect gave up after %us waiting for %d "
+                         "peer thread(s) and %d dns thread(s) to exit — proceeding rather than "
                          "holding the peer-manager guard forever",
                          (unsigned)PEER_DISCONNECT_WAIT_SECS,
-                         (size_t)peerThreadCount, (size_t)dnsThreadCount);
+                         peerThreadCount, dnsThreadCount);
+
+            // WHERE are they stuck? The count alone says how many but not why, and "8 threads did
+            // not exit in 5s" was as far as the first on-device sighting got. Sockets carry
+            // SO_RCVTIMEO = 1s, so a thread blocked in read() should notice a closed socket well
+            // inside the deadline — a peer still Connected here with an OPEN socket points at the
+            // ctx->socket lifetime race (read-then-clear-then-close), where a thread keeps a stale
+            // local fd for a socket nobody closed. Per-peer status makes that distinguishable
+            // instead of inferable.
+            MGR_LOCK(manager);
+            for (size_t i = array_count(manager->connectedPeers); i > 0; i--) {
+                BRPeer *sp = manager->connectedPeers[i - 1];
+                CF_SLOW_WLOG("[CF-SLOW]   stuck peer %s:%u status=%d socketOpen=%d lastRecv=%.0fs ago",
+                             BRPeerHost(sp), (unsigned)sp->port,
+                             (int)BRPeerConnectStatus(sp), BRPeerIsSocketOpen(sp) ? 1 : 0,
+                             (double)time(NULL) - BRPeerLastRecvTime(sp));
+            }
+            MGR_UNLOCK(manager);
             break;
         }
         nanosleep(&ts, NULL); // pthread_yield() isn't POSIX standard :(

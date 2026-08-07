@@ -212,6 +212,21 @@ BRPeerStatus BRPeerConnectStatus(BRPeer *peer);
 // dead-socket zombie whose status is still Connected but whose fd is already -1)
 int BRPeerIsSocketOpen(BRPeer *peer);
 
+// WHERE a peer thread is, for diagnosing threads that never exit.
+//
+// A peer reporting status=Connected together with socketOpen=0 CANNOT be in the read
+// loop: BRPeerDisconnect sets socket=-1, both read loops re-read ctx->socket every
+// iteration and exit, and the thread routine then sets status=Disconnected. It is
+// therefore in message DISPATCH, which reaches manager callbacks that take
+// manager->lock. These two report which message and for how long — the fact that
+// separates "a slow callback" from "one thread computing under the lock".
+//
+// Both are LOCK-FREE on purpose: the caller is typically diagnosing a suspected lock
+// wedge, and acquiring anything here could block on the mutex under investigation.
+// Type is "" and secs is 0 when the thread is not dispatching.
+const char *BRPeerCurrentMessageType(BRPeer *peer);
+double BRPeerCurrentMessageSecs(BRPeer *peer);
+
 // open connection to peer and perform handshake
 void BRPeerConnect(BRPeer *peer);
 

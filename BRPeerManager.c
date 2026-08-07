@@ -557,9 +557,26 @@ double BRPeerManagerLockHeldMs(const char **outFn, int *outLine)
     return _cfNowMs() - since;
 }
 
+// WAIT time, not hold time. MGR_UNLOCK below reports how long a holder KEPT the lock, and
+// during the 2026-08-07 restore it never once fired — yet eight peer threads sat inside
+// `headers` dispatch for up to 699s. Both facts are consistent only if the time is spent
+// WAITING to acquire, which nothing measured. pthread mutexes are not fair: with 8 threads
+// each acquiring ~2000 times per headers message, a barging waiter can starve for minutes
+// while every individual hold stays microseconds. This distinguishes "someone holds it too
+// long" (hold log) from "too many acquisitions, unfairly scheduled" (this log) — which point
+// at completely different fixes, so guessing between them is not acceptable.
 #define MGR_LOCK(m)                                                                          \
     do {                                                                                     \
+        double _waitStart = _cfNowMs();                                                       \
         pthread_mutex_lock(&(m)->lock);                                                      \
+        double _waited = _cfNowMs() - _waitStart;                                            \
+        if (_waited >= CF_SLOW_PHASE_MS) {                                                   \
+            CF_SLOW_WLOG("[CF-SLOW] manager->lock WAITED %.1fs to acquire at %s:%d "          \
+                         "(holder on entry %s:%d) — long WAIT with short HOLDS is lock "      \
+                         "starvation, not a slow critical section",                           \
+                         _waited / 1000.0, __func__, __LINE__,                                \
+                         (m)->lockHolderFn ? (m)->lockHolderFn : "?", (m)->lockHolderLine);   \
+        }                                                                                     \
         atomic_store_explicit(&g_lockHeldSinceMs, _cfNowMs(), memory_order_relaxed);         \
         atomic_store_explicit(&g_lockHolderFn, __func__, memory_order_relaxed);              \
         atomic_store_explicit(&g_lockHolderLine, __LINE__, memory_order_relaxed);            \
@@ -5581,22 +5598,61 @@ void BRPeerManagerDisconnect(BRPeerManager *manager)
                          (unsigned)PEER_DISCONNECT_WAIT_SECS,
                          peerThreadCount, dnsThreadCount);
 
-            // WHERE are they stuck? The count alone says how many but not why, and "8 threads did
-            // not exit in 5s" was as far as the first on-device sighting got. Sockets carry
-            // SO_RCVTIMEO = 1s, so a thread blocked in read() should notice a closed socket well
-            // inside the deadline — a peer still Connected here with an OPEN socket points at the
-            // ctx->socket lifetime race (read-then-clear-then-close), where a thread keeps a stale
-            // local fd for a socket nobody closed. Per-peer status makes that distinguishable
-            // instead of inferable.
-            MGR_LOCK(manager);
-            for (size_t i = array_count(manager->connectedPeers); i > 0; i--) {
+            // WHERE are they stuck?
+            //
+            // The first on-device sighting (2026-08-07) answered the previous version of this
+            // question and REFUTED the hypothesis written here: all 8 threads reported
+            // status=Connected with socketOpen=**0**, not open. That combination cannot occur in
+            // the read loop — BRPeerDisconnect sets socket=-1, both loops in _peerThreadRoutine
+            // re-read ctx->socket every iteration and exit, and the routine then sets
+            // status=Disconnected. So the threads are in message DISPATCH, which reaches the
+            // manager callbacks below and takes THIS lock. The remaining unknown is which message
+            // and for how long, which BRPeerCurrentMessageType/Secs now report.
+            //
+            // TRYLOCK, not MGR_LOCK. The suspected wedge is a thread holding manager->lock, and
+            // blocking here would hang inside the very bounded wait that exists to stop this
+            // function hanging — the diagnostic would become the outage. If the lock is held we
+            // say so and report what can be read lock-free, which for the dispatch fields is
+            // everything that matters.
+            // BOUNDED RETRY, not a single try. The first cut used one trylock and lost to
+            // ordinary contention on its very first on-device firing: it reported the holder as
+            // _peerRelayedBlock held for 0.0s — i.e. a momentary, healthy hold — and skipped the
+            // peer census, which is the entire reason this block exists. One attempt answers
+            // "was the lock free at this instant", which is not a question anyone asked.
+            //
+            // Retrying for DIAG_LOCK_WAIT_MS keeps the useful case (transient contention: we get
+            // the census) without reintroducing the unbounded wait this whole function exists to
+            // avoid. If it is still unavailable after the budget, the lock really is being held
+            // or convoyed, and THAT is the finding — reported with the holder, not silently.
+            enum { DIAG_LOCK_WAIT_MS = 500, DIAG_LOCK_STEP_MS = 10 };
+            int _diagLocked = 0;
+            for (int _w = 0; _w < DIAG_LOCK_WAIT_MS / DIAG_LOCK_STEP_MS; _w++) {
+                if (pthread_mutex_trylock(&manager->lock) == 0) { _diagLocked = 1; break; }
+                struct timespec _dts = { 0, DIAG_LOCK_STEP_MS * 1000000L };
+                nanosleep(&_dts, NULL);
+            }
+            if (! _diagLocked) {
+                const char *_hf = NULL;
+                int         _hl = 0;
+                double      _hms = BRPeerManagerLockHeldMs(&_hf, &_hl);
+                CF_SLOW_WLOG("[CF-SLOW]   manager->lock UNAVAILABLE for %dms (holder now %s:%d, "
+                             "held %.1fs) — peer census skipped. A holder that keeps changing with "
+                             "a small held-time is a CONVOY (many short holds starving the "
+                             "dispatchers), not one long hold",
+                             (int)DIAG_LOCK_WAIT_MS, _hf ? _hf : "?", _hl, _hms / 1000.0);
+            }
+            for (size_t i = _diagLocked ? array_count(manager->connectedPeers) : 0; i > 0; i--) {
                 BRPeer *sp = manager->connectedPeers[i - 1];
-                CF_SLOW_WLOG("[CF-SLOW]   stuck peer %s:%u status=%d socketOpen=%d lastRecv=%.0fs ago",
+                const char *inMsg = BRPeerCurrentMessageType(sp);
+                double      inFor = BRPeerCurrentMessageSecs(sp);
+                CF_SLOW_WLOG("[CF-SLOW]   stuck peer %s:%u status=%d socketOpen=%d lastRecv=%.0fs ago "
+                             "dispatching=%s for %.1fs",
                              BRPeerHost(sp), (unsigned)sp->port,
                              (int)BRPeerConnectStatus(sp), BRPeerIsSocketOpen(sp) ? 1 : 0,
-                             (double)time(NULL) - BRPeerLastRecvTime(sp));
+                             (double)time(NULL) - BRPeerLastRecvTime(sp),
+                             (inMsg && inMsg[0]) ? inMsg : "(not in dispatch)", inFor);
             }
-            MGR_UNLOCK(manager);
+            if (_diagLocked) pthread_mutex_unlock(&manager->lock);
             break;
         }
         nanosleep(&ts, NULL); // pthread_yield() isn't POSIX standard :(

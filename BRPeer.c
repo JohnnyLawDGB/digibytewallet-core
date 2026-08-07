@@ -214,6 +214,24 @@ typedef struct {
     // by the manager thread under manager->lock; worst case is a torn read that
     // mis-times the 90s threshold by a hair -- harmless.
     volatile double lastRecvTime;
+    // WHERE IS THIS THREAD? Set immediately before _BRPeerAcceptMessage and cleared right
+    // after, so a peer thread that never exits can be located instead of inferred.
+    //
+    // The 2026-08-07 field sighting: BRPeerManagerDisconnect gave up on 8 peer threads,
+    // all reporting status=Connected AND socketOpen=0. Those two cannot both be true
+    // inside the read loop — BRPeerDisconnect sets socket=-1, both read loops re-read
+    // ctx->socket every iteration and exit, and the routine then sets status=Disconnected
+    // (:1675). So the threads were parked in message DISPATCH, which reaches
+    // BRPeerManager callbacks that take manager->lock. Which message, and for how long,
+    // is the missing fact — and it is the difference between "slow callback" and "one
+    // thread computing under the lock while everyone queues behind it".
+    //
+    // acceptStart is 0 when not dispatching. Written only by this peer's own thread and
+    // read by whoever is diagnosing; a torn read mis-times an age by a hair, which is
+    // harmless for a diagnostic and is why this needs no lock (taking one here could
+    // block on the very mutex under investigation).
+    volatile double acceptStart;
+    volatile char acceptType[16];
     int sentVerack, gotVerack, sentGetaddr, sentFilter, sentGetdata, sentMempool, sentGetblocks;
     int compactFiltersOnly; // BR_SYNC_MODE_COMPACT_FILTERS_ONLY: pull headers to tip, never getblocks
     // Paced-convoy fetch gate (spec Part A). Nonzero == the block-header frontier
@@ -1661,7 +1679,23 @@ static void *_peerThreadRoutine(void *arg)
                                      log_u256_hex_encode(hash));
                             error = EPROTO;
                         }
-                        else if (! _BRPeerAcceptMessage(peer, payload, msgLen, type)) error = EPROTO;
+                        else {
+                            // Mark WHERE this thread is before dispatch. _BRPeerAcceptMessage
+                            // reaches manager callbacks that take manager->lock, which is where
+                            // threads that never exit have been observed parked.
+                            size_t ti = 0;
+                            while (ti < sizeof(ctx->acceptType) - 1 && type[ti]) {
+                                ctx->acceptType[ti] = type[ti];
+                                ti++;
+                            }
+                            ctx->acceptType[ti] = '\0';
+                            ctx->acceptStart = time;   // nonzero == "in dispatch"
+
+                            int ok = _BRPeerAcceptMessage(peer, payload, msgLen, type);
+
+                            ctx->acceptStart = 0;      // cleared even on the failure path below
+                            if (! ok) error = EPROTO;
+                        }
                     }
                 }
             }
@@ -1820,6 +1854,30 @@ BRPeerStatus BRPeerConnectStatus(BRPeer *peer)
 int BRPeerIsSocketOpen(BRPeer *peer)
 {
     return ((BRPeerContext *)peer)->socket >= 0;
+}
+
+// Message type this peer's thread is currently dispatching, or "" when it is not in
+// dispatch (i.e. it is in the read loop, where it belongs). Lock-free by design: the
+// caller is usually diagnosing a suspected lock wedge, so acquiring anything here could
+// block on the mutex under investigation.
+const char *BRPeerCurrentMessageType(BRPeer *peer)
+{
+    BRPeerContext *ctx = (BRPeerContext *)peer;
+    return (ctx->acceptStart != 0) ? (const char *)ctx->acceptType : "";
+}
+
+// Seconds this peer's thread has been inside _BRPeerAcceptMessage, or 0 when not
+// dispatching. A large value is the signature that separates "the callback is slow" from
+// "this thread is parked on manager->lock while the holder computes".
+double BRPeerCurrentMessageSecs(BRPeer *peer)
+{
+    BRPeerContext *ctx = (BRPeerContext *)peer;
+    double start = ctx->acceptStart;
+    if (start == 0) return 0;
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    double now = tv.tv_sec + (double)tv.tv_usec / 1000000;
+    return (now > start) ? now - start : 0;
 }
 
 // open connection to peer and perform handshake

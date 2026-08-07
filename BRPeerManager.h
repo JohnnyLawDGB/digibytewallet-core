@@ -785,9 +785,32 @@ uint32_t BRPeerManagerLowestNeededHeight(BRPeerManager *manager);
 // MONOTONIC (only ever advances).
 uint32_t BRPeerManagerAbandonedBelow(BRPeerManager *manager);
 
-// Cumulative count of heights abandoned so far: heights in
-// [start .. abandonedBelow-1], i.e. max(abandonedBelow - start, 0).
+// SPAN below the watermark: heights in [start .. abandonedBelow-1], i.e.
+// max(abandonedBelow - start, 0).
+//
+// NOT the number of heights abandoned, and NOT usable as a diagnostic:
+//   * it OVER-reports — the span includes heights that were legitimately scanned, so a
+//     wallet that abandoned one deep height reads as its entire scanned history (which
+//     is why the banner renders a RANGE and never a count; see abandonedBandMessage and
+//     AbandonedBandBannerTextTest.neverRendersACount);
+//   * it UNDER-reports to ZERO right after the largest abandonment event in the system —
+//     the cfheaders floor snap calls BRCFScanLedgerInit(&cfLedger, floor) BEFORE
+//     surfacing, and Init resets `start` to that same floor, so abandonedBelow == start.
+// Use BRPeerManagerAbandonedHeightsTotal for "how much history did this wallet write
+// off". This accessor is kept as-is: its span semantics are pinned by the drive KAT and
+// no consumer is harmed by it (the UI deliberately does not render it).
 size_t BRPeerManagerAbandonedCount(BRPeerManager *manager);
+
+// TOTAL heights actually written off by this manager, summed over every surfacing event
+// from the count the ledger itself reports as dropped. Survives the three mid-session
+// ledger re-Inits (floor snap :3220, chain re-anchor :6088, arming clamp :6514) because
+// it lives on the manager; resets only with a genuinely new manager (fresh wallet / wipe
+// / rescan), which is exactly when it should.
+//
+// This is the number to trust when judging whether a retention change actually reduced
+// abandonment. Also emitted per event as `totalAbandoned=` on the ABANDONED WARN, so a
+// logcat capture is self-sufficient without replaying a whole session.
+size_t BRPeerManagerAbandonedHeightsTotal(BRPeerManager *manager);
 
 // ---- B2 valve / watchdog ORDERING (paced-convoy fetch, Task 6, spec Part C) -
 //

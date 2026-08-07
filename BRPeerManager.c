@@ -371,6 +371,19 @@ struct BRPeerManagerStruct {
     _Atomic int      cachedPeerCount;
     uint32_t         lastSpanClampLog;   // rate-limits the retention-span-clamp WARN
 
+    // TOTAL heights this manager has actually written off, accumulated across every
+    // surfacing event. Lives on the MANAGER, not the ledger, and that placement is the
+    // whole point: three paths re-Init the ledger mid-session (the cfheaders floor snap
+    // :3220, the CF chain re-anchor :6088, and the arming clamp :6514), and
+    // BRCFScanLedgerInit memsets the ledger and resets `start` to the NEW floor. Because
+    // BRPeerManagerAbandonedCount reports `abandonedBelow - start`, it therefore reads
+    // ZERO immediately after the single largest abandonment event in the system — the
+    // floor snap abandons a band and then reports none of it. A ledger-resident counter
+    // would be wiped by the same memset. This one survives, and is zeroed only by the
+    // calloc of a genuinely new manager (fresh wallet / wipe / rescan), which is exactly
+    // when the count SHOULD restart.
+    size_t           cfAbandonedHeightsTotal;
+
     // Highest cfFloor at which a FULL descent found nothing to free. Blocks are only
     // ever appended at the TIP, so the resident bottom never grows downward, and a
     // block can only BECOME prunable when cfFloor RISES above it. So if we already
@@ -1855,6 +1868,13 @@ static void _BRPeerManagerSurfaceUnscannableLocked(BRPeerManager *manager, uint3
     // Determinism, same shape as the B2 valve: cnt>0 <=> abandonedBelow advanced
     // <=> this WARN. "abandonedBelow == 0" therefore stays a verified log fact.
     if (cnt > 0) {
+#ifndef ABANDON_TOTAL_UNFIXED
+        // Accumulate BEFORE the WARN so the logged running total includes this event.
+        // `cnt` is the only trustworthy figure here: it is what the ledger actually
+        // dropped, computed inside AbandonUnscannableBelow. Anything derived from
+        // (abandonedBelow - start) is destroyed by the next ledger re-Init.
+        manager->cfAbandonedHeightsTotal += (size_t)cnt;
+#endif
         // The CAUSE comes from `why` — do NOT re-assert one in the format string. It
         // used to read "below the in-memory block floor %u", which was true of the
         // three original callers and FALSE of the fourth (the B2 valve's capped-and-
@@ -1863,10 +1883,16 @@ static void _BRPeerManagerSurfaceUnscannableLocked(BRPeerManager *manager, uint3
         // unchanged and no caller loses information (each `why` already names its own
         // cause). The "ABANDONED %u height(s) [%u..%u]" prefix is deliberately
         // byte-identical — that is what operators and the host KATs key on.
+        // `totalAbandoned` is APPENDED, never spliced into the prefix: the
+        // "ABANDONED %u height(s) [%u..%u]" opening is byte-identical by contract
+        // (operators and the host KATs key on it). It is logged because a log line
+        // that reports only the delta cannot be summed after the fact once the
+        // ledger re-Inits — which is precisely how the true field total was lost.
         CF_RETENTION_WLOG("[CF-SCAN] ABANDONED %u height(s) [%u..%u] — unscannable this session (%s); "
-                          "abandonedBelow=%u. Surfaced for recovery "
+                          "abandonedBelow=%u totalAbandoned=%zu. Surfaced for recovery "
                           "(rescan or 'Scan for missing transactions').\n",
-                          cnt, lo, floor - 1, why ? why : "", floor);
+                          cnt, lo, floor - 1, why ? why : "", floor,
+                          manager->cfAbandonedHeightsTotal);
     }
 }
 
@@ -6257,6 +6283,23 @@ size_t BRPeerManagerAbandonedCount(BRPeerManager *manager)
     uint32_t abandonedBelow = manager->cfLedger.abandonedBelow;
     MGR_UNLOCK(manager);
     return (abandonedBelow > start) ? (size_t)(abandonedBelow - start) : 0;
+}
+
+// The honest counterpart to BRPeerManagerAbandonedCount. See the field comment on
+// cfAbandonedHeightsTotal for why the older accessor cannot answer this question:
+// it derives from (abandonedBelow - start), and the three ledger re-Init paths reset
+// `start` to the new floor, so it reads ZERO right after the biggest abandonment
+// event and over-reports (the whole span below the watermark, including heights that
+// were legitimately scanned) the rest of the time. Neither accessor is being changed
+// — the UI already routes around the old one deliberately (it renders a RANGE, never
+// a count) and the drive KAT pins its span semantics. This one is additive.
+size_t BRPeerManagerAbandonedHeightsTotal(BRPeerManager *manager)
+{
+    assert(manager != NULL);
+    MGR_LOCK(manager);
+    size_t total = manager->cfAbandonedHeightsTotal;
+    MGR_UNLOCK(manager);
+    return total;
 }
 
 // B2-valve/watchdog ordering signal (see the header for the full contract and the

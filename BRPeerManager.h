@@ -812,6 +812,14 @@ size_t BRPeerManagerAbandonedCount(BRPeerManager *manager);
 // logcat capture is self-sufficient without replaying a whole session.
 size_t BRPeerManagerAbandonedHeightsTotal(BRPeerManager *manager);
 
+// DISCONNECT LEDGER summary (see the long note on BRPeerCloseCause in BRPeer.h). Writes a
+// human-readable histogram of who closed each peer connection into buf — cause counts, the
+// local-rule tag counts, and how many closes were short-lived. This is the readout that
+// decides whether peer churn is inflicted ON us (PEER_FIN dominant, short lifetimes =
+// eviction off saturated nodes) or BY us (LOCAL_* dominant = our own deadlines firing).
+// Takes manager->lock.
+void BRPeerManagerCloseLedgerSummary(BRPeerManager *manager, char *buf, size_t bufLen);
+
 // ---- B2 valve / watchdog ORDERING (paced-convoy fetch, Task 6, spec Part C) -
 //
 // "Is the B2 abandonment valve currently mid-decision on the hole that PINS the

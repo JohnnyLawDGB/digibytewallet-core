@@ -231,6 +231,14 @@ struct BRPeerManagerStruct {
     const BRChainParams *params;
     BRWallet *wallet;
     int isConnected, connectFailureCount, misbehavinCount, dnsThreadCount, maxConnectCount, peerThreadCount;
+    // DISCONNECT LEDGER (BRPeer.h). Running histogram of WHO closed each connection, so an
+    // overnight run answers "are we being evicted, or are we hanging up on ourselves?" from
+    // one summary line instead of a hand-count over thousands of scattered log lines.
+    // Written only under manager->lock in _peerDisconnected.
+    uint32_t closeCounts[BR_CLOSE_CAUSE_COUNT];
+    uint32_t closeTagCounts[BR_DISC_TAG_COUNT];
+    uint32_t closeTotal;
+    double   closeShortLived;   // count of closes with lifetime < CLOSE_LEDGER_SHORT_SECS
     BRPeer *peers, *downloadPeer, fixedPeer, **connectedPeers;
     char downloadPeerName[INET6_ADDRSTRLEN + 6];
     uint32_t earliestKeyTime, syncStartHeight, estimatedHeight;
@@ -655,7 +663,7 @@ static void _BRPeerManagerPeerMisbehavin(BRPeerManager *manager, BRPeer *peer)
         array_clear(manager->peers);
     }
 
-    BRPeerDisconnect(peer);
+    BRPeerDisconnectTagged(peer, BR_DISC_TAG_MISBEHAVIN);
 }
 
 static void _BRPeerManagerSyncStopped(BRPeerManager *manager)
@@ -901,7 +909,7 @@ static void _BRPeerManagerPublishPendingTx(BRPeerManager *manager, BRPeer *peer)
 {
     for (size_t i = array_count(manager->publishedTx); i > 0; i--) {
         if (manager->publishedTx[i - 1].callback == NULL) continue;
-        BRPeerScheduleDisconnect(peer, PROTOCOL_TIMEOUT); // schedule publish timeout
+        BRPeerScheduleDisconnectTagged(peer, PROTOCOL_TIMEOUT, BR_DISC_TAG_PUBLISH); // schedule publish timeout
         break;
     }
     
@@ -1088,6 +1096,12 @@ static int _BRPeerManagerReanchorAtFloorLocked(BRPeerManager *manager, int force
 // BRPeerManagerKeepAlive's residual re-request driver can both use it.
 static int _BRPeerManagerPeerCanServeFilters(BRPeer *p);
 static uint32_t _BRPeerManagerBlockFloor(BRPeerManager *manager);
+#ifdef CF_KAT_COUNT_MAINCHAIN_WALK
+// Host-KAT-only: counts prevBlock steps taken by the "is block in main chain?" descent in
+// _peerRelayedBlock, so a gate can assert the walk is SKIPPED when its answer is unused.
+// A gate on wall-clock could not distinguish a skipped walk from a fast machine.
+unsigned long _cfMainChainWalkSteps = 0;
+#endif
 #ifdef CF_KAT_COUNT_FLOOR_WALKS
 // Host-KAT-only: counts actual _BRPeerManagerBlockFloor descents so the KAT can
 // assert the F1 clamp costs ONE walk per tick, not one per send. Never defined in
@@ -1319,7 +1333,7 @@ static void _BRPeerManagerPushConvoyHdrGate(BRPeerManager *manager)
         if (hnow - BRPeerLastRecvTime(manager->downloadPeer) <= PEER_INBOUND_IDLE_LIMIT &&
             manager->convoyHoldSince != 0 &&
             (time(NULL) - manager->convoyHoldSince) <= CF_CONVOY_HOLD_MAX_SECS) {
-            BRPeerScheduleDisconnect(manager->downloadPeer, PROTOCOL_TIMEOUT);
+            BRPeerScheduleDisconnectTagged(manager->downloadPeer, PROTOCOL_TIMEOUT, BR_DISC_TAG_SYNC);
         }
     }
 #endif
@@ -1425,11 +1439,11 @@ static void _peerConnected(void *info)
     // TODO: XXX does this work with 0.11 pruned nodes?
     if ((peer->services & manager->params->services) != manager->params->services) {
         peer_log(peer, "unsupported node type");
-        BRPeerDisconnect(peer);
+        BRPeerDisconnectTagged(peer, BR_DISC_TAG_UNUSABLE_PEER);
     }
     else if ((peer->services & SERVICES_NODE_NETWORK) != SERVICES_NODE_NETWORK) {
         peer_log(peer, "node doesn't carry full blocks");
-        BRPeerDisconnect(peer);
+        BRPeerDisconnectTagged(peer, BR_DISC_TAG_UNUSABLE_PEER);
     }
     else if (BRPeerLastBlock(peer) + 10 < manager->lastBlock->height) {
         peer_log(peer, "node isn't synced");
@@ -1441,7 +1455,7 @@ static void _peerConnected(void *info)
         // it next Connect; a genuinely dead socket is still reaped by _peerDisconnected).
         if (! BRPeerIsPinned(manager->pinnedAddr, manager->pinnedPort, peer->address, peer->port))
             _penalize(manager, peer->address, peer->port, now);
-        BRPeerDisconnect(peer);
+        BRPeerDisconnectTagged(peer, BR_DISC_TAG_NOT_SYNCED);
     }
     else if (BRPeerVersion(peer) >= 70011 &&
              ! BRPeerServicesAllowedForSyncMode(peer->services, manager->syncMode)) {
@@ -1458,7 +1472,7 @@ static void _peerConnected(void *info)
         // Exempt the pinned own-node (see the "node isn't synced" branch above).
         if (! BRPeerIsPinned(manager->pinnedAddr, manager->pinnedPort, peer->address, peer->port))
             _penalize(manager, peer->address, peer->port, now);
-        BRPeerDisconnect(peer);
+        BRPeerDisconnectTagged(peer, BR_DISC_TAG_UNUSABLE_PEER);
     }
     else if (manager->downloadPeer && // check if we should stick with the existing download peer
              (BRPeerLastBlock(manager->downloadPeer) >= BRPeerLastBlock(peer) ||
@@ -1485,7 +1499,7 @@ static void _peerConnected(void *info)
                 BRPeerLastBlock(p) > BRPeerLastBlock(peer)) peer = p;
         }
         
-        if (manager->downloadPeer) BRPeerDisconnect(manager->downloadPeer);
+        if (manager->downloadPeer) BRPeerDisconnectTagged(manager->downloadPeer, BR_DISC_TAG_DOWNLOAD_SWAP);
         manager->downloadPeer = peer;
         manager->isConnected = 1;
         manager->estimatedHeight = BRPeerLastBlock(peer);
@@ -1496,7 +1510,7 @@ static void _peerConnected(void *info)
             UInt256 locators[_BRPeerManagerBlockLocators(manager, NULL, 0)];
             size_t count = _BRPeerManagerBlockLocators(manager, locators, sizeof(locators)/sizeof(*locators));
             
-            BRPeerScheduleDisconnect(peer, PROTOCOL_TIMEOUT); // schedule sync timeout
+            BRPeerScheduleDisconnectTagged(peer, PROTOCOL_TIMEOUT, BR_DISC_TAG_SYNC); // schedule sync timeout
 
             // request just block headers up to a week before earliestKeyTime, and then merkleblocks after that
             // we do not reset connect failure count yet incase this request times out
@@ -1526,6 +1540,49 @@ static void _peerConnected(void *info)
     MGR_UNLOCK(manager);
 }
 
+/* ---------- DISCONNECT LEDGER emission (BRPeer.h) ----------
+ *
+ * A close is "short-lived" below this many seconds. Eviction off a saturated node lands
+ * here (Core evicts shortly after the handshake when it has no free inbound slot); a peer
+ * we used for a while and then timed out does not. The split is what separates "we cannot
+ * GET a slot" from "we cannot HOLD one".
+ */
+#define CLOSE_LEDGER_SHORT_SECS   30.0
+/* Emit the running histogram every Nth close. Cheap, self-contained, and makes an overnight
+ * capture readable without parsing every per-close line. */
+#define CLOSE_LEDGER_SUMMARY_EVERY 10
+
+// Formats the histogram into buf. Call with manager->lock held.
+static void _BRPeerManagerFormatCloseLedger(BRPeerManager *manager, char *buf, size_t bufLen)
+{
+    size_t off = 0;
+    int n;
+
+    n = snprintf(buf, bufLen, "closes=%u shortLived(<%.0fs)=%u |",
+                 manager->closeTotal, CLOSE_LEDGER_SHORT_SECS, (unsigned)manager->closeShortLived);
+    if (n > 0 && (size_t)n < bufLen) off = (size_t)n; else return;
+
+    for (int c = 1; c < BR_CLOSE_CAUSE_COUNT; c++) {
+        if (manager->closeCounts[c] == 0) continue;
+        n = snprintf(buf + off, bufLen - off, " %s=%u",
+                     BRPeerCloseCauseName((BRPeerCloseCause)c), manager->closeCounts[c]);
+        if (n <= 0 || (size_t)n >= bufLen - off) return;
+        off += (size_t)n;
+    }
+
+    n = snprintf(buf + off, bufLen - off, " | tags:");
+    if (n <= 0 || (size_t)n >= bufLen - off) return;
+    off += (size_t)n;
+
+    for (int t = 1; t < BR_DISC_TAG_COUNT; t++) {
+        if (manager->closeTagCounts[t] == 0) continue;
+        n = snprintf(buf + off, bufLen - off, " %s=%u",
+                     BRPeerDisconnectTagName((BRPeerDisconnectTag)t), manager->closeTagCounts[t]);
+        if (n <= 0 || (size_t)n >= bufLen - off) return;
+        off += (size_t)n;
+    }
+}
+
 static void _peerDisconnected(void *info, int error)
 {
     BRPeer *peer = ((BRPeerCallbackInfo *)info)->peer;
@@ -1533,9 +1590,49 @@ static void _peerDisconnected(void *info, int error)
     BRTxPeerList *peerList;
     int willSave = 0, willReconnect = 0, txError = 0;
     size_t txCount = 0;
-    
+
     //free(info);
     MGR_LOCK(manager);
+
+    /* ---- DISCONNECT LEDGER: record this close before any teardown touches the peer ----
+     * peer is BRPeerFree'd at the bottom of this function, so everything must be read here.
+     * The download-peer flag matters most: a close on the download peer stalls the sync,
+     * while a close on a spare costs nothing — mixing them hides the signal. */
+    {
+        BRPeerCloseCause    cause = BRPeerCloseCauseOf(peer);
+        BRPeerDisconnectTag tag   = BRPeerDisconnectTagOf(peer);
+        double              life  = BRPeerConnectedSecs(peer);
+        int                 isDl  = (peer == manager->downloadPeer);
+
+        if ((size_t)cause < BR_CLOSE_CAUSE_COUNT) manager->closeCounts[cause]++;
+        if ((size_t)tag < BR_DISC_TAG_COUNT)      manager->closeTagCounts[tag]++;
+        manager->closeTotal++;
+        if (life > 0 && life < CLOSE_LEDGER_SHORT_SECS) manager->closeShortLived++;
+
+        /* lastRecvAgo must be differenced against a FRACTIONAL clock. time(NULL) floors to
+         * whole seconds while lastRecvTime is a gettimeofday double, so the subtraction
+         * printed values up to a second negative — nonsense for an "age", and it would
+         * misjudge exactly the sub-second window that separates "went quiet then closed"
+         * from "closed mid-traffic". */
+        struct timeval ltv;
+        gettimeofday(&ltv, NULL);
+        double lnow = ltv.tv_sec + (double)ltv.tv_usec/1000000;
+        double lastRecv = BRPeerLastRecvTime(peer);
+
+        peer_log(peer, "[PEER-LEDGER] close cause=%s tag=%s dl=%d err=%d life=%.1fs "
+                       "in=%llub/%umsg out=%llub/%umsg handshake=%d lastRecvAgo=%.1fs",
+                 BRPeerCloseCauseName(cause), BRPeerDisconnectTagName(tag), isDl, error, life,
+                 (unsigned long long)BRPeerBytesIn(peer), BRPeerMsgsIn(peer),
+                 (unsigned long long)BRPeerBytesOut(peer), BRPeerMsgsOut(peer),
+                 BRPeerCompletedHandshake(peer),
+                 (lastRecv > 0) ? (lnow - lastRecv) : -1.0);
+
+        if (manager->closeTotal % CLOSE_LEDGER_SUMMARY_EVERY == 0) {
+            char summary[512];
+            _BRPeerManagerFormatCloseLedger(manager, summary, sizeof(summary));
+            peer_log(peer, "[PEER-LEDGER] %s", summary);
+        }
+    }
 
     void *txInfo[array_count(manager->publishedTx)];
     void (*txCallback[array_count(manager->publishedTx)])(void *, int);
@@ -1708,7 +1805,7 @@ static void _peerRelayedTx(void *info, BRTransaction *tx)
     if (tx && isWalletTx) {
         // reschedule sync timeout
         if (manager->syncStartHeight > 0 && peer == manager->downloadPeer) {
-            BRPeerScheduleDisconnect(peer, PROTOCOL_TIMEOUT);
+            BRPeerScheduleDisconnectTagged(peer, PROTOCOL_TIMEOUT, BR_DISC_TAG_SYNC);
         }
         
         if (BRWalletAmountSentByTx(manager->wallet, tx) > 0 && BRWalletTransactionIsValid(manager->wallet, tx)) {
@@ -1781,7 +1878,7 @@ static void _peerHasTx(void *info, UInt256 txHash)
 
         // reschedule sync timeout
         if (manager->syncStartHeight > 0 && peer == manager->downloadPeer && isWalletTx) {
-            BRPeerScheduleDisconnect(peer, PROTOCOL_TIMEOUT);
+            BRPeerScheduleDisconnectTagged(peer, PROTOCOL_TIMEOUT, BR_DISC_TAG_SYNC);
         }
         
         // keep track of how many peers have or relay a tx, this indicates how likely the tx is to confirm
@@ -2377,7 +2474,7 @@ static void _peerRelayedBlock(void *info, BRMerkleBlock *block)
         if (manager->downloadPeer) BRPeerSetCurrentBlockHeight(manager->downloadPeer, block->height);
             
         if (block->height < manager->estimatedHeight && peer == manager->downloadPeer) {
-            BRPeerScheduleDisconnect(peer, PROTOCOL_TIMEOUT); // reschedule sync timeout
+            BRPeerScheduleDisconnectTagged(peer, PROTOCOL_TIMEOUT, BR_DISC_TAG_SYNC); // reschedule sync timeout
             manager->connectFailureCount = 0; // reset failure count once we know our initial request didn't timeout
         }
         
@@ -2394,9 +2491,44 @@ static void _peerRelayedBlock(void *info, BRMerkleBlock *block)
             peer_log(peer, "relayed existing block #%"PRIu32, block->height);
         }
         
-        b = manager->lastBlock;
-        while (b && b->height > block->height)
-            b = BRSetGet(manager->blocks, &b->prevBlock); // is block in main chain?
+        // ---- SKIP THE MAIN-CHAIN DESCENT WHEN ITS ANSWER IS UNUSED ------------------
+        //
+        // The descent below walks prevBlock from the tip down to block->height purely to
+        // answer "is `block` on the main chain?". That answer is consumed ONLY by the two
+        // statements in the `if` beneath it, and each of those is ITSELF conditional:
+        // stamping tx heights needs txCount > 0, and re-pointing lastBlock needs
+        // block->height == lastBlock->height. When neither holds the entire walk is dead
+        // work and its result is discarded (`b` is reassigned by BRSetAdd immediately after).
+        //
+        // Neither holds during header catch-up: headers carry no transactions, and an
+        // ALREADY-KNOWN header is by definition below the tip. Meanwhile 8 peers send
+        // overlapping header ranges, so this branch runs for most arriving headers.
+        //
+        // MEASURED on a Note 8, deep restore from block 12,100,000 (2026-08-08), with every
+        // other profiled section reading ZERO:
+        //     51ms/37,711 it   53ms/49,846 it   58ms/51,953 it
+        //     52ms/55,474 it   53ms/56,824 it   53ms/61,085 it
+        // The iteration count GROWS with the resident set, so cost per block RISES as the
+        // restore proceeds — the self-amplifying shape behind the "deep restore never
+        // finishes" class: more headers -> longer walk -> slower processing -> more headers.
+        //
+        // Equivalence is exact, not approximate: under the negated guard both consumers are
+        // no-ops, so skipping changes nothing observable.
+        int needChainCheck = (txCount > 0) ||
+                             (manager->lastBlock && block->height == manager->lastBlock->height);
+#ifdef MAINCHAIN_WALK_UNFIXED
+        needChainCheck = 1;   // host-KAT red arm: always descend, as before this fix
+#endif
+        b = NULL;
+        if (needChainCheck) {
+            b = manager->lastBlock;
+            while (b && b->height > block->height) {
+                b = BRSetGet(manager->blocks, &b->prevBlock); // is block in main chain?
+#ifdef CF_KAT_COUNT_MAINCHAIN_WALK
+                _cfMainChainWalkSteps++;   // host-KAT only; never defined in production
+#endif
+            }
+        }
         
         // b == NULL means the walk ran off the bottom of the resident set (see the
         // same guard in _peerRelayedBlockTxns): we cannot prove `block` is on the main
@@ -3142,7 +3274,7 @@ static void _BRPeerManagerDropStalledFilterPeer(BRPeerManager *manager)
         BRPeer *p = manager->connectedPeers[i - 1];
         if (UInt128Eq(p->address, manager->cfHeadersPeerAddr)) {
             peer_log(p, "cfheaders: whole filter set stalled on batch — dropping this peer to force a fresh one");
-            BRPeerDisconnect(p);
+            BRPeerDisconnectTagged(p, BR_DISC_TAG_CF_STALL);
             return;
         }
     }
@@ -4078,7 +4210,7 @@ void BRPeerManagerSetMaxConnectCount(BRPeerManager *manager, size_t count)
             if (BRPeerIsPinned(manager->pinnedAddr, manager->pinnedPort,
                                p->address, p->port)) continue;        // keep the pinned own-node
             if (BRPeerConnectStatus(p) == BRPeerStatusDisconnected) continue;
-            BRPeerScheduleDisconnect(p, 0);
+            BRPeerScheduleDisconnectTagged(p, 0, BR_DISC_TAG_MAXCONN_TRIM);
             keeping--;
         }
     }
@@ -4631,7 +4763,7 @@ void BRPeerManagerKeepAlive(BRPeerManager *manager)
         // and re-dialed by BRPeerManagerConnect's reserved slot — the intended dark→recover.
         if (now - BRPeerLastRecvTime(p) > PEER_INBOUND_IDLE_LIMIT &&
             ! BRPeerIsPinned(manager->pinnedAddr, manager->pinnedPort, p->address, p->port)) {
-            BRPeerScheduleDisconnect(p, 0); // real deadline instead of the DBL_MAX idle sentinel
+            BRPeerScheduleDisconnectTagged(p, 0, BR_DISC_TAG_IDLE_REAPER); // real deadline instead of the DBL_MAX idle sentinel
         }
     }
 
@@ -5535,7 +5667,7 @@ void BRPeerManagerDisconnect(BRPeerManager *manager)
     for (size_t i = array_count(manager->connectedPeers); i > 0; i--) {
         p = manager->connectedPeers[i - 1];
         manager->connectFailureCount = MAX_CONNECT_FAILURES; // prevent futher automatic reconnect attempts
-        BRPeerDisconnect(p);
+        BRPeerDisconnectTagged(p, BR_DISC_TAG_MANAGER_STOP);
         // "Waiting for network": a peer still in Connecting has a thread parked in connect(), which
         // this pre-decrement assumes will not decrement itself on the way out. If that assumption
         // is ever wrong the count goes negative — historically an infinite wait, because the loop
@@ -5700,7 +5832,7 @@ void BRPeerManagerRescan(BRPeerManager *manager)
                 if (BRPeerEq(&manager->peers[i - 1], manager->downloadPeer)) array_rm(manager->peers, i - 1);
             }
             
-            BRPeerDisconnect(manager->downloadPeer);
+            BRPeerDisconnectTagged(manager->downloadPeer, BR_DISC_TAG_DOWNLOAD_SWAP);
         }
 
         manager->syncStartHeight = 0; // a syncStartHeight of 0 indicates that syncing hasn't started yet
@@ -6356,6 +6488,16 @@ size_t BRPeerManagerAbandonedHeightsTotal(BRPeerManager *manager)
     size_t total = manager->cfAbandonedHeightsTotal;
     MGR_UNLOCK(manager);
     return total;
+}
+
+void BRPeerManagerCloseLedgerSummary(BRPeerManager *manager, char *buf, size_t bufLen)
+{
+    assert(manager != NULL);
+    if (! buf || bufLen == 0) return;
+    buf[0] = '\0';
+    MGR_LOCK(manager);
+    _BRPeerManagerFormatCloseLedger(manager, buf, bufLen);
+    MGR_UNLOCK(manager);
 }
 
 // B2-valve/watchdog ordering signal (see the header for the full contract and the

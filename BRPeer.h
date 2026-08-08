@@ -227,14 +227,97 @@ int BRPeerIsSocketOpen(BRPeer *peer);
 const char *BRPeerCurrentMessageType(BRPeer *peer);
 double BRPeerCurrentMessageSecs(BRPeer *peer);
 
+// ---------------------------------------------------------------------------
+// DISCONNECT LEDGER — WHO HUNG UP, AND WHY?
+//
+// Every churn theory this wallet has (peer-side eviction, self-inflicted timeout,
+// OS freeze) predicts a different disconnect mix, and until now NOTHING recorded
+// which one actually happened. `error` alone cannot answer it, for two reasons:
+//
+//   1. An ORDERLY close by the remote (read() == 0, i.e. FIN) is reported by the
+//      read loops as ECONNRESET — the same value a genuine RST produces. Core's
+//      eviction (AttemptToEvictConnection -> CloseSocketDisconnect) closes
+//      ORDERLY, so on the current code an eviction and a network reset are
+//      literally indistinguishable. That conflation is why "are we being
+//      evicted?" has never been answerable from our own logs.
+//   2. ETIMEDOUT is produced by THREE different local deadlines (the scheduled
+//      disconnectTime, the mid-message MESSAGE_TIMEOUT, and the send deadline),
+//      and the scheduled one is armed by ~8 distinct call sites in
+//      BRPeerManager.c (20s PROTOCOL_TIMEOUT on the download peer, the 90s
+//      inbound-idle reaper, publish timeouts). "ETIMEDOUT" tells us we hung up;
+//      it does not tell us which of our own rules did it.
+//
+// The cause is recorded ALONGSIDE `error`, never instead of it — `error` keeps
+// its exact existing values and every consumer (strerror logging, the ETIMEDOUT
+// test in _peerDisconnected) is untouched. This is purely additive.
+typedef enum {
+    BR_CLOSE_UNKNOWN = 0,
+    BR_CLOSE_CONNECT_FAIL,       // never completed _BRPeerOpenSocket
+    BR_CLOSE_LOCAL_SCHEDULED,    // WE hung up: ctx->disconnectTime fired (tag says which rule)
+    BR_CLOSE_LOCAL_MSG_TIMEOUT,  // WE hung up: stalled mid-message (MESSAGE_TIMEOUT)
+    BR_CLOSE_LOCAL_SEND_TIMEOUT, // WE hung up: send deadline (half-dead / zero-window socket)
+    BR_CLOSE_LOCAL_PROTOCOL,     // WE hung up: EPROTO (malformed, bad checksum, handler reject)
+    BR_CLOSE_LOCAL_EXPLICIT,     // WE hung up: BRPeerDisconnect() (tag says which caller)
+    BR_CLOSE_PEER_FIN,           // THEY hung up, ORDERLY — this is the eviction signature
+    BR_CLOSE_PEER_RST,           // THEY hung up, ECONNRESET
+    BR_CLOSE_SOCKET_ERR,         // some other errno off the socket
+    BR_CLOSE_CAUSE_COUNT
+} BRPeerCloseCause;
+
+// Which local rule armed the deadline / called the disconnect. Only meaningful for
+// the BR_CLOSE_LOCAL_* causes.
+typedef enum {
+    BR_DISC_TAG_NONE = 0,
+    BR_DISC_TAG_SYNC,           // PROTOCOL_TIMEOUT on the sync / download path
+    BR_DISC_TAG_PUBLISH,        // PROTOCOL_TIMEOUT waiting on a tx publish
+    BR_DISC_TAG_IDLE_REAPER,    // inbound-idle eviction (ScheduleDisconnect(p, 0))
+    BR_DISC_TAG_MANAGER_STOP,   // BRPeerManagerDisconnect / teardown
+    BR_DISC_TAG_MISBEHAVIN,     // peer misbehaved
+    BR_DISC_TAG_NOT_SYNCED,     // peer too far behind to be useful
+    BR_DISC_TAG_SEND_STALL,     // send deadline blew
+    BR_DISC_TAG_MAXCONN_TRIM,   // shed to satisfy a lowered maxConnectCount
+    BR_DISC_TAG_UNUSABLE_PEER,  // capability reject at handshake (services / no SPV / no full blocks)
+    BR_DISC_TAG_DOWNLOAD_SWAP,  // dropped to hand the download role to a better peer
+    BR_DISC_TAG_CF_STALL,       // dropped by the cfheaders stall watchdog
+    BR_DISC_TAG_COUNT
+} BRPeerDisconnectTag;
+
+// Classifies one read()/send() return into a close cause. Pure — no peer state — so the
+// host KAT can drive it with the exact (n, err) tuples the socket loops produce.
+// n > 0 (progress) yields BR_CLOSE_UNKNOWN.
+BRPeerCloseCause BRPeerClassifySocketResult(long n, int err);
+
+// Ledger readout. All lock-free, same rationale as BRPeerLastRecvTime below: written by
+// this peer's own thread, read by the manager thread while it tears the peer down. They
+// are only read AFTER that thread has left its loop, so there is no live race to lose;
+// a torn read of a diagnostic counter would be harmless regardless.
+BRPeerCloseCause    BRPeerCloseCauseOf(BRPeer *peer);
+BRPeerDisconnectTag BRPeerDisconnectTagOf(BRPeer *peer);
+const char *BRPeerCloseCauseName(BRPeerCloseCause cause);
+const char *BRPeerDisconnectTagName(BRPeerDisconnectTag tag);
+double   BRPeerConnectedSecs(BRPeer *peer);  // 0 if it never got a socket
+uint64_t BRPeerBytesIn(BRPeer *peer);
+uint64_t BRPeerBytesOut(BRPeer *peer);
+uint32_t BRPeerMsgsIn(BRPeer *peer);
+uint32_t BRPeerMsgsOut(BRPeer *peer);
+int      BRPeerCompletedHandshake(BRPeer *peer); // got verack — separates "never usable" from "went bad"
+
 // open connection to peer and perform handshake
 void BRPeerConnect(BRPeer *peer);
 
 // close connection to peer
 void BRPeerDisconnect(BRPeer *peer);
 
+// Same as BRPeerDisconnect, but records WHICH rule closed the peer. Prefer this at every
+// deliberate call site; the untagged form remains for teardown paths where the tag is set already.
+void BRPeerDisconnectTagged(BRPeer *peer, BRPeerDisconnectTag tag);
+
 // call this to (re)schedule a disconnect in the given number of seconds, or < 0 to cancel (useful for sync timeout)
 void BRPeerScheduleDisconnect(BRPeer *peer, double seconds);
+
+// As above, but stamps the rule that armed the deadline so the ledger can attribute the
+// resulting ETIMEDOUT. seconds < 0 (cancel) clears the tag.
+void BRPeerScheduleDisconnectTagged(BRPeer *peer, double seconds, BRPeerDisconnectTag tag);
 
 // display name of peer address
 const char *BRPeerHost(BRPeer *peer);

@@ -876,9 +876,68 @@ size_t BRWalletTransactions(BRWallet *wallet, BRTransaction *transactions[], siz
     for (size_t i = 0; transactions && i < txCount; i++) {
         transactions[i] = wallet->transactions[i];
     }
-    
+
     pthread_mutex_unlock(&wallet->lock);
     return txCount;
+}
+
+// Serializes ALL registered transactions into `buf` as a single persistence blob,
+// oldest-first, holding wallet->lock across BOTH the sizing pass and the write pass.
+//
+// This is the lock-safe replacement for the old getSerializedTransactions JNI shape
+// (BRWalletTransactions to COPY raw BRTransaction* pointers, unlock, then serialize the
+// copies) — the SAME lock-release-then-use class as the saveBlocks race. Because a
+// BRTransaction can be freed under wallet->lock by BRWalletRemoveTransaction (at-tip
+// cleanup / reconcile), serializing a copied-out pointer with the lock released is a
+// use-after-free. Here every dereference of wallet->transactions[i] happens inside one
+// lock hold, so no tx can be freed mid-serialize. BRTransactionSerialize is a pure read
+// of the tx (no wallet re-entry, no callback, no other lock), so holding wallet->lock
+// across it introduces no lock-ordering inversion.
+//
+// Wire layout (byte-identical to the previous getSerializedTransactions output, so
+// persisted `saved_transactions` blobs stay round-trip compatible with
+// loadSerializedTransactions):
+//   [4] tx count (LE)
+//   per tx: [4] serialized length (LE)  [4] blockHeight (LE)  [4] timestamp (LE)  [N] tx bytes
+//
+// Two-pass (size then fill) contract: if buf == NULL, or bufLen is too small to hold the
+// whole blob, nothing is written and the total number of bytes REQUIRED is returned (query
+// the size with buf == NULL, malloc it, then call again). When the blob fits, it is written
+// and the number of bytes WRITTEN is returned (== the required size). The caller distinguishes
+// "written" from "needs a bigger buffer" by comparing the return value against bufLen.
+size_t BRWalletSerializeTransactions(BRWallet *wallet, uint8_t *buf, size_t bufLen)
+{
+    assert(wallet != NULL);
+    pthread_mutex_lock(&wallet->lock);
+
+    size_t txCount = array_count(wallet->transactions);
+
+    // size pass (under the lock): count header + per-tx (len + height + timestamp + data)
+    size_t totalSize = 4;
+    for (size_t i = 0; i < txCount; i++) {
+        totalSize += 4 + 4 + 4 + BRTransactionSerialize(wallet->transactions[i], NULL, 0);
+    }
+
+    // size-only query, or buffer too small: report the required size, write nothing.
+    if (! buf || bufLen < totalSize) {
+        pthread_mutex_unlock(&wallet->lock);
+        return totalSize;
+    }
+
+    // write pass (same lock hold — the size just computed cannot go stale)
+    size_t pos = 0;
+    UInt32SetLE(&buf[pos], (uint32_t)txCount); pos += 4;
+    for (size_t i = 0; i < txCount; i++) {
+        BRTransaction *tx = wallet->transactions[i];
+        size_t len = BRTransactionSerialize(tx, NULL, 0);
+        UInt32SetLE(&buf[pos], (uint32_t)len);       pos += 4;
+        UInt32SetLE(&buf[pos], tx->blockHeight);     pos += 4;
+        UInt32SetLE(&buf[pos], tx->timestamp);       pos += 4;
+        BRTransactionSerialize(tx, &buf[pos], len);  pos += len;
+    }
+
+    pthread_mutex_unlock(&wallet->lock);
+    return pos; // == totalSize
 }
 
 // writes transactions registered in the wallet, and that were unconfirmed before blockHeight, to the transactions array

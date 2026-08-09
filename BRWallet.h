@@ -232,6 +232,15 @@ int BRWalletAddressIsUsed(BRWallet *wallet, const char *addr);
 // returns the number of transactions written, or total number available if transactions is NULL
 size_t BRWalletTransactions(BRWallet *wallet, BRTransaction *transactions[], size_t txCount);
 
+// serializes ALL registered transactions (oldest first) into `buf` as one persistence blob,
+// holding wallet->lock across the ENTIRE size+write pass so no BRTransaction can be freed
+// mid-serialize (the lock-safe replacement for the BRWalletTransactions-copy-then-serialize
+// shape — same lock-release-then-use class as the saveBlocks race). Wire layout:
+//   [4] tx count, then per tx: [4] serialized len, [4] blockHeight, [4] timestamp, [N] tx bytes.
+// If buf == NULL or bufLen is too small, nothing is written and the REQUIRED size is returned;
+// otherwise the blob is written and the number of bytes WRITTEN (== required size) is returned.
+size_t BRWalletSerializeTransactions(BRWallet *wallet, uint8_t *buf, size_t bufLen);
+
 // writes transactions registered in the wallet, and that were unconfirmed before blockHeight, to the transactions array
 // returns the number of transactions written, or total number available if transactions is NULL
 size_t BRWalletTxUnconfirmedBefore(BRWallet *wallet, BRTransaction *transactions[], size_t txCount,

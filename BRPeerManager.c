@@ -24,6 +24,7 @@
 
 #include <arpa/inet.h>   // inet_ntop for IPv6-correct peer logging
 #include "BRPeerManager.h"
+#include "BRPeerConnectPolicy.h"
 #include "BRSet.h"
 #include "BRArray.h"
 #include "BRInt.h"
@@ -4061,8 +4062,8 @@ void BRPeerManagerSetFixedPeer(BRPeerManager *manager, UInt128 address, uint16_t
 // count once SYNCED so thousands of idle wallets stop each pinning 8 slots on the shared
 // filter-node fleet. Reducing gently schedule-disconnects the excess via the SAME async path
 // idle-eviction uses (BRPeerScheduleDisconnect) — NEVER the download peer (it drives the sync)
-// or the pinned own-node. maxConnectCount then gates re-dials so the reduced set is maintained;
-// increasing (fell behind → catch up) tops back up via BRPeerManagerConnect.
+// or the pinned own-node. maxConnectCount then gates re-dials so the reduced set is maintained.
+// Every application also repairs an underfilled pool, even when the target itself is unchanged.
 void BRPeerManagerSetMaxConnectCount(BRPeerManager *manager, size_t count)
 {
     assert(manager != NULL);
@@ -4070,6 +4071,7 @@ void BRPeerManagerSetMaxConnectCount(BRPeerManager *manager, size_t count)
     MGR_LOCK(manager);
     size_t prev = manager->maxConnectCount;
     manager->maxConnectCount = count;
+    int needsTopUp = BRPeerManagerNeedsTopUp(prev, count, array_count(manager->connectedPeers));
     if (count < prev) {
         size_t keeping = array_count(manager->connectedPeers);
         for (size_t i = array_count(manager->connectedPeers); i > 0 && keeping > count; i--) {
@@ -4083,7 +4085,7 @@ void BRPeerManagerSetMaxConnectCount(BRPeerManager *manager, size_t count)
         }
     }
     MGR_UNLOCK(manager);
-    if (count > prev) BRPeerManagerConnect(manager);                  // fell behind — top back up
+    if (needsTopUp) BRPeerManagerConnect(manager);                    // maintain the requested target
 }
 
 // current connect status

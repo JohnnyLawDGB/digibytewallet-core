@@ -2262,6 +2262,20 @@ static uint8_t *_serializeSavedBlocks(BRMerkleBlock *blocks[], size_t count, siz
     return buf;
 }
 
+// Caller holds manager->lock. The callback copies the bytes before returning.
+static void _BRPeerManagerPersistCFLedgerLocked(BRPeerManager *manager)
+{
+    if (!manager->saveCFLedger) return;
+    size_t ledgerLen = BRCFScanLedgerSerialize(&manager->cfLedger, NULL, 0);
+    uint8_t *ledgerBuf = (ledgerLen > 0) ? malloc(ledgerLen) : NULL;
+    if (!ledgerBuf) return;
+    size_t wrote = BRCFScanLedgerSerialize(&manager->cfLedger, ledgerBuf, ledgerLen);
+    if (wrote == ledgerLen) {
+        manager->saveCFLedger(manager->saveCFLedgerInfo, ledgerBuf, ledgerLen);
+    }
+    free(ledgerBuf);
+}
+
 static void _peerRelayedBlock(void *info, BRMerkleBlock *block)
 {
     BRPeer *peer = ((BRPeerCallbackInfo *)info)->peer;
@@ -2652,6 +2666,13 @@ static void _peerRelayedBlockTxns(void *info, UInt256 blockHash, const UInt256 t
         _BRPeerManagerUpdateTx(manager, walletHashes, walletCount, b->height, b->timestamp);
         confirmed = 1;
     }
+
+#ifndef CF_MATCH_MARK_ON_REQUEST_UNFIXED
+    // Every transaction in the full block was parsed and handed through relayedTx
+    // before this callback. Only now is a matched filter durably complete.
+    BRCFScanLedgerMarkEvaluated(&manager->cfLedger, b->height);
+    _BRPeerManagerPersistCFLedgerLocked(manager);
+#endif
 
     free(walletHashes);
     MGR_UNLOCK(manager);
@@ -3604,15 +3625,7 @@ static void _peerRelayedCFHeaders(void *info, uint8_t filterType, UInt256 stopHa
     // Persist the CF scan-completeness ledger alongside the filter headers. Size
     // first (NULL buf), then malloc + fill. Coalescing/throttling is the Kotlin
     // caller's job (same contract as saveFilterHeaders).
-    if (manager->saveCFLedger) {
-        size_t ledgerLen = BRCFScanLedgerSerialize(&manager->cfLedger, NULL, 0);
-        uint8_t *ledgerBuf = (ledgerLen > 0) ? malloc(ledgerLen) : NULL;
-        if (ledgerBuf) {
-            size_t wrote = BRCFScanLedgerSerialize(&manager->cfLedger, ledgerBuf, ledgerLen);
-            if (wrote == ledgerLen) manager->saveCFLedger(manager->saveCFLedgerInfo, ledgerBuf, ledgerLen);
-            free(ledgerBuf);
-        }
-    }
+    _BRPeerManagerPersistCFLedgerLocked(manager);
 
     // Auto-fetch cfilters for the newly validated range, capped at the spec
     // MAX_CFILTERS_RESULTS. The driver requests one batch per cfheaders
@@ -3627,7 +3640,7 @@ static void _peerRelayedCFHeaders(void *info, uint8_t filterType, UInt256 stopHa
     // backlog down in the meantime.
     if (manager->autoFetchCFiltersEnabled
 #if CF_LEDGER_DRIVE_REREQUEST
-        && BRCFScanLedgerOutstandingCount(&manager->cfLedger) < CF_OUTSTANDING_LOWWATER
+        && BRCFScanLedgerCanRequestForward(&manager->cfLedger)
 #endif
         ) {
         uint32_t reqStart = manager->autoFetchCFiltersThrough + 1;
@@ -3963,18 +3976,31 @@ static void _peerRelayedCFilter(void *info, uint8_t filterType, UInt256 blockHas
         BRPeerSendGetdataBlocks(peer, &blockHash, 1);
     }
 
-    // The cfilter was evaluated (matched above or cleanly missed) — remove this
-    // height from the ledger's outstanding set and advance scannedThrough.
+    // A clean miss is complete immediately. A match is not: the requested full
+    // block still has to be parsed and registered into the wallet, so its height
+    // remains outstanding until _peerRelayedBlockTxns.
 #ifdef CF_PIN_DIAG
     if (arrInWindow) {
-        debug_log("[CF-ARR] h=%u EXIT=evaluated (hit=%d) — MarkEvaluated, scannedThrough %u -> ?\n",
+        debug_log("[CF-ARR] h=%u EXIT=evaluated (hit=%d) — scannedThrough before=%u\n",
                   b->height, hit, BRCFScanLedgerScannedThrough(&manager->cfLedger));
     }
 #endif
 #ifdef CF_RECV_DIAG
     manager->cfExitEvaluated++;   /* the only good outcome */
 #endif
-    BRCFScanLedgerMarkEvaluated(&manager->cfLedger, b->height);
+    if (!hit) {
+        BRCFScanLedgerMarkEvaluated(&manager->cfLedger, b->height);
+    }
+#ifdef CF_MATCH_MARK_ON_REQUEST_UNFIXED
+    else {
+        BRCFScanLedgerMarkEvaluated(&manager->cfLedger, b->height);
+    }
+#else
+    else {
+        peer_log(peer, "cf-ledger: matched block @ %u left outstanding until full block delivery",
+                 b->height);
+    }
+#endif
 
     MGR_UNLOCK(manager);
 }
@@ -4508,12 +4534,12 @@ void BRPeerManagerConnect(BRPeerManager *manager)
 //
 // THE crux invariant: on a wallet HIT, the block is fetched via getdata
 // (BRPeerSendGetdataBlocks) BEFORE MarkEvaluated -- that fetch is what
-// actually credits the receive. Marking the height evaluated without
-// dispatching getdata would silently lose a payment that arrived during a
-// header race. A hit with no CF-capable peer connected KEEPS the entry
-// buffered (returns 0, not 1) so the very next drive tick retries instead of
-// the payment being lost. This mirrors the live match path's own
-// getdata-then-MarkEvaluated order at _peerRelayedCFilter above.
+// actually credits the receive. Marking the height evaluated before the full
+// block is delivered would silently lose a payment if the process dies after
+// getdata. A hit with no CF-capable peer connected KEEPS the entry buffered
+// (returns 0, not 1) so the very next drive tick retries instead of the payment
+// being lost. Like the live match path, a dispatched hit stays outstanding
+// until _peerRelayedBlockTxns has parsed and registered the full block.
 #if CF_LEDGER_DRIVE_REREQUEST
 struct _cfDrainCtx { BRPeerManager *m; BRWalletFilterElements *elems; };  // elems fetched ONCE per drain batch (perf)
 
@@ -4552,9 +4578,16 @@ static int _cfBufEval(void *vctx, uint32_t height, UInt256 blockHash, const uint
         }
         if (! p) return 0;                                                 // hit but no peer -> KEEP buffered, stay outstanding, retry
         BRPeerSendGetdataBlocks(p, &blockHash, 1);                         // credit: fetch the block -> tx registered on arrival
+#ifdef CF_MATCH_MARK_ON_REQUEST_UNFIXED
+        BRCFScanLedgerMarkEvaluated(&m->cfLedger, height);
+#else
+        peer_log(p, "cf-ledger: buffered matched block height %u left outstanding until full block delivery",
+                 height);
+#endif
+        return 1;                                                          // request dispatched; remove bytes, retain ledger hole
     }
 
-    BRCFScanLedgerMarkEvaluated(&m->cfLedger, height);                     // scanned (hit dispatched, or clean verified miss)
+    BRCFScanLedgerMarkEvaluated(&m->cfLedger, height);                     // clean verified miss is complete immediately
     return 1;                                                              // remove from buffer
 }
 #endif // CF_LEDGER_DRIVE_REREQUEST
@@ -5251,7 +5284,7 @@ void BRPeerManagerKeepAlive(BRPeerManager *manager)
         // Keep the two paths byte-comparable; if one changes, change both.
         if (cfhNext > 0
 #if CF_LEDGER_DRIVE_REREQUEST
-            && BRCFScanLedgerOutstandingCount(&manager->cfLedger) < CF_OUTSTANDING_LOWWATER
+            && BRCFScanLedgerCanRequestForward(&manager->cfLedger)
 #endif
             ) {
             uint32_t cfhFrontier = cfhNext - 1;   // NextHeight is one PAST the last appended cfheader

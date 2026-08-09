@@ -60,7 +60,7 @@ extern "C" {
 // NOTE: this gate is a CALLER guard. BRCFScanLedgerNextRerequest (the Phase-2
 // driver logic) is ALWAYS compiled so it stays unit-testable; production simply
 // does not invoke it while the gate is 0.
-// SHIPPING AT 0 (Phase 1, observe-only) — deliberately, not by oversight. Phase 2
+// v4.0.34 SHIPPED AT 0 (Phase 1, observe-only) — deliberately, not by oversight. Phase 2
 // was armed here before it had ever shipped, and the back-pressure half of it is
 // unsafe against this core's retention predicate:
 //
@@ -97,10 +97,10 @@ extern "C" {
 // retention fix must not be cherry-picked alone either: it retains every header from
 // the scan frontier to the tip, and only the convoy bounds that span.
 //
-// KATs pass -DCF_LEDGER_DRIVE_REREQUEST=1 explicitly, so Phase-2 logic stays fully
-// covered by the host suite while production runs at 0.
+// v4.0.34 included those prerequisites. Corrected builds run at 1 and serialize
+// forward fetch to one unresolved batch so partial responses are retried first.
 #ifndef CF_LEDGER_DRIVE_REREQUEST
-#define CF_LEDGER_DRIVE_REREQUEST 0   // Phase 1: observe only. -D wins for KATs.
+#define CF_LEDGER_DRIVE_REREQUEST 1
 #endif
 
 // Sentinel: "no height was evicted" — returned by the overflow-drop-reporting
@@ -677,6 +677,7 @@ void     BRCFScanLedgerMarkOffersMissedLivePeer(BRCFScanLedger *l, uint32_t star
 uint32_t BRCFScanLedgerScannedThrough(const BRCFScanLedger *l);
 size_t   BRCFScanLedgerOutstandingCount(const BRCFScanLedger *l);
 size_t   BRCFScanLedgerGaveUpCount(const BRCFScanLedger *l);
+int      BRCFScanLedgerCanRequestForward(const BRCFScanLedger *l);
 
 // ---- CF-retention scan-floor (Task 1) --------------------------------------
 

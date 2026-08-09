@@ -851,6 +851,10 @@ int BRCFScanLedgerReArmGaveUp(BRCFScanLedger *l, uint32_t height)
 uint32_t BRCFScanLedgerScannedThrough(const BRCFScanLedger *l) { return l->scannedThrough; }
 size_t   BRCFScanLedgerOutstandingCount(const BRCFScanLedger *l) { return l->outstandingCount; }
 size_t   BRCFScanLedgerGaveUpCount(const BRCFScanLedger *l) { return l->gaveUpCount; }
+int      BRCFScanLedgerCanRequestForward(const BRCFScanLedger *l)
+{
+    return l->outstandingCount == 0 && l->gaveUpCount == 0;
+}
 
 // ---- CF-retention scan-floor (Task 1) --------------------------------------
 

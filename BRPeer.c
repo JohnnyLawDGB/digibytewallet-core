@@ -159,6 +159,41 @@ static int _BRPeerSocks5Handshake(int sock, const UInt128 *peer_addr, uint16_t p
 #define CONNECT_TIMEOUT    10.0
 #define MESSAGE_TIMEOUT    10.0
 
+/* ---------- DISCONNECT LEDGER (see BRPeer.h for why this exists) ----------
+ *
+ * THE DISTINCTION THIS EXISTS TO MAKE. read() == 0 is an ORDERLY close by the remote —
+ * it sent FIN. read() < 0 with ECONNRESET is the remote (or a middlebox) tearing the
+ * connection down hard. The socket loops below map BOTH onto error = ECONNRESET, which
+ * is fine for `error` (they are both "connection is gone") but destroys the only
+ * evidence that distinguishes the two. It matters because DigiByte Core's inbound
+ * eviction path — AttemptToEvictConnection -> CloseSocketDisconnect — closes ORDERLY.
+ * So "we are being evicted off saturated nodes" and "the network reset us" produce
+ * identical logs today, and the eviction question cannot be settled from our own data.
+ *
+ * BRPeerClassifySocketResult is deliberately PURE so the host KAT can drive it with the
+ * exact (n, err) tuples the loops produce, instead of asserting against a live socket.
+ */
+BRPeerCloseCause BRPeerClassifySocketResult(long n, int err)
+{
+    if (n > 0) return BR_CLOSE_UNKNOWN;   // progress, not a close
+
+#ifdef PEER_CLOSE_LEDGER_UNFIXED
+    /* RED ARM ONLY — reproduces the pre-ledger conflation: an orderly FIN is reported as
+     * a reset, so eviction and RST become the same observation. */
+    if (n == 0) return BR_CLOSE_PEER_RST;
+#else
+    if (n == 0) return BR_CLOSE_PEER_FIN; // remote sent FIN — the eviction signature
+#endif
+
+    switch (err) {
+        case ECONNRESET: return BR_CLOSE_PEER_RST;
+        case ETIMEDOUT:  return BR_CLOSE_LOCAL_MSG_TIMEOUT; // only our own deadlines set ETIMEDOUT here
+        case EPROTO:     return BR_CLOSE_LOCAL_PROTOCOL;
+        default:         return BR_CLOSE_SOCKET_ERR;
+    }
+}
+
+
 // the standard blockchain download protocol works as follows (for SPV mode):
 // - local peer sends getblocks
 // - remote peer reponds with inv containing up to 500 block hashes
@@ -206,6 +241,22 @@ typedef struct {
     uint32_t version, lastblock, earliestKeyTime, currentBlockHeight;
     double startTime, pingTime;
     volatile double disconnectTime, mempoolTime;
+    // ---- DISCONNECT LEDGER (BRPeer.h) ----
+    // closeCause is FIRST-WRITER-WINS via _BRPeerNoteClose: the first decisive event is the
+    // real cause. Teardown paths run afterwards (BRPeerDisconnect during manager shutdown,
+    // for instance) and must not overwrite it, or every close would read LOCAL_EXPLICIT.
+    volatile BRPeerCloseCause closeCause;
+    volatile BRPeerDisconnectTag discTag;
+    volatile uint64_t bytesIn, bytesOut;
+    volatile uint32_t msgsIn, msgsOut;
+    // CONNECTION CLOCK. Deliberately NOT ctx->startTime: that field is a PING STOPWATCH —
+    // BRPeerSendPing/SendPingProbe reset it to now, and the verack and pong handlers zero it
+    // after folding it into pingTime. Measuring a connection lifetime from it yields "time
+    // since the last ping" (observed on-device as life=0.0s on connections that had moved
+    // megabytes), and testing it against 0 to detect a failed connect misfires on any peer
+    // that completed its handshake. Written once at socket open, never reset.
+    double connectTime;
+    double closeTime;   // set in the thread-routine funnel; lifetime = closeTime - connectTime
     // Wall-clock timestamp of the last successful (n > 0) socket read. Set on connect
     // and on every inbound read (below). Read by BRPeerManagerKeepAlive (via the
     // BRPeerLastRecvTime getter) to evict peers that have gone silent for
@@ -318,6 +369,23 @@ typedef struct {
     void (*volatile mempoolCallback)(void *info, int success);
     pthread_t thread;
 } BRPeerContext;
+
+/* DISCONNECT LEDGER writers. FIRST-WRITER-WINS: the first decisive event is the true
+ * cause, and teardown that follows (BRPeerDisconnect from manager shutdown, say) must not
+ * overwrite it — otherwise every close would read LOCAL_EXPLICIT and the ledger would say
+ * "we always hang up" no matter what actually happened. Unsynchronized by design, matching
+ * the other volatile diagnostics in this file: both racers would be recording a genuine
+ * cause, and taking a lock on a disconnect path risks the very mutex these diagnostics
+ * exist to investigate. */
+static void _BRPeerNoteClose(BRPeerContext *ctx, BRPeerCloseCause cause)
+{
+    if (ctx && ctx->closeCause == BR_CLOSE_UNKNOWN) ctx->closeCause = cause;
+}
+
+static void _BRPeerNoteTag(BRPeerContext *ctx, BRPeerDisconnectTag tag)
+{
+    if (ctx) ctx->discTag = tag;
+}
 
 // RED ARM SEAM. -DPONG_LOCK_UNFIXED compiles the lock out, restoring the exact unsynchronized
 // shape that crashed, so cf_peer_pong_race_kat can prove it fails BEFORE the fix. Guarded with
@@ -1369,6 +1437,41 @@ static int _BRPeerAcceptCFCheckptMessage(BRPeer *peer, const uint8_t *msg, size_
     return r;
 }
 
+
+/* ---------- message-header COMMAND FIELD validation ----------
+ *
+ * THE DEFECT THIS REPLACES. The old test was `header[15] != 0` — "the type must be NUL
+ * terminated". The wire header is magic(4) + command(12, bytes 4..15) + length(4) +
+ * checksum(4), so header[15] is the LAST byte of the command field. A command name that
+ * uses all twelve bytes is legal and carries NO terminator: the Bitcoin/DigiByte wire
+ * format specifies the command as 12 bytes NUL-PADDED, and Core's own
+ * CMessageHeader::IsCommandValid() accepts a full-12 name. Our check rejected it.
+ *
+ * The cost was not a dropped message. EPROTO propagates to _peerDisconnected, which routes
+ * error == EPROTO into _BRPeerManagerPeerMisbehavin — that REMOVES the peer from
+ * manager->peers, and on the tenth such event clears the ENTIRE pool. So a spec-compliance
+ * bug in this one byte-test evicted our own canon CF oracle nodes from the peer pool for
+ * speaking the protocol correctly.
+ *
+ * This mirrors Core: printable ASCII, and once a NUL appears every remaining byte must be
+ * NUL (so trailing garbage after the name is still rejected). A full-12 name is accepted.
+ */
+static int _BRPeerCommandFieldValid(const uint8_t *cmd)
+{
+    for (size_t i = 0; i < 12; i++) {
+#ifdef PEER_CMD12_UNFIXED
+        /* RED ARM ONLY — the original "must be NUL terminated" test. */
+        return cmd[11] == 0;
+#endif
+        if (cmd[i] == 0) {                                  /* padding begins */
+            for (; i < 12; i++) if (cmd[i] != 0) return 0;   /* must be all-NUL from here */
+            return 1;
+        }
+        if (cmd[i] < ' ' || cmd[i] > 0x7E) return 0;         /* printable ASCII only */
+    }
+    return 1;   /* exactly 12 characters, no terminator — legal */
+}
+
 static int _BRPeerAcceptMessage(BRPeer *peer, const uint8_t *msg, size_t msgLen, const char *type)
 {
     BRPeerContext *ctx = (BRPeerContext *)peer;
@@ -1613,6 +1716,7 @@ static void *_peerThreadRoutine(void *arg)
         assert(payload != NULL);
         gettimeofday(&tv, NULL);
         ctx->startTime = tv.tv_sec + (double)tv.tv_usec/1000000;
+        ctx->connectTime = ctx->startTime;  // LEDGER: write-once; startTime is reused as a ping stopwatch
         ctx->lastRecvTime = ctx->startTime; // baseline so a peer isn't "idle" before its first read
         BRPeerSendVersionMessage(peer);
         
@@ -1623,12 +1727,21 @@ static void *_peerThreadRoutine(void *arg)
             while (socket >= 0 && ! error && len < HEADER_LENGTH) {
                 n = read(socket, &header[len], sizeof(header) - len);
                 if (n > 0) len += n;
+                if (n > 0) ctx->bytesIn += (uint64_t)n;   // LEDGER
+                // LEDGER: classify BEFORE `error` collapses FIN and RST onto one value.
+                // `error` itself is left exactly as it was — additive only.
+                if (n <= 0 && ! (n < 0 && errno == EWOULDBLOCK)) {
+                    _BRPeerNoteClose(ctx, BRPeerClassifySocketResult(n, errno));
+                }
                 if (n == 0) error = ECONNRESET;
                 if (n < 0 && errno != EWOULDBLOCK) error = errno;
                 gettimeofday(&tv, NULL);
                 time = tv.tv_sec + (double)tv.tv_usec/1000000;
                 if (n > 0) ctx->lastRecvTime = time;
-                if (! error && time >= ctx->disconnectTime) error = ETIMEDOUT;
+                if (! error && time >= ctx->disconnectTime) {
+                    error = ETIMEDOUT;
+                    _BRPeerNoteClose(ctx, BR_CLOSE_LOCAL_SCHEDULED); // WE hung up; ctx->discTag says which rule
+                }
 
                 if (! error && time >= ctx->mempoolTime) {
                     peer_log(peer, "done waiting for mempool response");
@@ -1647,9 +1760,17 @@ static void *_peerThreadRoutine(void *arg)
             if (error) {
                 peer_log(peer, "%s", strerror(error));
             }
-            else if (header[15] != 0) { // verify header type field is NULL terminated
-                peer_log(peer, "malformed message header: type not NULL terminated");
+            else if (! _BRPeerCommandFieldValid(&header[4])) { // verify the 12-byte command field
+                // Log the RAW bytes: the old message named nothing, so the offending command
+                // could never be identified from a capture — which is exactly why this went
+                // unnoticed while it evicted canon peers.
+                peer_log(peer, "malformed message header: bad command field "
+                         "[%02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x] '%.12s'",
+                         header[4], header[5], header[6], header[7], header[8], header[9],
+                         header[10], header[11], header[12], header[13], header[14], header[15],
+                         (const char *)&header[4]);
                 error = EPROTO;
+                _BRPeerNoteClose(ctx, BR_CLOSE_LOCAL_PROTOCOL); // LEDGER
             }
             else if (len == HEADER_LENGTH) {
                 const char *type = (const char *)(&header[4]);
@@ -1660,6 +1781,7 @@ static void *_peerThreadRoutine(void *arg)
                 if (msgLen > MAX_MSG_LENGTH) { // check message length
                     peer_log(peer, "error reading %s, message length %"PRIu32" is too long", type, msgLen);
                     error = EPROTO;
+                    _BRPeerNoteClose(ctx, BR_CLOSE_LOCAL_PROTOCOL); // LEDGER
                 }
                 else {
                     if (msgLen > payloadLen) payload = realloc(payload, (payloadLen = msgLen));
@@ -1671,13 +1793,23 @@ static void *_peerThreadRoutine(void *arg)
                     while (socket >= 0 && ! error && len < msgLen) {
                         n = read(socket, &payload[len], msgLen - len);
                         if (n > 0) len += n;
+                        if (n > 0) ctx->bytesIn += (uint64_t)n;   // LEDGER
+                        // LEDGER: same FIN-vs-RST split as the header loop above.
+                        if (n <= 0 && ! (n < 0 && errno == EWOULDBLOCK)) {
+                            _BRPeerNoteClose(ctx, BRPeerClassifySocketResult(n, errno));
+                        }
                         if (n == 0) error = ECONNRESET;
                         if (n < 0 && errno != EWOULDBLOCK) error = errno;
                         gettimeofday(&tv, NULL);
                         time = tv.tv_sec + (double)tv.tv_usec/1000000;
                         if (n > 0) ctx->lastRecvTime = time;
                         if (n > 0) msgTimeout = time + MESSAGE_TIMEOUT;
-                        if (! error && time >= msgTimeout) error = ETIMEDOUT;
+                        if (! error && time >= msgTimeout) {
+                            error = ETIMEDOUT;
+                            // WE hung up: stalled part-way through a message body. Distinct from the
+                            // scheduled deadline — this one means the peer started answering and stopped.
+                            _BRPeerNoteClose(ctx, BR_CLOSE_LOCAL_MSG_TIMEOUT);
+                        }
                         socket = ctx->socket;
                     }
                     
@@ -1692,6 +1824,7 @@ static void *_peerThreadRoutine(void *arg)
                                      ", SHA256_2:%s", type, UInt32GetLE(&hash), checksum, msgLen,
                                      log_u256_hex_encode(hash));
                             error = EPROTO;
+                            _BRPeerNoteClose(ctx, BR_CLOSE_LOCAL_PROTOCOL); // LEDGER
                         }
                         else {
                             // Mark WHERE this thread is before dispatch. _BRPeerAcceptMessage
@@ -1708,7 +1841,13 @@ static void *_peerThreadRoutine(void *arg)
                             int ok = _BRPeerAcceptMessage(peer, payload, msgLen, type);
 
                             ctx->acceptStart = 0;      // cleared even on the failure path below
-                            if (! ok) error = EPROTO;
+                            ctx->msgsIn++;             // LEDGER: a complete, checksum-valid message
+                            if (! ok) {
+                                error = EPROTO;
+                                // WE hung up: a handler rejected the message. Distinct from a
+                                // malformed frame — the peer spoke valid protocol we refused.
+                                _BRPeerNoteClose(ctx, BR_CLOSE_LOCAL_PROTOCOL);
+                            }
                         }
                     }
                 }
@@ -1718,12 +1857,24 @@ static void *_peerThreadRoutine(void *arg)
         free(payload);
     }
     
+    // LEDGER: stamp the close and resolve the two cases nothing else could have recorded.
+    //   * never got a socket at all -> CONNECT_FAIL (connectTime is still 0)
+    //   * loop exited with error == 0 -> the ONLY way out is ctx->socket going to -1, and
+    //     the only writer of that is BRPeerDisconnect. So this is us, explicitly.
+    {
+        struct timeval ctv;
+        gettimeofday(&ctv, NULL);
+        ctx->closeTime = ctv.tv_sec + (double)ctv.tv_usec/1000000;
+    }
+    if (ctx->connectTime == 0) _BRPeerNoteClose(ctx, BR_CLOSE_CONNECT_FAIL);
+    else if (error == 0)       _BRPeerNoteClose(ctx, BR_CLOSE_LOCAL_EXPLICIT);
+
     socket = ctx->socket;
     ctx->socket = -1;
     ctx->status = BRPeerStatusDisconnected;
     if (socket >= 0) close(socket);
     peer_log(peer, "disconnected");
-    
+
     // THE 2026-08-03 CRASH SITE. Unsynchronized, this loop read array_count() out of a
     // buffer the keepalive thread had just realloc'd away and shifted ~235k elements off
     // the end of the mapping. Pop under the lock, invoke outside it.
@@ -1952,14 +2103,92 @@ void BRPeerDisconnect(BRPeer *peer)
     }
 }
 
+// As BRPeerDisconnect, but records which rule closed the peer.
+void BRPeerDisconnectTagged(BRPeer *peer, BRPeerDisconnectTag tag)
+{
+    BRPeerContext *ctx = (BRPeerContext *)peer;
+
+    _BRPeerNoteTag(ctx, tag);
+    _BRPeerNoteClose(ctx, BR_CLOSE_LOCAL_EXPLICIT);
+    BRPeerDisconnect(peer);
+}
+
 // call this to (re)schedule a disconnect in the given number of seconds, or < 0 to cancel (useful for sync timeout)
 void BRPeerScheduleDisconnect(BRPeer *peer, double seconds)
 {
+    BRPeerScheduleDisconnectTagged(peer, seconds, BR_DISC_TAG_NONE);
+}
+
+void BRPeerScheduleDisconnectTagged(BRPeer *peer, double seconds, BRPeerDisconnectTag tag)
+{
     BRPeerContext *ctx = ((BRPeerContext *)peer);
     struct timeval tv;
-    
+
     gettimeofday(&tv, NULL);
     ctx->disconnectTime = (seconds < 0) ? DBL_MAX : tv.tv_sec + (double)tv.tv_usec/1000000 + seconds;
+    // Cancelling clears the tag: leaving a stale one behind would misattribute whatever
+    // deadline fires next. An untagged (re)schedule from the legacy wrapper also clears,
+    // so a tag can never outlive the rule that set it.
+    _BRPeerNoteTag(ctx, (seconds < 0) ? BR_DISC_TAG_NONE : tag);
+}
+
+/* ---------- disconnect-ledger readout (see BRPeer.h) ---------- */
+
+BRPeerCloseCause BRPeerCloseCauseOf(BRPeer *peer) { return ((BRPeerContext *)peer)->closeCause; }
+BRPeerDisconnectTag BRPeerDisconnectTagOf(BRPeer *peer) { return ((BRPeerContext *)peer)->discTag; }
+uint64_t BRPeerBytesIn(BRPeer *peer)  { return ((BRPeerContext *)peer)->bytesIn; }
+uint64_t BRPeerBytesOut(BRPeer *peer) { return ((BRPeerContext *)peer)->bytesOut; }
+uint32_t BRPeerMsgsIn(BRPeer *peer)   { return ((BRPeerContext *)peer)->msgsIn; }
+uint32_t BRPeerMsgsOut(BRPeer *peer)  { return ((BRPeerContext *)peer)->msgsOut; }
+int BRPeerCompletedHandshake(BRPeer *peer) { return ((BRPeerContext *)peer)->gotVerack; }
+
+double BRPeerConnectedSecs(BRPeer *peer)
+{
+    BRPeerContext *ctx = (BRPeerContext *)peer;
+    double end;
+
+    if (ctx->connectTime == 0) return 0; // never got a socket
+    if (ctx->closeTime != 0) end = ctx->closeTime;
+    else {
+        struct timeval tv;
+        gettimeofday(&tv, NULL);
+        end = tv.tv_sec + (double)tv.tv_usec/1000000;
+    }
+    return (end > ctx->connectTime) ? end - ctx->connectTime : 0;
+}
+
+const char *BRPeerCloseCauseName(BRPeerCloseCause cause)
+{
+    switch (cause) {
+        case BR_CLOSE_CONNECT_FAIL:       return "CONNECT_FAIL";
+        case BR_CLOSE_LOCAL_SCHEDULED:    return "LOCAL_SCHEDULED";
+        case BR_CLOSE_LOCAL_MSG_TIMEOUT:  return "LOCAL_MSG_TIMEOUT";
+        case BR_CLOSE_LOCAL_SEND_TIMEOUT: return "LOCAL_SEND_TIMEOUT";
+        case BR_CLOSE_LOCAL_PROTOCOL:     return "LOCAL_PROTOCOL";
+        case BR_CLOSE_LOCAL_EXPLICIT:     return "LOCAL_EXPLICIT";
+        case BR_CLOSE_PEER_FIN:           return "PEER_FIN";
+        case BR_CLOSE_PEER_RST:           return "PEER_RST";
+        case BR_CLOSE_SOCKET_ERR:         return "SOCKET_ERR";
+        default:                          return "UNKNOWN";
+    }
+}
+
+const char *BRPeerDisconnectTagName(BRPeerDisconnectTag tag)
+{
+    switch (tag) {
+        case BR_DISC_TAG_SYNC:         return "sync";
+        case BR_DISC_TAG_PUBLISH:      return "publish";
+        case BR_DISC_TAG_IDLE_REAPER:  return "idle-reaper";
+        case BR_DISC_TAG_MANAGER_STOP: return "manager-stop";
+        case BR_DISC_TAG_MISBEHAVIN:   return "misbehavin";
+        case BR_DISC_TAG_NOT_SYNCED:   return "not-synced";
+        case BR_DISC_TAG_SEND_STALL:   return "send-stall";
+        case BR_DISC_TAG_MAXCONN_TRIM: return "maxconn-trim";
+        case BR_DISC_TAG_UNUSABLE_PEER:return "unusable-peer";
+        case BR_DISC_TAG_DOWNLOAD_SWAP:return "download-swap";
+        case BR_DISC_TAG_CF_STALL:     return "cf-stall";
+        default:                       return "none";
+    }
 }
 
 // display name of peer address
@@ -2088,15 +2317,34 @@ static void _BRPeerSendMessageTimeout(BRPeer *peer, const uint8_t *msg, size_t m
             double now;
             n = send(socket, &buf[msgLen], bufLen - msgLen, MSG_NOSIGNAL);
             if (n >= 0) msgLen += n;
+            if (n > 0) ctx->bytesOut += (uint64_t)n;   // LEDGER
+            // LEDGER: a send-side error is the REMOTE's teardown observed from our side —
+            // ECONNRESET/EPIPE here mean they closed on us, which is the same evidence the
+            // read loops carry. Classify before `error` is set; `error` is untouched.
+            if (n < 0 && errno != EWOULDBLOCK) {
+                _BRPeerNoteClose(ctx, (errno == EPIPE) ? BR_CLOSE_PEER_RST
+                                                       : BRPeerClassifySocketResult(n, errno));
+            }
             if (n < 0 && errno != EWOULDBLOCK) error = errno;
             gettimeofday(&tv, NULL);
             now = tv.tv_sec + (double)tv.tv_usec/1000000;
-            if (! error && now >= ctx->disconnectTime) error = ETIMEDOUT;
-            if (! error && now >= sendDeadline) error = ETIMEDOUT; // hard cap; disconnectTime is DBL_MAX for idle peers
+            if (! error && now >= ctx->disconnectTime) {
+                error = ETIMEDOUT;
+                _BRPeerNoteClose(ctx, BR_CLOSE_LOCAL_SCHEDULED); // LEDGER
+            }
+            if (! error && now >= sendDeadline) {
+                error = ETIMEDOUT; // hard cap; disconnectTime is DBL_MAX for idle peers
+                // LEDGER: the send stalled. This is the half-dead / zero-window socket the
+                // v3.10.21 keepalive regression turned into a lock wedge.
+                _BRPeerNoteClose(ctx, BR_CLOSE_LOCAL_SEND_TIMEOUT);
+                _BRPeerNoteTag(ctx, BR_DISC_TAG_SEND_STALL);
+            }
             socket = ctx->socket;
         }
 
         if (buf != stackbuf) free(buf);
+
+        if (! error) ctx->msgsOut++;   // LEDGER: message fully on the wire
 
         if (error) {
             peer_log(peer, "%s", strerror(error));

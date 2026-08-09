@@ -278,7 +278,8 @@ typedef struct {
     void (*hasTx)(void *info, UInt256 txHash);
     void (*rejectedTx)(void *info, UInt256 txHash, uint8_t code);
     void (*relayedBlock)(void *info, BRMerkleBlock *block);
-    void (*relayedBlockTxns)(void *info, UInt256 blockHash, const UInt256 txHashes[], size_t txCount);
+    void (*relayedBlockTxns)(void *info, UInt256 blockHash, UInt256 merkleRoot, const UInt256 txHashes[],
+                             size_t txCount);
     void (*relayedBlockInv)(void *info, UInt256 blockHash);
     void (*notfound)(void *info, const UInt256 txHashes[], size_t txCount, const UInt256 blockHashes[],
                      size_t blockCount);
@@ -1200,7 +1201,13 @@ static int _BRPeerAcceptBlockMessage(BRPeer *peer, const uint8_t *msg, size_t ms
     }
 
     if (ctx->relayedBlockTxns && txCount > 0) {
-        ctx->relayedBlockTxns(ctx->info, blockHash, txHashes, txCount);
+        // The merkle root COMMITTED BY THIS MESSAGE'S OWN HEADER, at msg[36..68] — inside the
+        // same 80 bytes blockHash is the double-SHA256 of, so a peer cannot touch it without
+        // changing blockHash. Handing it up is what lets the manager prove the tx list below is
+        // the block's actual, complete list once it has resolved blockHash in its trusted header
+        // set: nothing in this function checks the tx list against anything, and the wallet's own
+        // resident header may be a hardcoded checkpoint stub carrying no merkleRoot of its own.
+        ctx->relayedBlockTxns(ctx->info, blockHash, UInt256Get(&msg[36]), txHashes, txCount);
     }
     free(txHashes);
 
@@ -1774,9 +1781,15 @@ BRPeer *BRPeerNew(uint32_t magicNumber)
 // void hasTx(void *, UInt256 txHash) - called when an "inv" message with an already-known tx hash is received from peer
 // void rejectedTx(void *, UInt256 txHash, uint8_t) - called when a "reject" message is received from peer
 // void relayedBlock(void *, BRMerkleBlock *) - called when a "merkleblock" or "headers" message is received from peer
-// void relayedBlockTxns(void *, UInt256, const UInt256[], size_t) - called after a full "block" message's txs are
-//     all delivered via relayedTx, with the block hash and the hashes of the txs just delivered (BIP158 CF
-//     confirmation path: lets the manager confirm those txs into the block once its header/height is known)
+// void relayedBlockTxns(void *, UInt256 blockHash, UInt256 merkleRoot, const UInt256[], size_t) - called after a
+//     full "block" message's txs are all delivered via relayedTx, with the block hash, the merkle root COMMITTED BY
+//     THE DELIVERED HEADER, and the hashes of ALL the block's txs in order (BIP158 CF confirmation path: lets the
+//     manager confirm those txs into the block once its header/height is known).
+//     merkleRoot is msg[36..68] of the same 80 bytes blockHash is the double-SHA256 of, so it cannot be altered
+//     without changing blockHash -- once the manager resolves blockHash in its trusted header set, this root is
+//     authentic, and recomputing it over txHashes proves the delivered tx list is the block's ACTUAL, complete tx
+//     list (see BRMerkleRootFromTxHashes). Without that check a peer can answer a getdata with the real header and
+//     a tx list with the wallet's payment stripped out.
 // void notfound(void *, const UInt256[], size_t, const UInt256[], size_t) - called when "notfound" message is received
 // BRTransaction *requestedTx(void *, UInt256) - called when "getdata" message with a tx hash is received from peer
 // int networkIsReachable(void *) - must return true when networking is available, false otherwise
@@ -1789,8 +1802,8 @@ void BRPeerSetCallbacks(BRPeer *peer, void *info,
                         void (*hasTx)(void *info, UInt256 txHash),
                         void (*rejectedTx)(void *info, UInt256 txHash, uint8_t code),
                         void (*relayedBlock)(void *info, BRMerkleBlock *block),
-                        void (*relayedBlockTxns)(void *info, UInt256 blockHash, const UInt256 txHashes[],
-                                                  size_t txCount),
+                        void (*relayedBlockTxns)(void *info, UInt256 blockHash, UInt256 merkleRoot,
+                                                  const UInt256 txHashes[], size_t txCount),
                         void (*relayedBlockInv)(void *info, UInt256 blockHash),
                         void (*notfound)(void *info, const UInt256 txHashes[], size_t txCount,
                                          const UInt256 blockHashes[], size_t blockCount),

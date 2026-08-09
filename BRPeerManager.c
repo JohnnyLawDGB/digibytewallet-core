@@ -228,6 +228,39 @@ inline static int _BRBlockHeightEq(const void *block, const void *otherBlock)
     return (((const BRMerkleBlock *)block)->height == ((const BRMerkleBlock *)otherBlock)->height);
 }
 
+// ---- CF full-block SOLICITATION table (C1 request-gate) ---------------------
+// A CF scan height is completed (BRCFScanLedgerMarkEvaluated) by the arrival of the full
+// block for that height, in _peerRelayedBlockTxns. That handler is fed by BRPeer.c's
+// `block` message path, which is NOT request-gated (BRPeer.c dispatches MSG_BLOCK
+// unconditionally) and does NOT check the delivered tx list against the header's committed
+// merkle root. So without this table, ANY peer the wallet dials can complete an outstanding
+// height with an unsolicited `block` (real public header + one arbitrary tx), or the peer
+// serving that height can answer our getdata with the real header and the wallet's payment
+// STRIPPED out of the tx list. Either way scannedThrough sails past a height that was never
+// scanned, the ledger persists it, and the receive is invisible until a manual rescan.
+//
+// So: every getdata dispatched after a cfilter that VERIFIED against the committed cfheader
+// chain and MATCHED is recorded here, and only a block found here may complete a height.
+//
+// Deliberately NOT keyed by peer: content integrity is proven by the merkle-root check
+// against OUR OWN header, so it does not matter which peer hands us the bytes; the table's
+// job is only "did this wallet ever ask for this height at all".
+//
+// Manager-INLINE and bounded: no allocation, so nothing new to free (BRPeerManagerFree is
+// untouched). When full, the OLDEST solicitation is evicted; losing an entry only costs a
+// re-request (the height simply stays outstanding), never a silent completion. Entries are
+// dropped on successful completion and the whole table is cleared whenever the scan is
+// re-anchored/re-armed/disabled/restored (the solicitation belongs to the old scan) and on
+// BRPeerManagerDisconnect (the getdata died with the connections).
+#define CF_SOLICITED_BLOCKS_MAX 256
+
+typedef struct {
+    UInt256  blockHash;
+    uint32_t height;   // the height we believed this hash sat at when we asked
+    uint64_t seq;      // insertion order, for oldest-first eviction (0 == free slot)
+    int      used;
+} BRCFSolicitedBlock;
+
 struct BRPeerManagerStruct {
     const BRChainParams *params;
     BRWallet *wallet;
@@ -263,6 +296,10 @@ struct BRPeerManagerStruct {
     void *saveCFLedgerInfo;
     void (*saveCFLedger)(void *info, const uint8_t *bytes, size_t len);
     BRCFScanLedger cfLedger;
+    // C1 request-gate: full blocks THIS wallet asked for after a verified cfilter match.
+    // See BRCFSolicitedBlock above. calloc'd with the manager -> starts empty.
+    BRCFSolicitedBlock cfSolicitedBlocks[CF_SOLICITED_BLOCKS_MAX];
+    uint64_t cfSolicitedSeq;
     // Cached BIP 158 wallet element set, reused across arriving cfilters. Rebuilding it
     // per filter was 98.8% of the per-filter cost (see _BRPeerManagerFilterElementsLocked).
     // cfElemsAddrCount is the address count the cache was built from and is the ONLY
@@ -2278,6 +2315,62 @@ static void _BRPeerManagerPersistCFLedgerLocked(BRPeerManager *manager)
     free(ledgerBuf);
 }
 
+// ---- CF full-block solicitation table (C1 request-gate) --------------------
+// Contract and rationale: see BRCFSolicitedBlock at the top of this file. All three
+// require manager->lock.
+
+// Records that WE dispatched getdata for `blockHash` (resolved at `height`) because a
+// cfilter that verified against the committed cfheader chain matched the wallet.
+static void _BRPeerManagerRecordSolicitedBlockLocked(BRPeerManager *manager, UInt256 blockHash, uint32_t height)
+{
+    size_t slot = SIZE_MAX, oldest = 0;
+
+    for (size_t i = 0; i < CF_SOLICITED_BLOCKS_MAX; i++) {
+        if (manager->cfSolicitedBlocks[i].used &&
+            UInt256Eq(manager->cfSolicitedBlocks[i].blockHash, blockHash)) { // re-request of the same block
+            manager->cfSolicitedBlocks[i].height = height;
+            manager->cfSolicitedBlocks[i].seq    = ++manager->cfSolicitedSeq;
+            return;
+        }
+
+        if (slot == SIZE_MAX && ! manager->cfSolicitedBlocks[i].used) slot = i;
+        if (manager->cfSolicitedBlocks[i].seq < manager->cfSolicitedBlocks[oldest].seq) oldest = i;
+    }
+
+    if (slot == SIZE_MAX) { // table full: evict the oldest in-flight solicitation
+        slot = oldest;
+        _peer_log("cf-ledger: solicited-block table full (%d) — evicting the getdata for height %u; "
+                  "that height stays outstanding and is re-requested\n",
+                  CF_SOLICITED_BLOCKS_MAX, manager->cfSolicitedBlocks[slot].height);
+    }
+
+    manager->cfSolicitedBlocks[slot].blockHash = blockHash;
+    manager->cfSolicitedBlocks[slot].height    = height;
+    manager->cfSolicitedBlocks[slot].seq       = ++manager->cfSolicitedSeq;
+    manager->cfSolicitedBlocks[slot].used      = 1;
+}
+
+// Returns the table index of an OUTSTANDING solicitation for exactly this (blockHash, height)
+// pair, or -1. Deliberately does NOT consume: a forged/stripped delivery must not be able to
+// burn the solicitation and lock the honest block out of completing the height.
+static int _BRPeerManagerFindSolicitedBlockLocked(BRPeerManager *manager, UInt256 blockHash, uint32_t height)
+{
+    for (size_t i = 0; i < CF_SOLICITED_BLOCKS_MAX; i++) {
+        if (manager->cfSolicitedBlocks[i].used &&
+            manager->cfSolicitedBlocks[i].height == height &&
+            UInt256Eq(manager->cfSolicitedBlocks[i].blockHash, blockHash)) return (int)i;
+    }
+
+    return -1;
+}
+
+// Drops every recorded solicitation. Called wherever the scan they belong to goes away.
+static void _BRPeerManagerClearSolicitedBlocksLocked(BRPeerManager *manager)
+{
+    memset(manager->cfSolicitedBlocks, 0, sizeof(manager->cfSolicitedBlocks));
+    manager->cfSolicitedSeq = 0;
+}
+
 static void _peerRelayedBlock(void *info, BRMerkleBlock *block)
 {
     BRPeer *peer = ((BRPeerCallbackInfo *)info)->peer;
@@ -2611,7 +2704,8 @@ static void _peerRelayedBlock(void *info, BRMerkleBlock *block)
 // _BRPeerAcceptBlockMessage). Chain extension for the block itself is handled entirely by the
 // regular headers/merkleblock path (_peerRelayedBlock above); this handler only fires once that
 // block's header is already known, so it can attach a confirmation height/timestamp to the txs.
-static void _peerRelayedBlockTxns(void *info, UInt256 blockHash, const UInt256 txHashes[], size_t txCount)
+static void _peerRelayedBlockTxns(void *info, UInt256 blockHash, UInt256 merkleRoot,
+                                  const UInt256 txHashes[], size_t txCount)
 {
     BRPeerManager *manager = ((BRPeerCallbackInfo *)info)->manager;
     BRMerkleBlock *b, *b2;
@@ -2677,8 +2771,79 @@ static void _peerRelayedBlockTxns(void *info, UInt256 blockHash, const UInt256 t
 #ifndef CF_MATCH_MARK_ON_REQUEST_UNFIXED
     // Every transaction in the full block was parsed and handed through relayedTx
     // before this callback. Only now is a matched filter durably complete.
+#ifdef CF_BLOCK_COMPLETION_UNGATED_UNFIXED
+    // PRE-FIX shape — host-KAT red-before-green ONLY (never defined in a production build).
+    // Completion trusts the `block` message outright: any dialed peer's UNSOLICITED block
+    // clears an outstanding hole, and a SOLICITED block with the wallet's payment stripped
+    // out of its tx list completes the height with the receive uncredited. See the
+    // cf_block_completion_gate_kat RED arm.
     BRCFScanLedgerMarkEvaluated(&manager->cfLedger, b->height);
     _BRPeerManagerPersistCFLedgerLocked(manager);
+#else
+    // C1 (fund safety). Two things must hold before this delivery is allowed to retire a
+    // scan height, because BRPeer.c's `block` path proves NEITHER on its own:
+    //
+    //   1. WE asked for it. BRPeer.c:_BRPeerAcceptBlockMessage is dispatched with no
+    //      request-gating at all, and the callback is wired on every connected peer — so
+    //      without this, any peer can erase a hole another peer was asked to fill (and
+    //      RecordRequested puts an ENTIRE requested range into `outstanding` at getcfilters
+    //      time, so a peer that withholds its cfilters and sprays blocks could drive
+    //      scannedThrough to requestedThrough with ZERO filters ever evaluated).
+    //
+    //   2. The delivered tx list is the block's ACTUAL tx list. Nothing upstream checks it
+    //      against the header's committed merkle root, so the peer serving the height can
+    //      answer our own getdata with the real 80-byte header (correct blockHash, resolves
+    //      here, passes the main-chain walk) and a tx list with the wallet's payment removed.
+    //      Recomputing the root over the delivered txids is exactly what catches that.
+    //
+    // `merkleRoot` is the root committed by the DELIVERED header (BRPeer.c hands up msg[36..68]
+    // from the same 80 bytes blockHash is the double-SHA256 of). Since blockHash just resolved
+    // in our own header set, that root is authentic — and it is the right one to check against,
+    // because our RESIDENT header can be a hardcoded checkpoint stub with no merkleRoot at all
+    // (BRPeerManagerNewEx seeds every checkpoint as a stub, and the scan floor sits on one).
+    // Checking a stub's zero root instead would refuse every honest delivery at the floor and
+    // wedge the scan there forever. b->merkleRoot is still cross-checked when it HAS one.
+    //
+    // A verified block with NO wallet transactions still completes the height — the question
+    // is "did I ask for this, and does it verify", never "did it pay me". On either failure
+    // the height stays OUTSTANDING and the ordinary re-request driver retries it, which is
+    // the safe direction: re-scanning a height costs a round trip, skipping one hides a
+    // receive until a manual rescan.
+    int solicited = _BRPeerManagerFindSolicitedBlockLocked(manager, blockHash, b->height);
+
+    if (solicited >= 0) {
+        UInt256 deliveredRoot = UINT256_ZERO;
+
+        if (! BRMerkleRootFromTxHashes(&deliveredRoot, txHashes, txCount)) {
+            _peer_log("cf-ledger: block %u tx list is not a usable merkle preimage (%zu tx, "
+                      "duplicate-subtree mutation?) — height stays outstanding\n", b->height, txCount);
+        }
+        else if (! UInt256Eq(deliveredRoot, merkleRoot)) {
+            // Stripped/substituted/reordered tx list: it does not hash to what this block's own
+            // header commits to, so it proves nothing about what height b->height contains.
+            _peer_log("cf-ledger: block %u tx list does NOT hash to the header's committed merkle "
+                      "root — refusing to complete the height, left outstanding for re-request\n",
+                      b->height);
+        }
+        else if (! UInt256IsZero(b->merkleRoot) && ! UInt256Eq(merkleRoot, b->merkleRoot)) {
+            // Defence in depth: unreachable while blockHash resolution is sound (the hash commits
+            // to the header the root lives in), so reaching it means our resident header and the
+            // delivered one disagree — do not complete on that.
+            _peer_log("cf-ledger: block %u delivered header's merkle root disagrees with our "
+                      "resident header — refusing to complete the height\n", b->height);
+        }
+        else {
+            manager->cfSolicitedBlocks[solicited].used = 0; // consume ONLY on success
+            manager->cfSolicitedBlocks[solicited].seq  = 0;
+            BRCFScanLedgerMarkEvaluated(&manager->cfLedger, b->height);
+            _BRPeerManagerPersistCFLedgerLocked(manager);
+        }
+    }
+    else {
+        _peer_log("cf-ledger: full block for height %u was never solicited by this wallet — "
+                  "not completing its scan height\n", b->height);
+    }
+#endif
 #endif
 
     free(walletHashes);
@@ -3336,6 +3501,7 @@ static void _BRPeerManagerRequestNextCFHeaders(BRPeerManager *manager, BRPeer *p
             manager->autoFetchCFiltersStart    = restart;
             manager->autoFetchCFiltersThrough  = restart > 0 ? restart - 1 : 0;
             BRCFScanLedgerInit(&manager->cfLedger, restart);
+            _BRPeerManagerClearSolicitedBlocksLocked(manager); // C1: in-flight solicitations belong to the scan just replaced
 #if CF_LEDGER_DRIVE_REREQUEST
             BRCFScanLedgerClearFilterBuffer(&manager->cfLedger);
 #endif
@@ -4015,6 +4181,10 @@ static void _peerRelayedCFilter(void *info, uint8_t filterType, UInt256 blockHas
     if (hit) {
         peer_log(peer, "cfilter: MATCH on block %s @ height %u, requesting full block",
                  log_u256_hex_encode(blockHash), b->height);
+        // C1 request-gate: record the solicitation BEFORE the send, so the answer can
+        // never race ahead of the record. Only a block in this table may complete a scan
+        // height in _peerRelayedBlockTxns.
+        _BRPeerManagerRecordSolicitedBlockLocked(manager, blockHash, b->height);
         // Send while holding the lock — matches the pattern used elsewhere
         // in this file (e.g. _BRPeerManagerRequestNextCFHeaders also sends
         // under the lock). The lock guards manager state, not the socket.
@@ -4622,6 +4792,7 @@ static int _cfBufEval(void *vctx, uint32_t height, UInt256 blockHash, const uint
             if (_BRPeerManagerPeerCanServeFilters(m->connectedPeers[i - 1])) { p = m->connectedPeers[i - 1]; break; }
         }
         if (! p) return 0;                                                 // hit but no peer -> KEEP buffered, stay outstanding, retry
+        _BRPeerManagerRecordSolicitedBlockLocked(m, blockHash, height);    // C1: record BEFORE the send (see _peerRelayedBlockTxns)
         BRPeerSendGetdataBlocks(p, &blockHash, 1);                         // credit: fetch the block -> tx registered on arrival
 #ifdef CF_MATCH_MARK_ON_REQUEST_UNFIXED
         BRCFScanLedgerMarkEvaluated(&m->cfLedger, height);
@@ -5394,6 +5565,9 @@ void BRPeerManagerDisconnect(BRPeerManager *manager)
     // prevent new peers from being spawned
     maxConnectCount = manager->maxConnectCount;
     manager->maxConnectCount = 0;
+    // C1: every in-flight getdata dies with these connections. A block arriving after a
+    // reconnect was not solicited by the reconnected session, so it must not complete a height.
+    _BRPeerManagerClearSolicitedBlocksLocked(manager);
     
     for (size_t i = array_count(manager->connectedPeers); i > 0; i--) {
         p = manager->connectedPeers[i - 1];
@@ -6036,6 +6210,7 @@ static int _BRPeerManagerReanchorAtFloorLocked(BRPeerManager *manager, int force
     manager->autoFetchCFiltersStart    = restart;
     manager->autoFetchCFiltersThrough  = restart > 0 ? restart - 1 : 0;
     BRCFScanLedgerInit(&manager->cfLedger, restart);
+    _BRPeerManagerClearSolicitedBlocksLocked(manager); // C1: in-flight solicitations belong to the scan just replaced
 #if CF_LEDGER_DRIVE_REREQUEST
     // Explicit/defensive (Task 5 EDIT 4): stale buffered raw filter bytes from the
     // pre-reanchor chain must not survive — Init already frees them internally.
@@ -6169,6 +6344,9 @@ int BRPeerManagerCFLedgerRestore(BRPeerManager *manager, const uint8_t *buf, siz
     assert(manager != NULL);
     MGR_LOCK(manager);
     int ok = BRCFScanLedgerParse(&manager->cfLedger, buf, buflen);
+    // C1: the restored ledger is a different scan state than whatever this manager had in
+    // flight — a solicitation recorded against the old one must not complete a hole in it.
+    _BRPeerManagerClearSolicitedBlocksLocked(manager);
     MGR_UNLOCK(manager);
     return ok;
 }
@@ -6461,6 +6639,7 @@ void BRPeerManagerEnableAutoCompactFilterFetch(BRPeerManager *manager, uint32_t 
     // residual driver slowly retried, not anything special about the anchor. Skipping it
     // would silently drop a height the wallet does scan.
     BRCFScanLedgerInit(&manager->cfLedger, startHeight);
+    _BRPeerManagerClearSolicitedBlocksLocked(manager); // C1: in-flight solicitations belong to the scan just replaced
 #if CF_LEDGER_DRIVE_REREQUEST
     // Explicit/defensive (Task 5 EDIT 4): re-arm must not carry stale buffered raw
     // filter bytes from before this (re-)enable — Init already frees them internally.
@@ -6477,6 +6656,7 @@ void BRPeerManagerDisableAutoCompactFilterFetch(BRPeerManager *manager)
     manager->autoFetchCFiltersStart = 0;
     manager->autoFetchCFiltersThrough = 0;
     manager->autoFetchCFiltersRequested = 0;   // hygiene: no stale requested floor for the next arm
+    _BRPeerManagerClearSolicitedBlocksLocked(manager); // C1: nothing may complete a height after the scan is disarmed
 #if CF_LEDGER_DRIVE_REREQUEST
     // Hygiene (Task 5 EDIT 4): a disable must not leave stale buffered bytes
     // lingering — unlike the re-anchor/re-arm sites, Disable does NOT call

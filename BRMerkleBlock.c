@@ -278,6 +278,52 @@ void BRMerkleBlockSetTxHashes(BRMerkleBlock *block, const UInt256 hashes[], size
     if (block->flags) memcpy(block->flags, flags, flagsLen);
 }
 
+// Computes a block's merkle root from the COMPLETE, in-order list of its transaction hashes (txids) --
+// the form a full "block" message delivers (BRPeer.c _BRPeerAcceptBlockMessage), as opposed to the
+// partial tree BRMerkleBlockParse/_BRMerkleBlockRootR walk for a "merkleblock". This is what lets a
+// caller check a delivered tx list against the header's committed merkleRoot: omitting, adding, or
+// substituting any transaction changes the computed root.
+//
+// NOTE (CVE-2012-2459): the tree duplicates the last node of an odd row, so a mutated list can
+// reproduce an honest root. Any row containing an adjacent duplicate pair is therefore rejected
+// outright (returns 0) rather than reduced -- a valid block can never contain duplicate txids
+// (BIP30), so this only ever rejects a mutation.
+//
+// Returns 1 and writes *root on success. Returns 0 (leaving *root untouched) on a NULL/empty list,
+// an allocation failure, or a mutated tree.
+int BRMerkleRootFromTxHashes(UInt256 *root, const UInt256 *txHashes, size_t txCount)
+{
+    if (! root || ! txHashes || txCount == 0) return 0;
+    if (txCount == 1) { *root = txHashes[0]; return 1; } // coinbase-only block: root == the single txid
+
+    // +1 so an odd row can duplicate its last entry in place
+    UInt256 *row = malloc((txCount + 1)*sizeof(*row));
+    size_t n = txCount;
+
+    if (! row) return 0;
+    memcpy(row, txHashes, txCount*sizeof(*row));
+
+    while (n > 1) {
+        for (size_t i = 0; i + 1 < n; i += 2) { // pre-duplication row: same comparison Bitcoin Core's mutation check makes
+            if (UInt256Eq(row[i], row[i + 1])) { free(row); return 0; }
+        }
+
+        if (n & 1) { row[n] = row[n - 1]; n++; } // odd row: duplicate the last entry
+
+        for (size_t i = 0; i < n/2; i++) {
+            UInt256 pair[2] = { row[2*i], row[2*i + 1] };
+
+            BRSHA256_2(&row[i], pair, sizeof(pair)); // same concat-then-double-SHA256 _BRMerkleBlockRootR uses
+        }
+
+        n /= 2;
+    }
+
+    *root = row[0];
+    free(row);
+    return 1;
+}
+
 // recursively walks the merkle tree to calculate the merkle root
 // NOTE: this merkle tree design has a security vulnerability (CVE-2012-2459), which can be defended against by
 // considering the merkle root invalid if there are duplicate hashes in any rows with an even number of elements

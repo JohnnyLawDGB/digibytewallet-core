@@ -102,6 +102,13 @@ size_t BRMerkleBlockSerialize(const BRMerkleBlock *block, uint8_t *buf, size_t b
 // returns number of tx hashes written, or the total hashesCount needed if txHashes is NULL
 size_t BRMerkleBlockTxHashes(const BRMerkleBlock *block, UInt256 *txHashes, size_t hashesCount);
 
+// computes a block's merkle root from the COMPLETE, in-order list of its transaction hashes (txids),
+// i.e. the form a full "block" message delivers -- compare the result against a header's committed
+// merkleRoot to prove the delivered tx list is the block's actual, unmodified tx list
+// returns 1 and writes *root on success; returns 0 (leaving *root untouched) on an empty list, an
+// allocation failure, or a CVE-2012-2459 duplicate-subtree mutation
+int BRMerkleRootFromTxHashes(UInt256 *root, const UInt256 *txHashes, size_t txCount);
+
 // sets the hashes and flags fields for a block created with BRMerkleBlockNew()
 void BRMerkleBlockSetTxHashes(BRMerkleBlock *block, const UInt256 hashes[], size_t hashesCount,
                               const uint8_t *flags, size_t flagsLen);

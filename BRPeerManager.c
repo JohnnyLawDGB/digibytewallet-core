@@ -1063,6 +1063,7 @@ static void _BRPeerManagerFindPeers(BRPeerManager *manager)
 // _peerRelayedCFHeaders. Definitions live near BRPeerManagerSetCallbacks
 // alongside the rest of the compact-filter helpers.
 static void _BRPeerManagerOnFilterCapablePeerConnected(BRPeerManager *manager, void *peerCbInfo, BRPeer *peer);
+static void _BRPeerManagerInstallSavedBlock(BRPeerManager *manager, BRMerkleBlock *block);
 static size_t _BRPeerManagerRequestCFiltersLocked(BRPeerManager *manager,
                                                   uint32_t startHeight, uint32_t stopHeight,
                                                   BRPeer *preferred);
@@ -2364,7 +2365,7 @@ static void _peerRelayedBlock(void *info, BRMerkleBlock *block)
             peer_log(peer, "adding block #%"PRIu32, block->height);
         }
         
-        BRSetAdd(manager->blocks, block);
+        _BRPeerManagerInstallSavedBlock(manager, block);
         manager->lastBlock = block;
 
         // Paced-convoy: lastBlock just advanced, so the header window changed —
@@ -2425,6 +2426,10 @@ static void _peerRelayedBlock(void *info, BRMerkleBlock *block)
         
         // check if another block with equal hash existed
         if (b != block) {
+            if (BRSetGet(manager->checkpoints, b) == b) {
+                BRMerkleBlock *checkpoint = BRSetAdd(manager->checkpoints, block);
+                assert(checkpoint == b);
+            }
             // remove the block from orphans, if it exists
             if (BRSetGet(manager->orphans, b) == b) BRSetRemove(manager->orphans, b);
             if (manager->lastOrphan == b) manager->lastOrphan = NULL;
@@ -2859,6 +2864,21 @@ BRPeerManager *BRPeerManagerNew(const BRChainParams *params, BRWallet *wallet, u
     return BRPeerManagerNewEx(params, wallet, earliestKeyTime, blocks, blocksCount, peers, peersCount, NULL);
 }
 
+// Install a persisted header into the live main-chain set. A persisted run may
+// cross a hardcoded checkpoint whose hash-only stub is already in both sets.
+// Replace that stub in BOTH indexes with the real serialized header so its
+// prevBlock keeps the restored chain connected and ownership remains singular.
+static void _BRPeerManagerInstallSavedBlock(BRPeerManager *manager, BRMerkleBlock *block)
+{
+    BRMerkleBlock *replaced = BRSetAdd(manager->blocks, block);
+    if (replaced && replaced != block &&
+        BRSetGet(manager->checkpoints, replaced) == replaced) {
+        BRMerkleBlock *checkpoint = BRSetAdd(manager->checkpoints, block);
+        assert(checkpoint == replaced);
+        BRMerkleBlockFree(replaced);
+    }
+}
+
 // returns a newly allocated BRPeerManager struct that must be freed by calling BRPeerManagerFree()
 BRPeerManager *BRPeerManagerNewEx(const BRChainParams *params, BRWallet *wallet, uint32_t earliestKeyTime,
                                 BRMerkleBlock *blocks[], size_t blocksCount, const BRPeer peers[], size_t peersCount, BRMerkleBlock* startSyncFrom)
@@ -2990,12 +3010,21 @@ BRPeerManager *BRPeerManagerNewEx(const BRChainParams *params, BRWallet *wallet,
         // cycle can never spin here, and the BRSetContains check stops the walk the
         // moment it would revisit a header already made resident.
         for (size_t i = 0; block && i < blocksCount; i++) {
-            BRSetAdd(manager->blocks, block);
+            _BRPeerManagerInstallSavedBlock(manager, block);
             orphan.prevBlock = block->prevBlock;
             BRMerkleBlock *dropped = BRSetRemove(manager->orphans, &orphan);
             if (dropped && dropped != block) BRSetAdd(manager->orphans, dropped);   // a sibling: keep it owned
             block = BRSetGet(savedByHash, &block->prevBlock);
-            if (block && BRSetContains(manager->blocks, block)) block = NULL;       // already resident: stop
+            if (block) {
+                BRMerkleBlock *resident = BRSetGet(manager->blocks, block);
+#ifdef RESUME_CHECKPOINT_STUB_UNFIXED
+                if (resident) block = NULL;
+#else
+                BRMerkleBlock *checkpoint = BRSetGet(manager->checkpoints, block);
+                if (resident && resident != checkpoint) block = NULL;
+#endif
+            }
+
         }
 
         BRSetFree(savedByHash);

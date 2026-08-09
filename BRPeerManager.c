@@ -2592,13 +2592,35 @@ static void _peerRelayedBlock(void *info, BRMerkleBlock *block)
         }
         
         b = BRSetAdd(manager->blocks, block);
-        
+
         // check if another block with equal hash existed
         if (b != block) {
+            int freeable = 1;
+#ifdef CHECKPOINT_STUB_FREE_UNGUARDED_UNFIXED
+            // RED ARM ONLY (checkpoint_stub_free_guard_kat) — never defined in a production
+            // build. Pre-fix shape: repoints checkpoints by HEIGHT, trusting an assert() that
+            // is compiled out under NDEBUG, then frees `b` unconditionally below (P1).
             if (BRSetGet(manager->checkpoints, b) == b) {
                 BRMerkleBlock *checkpoint = BRSetAdd(manager->checkpoints, block);
                 assert(checkpoint == b);
             }
+#else
+            if (BRSetGet(manager->checkpoints, b) == b) {
+                // checkpoints is keyed by HEIGHT, `b`/manager->blocks by HASH: the repoint
+                // below only lands on `b`'s slot when the two heights agree. If they don't,
+                // BRSetAdd(checkpoints, block) inserts under a DIFFERENT key and `b` stays
+                // resident in manager->checkpoints — freeing it at the bottom of this branch
+                // would then leave a dangling pointer in a set nothing ever removes from
+                // (P1). Gate the free on the repoint having actually landed, at runtime.
+                if (b->height == block->height) {
+                    BRMerkleBlock *checkpoint = BRSetAdd(manager->checkpoints, block);
+                    assert(checkpoint == b);
+                    if (checkpoint != b) freeable = 0;   // still held elsewhere — leak, not dangle
+                } else {
+                    freeable = 0;   // heights disagree: leave the stub owned by checkpoints
+                }
+            }
+#endif
             // remove the block from orphans, if it exists
             if (BRSetGet(manager->orphans, b) == b) BRSetRemove(manager->orphans, b);
             if (manager->lastOrphan == b) manager->lastOrphan = NULL;
@@ -2629,7 +2651,16 @@ static void _peerRelayedBlock(void *info, BRMerkleBlock *block)
             if (manager->floorMemoTip == b) manager->floorMemoValid = 0;
             if (manager->startSyncFrom == b) manager->startSyncFrom = block;
 
+#ifdef CHECKPOINT_STUB_FREE_UNGUARDED_UNFIXED
             BRMerkleBlockFree(b);
+#else
+            if (freeable) {
+                BRMerkleBlockFree(b);
+            }
+            // else: `b` leaks — still resident in manager->checkpoints under a height key
+            // that disagrees with `block`'s. The correct degradation per P1: a leak is safe,
+            // a dangling checkpoints entry is not.
+#endif
         }
     }
     else if (manager->lastBlock->height < BRPeerLastBlock(peer) &&
@@ -3132,12 +3163,43 @@ BRPeerManager *BRPeerManagerNew(const BRChainParams *params, BRWallet *wallet, u
 static void _BRPeerManagerInstallSavedBlock(BRPeerManager *manager, BRMerkleBlock *block)
 {
     BRMerkleBlock *replaced = BRSetAdd(manager->blocks, block);
+#ifdef CHECKPOINT_STUB_FREE_UNGUARDED_UNFIXED
+    // RED ARM ONLY (checkpoint_stub_free_guard_kat) — never defined in a production build.
+    // Pre-fix shape: manager->blocks matched `replaced` by HASH but manager->checkpoints
+    // is repointed by HEIGHT, and the only guard against the two disagreeing was
+    // assert(checkpoint == replaced) — a no-op under NDEBUG. If block->height differs
+    // from replaced->height, BRSetAdd(checkpoints, block) inserts under a different key,
+    // `replaced` stays resident in manager->checkpoints, and this frees it anyway (P1).
     if (replaced && replaced != block &&
         BRSetGet(manager->checkpoints, replaced) == replaced) {
         BRMerkleBlock *checkpoint = BRSetAdd(manager->checkpoints, block);
         assert(checkpoint == replaced);
         BRMerkleBlockFree(replaced);
     }
+#else
+    if (replaced && replaced != block &&
+        BRSetGet(manager->checkpoints, replaced) == replaced) {
+        // checkpoints is keyed by HEIGHT, blocks is keyed by HASH: the repoint below
+        // only lands on `replaced`'s slot when the two heights agree. If they don't,
+        // BRSetAdd(checkpoints, block) inserts under a DIFFERENT key and `replaced`
+        // stays resident in manager->checkpoints — freeing it here would then leave a
+        // dangling pointer in a set nothing ever removes from (P1). Gate the free on
+        // the repoint having actually landed, at runtime, not just via assert().
+        if (replaced->height == block->height) {
+            BRMerkleBlock *checkpoint = BRSetAdd(manager->checkpoints, block);
+            assert(checkpoint == replaced);
+            if (checkpoint == replaced) {
+                BRMerkleBlockFree(replaced);
+            }
+            // else: checkpoints still holds `replaced` under some other key — leak
+            // rather than dangle. Should be unreachable given the height check above;
+            // kept as the runtime backstop the assert alone cannot provide.
+        }
+        // else: heights disagree — leave the stub owned by checkpoints and manager->blocks
+        // alone now points at `block`. `replaced` leaks (the pre-diff behavior) instead of
+        // dangling in manager->checkpoints.
+    }
+#endif
 }
 
 // returns a newly allocated BRPeerManager struct that must be freed by calling BRPeerManagerFree()

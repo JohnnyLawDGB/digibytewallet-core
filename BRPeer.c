@@ -172,9 +172,9 @@ static int _BRPeerSocks5Handshake(int sock, const UInt128 *peer_addr, uint16_t p
 //
 // we modify this sequence to improve sync performance and handle adding bip32 addresses to the bloom filter as needed:
 // - local peer sends getheaders
-// - remote peer responds with up to 2000 headers
-// - local peer immediately sends getheaders again and then processes the headers
-// - previous two steps repeat until a header within a week of earliestKeyTime is reached (further headers are ignored)
+// - remote peer responds with up to 20000 headers
+// - local peer processes the response, then requests another only if the paced convoy gate remains open
+// - the sequence repeats until a header within a week of earliestKeyTime is reached
 // - local peer sends getblocks
 // - remote peer responds with inv containing up to 500 block hashes
 // - local peer sends getdata with the block hashes
@@ -236,7 +236,7 @@ typedef struct {
     int compactFiltersOnly; // BR_SYNC_MODE_COMPACT_FILTERS_ONLY: pull headers to tip, never getblocks
     // Paced-convoy fetch gate (spec Part A). Nonzero == the block-header frontier
     // is already CF_CONVOY_WINDOW blocks ahead of the CF scan frontier, so the
-    // CF-only 2000-header continuation in _BRPeerAcceptHeadersMessage must HOLD
+    // CF-only 20000-header continuation in _BRPeerAcceptHeadersMessage must HOLD
     // (the headers in the current batch are still processed; only the request for
     // the NEXT batch is suppressed). That handler runs on this peer's read thread
     // with only a BRPeerContext -- it cannot dereference the opaque
@@ -244,10 +244,13 @@ typedef struct {
     // PUSHES the verdict here on every block-add and every KeepAlive tick.
     // volatile: written by the manager thread, read by this peer's read thread,
     // deliberately WITHOUT locking. A torn/stale read is safe by BOUNDED
-    // OVERSHOOT, not by analogy: a stale-OPEN read permits at most ONE extra
-    // 2000-header continuation (~0.44 MB at ~220 B/header), one-shot and
-    // self-correcting on the next batch, trivial against a 10000-block window.
+    // OVERSHOOT, not by analogy: the handler re-reads this only AFTER relaying
+    // the current batch, so an open gate permits at most ONE 20000-header
+    // response before the manager can close it.
     volatile int convoyHdrGated;
+#ifdef BRPEER_HEADERS_KAT
+    size_t katGetheadersCount;
+#endif
     UInt256 lastBlockHash;
     BRMerkleBlock *currentBlock;
     UInt256 *currentBlockTxHashes, *knownBlockHashes, *knownTxHashes;
@@ -779,11 +782,12 @@ static int _BRPeerAcceptHeadersMessage(BRPeer *peer, const uint8_t *msg, size_t 
     else {
         peer_log(peer, "got %zu header(s)", count);
     
-        // To improve chain download performance, if this message contains 2000 headers then request the next 2000
-        // headers immediately, and switch to requesting blocks when we receive a header newer than earliestKeyTime
+        // DigiByte peers return as many as 20,000 headers. Relay the whole
+        // response before deciding whether the paced convoy may request another.
         uint32_t timestamp = (count > 0) ? UInt32GetLE(&msg[off + 81*(count - 1) + 68]) : 0;
 
-        if (count >= 2000 || (timestamp > 0 && timestamp + 7*24*60*60 + BLOCK_MAX_TIME_DRIFT >= ctx->earliestKeyTime)) {
+        if (count >= MAX_HEADERS_RESULTS ||
+            (timestamp > 0 && timestamp + 7*24*60*60 + BLOCK_MAX_TIME_DRIFT >= ctx->earliestKeyTime)) {
             size_t last = 0;
             time_t now = time(NULL);
             UInt256 locators[2];
@@ -803,20 +807,12 @@ static int _BRPeerAcceptHeadersMessage(BRPeer *peer, const uint8_t *msg, size_t 
                 BRSHA256_2(&locators[0], &msg[off + 81*(last - 1)], 80);
                 BRPeerSendGetblocks(peer, locators, 2, UINT256_ZERO);
             }
-            // PACED-CONVOY GATE (spec Part A). This is the unpaced tip-racer: on
-            // any full 2000-header batch the old code immediately asked for the
-            // next one, fast-forwarding to the chain tip and filling
-            // manager->blocks with [birth..tip] long before the compact-filter
-            // scan had processed anything (the deep-restore OOM). Hold the
-            // CONTINUATION while the manager reports the header frontier a full
-            // CF_CONVOY_WINDOW ahead of the scan frontier; the batch already
-            // received is still parsed + relayed below, and the manager's
-            // KeepAlive convoy driver re-issues the continuation once the scan
-            // catches up. Recovery/sync-start getheaders (BRPeerManager's
-            // _peerConnected, orphan re-anchor, tip-stall watchdog) go out
-            // through BRPeerSendGetheaders directly and are NEVER gated.
+#ifdef BRPEER_HEADERS_CONTINUE_BEFORE_RELAY
+            // Test-only red arm: reproduce the old stale-open decision before
+            // relayedBlock has moved the manager's header frontier.
             else if (! ctx->convoyHdrGated) BRPeerSendGetheaders(peer, locators, 2, UINT256_ZERO);
             else peer_log(peer, "paced convoy: holding header continuation (header frontier a full window ahead of the CF scan)");
+#endif
 
             for (size_t i = 0; r && i < count; i++) {
                 BRMerkleBlock *block = BRMerkleBlockParse(&msg[off + 81*i], 81);
@@ -831,6 +827,17 @@ static int _BRPeerAcceptHeadersMessage(BRPeer *peer, const uint8_t *msg, size_t 
                 }
                 else BRMerkleBlockFree(block);
             }
+
+#ifndef BRPEER_HEADERS_CONTINUE_BEFORE_RELAY
+            // relayedBlock recomputes and pushes convoyHdrGated as each header
+            // enters the manager. Read it only after the full DigiByte response
+            // has moved that frontier; reading it before this loop queues a
+            // second 20,000-header response against a stale-open gate.
+            if (r && ctx->compactFiltersOnly) {
+                if (! ctx->convoyHdrGated) BRPeerSendGetheaders(peer, locators, 2, UINT256_ZERO);
+                else peer_log(peer, "paced convoy: holding header continuation (header frontier a full window ahead of the CF scan)");
+            }
+#endif
         }
         else if (ctx->compactFiltersOnly && count == 0) {
             // compact-filters mode pulls plain headers to the tip; an empty headers reply just means
@@ -2171,6 +2178,9 @@ void BRPeerSendMempool(BRPeer *peer, const UInt256 knownTxHashes[], size_t known
 
 void BRPeerSendGetheaders(BRPeer *peer, const UInt256 locators[], size_t locatorsCount, UInt256 hashStop)
 {
+#ifdef BRPEER_HEADERS_KAT
+    ((BRPeerContext *)peer)->katGetheadersCount++;
+#endif
     size_t i, off = 0;
     size_t msgLen = sizeof(uint32_t) + BRVarIntSize(locatorsCount) + sizeof(*locators)*locatorsCount + sizeof(hashStop);
     uint8_t msg[msgLen];

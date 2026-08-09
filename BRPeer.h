@@ -112,6 +112,7 @@ extern "C" {
 #define FILTER_TYPE_BASIC 0x00
 
 // BIP 157 wire limits.
+#define MAX_HEADERS_RESULTS  20000u  // DigiByte max block headers in one headers message
 #define MAX_CFHEADERS_RESULTS 2000u  // max filter_hashes in one cfheaders message
 #define MAX_CFILTERS_RESULTS  1000u  // max blocks one getcfilters may request
 // Hard cap on filter_headers in a cfcheckpt message. cfcheckpt sends one
@@ -194,12 +195,12 @@ void BRPeerSetCompactFiltersOnly(BRPeer *peer, int compactFiltersOnly);
 // manager while the block-header frontier is already a full convoy window ahead
 // of the CF scan frontier: the CF-only header handler then HOLDS its getheaders
 // continuation (the headers already received are still processed -- only the
-// request for the NEXT 2000-header batch is suppressed) so header sync cannot
+// request for the NEXT 20000-header batch is suppressed) so header sync cannot
 // fast-forward to the chain tip ahead of the compact-filter scan. Unlike
 // BRPeerSetCompactFiltersOnly this FLIPS over the life of the connection: the
 // manager recomputes and re-pushes it on every block-add and every KeepAlive
 // tick. Read lock-free from the peer's read thread; a stale read costs at most
-// one extra 2000-header batch and self-corrects on the next one.
+// one extra 20000-header batch and self-corrects on the next one.
 void BRPeerSetConvoyHdrGated(BRPeer *peer, int gated);
 
 // call this when local best block height changes (helps detect tarpit nodes)

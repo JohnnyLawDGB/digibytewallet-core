@@ -65,7 +65,7 @@ extern "C" {
 #define PEER_INBOUND_IDLE_LIMIT 90.0
 
 /* defines, how many blocks to be held in sqlite DB */
-#define SAVE_BLOCK_COUNT 300
+#define SAVE_BLOCK_COUNT 32768
 #define SAVE_BLOCK_INTERVAL 4000
     
 /* OPTIONS FOR CLEARING MEMORY */
@@ -85,7 +85,7 @@ Remarks:
     CLEAR_MEM_BLOCKS_COUNT_TAIL_LEN is at least the SAVE_BLOCK_COUNT
         plus a reserve of CLEAR_MEM_BLOCKS_RESERVE_COUNT blocks.
 */
-#define CLEAR_MEM_BLOCKS_COUNT_TRIGGER 5000
+#define CLEAR_MEM_BLOCKS_COUNT_TRIGGER 36000
 #define CLEAR_MEM_BLOCKS_RESERVE_COUNT 500
 #define CLEAR_MEM_BLOCKS_COUNT_TAIL_LEN (CLEAR_MEM_BLOCKS_COUNT_TRIGGER - SAVE_BLOCK_COUNT - CLEAR_MEM_BLOCKS_RESERVE_COUNT)
 
@@ -248,96 +248,39 @@ Remarks:
    not that the valve is broken. */
 #define CF_CONVOY_REARM_MAX 2
 
-/* PACED-CONVOY FETCH WINDOW (spec 2026-07-28-paced-convoy-fetch-design.md,
-   Parts A + C). The maximum number of blocks the block-header frontier
-   (manager->lastBlock->height) and the cfheader frontier
-   (BRCompactFilterChainNextHeight - 1) may lead the CF SCAN frontier
-   (BRCFScanLedgerLowestNeededHeight) by. Beyond it the two TIP-RACING
-   continuations -- BRPeer.c's CF-only 2000-header continuation and
-   _BRPeerManagerRequestNextCFHeaders' clean-append advance -- are suppressed, so
-   the header/cfheader/scan frontiers climb birth->tip as one convoy instead of
-   the headers fast-forwarding to the tip and filling manager->blocks with
-   [birth..tip] before the scan has processed anything (the deep-restore OOM).
-   RECOVERY and SYNC-START sends are NEVER gated -- suppressing one deadlocks the
-   convoy from the other side.
+/* PACED-CONVOY FETCH WINDOW. The block-header and cfheader frontiers are paced
+   against BRCFScanLedgerLowestNeededHeight. At a full window, block-header batch
+   continuation, reconnect/download-peer startup, block-inv pulls, and clean
+   cfheader advances are held. A fresh unarmed bootstrap remains open, while
+   cfheader re-anchor/recovery stays exempt so the scan can repair its chain.
 
-   The value is a floor-derived bound, not a magic number. It must EXCEED all of:
-   (1) the scan lookahead CF_OUTSTANDING_MAX(4096) + MAX_CFILTERS_RESULTS(1000)
-       = 5096 -- a smaller window starves the scan: the forward cfilter fetch can
-       only ask for heights the cfheader frontier already covers, so a window
-       below the in-flight ceiling would throttle the very path that ADVANCES the
-       scan frontier the window is measured from (deadlock from the other side);
-   (2) the cfheader quantum MAX_CFHEADERS_RESULTS(2000) -- below one batch the
-       gate would suppress every cfheaders advance and never re-open;
-   (3) a re-kick-latency margin at DGB's ~15 s blocks -- the window must hold
-       enough headers to keep the scan fed across one CF_CONVOY_HDR_REKICK_BASE_SECS
-       (30 s) re-kick interval, i.e. >= 30 s x the scan's 100 heights/s ceiling.
-   W = 10000 clears (1) by 4904, (2) by 8000, (3) by ~2 orders of magnitude.
+   W=10,000 exceeds the scan lookahead (CF_OUTSTANDING_MAX +
+   MAX_CFILTERS_RESULTS = 5,096), one cfheaders quantum (2,000), and a 30-second
+   re-kick interval at the scan's 100-heights/s ceiling.
 
-   THE THREE CONSEQUENCES OF THE CHOSEN VALUE (state them when changing it):
-   a. MAX RESIDENT BLOCK HEADERS ~= W + CLEAR_MEM_CF_RETENTION_MARGIN = 10144
-      (the retention floor sits 144 below the scan frontier, the header frontier
-      at most W above it), x ~220 B/header ~= 2.2 MB -- FLAT AT ANY RESTORE
-      DEPTH. That is the whole feature: the deep-restore OOM stops existing.
-      (Add the ~2-batch stale-flag overshoot at BRPeer.c:648, ~4000 headers /
-      ~0.88 MB, for the true instantaneous peak: ~14.1k headers / ~3.1 MB.)
-   b. MAX prevBlock WALK DEPTH = W_hdr ~= 10000. Every getcfilters/getcfheaders
-      stop hash resolves by walking down from lastBlock (_BRPeerManagerBlockHashAtHeight,
-      batched at _BRPeerManagerResolveHashesAtHeightsLocked), so the walk is short
-      BY CONSTRUCTION rather than by optimization -- depth-independent, sub-ANR,
-      and it is why no height->hash index is needed (or possible: the reorg path
-      never BRSetRemoves, so an index has no eviction hook).
-   c. SCAN-LOOKAHEAD HEADROOM = W - (CF_OUTSTANDING_MAX + MAX_CFILTERS_RESULTS)
-      = 10000 - 5096 = 4904 blocks of cfheader frontier the scan can consume
-      before the convoy has to re-kick, i.e. ~5 full forward-fetch batches of
-      slack against a stalled header supply. */
+   DigiByte's observed headers response is 20,000, not Bitcoin's 2,000. BRPeer
+   now evaluates the pushed gate after relaying each response, so at most one
+   already-requested response overshoots an open verdict:
+     max header lead < W + MAX_HEADERS_RESULTS = 30,000
+     max resident/persisted span adds CLEAR_MEM_CF_RETENTION_MARGIN
+   SAVE_BLOCK_COUNT is therefore sized above W + MAX_HEADERS_RESULTS, keeping the
+   restored scan frontier inside the saved header run after process death. */
 #define CF_CONVOY_WINDOW 10000
 
-/* PACED-CONVOY driver B1.3 -- the getheaders re-kick's RATE LIMIT (spec Part B1
-   step 3). KeepAlive re-issues the header continuation BRPeer.c holds while the
-   window is full; the trigger (a header frontier frozen across a whole ~10 s
-   tick) is necessary but NOT sufficient, because "frozen" cannot distinguish
-   "the continuation was suppressed and nothing is in flight" (re-kick wanted)
-   from "a reply IS in flight and just hasn't been parsed yet" (re-kick harmful).
-   BRPeer.c issues its continuation BEFORE the relay loop, so lastBlock does not
-   move until the whole ~440 KB batch is parsed -- on a slow link that is minutes
-   of "frozen". So the re-kick is additionally rate-limited by an interval that
-   BACKS OFF while unproductive and RESETS the moment the header tip actually
-   advances. Same 'delay = min(BASE << n, CAP), reset on progress' idiom the CF
-   scan-ledger's residual re-request driver already uses (CF_REREQ_BASE_SECS /
-   CF_REREQ_BACKOFF_CAP_SECS) -- deliberately not a new mechanism.
+/* PACED-CONVOY driver B1.3 -- getheaders re-kick rate limit. KeepAlive restarts
+   header supply after the scan moves enough to re-open the window. A frozen tip
+   cannot distinguish "the continuation was held" from "a 1.62 MB, 20,000-header
+   response is still in flight or dispatching", so retries back off 30, 60, 120,
+   240, 480, 600 seconds and reset on real tip progress or a gated->open episode.
 
-   Sequence: 30, 60, 120, 240, 480, 600, 600, ... An EPISODE ends -- and the
-   interval resets to 30 -- on either of the two things that mean the accumulated
-   penalty no longer describes reality: real header-tip progress (the chain is
-   alive), or a GATED->open transition (a gated period issues no re-kicks, so it
-   can neither earn a penalty nor carry one across; the reopen is served on the
-   very next tick, which is what B1.3 exists for). Note those two are INDEPENDENT:
-   the window can close and reopen from scanFrontier movement alone, with the
-   header tip never advancing.
+   TOO SHORT queues duplicate full DigiByte responses before the first lands:
+   each costs ~1.62 MB on the wire and roughly 4.4 MB of resident header objects.
+   It also leaks steady-state traffic when estimatedHeight remains above an
+   unreachable advertised tip. The 600-second ceiling bounds that tail.
 
-   TOO SHORT costs bandwidth, and it COMPOUNDS: each injected getheaders is
-   answered with a full 2000-header batch, and because count >= 2000 every reply
-   spawns its OWN independent, lockstep continuation chain that persists until
-   the gate shuts it -- N re-kicks during one slow batch means N x ~2.2 MB of
-   duplicate headers per window-open period, recurring on every re-open of a
-   multi-hour deep restore, amplifying exactly on the slow mobile links the
-   convoy exists to make cheap. It also has a STEADY-STATE leak: estimatedHeight
-   is only ever RAISED, so a peer that advertised a height we never reach leaves
-   lastBlock->height < estimatedHeight forever on a fully-synced wallet (where
-   W_hdr ~ 0, i.e. the window is permanently open) -- at the bare 10 s tick that
-   is a ~1.2 KB full-locator getheaders every 10 s forever (~10 MB/day upstream),
-   each answered with 0 headers. The 600 s ceiling bounds that to ~170 KB/day.
-
-   TOO LONG costs window-reopen recovery latency: after the scan climbs enough to
-   re-open the window, the header frontier stays frozen until the next re-kick is
-   due. BASE is what that path actually pays, because the previous batch landing
-   is itself tip progress and RESETS the backoff -- so an ordinary descent always
-   re-kicks at 30 s, never at the ceiling. At 30 s the header supply is ~4000
-   headers per interval (the M-2 two-batch overshoot: BRPeer.c reads the gate
-   flag one batch stale), i.e. ~133 heights/s, which stays ahead of the scan's
-   ceiling of MAX_CFILTERS_RESULTS(1000) per ~10 s tick == 100 heights/s. So the
-   convoy is never header-starved by this throttle. */
+   TOO LONG starves a reopened convoy. One 20,000-header response per 30-second
+   base interval supplies ~667 heights/s, comfortably above the compact-filter
+   scan ceiling of 1,000 heights per ~10-second KeepAlive tick. */
 #define CF_CONVOY_HDR_REKICK_BASE_SECS 30
 #define CF_CONVOY_HDR_REKICK_MAX_SECS  600
 
@@ -393,6 +336,10 @@ CF_STATIC_ASSERT(SAVE_BLOCK_COUNT + CLEAR_MEM_BLOCKS_RESERVE_COUNT < CLEAR_MEM_B
                "CLEAR_MEM_BLOCKS_COUNT_TAIL_LEN must stay positive, else _BRPeerManagerClearMemory's "
                "walk-down bound exceeds the resident chain, the free is skipped, and block-header "
                "pruning silently stops happening at all");
+
+CF_STATIC_ASSERT(SAVE_BLOCK_COUNT >= CF_CONVOY_WINDOW + MAX_HEADERS_RESULTS,
+               "the saved block-header window must cover the convoy plus one full headers response, "
+               "else process death can restore the scan frontier below the resident block floor");
 
 /* --- the residual re-request run vs what one getcfilters can carry ---
  * BREAKS: BRCFScanLedgerPeekRerequestRange coalesces a run of up to
@@ -470,31 +417,20 @@ CF_STATIC_ASSERT(CF_CONVOY_WINDOW >= CF_CONVOY_HDR_REKICK_BASE_SECS * (MAX_CFILT
                "at the re-kick's rate instead of the fetch's");
 
 /* --- re-kick backoff: ceiling vs base ---
- * BREAKS: the escalation is `backoff = (backoff >= MAX/2) ? MAX : backoff * 2`, starting at
- * BASE. With MAX < BASE the very first send clamps the interval DOWN to MAX, so the ceiling
- * becomes a floor-breaker: re-kicks fire more often than BASE forever. That is the expensive
- * direction — each injected getheaders is answered with a full 2000-header batch that spawns
- * its own lockstep continuation chain, so the CF_CONVOY_HDR_REKICK_BASE_SECS comment's
- * "N re-kicks during one slow batch means N x ~2.2 MB of duplicate headers" compounds on
- * exactly the slow mobile links the convoy exists to make cheap. */
+ * BREAKS: with MAX < BASE the first escalation clamps the interval down, so
+ * re-kicks fire faster than BASE forever. Each premature getheaders can queue a
+ * duplicate 20,000-header response (~1.62 MB wire, ~4.4 MB resident) while the
+ * prior response is still in flight, exactly on slow mobile links. */
 CF_STATIC_ASSERT(CF_CONVOY_HDR_REKICK_MAX_SECS >= CF_CONVOY_HDR_REKICK_BASE_SECS,
                "the re-kick backoff CEILING must not sit below its BASE, else the first "
                "escalation clamps the interval DOWN and re-kicks fire faster than BASE forever");
 
 /* --- retention margin vs the convoy window ---
- * These are the two terms of the resident-header span: the header frontier rides at most
- * CF_CONVOY_WINDOW above the CF scan frontier, and _BRPeerManagerClearMemory's floor sits
- * CLEAR_MEM_CF_RETENTION_MARGIN below it, so resident headers ~= W + MARGIN.
- * BREAKS: both headline guarantees of the paced convoy are stated in terms of W —
- * consequence (a) "MAX RESIDENT BLOCK HEADERS ~= W + MARGIN ... ~2.2 MB, FLAT AT ANY RESTORE
- * DEPTH" (the deep-restore OOM fix itself) and consequence (b) "MAX prevBlock WALK DEPTH
- * ~= W" (the sub-ANR, index-free hash resolution). If MARGIN is not the small correction
- * term, both are actually governed by a constant sized for a completely different job
- * (keeping ~one DigiShield window of headers alive so cfheaders can walk prevBlock links
- * back to its next batch's stop), and W could be tuned to no effect while the real
- * footprint and the real walk depth stayed put.
- * This one is a GUARANTEE/footprint relation, not a correctness one — said plainly so
- * nobody reads it as stronger than it is. */
+ * The ideal resident span is W + MARGIN. One already-requested DigiByte headers
+ * response can extend the header frontier by MAX_HEADERS_RESULTS after an open
+ * verdict, so the hard persisted/resident requirement is W + MAX_HEADERS_RESULTS
+ * + MARGIN. MARGIN must remain the small correction term; otherwise tuning W no
+ * longer controls either footprint or prevBlock walk depth. */
 CF_STATIC_ASSERT(CLEAR_MEM_CF_RETENTION_MARGIN < CF_CONVOY_WINDOW,
                "CLEAR_MEM_CF_RETENTION_MARGIN must stay the small correction term under "
                "CF_CONVOY_WINDOW, else the resident-header footprint and the prevBlock walk "
@@ -812,47 +748,12 @@ size_t BRPeerManagerAbandonedCount(BRPeerManager *manager);
 // logcat capture is self-sufficient without replaying a whole session.
 size_t BRPeerManagerAbandonedHeightsTotal(BRPeerManager *manager);
 
-// ---- B2 valve / watchdog ORDERING (paced-convoy fetch, Task 6, spec Part C) -
+// ---- Retry recovery / watchdog ordering (paced convoy) -------------------
 //
-// "Is the B2 abandonment valve currently mid-decision on the hole that PINS the
-// scan frontier?" — the signal the Kotlin tip-stall watchdog uses to stand down
-// while the valve does its work, so the two scan-stall watchers do not race
-// (the valve owns a KNOWN gaveUp stall and its re-arm IS productive work, where
-// the watchdog's escalation — an ungated getheaders, then a manager recreate —
-// is pure churn on top of it).
-//
-// PENDING covers BOTH halves of the valve's window, not just the decision instant:
-//   (a) the frontier-pinning hole is PARKED in gaveUp — the valve decides at the
-//       next KeepAlive tick; and
-//   (b) the frontier-pinning hole is OUTSTANDING with rearmCycles > 0 — a
-//       valve-granted RE-ARM CYCLE IS IN FLIGHT (~7.5 min of rotated retry, the
-//       larger half of the window). An ordinary outstanding hole (rearmCycles == 0)
-//       belongs to the residual driver, not the valve, and reads 0.
-//
-// RETURN VALUE — a COUNT, not a boolean, and that is load-bearing:
-//   0  == the valve owns nothing at the scan frontier; nothing pending.
-//   N>0 == the valve is on cycle N of that hole: N == 1 is the ORIGINAL cycle
-//          (exhausted, no re-arm granted yet); N == 2 is the first re-arm cycle
-//          (in flight, or exhausted and being decided); in general
-//          N == rearmCycles + 1, and the valve may abandon once
-//          N == CF_CONVOY_REARM_MAX + 1. Saturating (rearmCycles is a uint8_t
-//          widened to uint32_t), so it never wraps back to 0 and can never be
-//          mistaken for "not pending".
-//
-// WHY A COUNT (do NOT reduce this to a bare boolean — the Task-5 review found the
-// failure it prevents). The valve's per-cycle offersReachedLivePeer latch is
-// cleared by ANY disconnect of the peer stamped on the hole, and a deciding cycle
-// is 5 offers over ~7.5 min. On a churny fleet — canon oracles at maxconnections,
-// errno-101 blips, ~8 peers rotating — EVERY cycle can be tainted, so the valve
-// re-arms INDEFINITELY and this function returns non-zero forever. A consumer
-// that suppresses its watchdog on a bare "pending" would then stand down FOREVER,
-// in exactly the case the backstop exists for. So BOUND THE SUPPRESSION on this
-// value: suppress only while the returned N is within the cycles the valve is
-// actually entitled to (N <= CF_CONVOY_REARM_MAX + 1, i.e. through the deciding
-// cycle); once N exceeds that, the hole is re-arming without converging and MUST
-// be re-exposed to the watchdog. The resulting failure mode is a bounded-memory
-// VISIBLE stall (the convoy gate holds manager->blocks flat at ~W+144), never an
-// OOM and never a silent wrong balance.
+// Returns 1 while any unresolved hole pins the scan frontier, including its first
+// request, parked state, and every re-armed retry cycle; returns 0 otherwise. Retry
+// recovery has no finite abandonment budget: watchdogs must not delete or re-anchor
+// the ledger while this signal is active.
 //
 // The pinning-hole predicate is the valve's own (the LOWEST hole of either kind —
 // _cfLedgerAdvance caps scannedThrough at min(outstanding[0], gaveUp[0]) - 1), so a

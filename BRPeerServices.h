@@ -17,4 +17,10 @@ static inline int BRPeerServicesAllowedForSyncMode(uint64_t services, int syncMo
     return (services & SERVICES_NODE_COMPACT_FILTERS) == SERVICES_NODE_COMPACT_FILTERS ? 1 : 0;
 }
 
+static inline int BRPeerShouldRequestMempool(uint64_t services, int compactFiltersOnly)
+{
+    return !compactFiltersOnly &&
+           (services & SERVICES_NODE_BLOOM) == SERVICES_NODE_BLOOM ? 1 : 0;
+}
+
 #endif // BRPeerServices_h

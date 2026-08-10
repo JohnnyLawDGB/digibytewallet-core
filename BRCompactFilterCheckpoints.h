@@ -492,4 +492,23 @@ static const BRCFCheckpoint BRMainNetCFCheckpoints[] = {
 
 static const size_t BRMainNetCFCheckpointsCount = sizeof(BRMainNetCFCheckpoints)/sizeof(BRMainNetCFCheckpoints[0]);
 
+static inline const BRCFCheckpoint *BRCFHighestCheckpointAtOrBelow(uint32_t height) {
+    const BRCFCheckpoint *best = NULL;
+    for (size_t i = 0; i < BRMainNetCFCheckpointsCount; i++) {
+        if (BRMainNetCFCheckpoints[i].height <= height) best = &BRMainNetCFCheckpoints[i];
+        else break; // ascending
+    }
+    return best;
+}
+static inline size_t BRCFCheckpointsInRange(uint32_t lo, uint32_t hi,
+                                            const BRCFCheckpoint **out, size_t outCap) {
+    size_t n = 0;
+    for (size_t i = 0; i < BRMainNetCFCheckpointsCount && n < outCap; i++) {
+        uint32_t h = BRMainNetCFCheckpoints[i].height;
+        if (h >= lo && h <= hi) out[n++] = &BRMainNetCFCheckpoints[i];
+        else if (h > hi) break;
+    }
+    return n;
+}
+
 #endif // BRCompactFilterCheckpoints_h

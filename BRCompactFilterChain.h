@@ -93,6 +93,31 @@ int BRCompactFilterChainAppend(BRCompactFilterChain *chain,
                                 const UInt256 *filterHashes, size_t count);
 
 /**
+ * Check whether a pending cfheaders batch -- folded forward from the
+ * chain's current tip at NextHeight() WITHOUT mutating the chain -- would
+ * disagree with any pinned mainnet checkpoint whose height falls inside
+ * the batch's range [NextHeight, NextHeight + count - 1]. Consults
+ * BRCFCheckpointsInRange / BRMainNetCFCheckpoints (BRCompactFilterCheckpoints.h);
+ * mainnet-only in effect, since that table is mainnet-only.
+ *
+ *   chain          the chain to fold from (read-only; never mutated).
+ *   filterHashes   contiguous filter hashes starting at NextHeight(), same
+ *                  semantics as BRCompactFilterChainAppend's filterHashes.
+ *   count          number of hashes; 0 is never a violation.
+ *   outHeight      if non-NULL and a violation is found, set to the first
+ *                  mismatching checkpoint's height.
+ *   outComputed    if non-NULL and a violation is found, set to the
+ *                  computed (wrong) filter header at that height.
+ *
+ * Returns 1 if the fold disagrees with an in-range checkpoint (outHeight/
+ * outComputed set to the first divergence), 0 if every in-range checkpoint
+ * matches or none are in range. Never allocates, never mutates chain.
+ */
+int BRCompactFilterChainBatchViolatesCheckpoint(const BRCompactFilterChain *chain,
+                                                 const UInt256 *filterHashes, size_t count,
+                                                 uint32_t *outHeight, UInt256 *outComputed);
+
+/**
  * Verify a freshly-decoded filter against the chain.
  *
  * Given the encoded filter bytes for a block at the named height, computes

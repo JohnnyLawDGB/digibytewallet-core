@@ -7,12 +7,22 @@
 #include "BRCompactFilterChain.h"
 #include "BRGCSFilter.h"
 #include "BRCrypto.h"
+#include "BRCompactFilterCheckpoints.h"
 
 #include <stdlib.h>
 #include <string.h>
 
 #define BR_COMPACT_FILTER_CHAIN_MAGIC   0x46434243u // "BCFC"
 #define BR_COMPACT_FILTER_CHAIN_VERSION 1u
+
+// filterHeader_i = dSHA256(filterHash_i || prev). Single source of truth for
+// the fold math -- both BRCompactFilterChainAppend (commits) and
+// BRCompactFilterChainBatchViolatesCheckpoint (never commits) call this, so
+// the two can never diverge.
+static UInt256 _foldHeader(UInt256 prev, UInt256 filterHash)
+{
+    return BRGCSFilterHeader(filterHash, prev);
+}
 
 #define HEADER_LEN (4u + 1u + 1u + 4u + 32u + 4u) // magic+ver+type+start+anchor+count = 46 bytes
 
@@ -125,12 +135,62 @@ int BRCompactFilterChainAppend(BRCompactFilterChain *chain,
 
     UInt256 prev = tip;
     for (size_t i = 0; i < count; i++) {
-        UInt256 hdr = BRGCSFilterHeader(filterHashes[i], prev);
+        UInt256 hdr = _foldHeader(prev, filterHashes[i]);
         chain->headers[chain->count + i] = hdr;
         prev = hdr;
     }
     chain->count = need;
     return 1;
+}
+
+// Core comparator: folds filterHashes forward from the chain's current tip
+// WITHOUT mutating the chain, checking the folded header at each height
+// against every checkpoint in cps[0..nc). Returns 1 (and sets *outHeight/
+// *outComputed) on the first mismatch; 0 if every checkpoint checked
+// matches, or nc == 0. Factored out from BRCompactFilterChainBatchViolates-
+// Checkpoint (which always looks up cps from the real BRMainNetCFCheckpoints
+// table via BRCFCheckpointsInRange) so a host test can exercise this exact
+// fold+compare logic against a self-consistent synthetic checkpoint --
+// matching one of the real pinned mainnet values from constructed data is a
+// SHA256d preimage problem, not something a test can forge from scratch.
+static int _batchViolatesCheckpoints(const BRCompactFilterChain *chain,
+        const UInt256 *filterHashes, size_t count,
+        const BRCFCheckpoint * const *cps, size_t nc,
+        uint32_t *outHeight, UInt256 *outComputed)
+{
+    if (nc == 0) return 0;
+
+    uint32_t start = BRCompactFilterChainNextHeight(chain);
+    UInt256 h = BRCompactFilterChainTipHeader(chain);
+
+    for (size_t i = 0; i < count; i++) {
+        h = _foldHeader(h, filterHashes[i]);
+        uint32_t height = start + (uint32_t)i;
+        for (size_t c = 0; c < nc; c++) {
+            if (cps[c]->height == height && ! UInt256Eq(h, cps[c]->filterHeader)) {
+                if (outHeight) *outHeight = height;
+                if (outComputed) *outComputed = h;
+                return 1;
+            }
+        }
+    }
+    return 0;
+}
+
+int BRCompactFilterChainBatchViolatesCheckpoint(const BRCompactFilterChain *chain,
+        const UInt256 *filterHashes, size_t count,
+        uint32_t *outHeight, UInt256 *outComputed)
+{
+    if (!chain) return 0;
+    if (count == 0) return 0; // no-op batch; also avoids start+count-1 underflow below
+    if (!filterHashes) return 0;
+
+    uint32_t start = BRCompactFilterChainNextHeight(chain);
+    const BRCFCheckpoint *cps[16];
+    size_t nc = BRCFCheckpointsInRange(start, start + (uint32_t)count - 1, cps, 16);
+    if (nc == 0) return 0;
+
+    return _batchViolatesCheckpoints(chain, filterHashes, count, cps, nc, outHeight, outComputed);
 }
 
 int BRCompactFilterChainVerifyFilter(const BRCompactFilterChain *chain,

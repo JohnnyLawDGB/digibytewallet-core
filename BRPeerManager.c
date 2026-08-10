@@ -3971,6 +3971,37 @@ static void _peerRelayedCFHeaders(void *info, uint8_t filterType, UInt256 stopHa
         return;
     }
 
+    // Task 3 (cfcheckpt-active-rejection) — PRE-COMMIT checkpoint enforcement.
+    // Before this batch is allowed to touch the chain at all, fold it forward
+    // (without mutating anything — BRCompactFilterChainBatchViolatesCheckpoint
+    // is pure) and compare against any pinned mainnet filter-header checkpoint
+    // that falls inside it. A mismatch means this peer is either lying or
+    // stuck on a divergent fork; reject the whole batch, ban the peer, and
+    // leave cfHeadersRequestedThrough untouched so the existing "no advance"
+    // continuity path re-requests it from someone else. Mainnet-only — the
+    // checkpoint table is DGB mainnet filter-headers; testnet26 has none.
+    // Guarded behind CF_CHECKPOINT_ENFORCE_UNFIXED so the red arm of
+    // cf_checkpoint_enforce_kat can restore the pre-Task-3 observe-only shape
+    // (append-then-log) and prove the gate is load-bearing.
+#ifndef CF_CHECKPOINT_ENFORCE_UNFIXED
+    if (manager->params->standardPort == BRMainNetParams.standardPort) {
+        uint32_t vh; UInt256 vc;
+        if (BRCompactFilterChainBatchViolatesCheckpoint(manager->compactFilterChain,
+                filterHashes, count, &vh, &vc)) {
+            const BRCFCheckpoint *pinned = BRCFHighestCheckpointAtOrBelow(vh);
+            peer_log(peer, "cf-checkpoint: height %u *** ENFORCE REJECT *** computed=%s pinned=%s",
+                     vh, log_u256_hex_encode(vc),
+                     pinned ? log_u256_hex_encode(pinned->filterHeader) : "?");
+            _BRPeerManagerPeerMisbehavin(manager, peer);   // crypto-proof ban
+            // Do NOT append, do NOT advance cfHeadersRequestedThrough — the
+            // existing "no advance" path (see the !ok branch below) re-requests
+            // on the next driver tick via a fresh peer.
+            MGR_UNLOCK(manager);
+            return;
+        }
+    }
+#endif
+
     int ok = BRCompactFilterChainAppend(manager->compactFilterChain, prevFilterHeader, filterHashes, count);
 
     // R1 (Neutrino review) — OBSERVE-MODE filter-header checkpoint cross-check.

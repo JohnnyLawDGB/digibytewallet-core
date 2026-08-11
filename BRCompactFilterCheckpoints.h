@@ -500,6 +500,16 @@ static inline const BRCFCheckpoint *BRCFHighestCheckpointAtOrBelow(uint32_t heig
     }
     return best;
 }
+
+// The height of the highest pinned checkpoint in the table (the historical/tip
+// boundary). BRCFHighestCheckpointAtOrBelow(h) clamps to this same top entry for
+// ANY h at or above it, so callers that need to know whether a height is still
+// inside the checkpoint-covered historical region (as opposed to the tip region
+// checkpoints say nothing about) must compare against this, not merely check
+// that BRCFHighestCheckpointAtOrBelow(h) returned non-NULL.
+static inline uint32_t BRCFTopCheckpointHeight(void) {
+    return BRMainNetCFCheckpointsCount ? BRMainNetCFCheckpoints[BRMainNetCFCheckpointsCount - 1].height : 0;
+}
 static inline size_t BRCFCheckpointsInRange(uint32_t lo, uint32_t hi,
                                             const BRCFCheckpoint **out, size_t outCap) {
     size_t n = 0;

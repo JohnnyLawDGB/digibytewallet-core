@@ -3935,6 +3935,13 @@ static int _BRPeerManagerConnectedFilterPeerCount(BRPeerManager *manager)
 static int _BRPeerManagerCheckpointConfirmsOurChainLocked(BRPeerManager *manager, uint32_t contested)
 {
     if (manager->params->standardPort != BRMainNetParams.standardPort) return 0;
+#ifndef CF_VETO_TIP_UNFIXED
+    // Checkpoints vouch only for the historical region up to the top pin; above it
+    // (the tip region) they say nothing, so a tip-region divergence must fall through
+    // to the quorum path (design Piece 2). Without this, a historical checkpoint match
+    // vetoes a legitimate tip re-anchor and bans honest peers — the near-tip wedge.
+    if (contested > BRCFTopCheckpointHeight()) return 0;
+#endif
     const BRCFCheckpoint *cp = BRCFHighestCheckpointAtOrBelow(contested);
     if (! cp) return 0;
     if (BRCompactFilterChainCount(manager->compactFilterChain) == 0) return 0;
@@ -4026,6 +4033,7 @@ static void _peerRelayedCFHeaders(void *info, uint8_t filterType, UInt256 stopHa
                      vh, log_u256_hex_encode(vc),
                      pinned ? log_u256_hex_encode(pinned->filterHeader) : "?");
             _BRPeerManagerPeerMisbehavin(manager, peer);   // crypto-proof ban
+            manager->cfHeadersRequestedThrough = 0;  // let another (honest) peer be tried immediately
             // Do NOT append, do NOT advance cfHeadersRequestedThrough — the
             // existing "no advance" path (see the !ok branch below) re-requests
             // on the next driver tick via a fresh peer.
@@ -4056,7 +4064,11 @@ static void _peerRelayedCFHeaders(void *info, uint8_t filterType, UInt256 stopHa
             if (UInt256Eq(computed, BRMainNetCFCheckpoints[ci].filterHeader)) {
                 peer_log(peer, "cf-checkpoint: height %u MATCH (observe)", h);
             } else {
-                // Separate calls: log_u256_hex_encode may reuse a static buffer.
+                // Separate calls, and this is safe even though both compute a hex
+                // string for the same peer_log() format: log_u256_hex_encode is a
+                // compound-literal macro (BRInt.h ((const char[]){…})), so each
+                // expansion produces its own distinct block-scoped array — no
+                // shared/static buffer to alias between the two calls below.
                 peer_log(peer, "cf-checkpoint: height %u *** MISMATCH (observe) *** computed=%s",
                          h, log_u256_hex_encode(computed));
                 peer_log(peer, "cf-checkpoint: height %u *** MISMATCH (observe) *** pinned=%s",

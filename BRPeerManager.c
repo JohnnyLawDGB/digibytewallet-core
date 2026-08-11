@@ -3910,6 +3910,32 @@ static int _BRPeerManagerConnectedFilterPeerCount(BRPeerManager *manager)
     return n;
 }
 
+// Task 4 (cfcheckpt-active-rejection) — close the single-peer-liar hole. Both
+// re-anchor triggers below (the K-distinct-disagreers quorum path and the
+// single-peer escape hatch) exist to recover when OUR chain is the divergent
+// outlier. But if a pinned mainnet filter-header checkpoint falls at or below
+// the contested height AND our own committed chain's header there matches the
+// pin exactly, our chain is independently proven correct at that point — a
+// disagreeing peer (quorum or lone) is the one that's wrong, whether lying or
+// stuck on a fork. Vetoing the re-anchor there closes the hole where a single
+// lying peer (CF_SINGLE_PEER_REANCHOR_ROUNDS consecutive diverged rounds)
+// could otherwise force the wallet off a checkpoint-confirmed chain and onto
+// its fork. Returns 0 (do not veto — proceed with the re-anchor) whenever the
+// checkpoint can't vouch for us: mainnet-only, no checkpoint at/below
+// `contested`, chain not yet resident that far, or our own header there
+// simply doesn't match (i.e. WE are the ones off the confirmed chain, and
+// re-anchoring away is the correct call). Caller must hold manager->lock.
+static int _BRPeerManagerCheckpointConfirmsOurChainLocked(BRPeerManager *manager, uint32_t contested)
+{
+    if (manager->params->standardPort != BRMainNetParams.standardPort) return 0;
+    const BRCFCheckpoint *cp = BRCFHighestCheckpointAtOrBelow(contested);
+    if (! cp) return 0;
+    if (BRCompactFilterChainCount(manager->compactFilterChain) == 0) return 0;
+    if (BRCompactFilterChainStartHeight(manager->compactFilterChain) > cp->height) return 0;
+    return UInt256Eq(BRCompactFilterChainHeader(manager->compactFilterChain, cp->height),
+                     cp->filterHeader);
+}
+
 // --- BIP 158 peer callbacks -----------------------------------------------
 
 static void _peerRelayedCFHeaders(void *info, uint8_t filterType, UInt256 stopHash,
@@ -4033,6 +4059,14 @@ static void _peerRelayedCFHeaders(void *info, uint8_t filterType, UInt256 stopHa
     }
 
     if (!ok) {
+        // Task 4 (cfcheckpt-active-rejection) — the height the divergent batch
+        // would have written had it appended. The append above failed, so
+        // manager->compactFilterChain is untouched and NextHeight is still the
+        // base this (and every subsequent, same-round) contested batch tries to
+        // extend; stable for the rest of this !ok block since nothing here
+        // mutates the chain. Used by both re-anchor gates below.
+        uint32_t contestedHeight = BRCompactFilterChainNextHeight(manager->compactFilterChain);
+
         // Record this peer as one that disagrees with our tip (dedup by address).
         // Do NOT mark it misbehavin'/disconnect — if the majority disagrees, the
         // honest peers are right and OUR chain is the divergent outlier.
@@ -4065,6 +4099,22 @@ static void _peerRelayedCFHeaders(void *info, uint8_t filterType, UInt256 stopHa
 
         if (manager->cfDisagreedCount >= CF_CONTINUITY_REANCHOR_K &&
             manager->cfReanchorCount < CF_CONTINUITY_REANCHOR_MAX) {
+#ifndef CF_CHECKPOINT_VETO_UNFIXED
+            // Task 4 — a checkpoint-confirmed chain vetoes the re-anchor. The
+            // K-distinct-disagreers quorum is normally trustworthy, but if our
+            // own chain is independently proven correct at the contested height
+            // by a pinned checkpoint, the "quorum" is itself wrong (colluding or
+            // coincidentally all stuck on the same fork) — do not throw away
+            // confirmed history for it. Ban the disagreeing peer instead.
+            if (_BRPeerManagerCheckpointConfirmsOurChainLocked(manager, contestedHeight)) {
+                peer_log(peer, "cf-checkpoint: re-anchor VETOED (quorum path, %u disagreers) — "
+                         "our chain is checkpoint-confirmed at/below height %u",
+                         manager->cfDisagreedCount, contestedHeight);
+                _BRPeerManagerPeerMisbehavin(manager, peer);  // the disagreeing peer is the liar
+                MGR_UNLOCK(manager);
+                return;
+            }
+#endif
             manager->cfReanchorCount++;
             peer_log(peer, "cfheaders: %u peers disagree with our tip — chain is the outlier, "
                      "re-anchoring (attempt %u/%u)",
@@ -4088,6 +4138,21 @@ static void _peerRelayedCFHeaders(void *info, uint8_t filterType, UInt256 stopHa
             manager->cfSingleDisagreeRounds++;
             if (manager->cfSingleDisagreeRounds >= CF_SINGLE_PEER_REANCHOR_ROUNDS &&
                 manager->cfReanchorCount < CF_CONTINUITY_REANCHOR_MAX) {
+#ifndef CF_CHECKPOINT_VETO_UNFIXED
+                // Task 4 — close the single-peer-liar hole. Without this, one
+                // lying (or fork-stuck) lone peer can run out the clock on
+                // CF_SINGLE_PEER_REANCHOR_ROUNDS and force the wallet to tear
+                // down and re-anchor a chain that a pinned checkpoint has
+                // already independently confirmed as correct.
+                if (_BRPeerManagerCheckpointConfirmsOurChainLocked(manager, contestedHeight)) {
+                    peer_log(peer, "cf-checkpoint: re-anchor VETOED (single-peer escape hatch, "
+                             "%u rounds) — our chain is checkpoint-confirmed at/below height %u",
+                             manager->cfSingleDisagreeRounds, contestedHeight);
+                    _BRPeerManagerPeerMisbehavin(manager, peer);  // the lone disagreer is the liar
+                    MGR_UNLOCK(manager);
+                    return;
+                }
+#endif
                 manager->cfReanchorCount++;
                 peer_log(peer, "cfheaders: single filter peer, %u rounds diverged — "
                          "forcing re-anchor (attempt %u/%u)",

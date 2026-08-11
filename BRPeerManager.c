@@ -4225,8 +4225,59 @@ static void _peerRelayedCFHeaders(void *info, uint8_t filterType, UInt256 stopHa
         }
 
         // Below the quorum, or re-anchor budget exhausted: don't append and
-        // don't punish. If the budget is exhausted the chain stops advancing and
-        // the SyncService watchdog falls back to bloom as today — pool never burned.
+        // don't punish (the below-quorum case may still recover as more
+        // agreeing peers arrive — acting on it here would false-alarm).
+#ifndef CF_NEVERBRICK_UNFIXED
+        // NEVER-BRICK (Task 6, cfcheckpt-active-rejection). Once the re-anchor
+        // budget is truly EXHAUSTED (cfReanchorCount >= CF_CONTINUITY_REANCHOR_MAX),
+        // no further re-anchor can EVER fire again for this manager — both gates
+        // above are `cfReanchorCount < CF_CONTINUITY_REANCHOR_MAX` — so unlike the
+        // below-quorum case there is nothing left to wait for; act on the very
+        // first mismatch that reaches here once exhausted, whatever the quorum
+        // state happens to be that round. Silently stopping used to be excused by
+        // "the SyncService watchdog falls back to bloom" — that fallback no longer
+        // exists (bloom/BIP37 was fully excised in v4.0.0), so a silent stop here
+        // is a permanent brick: no data path is left to catch what the CF chain can
+        // no longer verify. Park the forward-fetch cursor at the nearest TRUSTED
+        // mainnet checkpoint instead — a compiled-in table value, never anything a
+        // peer supplied in this batch — and surface the unverifiable band through
+        // the same abandonedBelow funnel every other unscannable-band site uses, so
+        // "Scan for missing transactions" becomes reachable instead of the wallet
+        // spinning on "Syncing" forever. Mainnet-only (the checkpoint table is DGB
+        // mainnet filter-headers; testnet26 has none).
+        if (manager->cfReanchorCount >= CF_CONTINUITY_REANCHOR_MAX &&
+            manager->params->standardPort == BRMainNetParams.standardPort) {
+            uint32_t tip = manager->compactFilterChain
+                          ? BRCompactFilterChainNextHeight(manager->compactFilterChain) - 1 : 0;
+            const BRCFCheckpoint *cp = BRCFHighestCheckpointAtOrBelow(tip);
+            if (cp) {
+                // THE REAL resume cursor. Every forward-fetch request site computes
+                // reqStart = autoFetchCFiltersThrough + 1, clamped UP to
+                // autoFetchCFiltersStart (see :4280-4281 and the residual driver at
+                // :5969-5970) — Through, not Start, is what actually governs where
+                // the next fetch resumes. Setting only autoFetchCFiltersStart (a
+                // literal reading of this task's brief pseudocode) would be a NO-OP
+                // here: Through already sits at/above the checkpoint height from the
+                // header chain's own prior advance, so max(Through+1, Start) would
+                // still resolve to that old, unverified value. Snap BOTH — same
+                // idiom every other "park the cursor at X" site in this file uses
+                // (_BRPeerManagerReanchorAtFloorLocked, the C-1 snap-down in
+                // BRPeerManagerSnapAutoFetchThroughToScanFrontier, the abandon-band
+                // snap at :7407-7408): Start=X, Through=X-1, so reqStart resolves to
+                // exactly X on the next cycle — pinned to the checkpoint table, never
+                // a peer-supplied value.
+                manager->autoFetchCFiltersStart   = cp->height;
+                manager->autoFetchCFiltersThrough = (cp->height > 0) ? cp->height - 1 : 0;
+                _BRPeerManagerSurfaceUnscannableLocked(manager, cp->height, tip + 1,
+                    "filter-header chain could not be verified against checkpoints");
+            }
+            // cp == NULL means tip sits below the lowest pinned checkpoint — no
+            // trusted anchor exists yet to park at; fall through to the log below
+            // with no action (unreachable in practice: the lowest checkpoint is
+            // height 50000, far below any wallet birth height that could reach
+            // three exhausted re-anchor attempts).
+        }
+#endif
         peer_log(peer, "cfheaders: continuity mismatch (%u/%u disagreers collected, reanchors %u/%u) — not appending",
                  manager->cfDisagreedCount, CF_DISAGREED_CAP,
                  manager->cfReanchorCount, CF_CONTINUITY_REANCHOR_MAX);

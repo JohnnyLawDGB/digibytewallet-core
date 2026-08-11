@@ -4124,9 +4124,19 @@ static void _peerRelayedCFHeaders(void *info, uint8_t filterType, UInt256 stopHa
         // majority of connected filter peers AND >= CF_CONTINUITY_REANCHOR_FLOOR
         // distinct disagreers that agree with EACH OTHER on the claimed
         // prevFilterHeader": compute the plurality prevFilterHeader among the
-        // stored disagreers (O(N^2) over N <= CF_DISAGREED_CAP == 3, trivial)
-        // and require the largest agreeing bucket to clear both the floor and a
+        // stored disagreers (O(N^2) over N <= CF_DISAGREED_CAP ==
+        // PEER_MAX_CONNECTIONS (8), trivial — 64 comparisons worst case) and
+        // require the largest agreeing bucket to clear both the floor and a
         // majority of the currently connected filter-peer population.
+        //
+        // CF_DISAGREED_CAP is sized to the FULL connected-peer pool (not just
+        // CF_CONTINUITY_REANCHOR_FLOOR) precisely so this majority half stays
+        // satisfiable at healthy fleet size: since bestAgree <= cfDisagreedCount
+        // <= CF_DISAGREED_CAP, capping storage at the floor (3) would make
+        // "bestAgree > connected/2" structurally impossible the moment >=6
+        // filter peers are connected (3 can never exceed 6/2==3), even when a
+        // real majority of 6-8 honest peers coherently disagrees — see
+        // BRPeerManager.h's CF_DISAGREED_CAP comment.
 #ifndef CF_QUORUM_UNFIXED
         uint8_t bestAgree = 0;
         for (uint8_t i = 0; i < manager->cfDisagreedCount; i++) {

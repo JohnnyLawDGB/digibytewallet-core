@@ -318,11 +318,31 @@ Remarks:
    BRPeerManagerStruct. Deliberately NOT sized on CF_CONTINUITY_REANCHOR_FLOOR:
    that macro is undefined under -DCF_QUORUM_UNFIXED (see above), so an array
    declared `[CF_CONTINUITY_REANCHOR_FLOOR]` would fail to compile the red KAT
-   arm outright. Sized to hold CF_CONTINUITY_REANCHOR_FLOOR entries in the fixed
-   build; harmless (just three UInt128/UInt256 slots) in the red arm, where the
-   fallback decision never reads past cfDisagreedCount==CF_CONTINUITY_REANCHOR_K
-   anyway. */
-#define CF_DISAGREED_CAP 3
+   arm outright.
+
+   Sized to PEER_MAX_CONNECTIONS (the full connected-peer pool, defined above),
+   NOT to CF_CONTINUITY_REANCHOR_FLOOR — a whole-branch-review fix-round finding:
+   since bestAgree <= cfDisagreedCount <= CF_DISAGREED_CAP, sizing this at the
+   floor (3) made the quorum's majority half
+   (bestAgree > _BRPeerManagerConnectedFilterPeerCount(manager)/2) structurally
+   UNSATISFIABLE once >=6 filter peers are connected (3 can never exceed 6/2==3,
+   let alone 7/2==3 or 8/2==4) — exactly the NORMAL healthy-fleet state at
+   PEER_MAX_CONNECTIONS==8. A genuinely diverged chain with 6-8 honest,
+   coherently-agreeing peers could never clear the majority half at the old
+   cap, no matter how large the true majority actually was. Sizing to the full
+   pool lets the decision store and detect a real majority at any fleet size up
+   to PEER_MAX_CONNECTIONS. The O(N^2) plurality loop stays trivial at N<=8 (64
+   comparisons); CF_CONTINUITY_REANCHOR_FLOOR (3) remains the separate, smaller
+   minimum-agreeing-count floor, unchanged.
+
+   Guarded with #ifndef (not a plain #define) so the host KAT's red arm can
+   override it with -DCF_DISAGREED_CAP=3 to reconstitute the pre-fix-round
+   shape and red-confirm this fix is load-bearing — a plain #define here
+   cannot be beaten by a command-line -D (the header's definition wins, and
+   -w silences the redefinition warning instead of surfacing the mistake). */
+#ifndef CF_DISAGREED_CAP
+#define CF_DISAGREED_CAP PEER_MAX_CONNECTIONS
+#endif
 
 /* Floor of connected filter peers below which the cfheaders stall-recovery must
    NOT disconnect a peer. A batch no peer can serve (e.g. a contested range during

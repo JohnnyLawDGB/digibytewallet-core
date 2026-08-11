@@ -501,8 +501,15 @@ struct BRPeerManagerStruct {
     _Atomic int      cachedHasDownloadPeer;
     _Atomic int      cachedSyncMode;
     // Distinct peers that failed the cfheaders continuity check since the last
-    // successful append. K of them disagreeing means WE are the outlier.
-    UInt128  cfDisagreedPeers[CF_CONTINUITY_REANCHOR_K];
+    // successful append, and each one's claimed prevFilterHeader (parallel
+    // array, same index). Task 5 (cfcheckpt-active-rejection): the multi-peer
+    // re-anchor decision no longer trusts raw disagreement count alone — it
+    // requires a plurality of these stored prevFilterHeader values to AGREE
+    // (see the quorum decision in _peerRelayedCFHeaders). Sized on the
+    // always-defined CF_DISAGREED_CAP, not on CF_CONTINUITY_REANCHOR_FLOOR
+    // (which is undefined under -DCF_QUORUM_UNFIXED — see BRPeerManager.h).
+    UInt128  cfDisagreedPeers[CF_DISAGREED_CAP];
+    UInt256  cfDisagreedPrev[CF_DISAGREED_CAP];
     uint8_t  cfDisagreedCount;
     uint8_t  cfReanchorCount;            // continuity-triggered re-anchors this session
     // When only ONE filter peer is connected the K-distinct-disagreers threshold
@@ -4067,43 +4074,84 @@ static void _peerRelayedCFHeaders(void *info, uint8_t filterType, UInt256 stopHa
         // mutates the chain. Used by both re-anchor gates below.
         uint32_t contestedHeight = BRCompactFilterChainNextHeight(manager->compactFilterChain);
 
-        // Record this peer as one that disagrees with our tip (dedup by address).
-        // Do NOT mark it misbehavin'/disconnect — if the majority disagrees, the
-        // honest peers are right and OUR chain is the divergent outlier.
+        // Record this peer as one that disagrees with our tip (dedup by address),
+        // alongside the prevFilterHeader IT claims (Task 5: the quorum decision
+        // below needs to know whether disagreers describe the SAME alternate
+        // chain or are just independent noise). Do NOT mark it misbehavin'/
+        // disconnect here — if a genuine majority disagrees, the honest peers
+        // are right and OUR chain is the divergent outlier.
         int _known = 0;
         for (uint8_t i = 0; i < manager->cfDisagreedCount; i++) {
             if (UInt128Eq(manager->cfDisagreedPeers[i], peer->address)) { _known = 1; break; }
         }
-        if (!_known && manager->cfDisagreedCount < CF_CONTINUITY_REANCHOR_K) {
+        if (!_known && manager->cfDisagreedCount < CF_DISAGREED_CAP) {
+            manager->cfDisagreedPrev[manager->cfDisagreedCount] = prevFilterHeader;
             manager->cfDisagreedPeers[manager->cfDisagreedCount++] = peer->address;
         }
         manager->cfHeadersRequestedThrough = 0;  // let another peer be tried
 
-        // Below the re-anchor threshold: actively probe the OTHER filter peers about
-        // this same contested batch so distinct disagreers accumulate to K.
+        // Below the collection cap: actively probe the OTHER filter peers about
+        // this same contested batch so distinct disagreers accumulate toward the
+        // quorum floor.
         //
-        // Re-fire on EVERY mismatch while below K — not only on the first (fresh add).
-        // The disagreeing peer is usually the priority peer (digiscope.me), which
-        // connects first; the seeder's other filter peers finish their handshake a
-        // few seconds LATER. A one-shot probe (gated on the fresh add) therefore loops
-        // over a peer list that holds no other filter peer yet, reaches nobody, and the
-        // count wedges at 1/K until an unrelated rescan resets it ~tens of minutes on.
-        // Re-probing each round catches those peers the moment they connect. The probe
-        // skips peers already in the disagreed set and we only reach here once per
-        // cfheaders round-trip (the request is serialized), so it can't storm.
-        if (manager->cfDisagreedCount < CF_CONTINUITY_REANCHOR_K) {
+        // Re-fire on EVERY mismatch while below the cap — not only on the first
+        // (fresh add). The disagreeing peer is usually the priority peer
+        // (digiscope.me), which connects first; the seeder's other filter peers
+        // finish their handshake a few seconds LATER. A one-shot probe (gated on
+        // the fresh add) therefore loops over a peer list that holds no other
+        // filter peer yet, reaches nobody, and the count wedges short of the
+        // floor until an unrelated rescan resets it ~tens of minutes on.
+        // Re-probing each round catches those peers the moment they connect. The
+        // probe skips peers already in the disagreed set and we only reach here
+        // once per cfheaders round-trip (the request is serialized), so it can't
+        // storm. Capped on CF_DISAGREED_CAP (not the old K) so probing keeps
+        // running until CF_CONTINUITY_REANCHOR_FLOOR agreeing disagreers can
+        // actually be collected — capping this at the old K==2 would silently
+        // wedge collection two short of a 3-agreeing-disagreer floor, recreating
+        // the exact "count wedges" failure mode this comment describes, just one
+        // threshold higher.
+        if (manager->cfDisagreedCount < CF_DISAGREED_CAP) {
             _BRPeerManagerProbeOtherFilterPeersForCFHeaders(manager, peer, filterType,
                                                             BRCompactFilterChainNextHeight(manager->compactFilterChain),
                                                             stopHash);
         }
 
-        if (manager->cfDisagreedCount >= CF_CONTINUITY_REANCHOR_K &&
+        // Task 5 (cfcheckpt-active-rejection) — quorum-reliability. The old
+        // trigger was "CF_CONTINUITY_REANCHOR_K distinct disagreers, any
+        // complaint" — two peers with UNRELATED complaints (different claimed
+        // prevFilterHeader, i.e. independent transients rather than a coherent
+        // alternate chain) could force a re-anchor. Replace it with "a strict
+        // majority of connected filter peers AND >= CF_CONTINUITY_REANCHOR_FLOOR
+        // distinct disagreers that agree with EACH OTHER on the claimed
+        // prevFilterHeader": compute the plurality prevFilterHeader among the
+        // stored disagreers (O(N^2) over N <= CF_DISAGREED_CAP == 3, trivial)
+        // and require the largest agreeing bucket to clear both the floor and a
+        // majority of the currently connected filter-peer population.
+#ifndef CF_QUORUM_UNFIXED
+        uint8_t bestAgree = 0;
+        for (uint8_t i = 0; i < manager->cfDisagreedCount; i++) {
+            uint8_t agree = 0;
+            for (uint8_t j = 0; j < manager->cfDisagreedCount; j++) {
+                if (UInt256Eq(manager->cfDisagreedPrev[i], manager->cfDisagreedPrev[j])) agree++;
+            }
+            if (agree > bestAgree) bestAgree = agree;
+        }
+        int quorumMet = (bestAgree >= CF_CONTINUITY_REANCHOR_FLOOR) &&
+                        (bestAgree > _BRPeerManagerConnectedFilterPeerCount(manager) / 2);
+#else
+        // Red KAT arm only: restores the pre-Task-5 "K distinct disagreers,
+        // any complaint" trigger — CF_CONTINUITY_REANCHOR_FLOOR does not exist
+        // in this arm, so the decision cannot reference it.
+        int quorumMet = (manager->cfDisagreedCount >= CF_CONTINUITY_REANCHOR_K);
+#endif
+
+        if (quorumMet &&
             manager->cfReanchorCount < CF_CONTINUITY_REANCHOR_MAX) {
 #ifndef CF_CHECKPOINT_VETO_UNFIXED
             // Task 4 — a checkpoint-confirmed chain vetoes the re-anchor. The
-            // K-distinct-disagreers quorum is normally trustworthy, but if our
-            // own chain is independently proven correct at the contested height
-            // by a pinned checkpoint, the "quorum" is itself wrong (colluding or
+            // quorum above is normally trustworthy, but if our own chain is
+            // independently proven correct at the contested height by a pinned
+            // checkpoint, the "quorum" is itself wrong (colluding or
             // coincidentally all stuck on the same fork) — do not throw away
             // confirmed history for it. Ban the disagreeing peer instead.
             if (_BRPeerManagerCheckpointConfirmsOurChainLocked(manager, contestedHeight)) {
@@ -4166,11 +4214,11 @@ static void _peerRelayedCFHeaders(void *info, uint8_t filterType, UInt256 stopHa
             manager->cfSingleDisagreeRounds = 0;  // 2nd filter peer present → prefer K=2 path
         }
 
-        // Below the K threshold, or re-anchor budget exhausted: don't append and
+        // Below the quorum, or re-anchor budget exhausted: don't append and
         // don't punish. If the budget is exhausted the chain stops advancing and
         // the SyncService watchdog falls back to bloom as today — pool never burned.
-        peer_log(peer, "cfheaders: continuity mismatch (%u/%u disagree, reanchors %u/%u) — not appending",
-                 manager->cfDisagreedCount, CF_CONTINUITY_REANCHOR_K,
+        peer_log(peer, "cfheaders: continuity mismatch (%u/%u disagreers collected, reanchors %u/%u) — not appending",
+                 manager->cfDisagreedCount, CF_DISAGREED_CAP,
                  manager->cfReanchorCount, CF_CONTINUITY_REANCHOR_MAX);
         MGR_UNLOCK(manager);
         return;

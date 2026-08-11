@@ -288,9 +288,41 @@ Remarks:
    cfheaders continuity check against our current tip since the last successful
    append, our chain is the outlier (it diverged via unverified TOFU) — re-anchor
    instead of marking the (honest) peers misbehavin'. Bounded per session so a
-   persistently-divergent peer can't loop forever. */
+   persistently-divergent peer can't loop forever.
+
+   CF_CONTINUITY_REANCHOR_K is now consulted ONLY by the single-peer escape
+   hatch (CF_SINGLE_PEER_REANCHOR_ROUNDS' companion, one connected filter peer)
+   and by the -DCF_QUORUM_UNFIXED fallback below. The multi-peer quorum re-anchor
+   decision itself was widened past raw K (see CF_CONTINUITY_REANCHOR_FLOOR). */
 #define CF_CONTINUITY_REANCHOR_K   2
 #define CF_CONTINUITY_REANCHOR_MAX 3
+
+/* Task 5 (cfcheckpt-active-rejection) — quorum-reliability. The old
+   "CF_CONTINUITY_REANCHOR_K distinct disagreers, any complaint" trigger let
+   TWO peers with UNRELATED complaints (different claimed prevFilterHeader —
+   independent transients, e.g. each stuck on its own stale/dead socket) force
+   a re-anchor, even though they don't describe the same alternate chain. The
+   multi-peer re-anchor now additionally requires >= this many of the stored
+   disagreers to AGREE with each other on the claimed prevFilterHeader (a real,
+   coherent alternate chain, not noise) — see the plurality-prev computation at
+   the quorum decision site in BRPeerManager.c. Gated behind #ifndef so the host
+   KAT's red arm (-DCF_QUORUM_UNFIXED) can undefine it entirely and restore the
+   pre-Task-5 K=2/any-disagree decision, proving the floor+agreement check is
+   load-bearing. Do NOT read this macro outside a matching #ifndef
+   CF_QUORUM_UNFIXED guard — it does not exist in the red arm. */
+#ifndef CF_QUORUM_UNFIXED
+#define CF_CONTINUITY_REANCHOR_FLOOR 3
+#endif
+
+/* Always-defined storage capacity for cfDisagreedPeers[]/cfDisagreedPrev[] in
+   BRPeerManagerStruct. Deliberately NOT sized on CF_CONTINUITY_REANCHOR_FLOOR:
+   that macro is undefined under -DCF_QUORUM_UNFIXED (see above), so an array
+   declared `[CF_CONTINUITY_REANCHOR_FLOOR]` would fail to compile the red KAT
+   arm outright. Sized to hold CF_CONTINUITY_REANCHOR_FLOOR entries in the fixed
+   build; harmless (just three UInt128/UInt256 slots) in the red arm, where the
+   fallback decision never reads past cfDisagreedCount==CF_CONTINUITY_REANCHOR_K
+   anyway. */
+#define CF_DISAGREED_CAP 3
 
 /* Floor of connected filter peers below which the cfheaders stall-recovery must
    NOT disconnect a peer. A batch no peer can serve (e.g. a contested range during

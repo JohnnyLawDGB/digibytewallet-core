@@ -77,6 +77,28 @@ const sffcEntry sffcTable[] = {
 };
 
 /*
+ * Read the 8 bytes an SFFC field is decoded from WITHOUT running off the end of the script.
+ *
+ * The old code did UInt64GetBE(ptr) with the comment "safe because scriptLen (64) is after
+ * script" -- i.e. it assumed the allocation always had 8 readable bytes left. It does not:
+ * BRTxOutputSetScript allocates exactly scriptLen bytes, so a compact DigiAsset payload
+ * over-reads the heap. A live mainnet transfer does it today -- OP_RETURN 6a0644410115000a
+ * is 8 bytes total, and the transfer amount starts at offset 6, leaving 2. Peer-supplied
+ * transactions reach this path, so the over-read is remotely triggerable.
+ *
+ * Missing bytes read as zero, which is what a short/truncated field decodes to anyway.
+ */
+static uint64_t _sffcWordAt(const uint8_t *ptr, const uint8_t *end)
+{
+    uint8_t word[8] = { 0 };
+    size_t avail = (end > ptr) ? (size_t)(end - ptr) : 0;
+
+    if (avail > sizeof(word)) avail = sizeof(word);
+    if (avail > 0) memcpy(word, ptr, avail);
+    return UInt64GetBE(word);
+}
+
+/*
  * Returns 1 if an asset was sent to the output
  */
 uint8_t BRTxOutputIsAsset(const BRTransaction* transaction, const BRTxOutput* output) {
@@ -108,7 +130,11 @@ uint8_t BRTxOutputIsAsset(const BRTransaction* transaction, const BRTxOutput* ou
     if (idx == -1) return 0;
     if (or_output == NULL) return 0;
     
+    /* Every read below is bounded by this. */
+    const uint8_t *end = or_output->script + or_output->scriptLen;
+
     ptr = or_output->script + 4; /* OP_RETURN + LEN + TAG(2) */
+    if (ptr + 2 > end) return 0; /* no room for version + type */
     version = *ptr;
     ptr++;
     
@@ -131,7 +157,7 @@ uint8_t BRTxOutputIsAsset(const BRTransaction* transaction, const BRTxOutput* ou
         
         assert(flagsLen <= 6 && "sffc out of range");
         sffcEntry* data = &sffcTable[flagsLen];
-        amount = UInt64GetBE(ptr); // safe because scriptLen (64) is after script
+        amount = _sffcWordAt(ptr, end);
         ptr += data->byteSize;
         
         // mask flag bits
@@ -169,12 +195,15 @@ uint8_t BRTxOutputIsAsset(const BRTransaction* transaction, const BRTxOutput* ou
             percent = !!(flags & (1 << 5));
             outputIdx = flags & (~0xE0);
             if (range) {
-                uint8_t outputIdx2 = *ptr++;
+                uint8_t outputIdx2;
+                if (ptr >= end) break;
+                outputIdx2 = *ptr++;
                 // output size = 13 bits
                 outputIdx = outputIdx | (outputIdx2 << 8);
             }
             
             if (percent) {
+                if (ptr >= end) break;
                 amount = *ptr++;
             } else {
                 uint8_t flagsLen = (*ptr & 0xe0) >> 5;
@@ -182,7 +211,7 @@ uint8_t BRTxOutputIsAsset(const BRTransaction* transaction, const BRTxOutput* ou
                 
                 assert(flagsLen <= 6 && "sffc out of range");
                 sffcEntry* data = &sffcTable[flagsLen];
-                amount = UInt64GetBE(ptr); // safe because scriptLen (64) is after script
+                amount = _sffcWordAt(ptr, end);
                 ptr += data->byteSize;
                 
                 // mask flag bits

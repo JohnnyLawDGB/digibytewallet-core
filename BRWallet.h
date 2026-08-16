@@ -367,6 +367,14 @@ int64_t BRBitcoinAmount(int64_t localAmount, double price);
 
 BRUTXO * BRGetUTXO(BRWallet *wallet);
 
+// Record that (txHash, n) carries DigiAsset units the tx-local classifier cannot see --
+// chiefly implicit change (the units a transfer's instructions leave unassigned, which the
+// protocol credits to the transaction's LAST output). The outpoint is then held in
+// assetUtxos instead of the spendable set, so plain-DGB coin selection cannot destroy it.
+// Durable across balance rebuilds, not across process restart; idempotent. Returns 1 if
+// this call newly excluded the outpoint, 0 if it was already registered.
+int BRWalletRegisterAssetOutpoint(BRWallet *wallet, UInt256 txHash, uint32_t n);
+
 int BRWalletUtxoIsAsset(BRWallet* wallet, BRUTXO* utxo);
 
 int BRWalletHasAssetUtxo(BRWallet* wallet, const char* txid, int index);

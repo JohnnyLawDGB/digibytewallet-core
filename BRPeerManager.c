@@ -6501,6 +6501,39 @@ size_t BRPeerManagerRelayCount(BRPeerManager *manager, UInt256 txHash)
 }
 
 // frees memory allocated for manager
+// Serialize the penalty set so it survives a process restart. Without this the set is
+// session-scoped, and every cold start re-dials peers the previous session had already
+// learned were behind — the "one peer dialled 122x" churn, once per launch. Returns
+// bytes written, 0 if the buffer is too small (never a truncated blob).
+size_t BRPeerManagerSerializePenalties(BRPeerManager *manager, uint8_t *buf, size_t bufLen)
+{
+    size_t written, count;
+
+    assert(manager != NULL);
+    pthread_mutex_lock(&manager->lock);
+    count = manager->penaltyCount < PEER_PENALTY_MAX ? manager->penaltyCount : PEER_PENALTY_MAX;
+    written = BRPeerPenaltySerialize(manager->penaltyAddr, manager->penaltyPort, manager->penaltyUntil,
+                                     count, time(NULL), buf, bufLen);
+    pthread_mutex_unlock(&manager->lock);
+    return written;
+}
+
+// Restore penalties saved by BRPeerManagerSerializePenalties, dropping any whose window
+// has since lapsed. Replaces the live set rather than merging: it is only called before
+// the first dial pass, when the live set is empty. Returns the number restored.
+size_t BRPeerManagerLoadPenalties(BRPeerManager *manager, const uint8_t *buf, size_t bufLen)
+{
+    size_t loaded;
+
+    assert(manager != NULL);
+    pthread_mutex_lock(&manager->lock);
+    loaded = BRPeerPenaltyDeserialize(buf, bufLen, time(NULL), manager->penaltyAddr, manager->penaltyPort,
+                                      manager->penaltyUntil, PEER_PENALTY_MAX);
+    manager->penaltyCount = loaded;
+    pthread_mutex_unlock(&manager->lock);
+    return loaded;
+}
+
 void BRPeerManagerFree(BRPeerManager *manager)
 {
     assert(manager != NULL);

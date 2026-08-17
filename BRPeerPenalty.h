@@ -38,7 +38,8 @@
 #define BRPeerPenalty_h
 
 #include <time.h>
-#include "BRInt.h" // UInt128, UInt128Eq
+#include <string.h> // memcpy
+#include "BRInt.h" // UInt128, UInt128Eq, UInt16/32/64 get/set
 
 // Is (a, p) currently penalized? True iff some entry i < count matches
 // BOTH the address and the port AND its penalty window hasn't lapsed yet
@@ -53,6 +54,78 @@ static inline int BRPeerPenaltyContains(const UInt128 *addrs, const uint16_t *po
         if (ports[i] == p && UInt128Eq(addrs[i], a) && until[i] > now) return 1;
     }
     return 0;
+}
+
+// ---- persistence -------------------------------------------------------------
+//
+// The penalty set used to die with the process, so every cold start re-dialled peers
+// the previous session had already learned were behind — the "one peer dialled 122x"
+// churn, reintroduced once per launch. These two helpers round-trip it through a blob
+// the Kotlin layer persists alongside the saved peers.
+//
+// Wire format, little-endian: [4-byte count][per entry: 16-byte addr, 2-byte port,
+// 8-byte absolute deadline]. Deadlines are absolute on purpose: a blob written days
+// ago must expire on read rather than re-penalize a peer that has long since recovered.
+// Both directions drop lapsed entries, so a wallet that sat closed for an hour starts
+// with a clean slate.
+
+#define BR_PEER_PENALTY_ENTRY_BYTES 26u
+#define BR_PEER_PENALTY_HEADER_BYTES 4u
+
+// Serialize the live (unexpired) entries into [buf]. Returns bytes written, or 0 if the
+// buffer is too small — never a truncated blob, which would deserialize into garbage
+// penalties on the next launch.
+static inline size_t BRPeerPenaltySerialize(const UInt128 *addrs, const uint16_t *ports,
+                                            const time_t *until, size_t count, time_t now,
+                                            uint8_t *buf, size_t bufLen)
+{
+    size_t live = 0, pos;
+
+    if (! buf) return 0;
+    for (size_t i = 0; i < count; i++) if (until[i] > now) live++;
+    if (bufLen < BR_PEER_PENALTY_HEADER_BYTES + live * BR_PEER_PENALTY_ENTRY_BYTES) return 0;
+
+    UInt32SetLE(buf, (uint32_t)live);
+    pos = BR_PEER_PENALTY_HEADER_BYTES;
+    for (size_t i = 0; i < count; i++) {
+        if (until[i] <= now) continue;
+        memcpy(&buf[pos], &addrs[i], 16); pos += 16;
+        UInt16SetLE(&buf[pos], ports[i]); pos += 2;
+        UInt64SetLE(&buf[pos], (uint64_t)until[i]); pos += 8;
+    }
+
+    return pos;
+}
+
+// Restore penalties from [buf], dropping any whose deadline has already lapsed and
+// stopping at [maxCount]. Returns the number restored. A short, empty or malformed blob
+// restores nothing rather than inventing entries — this input comes off disk.
+static inline size_t BRPeerPenaltyDeserialize(const uint8_t *buf, size_t bufLen, time_t now,
+                                              UInt128 *addrs, uint16_t *ports, time_t *until,
+                                              size_t maxCount)
+{
+    size_t claimed, pos = BR_PEER_PENALTY_HEADER_BYTES, out = 0;
+
+    if (! buf || bufLen < BR_PEER_PENALTY_HEADER_BYTES) return 0;
+    claimed = (size_t)UInt32GetLE(buf);
+    if (bufLen < BR_PEER_PENALTY_HEADER_BYTES + claimed * BR_PEER_PENALTY_ENTRY_BYTES) return 0;
+
+    for (size_t i = 0; i < claimed && out < maxCount; i++) {
+        UInt128 a;
+        uint16_t p;
+        time_t u;
+
+        memcpy(&a, &buf[pos], 16); pos += 16;
+        p = UInt16GetLE(&buf[pos]); pos += 2;
+        u = (time_t)UInt64GetLE(&buf[pos]); pos += 8;
+        if (u <= now) continue;
+        addrs[out] = a;
+        ports[out] = p;
+        until[out] = u;
+        out++;
+    }
+
+    return out;
 }
 
 #endif // BRPeerPenalty_h

@@ -885,6 +885,13 @@ uint32_t BRPeerManagerConvoyRearmMax(void);
 // ----------- end BIP 158 opt-in -----------
 
 // frees memory allocated for manager (call BRPeerManagerDisconnect() first if connected)
+// Persist / restore the re-dial penalty set across process restarts, so a cold start
+// doesn't re-dial peers the last session already learned were behind. Deadlines are
+// absolute: a blob whose windows have all lapsed restores nothing.
+// Serialize returns bytes written (0 if bufLen is too small); Load returns entries restored.
+size_t BRPeerManagerSerializePenalties(BRPeerManager *manager, uint8_t *buf, size_t bufLen);
+size_t BRPeerManagerLoadPenalties(BRPeerManager *manager, const uint8_t *buf, size_t bufLen);
+
 void BRPeerManagerFree(BRPeerManager *manager);
 	
 /*

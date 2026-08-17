@@ -2327,6 +2327,31 @@ void BRFixAssetInputs(BRWallet *wallet, BRTransaction *assetTransaction)
 // but NOT across process restart -- the caller replays its registrations after wallet load.
 // Idempotent. Returns 1 if this call newly excluded the outpoint, 0 if it was already
 // registered.
+// The composed spent/held answer for one outpoint, as the asset layer consumes it:
+//    0 SPENT       the outpoint is in the wallet's spentOutputs set
+//    1 HELD        the funding tx is known, valid, and the outpoint is unspent
+//   -1 UNDETECTED  the wallet has no record of the funding tx (e.g. below the scan floor)
+//   -2 CONFLICTED  the funding tx is known but INVALID -- another transaction spent its
+//                  inputs, which is what a stuck send looks like after the user re-sends
+//
+// CONFLICTED exists because spent-ness cannot see it. Nothing ever spends the abandoned
+// attempt's OWN change output, so BRWalletOutpointSpent answers "unspent" forever while
+// BRWalletTransactionForHash answers "known" -- the pair reads HELD, and the asset layer
+// counts one send's change twice (measured: a supply-10 asset displaying 18).
+// BRWalletTransactionIsValid is the only predicate that separates them.
+int BRWalletOutpointAssetState(BRWallet *wallet, UInt256 txHash, uint32_t n)
+{
+    BRTransaction *tx;
+
+    assert(wallet != NULL);
+    if (BRWalletOutpointSpent(wallet, txHash, n)) return 0;
+
+    tx = BRWalletTransactionForHash(wallet, txHash);
+    if (! tx) return -1;
+    if (! BRWalletTransactionIsValid(wallet, tx)) return -2;
+    return 1;
+}
+
 int BRWalletRegisterAssetOutpoint(BRWallet *wallet, UInt256 txHash, uint32_t n)
 {
     int added = 0;

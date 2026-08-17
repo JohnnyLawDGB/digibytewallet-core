@@ -128,4 +128,42 @@ static inline size_t BRPeerPenaltyDeserialize(const uint8_t *buf, size_t bufLen,
     return out;
 }
 
+// Drop penalties against addresses in [exempt], compacting the arrays in place and
+// returning the number of entries kept.
+//
+// Used when RESTORING a persisted set. Only the pinned own-node is exempt from being
+// penalized in the first place, so the hardcoded CF oracle peers can and do land in the
+// set — a wallet the fleet is refusing (measured: 44% of canon closes are refused at the
+// door) will penalize most of them. That was harmless while the set died with the process,
+// because every launch got a clean slate. Once it persists, a wallet can come back up
+// skipping the entire fleet it needs to reach first, which is the on-ramp to 0 peers ->
+// watchdog -> recreate -> floor-to-birth.
+//
+// In-session penalties against these peers still work — that is what stopped the "one peer
+// dialled 122x while the wallet held 0 peers" loop. What must not survive a restart is a
+// penalty against the peers we have to reach before we have any peers at all.
+static inline size_t BRPeerPenaltyDropExempt(UInt128 *addrs, uint16_t *ports, time_t *until,
+                                             size_t count, const UInt128 *exempt, size_t exemptCount)
+{
+    size_t kept = 0;
+
+    if (! exempt || exemptCount == 0) return count;
+
+    for (size_t i = 0; i < count; i++) {
+        int isExempt = 0;
+
+        for (size_t e = 0; ! isExempt && e < exemptCount; e++) {
+            if (UInt128Eq(addrs[i], exempt[e])) isExempt = 1;
+        }
+        if (isExempt) continue;
+
+        addrs[kept] = addrs[i];
+        ports[kept] = ports[i];
+        until[kept] = until[i];
+        kept++;
+    }
+
+    return kept;
+}
+
 #endif // BRPeerPenalty_h

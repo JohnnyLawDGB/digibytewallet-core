@@ -41,6 +41,12 @@ struct BRWalletStruct {
     uint32_t blockHeight;
     BRUTXO *utxos;
     BRUTXO *assetUtxos;
+    // Outpoints an out-of-band authority (the Kotlin asset layer) has told us carry
+    // DigiAsset units that BRTxOutputIsAsset cannot see from the transaction alone --
+    // chiefly implicit change, where the units the transfer instructions did not assign
+    // ride on the tx's LAST output. Unlike assetUtxos this list is NOT rebuilt from the
+    // transaction set, so the exclusion survives every _BRWalletUpdateBalance.
+    BRUTXO *assetOverrides;
     BRUTXO *ddUtxos;      // DigiDollar token UTXOs (zero-value P2TR, cents-denominated)
     uint64_t ddBalance;   // DigiDollar balance in CENTS (never mixed with the sat balance)
     BRTransaction **transactions;
@@ -209,6 +215,18 @@ static uint64_t _brNextAddrGen(void)
     return g;
 }
 
+// Has an outpoint been registered as asset-bearing out of band? See assetOverrides.
+// Caller holds wallet->lock (or is still inside BRWalletNew).
+static int _BRWalletIsAssetOverride(BRWallet *wallet, UInt256 txHash, uint32_t n)
+{
+    for (size_t i = 0; i < array_count(wallet->assetOverrides); i++) {
+        if (UInt256Eq(wallet->assetOverrides[i].hash, txHash) && wallet->assetOverrides[i].n == n)
+            return 1;
+    }
+
+    return 0;
+}
+
 static void _BRWalletUpdateBalance(BRWallet *wallet)
 {
     int isInvalid, isPending;
@@ -316,7 +334,8 @@ static void _BRWalletUpdateBalance(BRWallet *wallet)
                         array_add(wallet->ddUtxos, ((BRUTXO) { tx->txHash, (uint32_t)j }));
                         ddBalance += (uint64_t)ddCents;
                         balance += 0; // DD tokens are zero-value; never touch the DGB balance
-                    } else if (BRTxOutputIsAsset(tx, &tx->outputs[j])) {
+                    } else if (BRTxOutputIsAsset(tx, &tx->outputs[j]) ||
+                               _BRWalletIsAssetOverride(wallet, tx->txHash, (uint32_t)j)) {
                         array_add(wallet->assetUtxos, ((BRUTXO) { tx->txHash, (uint32_t)j }));
                         balance += 0;
                     } else {
@@ -373,6 +392,7 @@ BRWallet *BRWalletNew(BRTransaction *transactions[], size_t txCount, BRMasterPub
     assert(wallet != NULL);
     array_new(wallet->utxos, 100);
     array_new(wallet->assetUtxos, 30);
+    array_new(wallet->assetOverrides, 10);
     array_new(wallet->ddUtxos, 30);
     array_new(wallet->transactions, txCount + 100);
     wallet->feePerKb = DEFAULT_FEE_PER_KB;
@@ -2236,6 +2256,7 @@ void BRWalletFree(BRWallet *wallet)
     array_free(wallet->transactions);
     array_free(wallet->utxos);
     array_free(wallet->assetUtxos);
+    array_free(wallet->assetOverrides);
     array_free(wallet->ddUtxos);
     pthread_mutex_unlock(&wallet->lock);
     pthread_mutex_destroy(&wallet->lock);
@@ -2289,6 +2310,63 @@ void BRFixAssetInputs(BRWallet *wallet, BRTransaction *assetTransaction)
             }
         }
     }
+}
+
+// Record that (txHash, n) carries DigiAsset units, so it is held in assetUtxos instead of
+// the spendable utxos set and no plain-DGB coin selection can reach it.
+//
+// The tx-local classifier BRTxOutputIsAsset only recognises outputs an explicit transfer
+// instruction targets. DigiAssets also credits every unassigned input unit to the
+// transaction's LAST output (DigiAsset_Core DigiByteTransaction.cpp, decodeAssetTransfer),
+// and deciding whether such a remainder exists requires the INPUT quantities -- a
+// chain-walk plus a per-outpoint store that lives in the Kotlin layer, not here. So the
+// asset layer resolves it and registers the outcome through this call, fail-closed:
+// registered whenever the remainder is positive OR unknown.
+//
+// Durable across _BRWalletUpdateBalance (the override list is not rebuilt from the tx set)
+// but NOT across process restart -- the caller replays its registrations after wallet load.
+// Idempotent. Returns 1 if this call newly excluded the outpoint, 0 if it was already
+// registered.
+// The composed spent/held answer for one outpoint, as the asset layer consumes it:
+//    0 SPENT       the outpoint is in the wallet's spentOutputs set
+//    1 HELD        the funding tx is known, valid, and the outpoint is unspent
+//   -1 UNDETECTED  the wallet has no record of the funding tx (e.g. below the scan floor)
+//   -2 CONFLICTED  the funding tx is known but INVALID -- another transaction spent its
+//                  inputs, which is what a stuck send looks like after the user re-sends
+//
+// CONFLICTED exists because spent-ness cannot see it. Nothing ever spends the abandoned
+// attempt's OWN change output, so BRWalletOutpointSpent answers "unspent" forever while
+// BRWalletTransactionForHash answers "known" -- the pair reads HELD, and the asset layer
+// counts one send's change twice (measured: a supply-10 asset displaying 18).
+// BRWalletTransactionIsValid is the only predicate that separates them.
+int BRWalletOutpointAssetState(BRWallet *wallet, UInt256 txHash, uint32_t n)
+{
+    BRTransaction *tx;
+
+    assert(wallet != NULL);
+    if (BRWalletOutpointSpent(wallet, txHash, n)) return 0;
+
+    tx = BRWalletTransactionForHash(wallet, txHash);
+    if (! tx) return -1;
+    if (! BRWalletTransactionIsValid(wallet, tx)) return -2;
+    return 1;
+}
+
+int BRWalletRegisterAssetOutpoint(BRWallet *wallet, UInt256 txHash, uint32_t n)
+{
+    int added = 0;
+
+    assert(wallet != NULL);
+    pthread_mutex_lock(&wallet->lock);
+
+    if (! _BRWalletIsAssetOverride(wallet, txHash, n)) {
+        array_add(wallet->assetOverrides, ((BRUTXO) { txHash, n }));
+        added = 1;
+        _BRWalletUpdateBalance(wallet);
+    }
+
+    pthread_mutex_unlock(&wallet->lock);
+    return added;
 }
 
 int BRWalletUtxoIsAsset(BRWallet* wallet, BRUTXO* utxo) {

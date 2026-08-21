@@ -788,6 +788,15 @@ uint32_t BRPeerManagerAbandonedBelow(BRPeerManager *manager);
    the block set, this does. */
 uint32_t BRPeerManagerRetireAbandonedBand(BRPeerManager *manager);
 
+/* One step of the abandoned-band backfill: retire whatever the resident headers already
+   allow, then ask one connected peer for the next stretch of headers under the band.
+   Returns the heights retired by THIS call.
+
+   Safe on any tick and safe to call forever — it re-derives everything from the ledger and
+   the block set, so a missed tick, a dropped peer or a process restart costs time, never
+   correctness. Does nothing when there is no band or no connected peer. */
+uint32_t BRPeerManagerBackfillAbandonedBandStep(BRPeerManager *manager);
+
 // SPAN below the watermark: heights in [start .. abandonedBelow-1], i.e.
 // max(abandonedBelow - start, 0).
 //

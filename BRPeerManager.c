@@ -512,6 +512,22 @@ struct BRPeerManagerStruct {
     UInt256  cfDisagreedPrev[CF_DISAGREED_CAP];
     uint8_t  cfDisagreedCount;
     uint8_t  cfReanchorCount;            // continuity-triggered re-anchors this session
+
+    // ── Abandoned-band backfill (2026-08-21) ──────────────────────────────
+    // Re-fetching the block headers under an abandoned band so the band can be
+    // retired, instead of the only cure being a full rebuild from wallet birth.
+    //
+    // Why a tracked tip rather than a walk: contiguity builds UPWARD from a block
+    // checkpoint (getheaders returns C+1, C+2, …) but BRMerkleBlock only links
+    // BACKWARD via prevBlock, so the top of a partially-rebuilt run cannot be
+    // found by walking. It has to be remembered as it grows.
+    //
+    // Deliberately NOT persisted: the ledger's abandonedBelow is the durable state,
+    // and a restart simply re-derives the starting locator from the checkpoint table.
+    // Losing this costs one re-walk, never correctness.
+    UInt256  cfBackfillTipHash;         // last header accepted into the backfill run
+    uint32_t cfBackfillTipHeight;       // its height; 0 = run not started
+    uint32_t cfBackfillTarget;          // the abandonedBelow value this run is chasing
     // When only ONE filter peer is connected the K-distinct-disagreers threshold
     // can never be met (the active probe reaches no other filter peer), so
     // cfDisagreedCount wedges at 1/K forever and cfheaders never advance. Count
@@ -2142,6 +2158,102 @@ uint32_t BRPeerManagerRetireAbandonedBand(BRPeerManager *manager)
     return retired;
 }
 
+// Note a header admitted into the backfill run, so the next request can use it as a
+// locator. Called from the fork branch of _peerRelayedBlock, which is where a header
+// below lastBlock lands. Caller must hold manager->lock.
+static void _BRPeerManagerNoteBackfillHeaderLocked(BRPeerManager *manager, const BRMerkleBlock *block)
+{
+    if (!manager->cfBackfillTarget || !block) return;
+    // Only headers that extend the run upward are interesting. A peer answering an old
+    // request can deliver something below the current tip; ignoring it keeps the locator
+    // moving in one direction and stops a stale reply rewinding progress.
+    if (block->height <= manager->cfBackfillTipHeight) return;
+    if (block->height >= manager->cfBackfillTarget) return;   // past the band, nothing to do
+    manager->cfBackfillTipHeight = block->height;
+    manager->cfBackfillTipHash   = block->blockHash;
+}
+
+// One step of the abandoned-band backfill. Safe to call on any tick: it retires whatever
+// the resident headers already allow, then asks one peer for the next stretch.
+//
+// Stateless with respect to progress — every call re-derives what to do from the ledger
+// and the block set, so a missed tick, a dropped peer or a process restart costs nothing
+// but time. Returns the number of heights retired by THIS call.
+//
+// Returns without requesting anything when there is no band, when the whole band is
+// already retired, or when no filter peer is available.
+uint32_t BRPeerManagerBackfillAbandonedBandStep(BRPeerManager *manager)
+{
+    if (!manager) return 0;
+    MGR_LOCK(manager);
+
+    uint32_t abandoned = BRCFScanLedgerAbandonedBelow(&manager->cfLedger);
+    if (abandoned == 0) {                       // nothing to do; forget any stale run
+        manager->cfBackfillTarget   = 0;
+        manager->cfBackfillTipHeight = 0;
+        MGR_UNLOCK(manager);
+        return 0;
+    }
+
+    // Free progress first: headers may already reach further down than when the band was
+    // raised (an ordinary re-anchor, a restore, or an earlier step of this backfill).
+    uint32_t retired = _BRPeerManagerRetireAbandonedToResidentLocked(manager);
+    abandoned = BRCFScanLedgerAbandonedBelow(&manager->cfLedger);
+    if (abandoned == 0) {
+        manager->cfBackfillTarget = 0;
+        manager->cfBackfillTipHeight = 0;
+        MGR_UNLOCK(manager);
+        return retired;
+    }
+
+    // (Re)start the run whenever the target moves — a band raised again while a backfill
+    // was in flight must not be chased with a locator derived from the old one.
+    if (manager->cfBackfillTarget != abandoned) {
+        manager->cfBackfillTarget    = abandoned;
+        manager->cfBackfillTipHeight = 0;
+    }
+
+    // Locator: the run's own tip once it exists, otherwise the highest BLOCK checkpoint
+    // at or below the band. Those checkpoints are inserted into manager->blocks at
+    // construction, so one is always available — which is what makes a pruned range
+    // reachable at all.
+    UInt256 locator = UINT256_ZERO;
+    if (manager->cfBackfillTipHeight > 0) {
+        locator = manager->cfBackfillTipHash;
+    }
+    else {
+        uint32_t best = 0;
+        for (size_t i = 0; i < manager->params->checkpointsCount; i++) {
+            uint32_t h = manager->params->checkpoints[i].height;
+            if (h < abandoned && h > best) {
+                best = h;
+                locator = UInt256Reverse(manager->params->checkpoints[i].hash);
+            }
+        }
+        if (best == 0) { MGR_UNLOCK(manager); return retired; }   // no anchor below the band
+        manager->cfBackfillTipHeight = best;
+        manager->cfBackfillTipHash   = locator;
+    }
+
+    // Any connected filter peer will do — this is ordinary header data, not filter data,
+    // so it needs no special capability beyond being connected.
+    BRPeer *peer = NULL;
+    for (size_t i = array_count(manager->connectedPeers); i > 0; i--) {
+        BRPeer *p = manager->connectedPeers[i - 1];
+        if (BRPeerConnectStatus(p) == BRPeerStatusConnected) { peer = p; break; }
+    }
+    if (!peer) { MGR_UNLOCK(manager); return retired; }
+
+    UInt256 locators[1] = { locator };
+    peer_log(peer, "cf-backfill: requesting headers from %u toward abandoned floor %u "
+             "(%u height(s) still condemned)",
+             manager->cfBackfillTipHeight, abandoned, abandoned - manager->cfBackfillTipHeight);
+    BRPeerSendGetheaders(peer, locators, 1, UINT256_ZERO);
+
+    MGR_UNLOCK(manager);
+    return retired;
+}
+
 #if CF_LEDGER_DRIVE_REREQUEST
 // May the forward cfilter drive issue the NEXT batch this tick? (fix-wave I3)
 //
@@ -2857,8 +2969,15 @@ static void _peerRelayedBlock(void *info, BRMerkleBlock *block)
         block = NULL;
     }
     else { // new block is on a fork
-        peer_log(peer, "chain fork reached height %"PRIu32, block->height);
+        // A backfilled header (below lastBlock, above the newest block checkpoint) lands
+        // here too — it is not really a fork, it is a height we already pruned. Note it
+        // so the backfill's next locator advances, and keep quiet: a 20k-height backfill
+        // would otherwise emit 20k "chain fork" lines.
+        int isBackfill = (manager->cfBackfillTarget != 0 &&
+                          block->height < manager->cfBackfillTarget);
+        if (!isBackfill) peer_log(peer, "chain fork reached height %"PRIu32, block->height);
         BRSetAdd(manager->blocks, block);
+        if (isBackfill) _BRPeerManagerNoteBackfillHeaderLocked(manager, block);
 
         if (block->height > manager->lastBlock->height) { // check if fork is now longer than main chain
             b = block;

@@ -4280,8 +4280,63 @@ static void _peerRelayedCFHeaders(void *info, uint8_t filterType, UInt256 stopHa
                 // a peer-supplied value.
                 manager->autoFetchCFiltersStart   = cp->height;
                 manager->autoFetchCFiltersThrough = (cp->height > 0) ? cp->height - 1 : 0;
-                _BRPeerManagerSurfaceUnscannableLocked(manager, cp->height, tip + 1,
-                    "filter-header chain could not be verified against checkpoints");
+
+                // Parking the cursor above IS the anti-brick action: the next cycle
+                // re-fetches from a checkpoint-pinned height, so progress resumes. Whether
+                // to ALSO abandon the band is a separate and much heavier question, because
+                // abandoning marks those heights permanently unscannable (abandonedBelow is
+                // monotonic) and raises a user-facing "history gap" that no rescan can clear.
+                //
+                // Shipped in v4.0.41 with no quorum gate at all — "act on the very first
+                // mismatch that reaches here once exhausted, whatever the quorum state" —
+                // which is wrong. Measured 2026-08-21 on a wallet ~6h into a session:
+                //
+                //   continuity mismatch (1/8 disagreers collected, reanchors 3/3)
+                //   ABANDONED 20273 height(s) [24050000..24070272]
+                //
+                // ONE peer out of eight disagreed, and 20k heights were condemned. The
+                // re-anchor budget is never reset, so any long session eventually spends it
+                // on ordinary tip churn; after that a single disagreeing peer — routine
+                // noise at the tip, where a reorg is often in flight — was enough.
+                //
+                // Require the SAME corroboration the re-anchor itself requires: a largest
+                // agreeing bucket that clears CF_CONTINUITY_REANCHOR_FLOOR and a majority of
+                // connected filter peers. A lone disagreer no longer condemns anything; it
+                // just costs a re-fetch from the checkpoint.
+                // Guarded so cf_checkpoint_neverbrick_kat's red arm
+                // (-DCF_NEVERBRICK_QUORUM_UNFIXED) can restore the ungated v4.0.41 shape and
+                // prove this corroboration check is load-bearing. Without a dedicated guard
+                // the only red arm available removes Task 6 wholesale, which cannot
+                // distinguish "no never-brick" from "never-brick without a quorum gate" —
+                // and it is exactly that missing distinction which shipped the field bug.
+#ifdef CF_NEVERBRICK_QUORUM_UNFIXED
+                int nbCorroborated = 1;   // v4.0.41: act on ANY mismatch once exhausted
+                (void)0;
+#else
+                uint8_t nbBestAgree = 0;
+                for (uint8_t i = 0; i < manager->cfDisagreedCount; i++) {
+                    uint8_t agree = 0;
+                    for (uint8_t j = 0; j < manager->cfDisagreedCount; j++) {
+                        if (UInt256Eq(manager->cfDisagreedPrev[i], manager->cfDisagreedPrev[j])) agree++;
+                    }
+                    if (agree > nbBestAgree) nbBestAgree = agree;
+                }
+                size_t nbFilterPeers = _BRPeerManagerConnectedFilterPeerCount(manager);
+                int nbCorroborated = (nbBestAgree >= CF_NEVERBRICK_CORROBORATION_FLOOR) &&
+                                     (nbFilterPeers > 0) &&
+                                     ((size_t)nbBestAgree * 2 > nbFilterPeers);
+#endif
+                if (nbCorroborated) {
+                    _BRPeerManagerSurfaceUnscannableLocked(manager, cp->height, tip + 1,
+                        "filter-header chain could not be verified against checkpoints");
+                } else {
+#ifndef CF_NEVERBRICK_QUORUM_UNFIXED
+                    peer_log(peer, "cf-checkpoint: parked fetch at trusted checkpoint %u "
+                             "(reanchors exhausted); NOT abandoning — only %u/%zu filter peers "
+                             "corroborate the divergence",
+                             cp->height, nbBestAgree, nbFilterPeers);
+#endif
+                }
             }
             // cp == NULL means tip sits below the lowest pinned checkpoint — no
             // trusted anchor exists yet to park at; fall through to the log below

@@ -314,6 +314,14 @@ Remarks:
 #define CF_CONTINUITY_REANCHOR_FLOOR 3
 #endif
 
+/* Corroboration required before the never-brick path may ABANDON the band above the
+   highest checkpoint (a permanent, monotonic, user-visible "history gap"). Same value as
+   CF_CONTINUITY_REANCHOR_FLOOR but ALWAYS defined: the never-brick decision must not be
+   silently disabled by the quorum KAT's red arm (-DCF_QUORUM_UNFIXED), which undefines
+   that macro. Parking the fetch cursor is unconditional; only condemning heights needs
+   this. */
+#define CF_NEVERBRICK_CORROBORATION_FLOOR 3
+
 /* Always-defined storage capacity for cfDisagreedPeers[]/cfDisagreedPrev[] in
    BRPeerManagerStruct. Deliberately NOT sized on CF_CONTINUITY_REANCHOR_FLOOR:
    that macro is undefined under -DCF_QUORUM_UNFIXED (see above), so an array

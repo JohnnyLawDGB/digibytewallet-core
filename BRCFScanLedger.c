@@ -870,6 +870,21 @@ uint32_t BRCFScanLedgerLowestNeededHeight(const BRCFScanLedger *l)
 
 uint32_t BRCFScanLedgerAbandonedBelow(const BRCFScanLedger *l) { return l->abandonedBelow; }
 
+uint32_t BRCFScanLedgerRetireAbandonedTo(BRCFScanLedger *l, uint32_t newFloor)
+{
+    if (!l) return 0;
+    // Lower only. Raising here would quietly become a second way to condemn heights,
+    // and this path is meant to be the one narrow escape from that, not another door.
+    if (newFloor >= l->abandonedBelow) return 0;
+    // Below the ledger's own start was never in scope; refuse rather than clamp, so a
+    // caller with a wrong floor learns it instead of silently getting a different one.
+    if (newFloor < l->start) return 0;
+
+    uint32_t retired = l->abandonedBelow - newFloor;
+    l->abandonedBelow = newFloor;
+    return retired;
+}
+
 uint32_t BRCFScanLedgerAbandonGaveUpBelow(BRCFScanLedger *l, uint32_t clamp,
                                           uint32_t *outCount, uint32_t *outLo, uint32_t *outHi)
 {

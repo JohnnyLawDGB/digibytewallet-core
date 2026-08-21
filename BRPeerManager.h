@@ -781,6 +781,13 @@ uint32_t BRPeerManagerLowestNeededHeight(BRPeerManager *manager);
 // MONOTONIC (only ever advances).
 uint32_t BRPeerManagerAbandonedBelow(BRPeerManager *manager);
 
+/* Retire as much of an abandoned band as the RESIDENT block headers can currently
+   support; returns the number of heights retired (0 if none). Safe to call at any time:
+   with no extra headers it retires nothing. Enforces the header-first ordering that
+   BRCFScanLedgerRetireAbandonedTo documents but cannot check — the ledger has no view of
+   the block set, this does. */
+uint32_t BRPeerManagerRetireAbandonedBand(BRPeerManager *manager);
+
 // SPAN below the watermark: heights in [start .. abandonedBelow-1], i.e.
 // max(abandonedBelow - start, 0).
 //

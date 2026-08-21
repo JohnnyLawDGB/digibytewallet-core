@@ -2100,6 +2100,48 @@ static void _BRPeerManagerSurfaceUnscannableLocked(BRPeerManager *manager, uint3
 #endif
 }
 
+// Retire as much of an abandoned band as the RESIDENT block headers can currently
+// support, and return how many heights were retired (0 if none).
+//
+// This is the enforcement half of BRCFScanLedgerRetireAbandonedTo's contract. The ledger
+// deliberately cannot see the block set, so it cannot check whether the headers for the
+// range are back; this can. _BRPeerManagerBlockFloor is exactly the right question — it
+// returns the lowest height still reachable by walking prevBlock links from lastBlock,
+// i.e. the deepest height for which a getcfilters stop hash can still be resolved.
+//
+// Retiring only down to that floor is what makes the operation safe to call at ANY time,
+// including before any header backfill has run: with no extra headers it simply retires
+// nothing. A backfill then lowers the block floor, and calling this again retires further.
+// Header-first, floor-second, enforced here rather than trusted.
+//
+// Caller must hold manager->lock.
+static uint32_t _BRPeerManagerRetireAbandonedToResidentLocked(BRPeerManager *manager)
+{
+    uint32_t abandoned = BRCFScanLedgerAbandonedBelow(&manager->cfLedger);
+    if (abandoned == 0) return 0;                      // nothing abandoned
+
+    uint32_t floor = _BRPeerManagerBlockFloor(manager);
+    if (floor == 0 || floor >= abandoned) return 0;    // no headers below the floor to help
+
+    uint32_t retired = BRCFScanLedgerRetireAbandonedTo(&manager->cfLedger, floor);
+    if (retired > 0) {
+        CF_RETENTION_WLOG("[CF-SCAN] RETIRED %u abandoned height(s) — headers are resident "
+                     "down to %u, so those heights are requestable again (abandonedBelow %u -> %u)",
+                     retired, floor, abandoned, floor);
+    }
+    return retired;
+}
+
+// Public entry point: same as above but takes the lock itself.
+uint32_t BRPeerManagerRetireAbandonedBand(BRPeerManager *manager)
+{
+    if (!manager) return 0;
+    MGR_LOCK(manager);
+    uint32_t retired = _BRPeerManagerRetireAbandonedToResidentLocked(manager);
+    MGR_UNLOCK(manager);
+    return retired;
+}
+
 #if CF_LEDGER_DRIVE_REREQUEST
 // May the forward cfilter drive issue the NEXT batch this tick? (fix-wave I3)
 //

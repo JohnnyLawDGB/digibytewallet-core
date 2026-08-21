@@ -697,6 +697,32 @@ uint32_t BRCFScanLedgerLowestNeededHeight(const BRCFScanLedger *l);
 // abandoned count is a reported, countable event — distinct from "scanned".
 uint32_t BRCFScanLedgerAbandonedBelow(const BRCFScanLedger *l);
 
+/* Lower the abandoned hard floor to `newFloor`, retiring the band
+   [newFloor .. abandonedBelow-1] so those heights become requestable again.
+   Returns the number of heights retired; 0 if this was a no-op.
+
+   THE ONLY path that lowers abandonedBelow. It exists because "monotonic" was never a
+   safety property — it was a consequence of having no way to put pruned block headers
+   back. The loop it breaks: abandoning clamps heights out of
+   BRCFScanLedgerLowestNeededHeight -> the prune floor rises above them -> their headers
+   are pruned -> getcfilters cannot resolve a stop hash for the range -> the band really
+   is unrequestable, retroactively justifying the abandonment. Without this, the only
+   cures were a backend reconcile or a full rebuild from wallet birth.
+
+   CONTRACT — the caller MUST have made block headers for [newFloor .. abandonedBelow-1]
+   resident BEFORE calling. This ledger has no view of the block set and cannot verify
+   it; lowering the floor with the headers still missing points the scan at heights
+   whose stop hashes cannot resolve, which is the wedge the floor exists to prevent.
+   Header-first, floor-second, never the reverse.
+
+   Refuses (returns 0, changes nothing) rather than clamping silently when:
+     - newFloor >= abandonedBelow  (this path can only ever LOWER; raising is
+       BRCFScanLedgerAbandonUnscannableBelow's job and must not gain a second entrance)
+     - newFloor < the ledger's start height (never in scope)
+   Does not touch scannedThrough: retiring is bookkeeping, not a rewind. In the field
+   case the band had ALREADY been scanned, so a rewind would force a needless re-scan. */
+uint32_t BRCFScanLedgerRetireAbandonedTo(BRCFScanLedger *l, uint32_t newFloor);
+
 // Retention memory ceiling reached: abandon retry-exhausted (gaveUp) heights that
 // are too deep to keep retaining. The PURE ledger has no logger — it RETURNS the
 // data the caller (BRPeerManager) warn-logs; do not add a logger dependency here.

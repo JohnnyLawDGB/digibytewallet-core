@@ -7317,6 +7317,15 @@ uint32_t BRPeerManagerAbandonedBelow(BRPeerManager *manager)
     return h;
 }
 
+uint32_t BRPeerManagerScanLedgerStart(BRPeerManager *manager)
+{
+    assert(manager != NULL);
+    MGR_LOCK(manager);
+    uint32_t h = BRCFScanLedgerStartHeight(&manager->cfLedger);
+    MGR_UNLOCK(manager);
+    return h;
+}
+
 size_t BRPeerManagerAbandonedCount(BRPeerManager *manager)
 {
     assert(manager != NULL);

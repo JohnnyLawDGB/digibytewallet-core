@@ -697,6 +697,13 @@ uint32_t BRCFScanLedgerLowestNeededHeight(const BRCFScanLedger *l);
 // abandoned count is a reported, countable event — distinct from "scanned".
 uint32_t BRCFScanLedgerAbandonedBelow(const BRCFScanLedger *l);
 
+/* The ledger's start height — the lowest height it has ever been responsible for.
+   Exposed because scannedThrough is a CONTIGUOUS high-water mark measured FROM this
+   start, so "scannedThrough >= X" only proves X was evaluated when start <= X. Without
+   it a caller can conclude a range was covered by a ledger that was re-Init'd above it,
+   which is the false "all clear" that matters. */
+uint32_t BRCFScanLedgerStartHeight(const BRCFScanLedger *l);
+
 /* Lower the abandoned hard floor to `newFloor`, retiring the band
    [newFloor .. abandonedBelow-1] so those heights become requestable again.
    Returns the number of heights retired; 0 if this was a no-op.

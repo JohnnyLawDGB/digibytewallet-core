@@ -781,6 +781,10 @@ uint32_t BRPeerManagerLowestNeededHeight(BRPeerManager *manager);
 // MONOTONIC (only ever advances).
 uint32_t BRPeerManagerAbandonedBelow(BRPeerManager *manager);
 
+/* The scan ledger's start height. scannedThrough is contiguous FROM this, so a caller can
+   only conclude a range was evaluated when start <= that range. */
+uint32_t BRPeerManagerScanLedgerStart(BRPeerManager *manager);
+
 /* Retire as much of an abandoned band as the RESIDENT block headers can currently
    support; returns the number of heights retired (0 if none). Safe to call at any time:
    with no extra headers it retires nothing. Enforces the header-first ordering that

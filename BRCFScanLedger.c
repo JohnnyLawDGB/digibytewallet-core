@@ -870,6 +870,8 @@ uint32_t BRCFScanLedgerLowestNeededHeight(const BRCFScanLedger *l)
 
 uint32_t BRCFScanLedgerAbandonedBelow(const BRCFScanLedger *l) { return l->abandonedBelow; }
 
+uint32_t BRCFScanLedgerStartHeight(const BRCFScanLedger *l) { return l ? l->start : 0; }
+
 uint32_t BRCFScanLedgerRetireAbandonedTo(BRCFScanLedger *l, uint32_t newFloor)
 {
     if (!l) return 0;

@@ -741,13 +741,30 @@ static void _BRPeerManagerSyncStopped(BRPeerManager *manager)
     }
 }
 
-// adds transaction to list of tx to be published, along with any unconfirmed inputs
-static void _BRPeerManagerAddTxToPublishList(BRPeerManager *manager, BRTransaction *tx, void *info,
-                                             void (*callback)(void *, int))
+// Adds transaction to list of tx to be published, along with any unconfirmed inputs.
+//
+// Returns 1 if `tx` was taken into the list — the manager owns it from then on — and 0 if an
+// equal transaction was already pending, in which case the CALLER still owns the copy it passed.
+//
+// A duplicate is not simply a no-op. If the pending entry carries no callback (it was added as a
+// parent input, or its original publisher has already been answered) it adopts the fresh one, so
+// a re-published send stays trackable through getPublishResult instead of reporting -1 for the
+// rest of the process's life. This matters more now than it used to: a peer timeout no longer
+// clears the entry, so the 90-second stranded-send sweep re-publishing a still-pending send is
+// the normal path rather than a corner case.
+static int _BRPeerManagerAddTxToPublishList(BRPeerManager *manager, BRTransaction *tx, void *info,
+                                            void (*callback)(void *, int))
 {
     if (tx && tx->blockHeight == TX_UNCONFIRMED) {
         for (size_t i = array_count(manager->publishedTx); i > 0; i--) {
-            if (BRTransactionEq(manager->publishedTx[i - 1].tx, tx)) return;
+            if (! BRTransactionEq(manager->publishedTx[i - 1].tx, tx)) continue;
+#ifndef PUBLISH_SURVIVOR_UNFIXED
+            if (callback && manager->publishedTx[i - 1].callback == NULL) {
+                manager->publishedTx[i - 1].info = info;
+                manager->publishedTx[i - 1].callback = callback;
+            }
+#endif
+            return 0;
         }
         
         array_add(manager->publishedTx, ((BRPublishedTx) { tx, info, callback }));
@@ -757,7 +774,10 @@ static void _BRPeerManagerAddTxToPublishList(BRPeerManager *manager, BRTransacti
             _BRPeerManagerAddTxToPublishList(manager, BRWalletTransactionForHash(manager->wallet, tx->inputs[i].txHash),
                                              NULL, NULL);
         }
+        return 1;
     }
+    
+    return 0;
 }
 
 static size_t _BRPeerManagerBlockLocators(BRPeerManager *manager, UInt256 locators[], size_t locatorsCount)
@@ -1691,6 +1711,33 @@ static void _BRPeerManagerFormatCloseLedger(BRPeerManager *manager, char *buf, s
     }
 }
 
+// How many OTHER peers could still carry a pending publish.
+//
+// BRPeerManagerPublishTx announces a send to every connected peer at once, but BRPublishedTx
+// records no peer — so there is no way to ask "was THIS publish sent to the peer that just
+// died?". This is the question that can be answered, and it is the one that decides the send's
+// fate anyway: a publish is dead only when nothing is left to carry it.
+//
+// Completing the handshake is required in BOTH directions, and for the same reason: a peer that
+// never got a verack was never sent a publish inv. It cannot cancel a publish (the v4.0.47 fix
+// just below) and it cannot keep one alive either — counting it would leave a genuinely dead
+// send pending forever instead of reporting its failure.
+static size_t _BRPeerManagerLivePublishPeerCount(BRPeerManager *manager, const BRPeer *excluding)
+{
+    size_t live = 0;
+
+    for (size_t i = array_count(manager->connectedPeers); i > 0; i--) {
+        BRPeer *p = manager->connectedPeers[i - 1];
+
+        if (p == excluding) continue;                                 // the one being torn down
+        if (BRPeerConnectStatus(p) != BRPeerStatusConnected) continue;
+        if (! BRPeerCompletedHandshake(p)) continue;                  // never sent the inv
+        live++;
+    }
+
+    return live;
+}
+
 static void _peerDisconnected(void *info, int error)
 {
     BRPeer *peer = ((BRPeerCallbackInfo *)info)->peer;
@@ -1778,9 +1825,28 @@ static void _peerDisconnected(void *info, int error)
         // about any publish. Requiring BRPeerCompletedHandshake() keeps the genuine
         // publish-timeout case (a peer we really did publish to, going quiet) while removing
         // the connect-failure case entirely.
+        //
+        // What v4.0.47 left behind was the same defect with a narrower trigger: a peer we
+        // genuinely DID publish to, going quiet, still cancelled every OTHER peer's copy of the
+        // send, because publishedTx has no peer attribution to narrow it with. So ask the
+        // question that can be answered — is anything left that could carry this? Cancelling
+        // early frees a transaction a live peer is about to request; cancelling late costs one
+        // 90-second sweep, and Kotlin reads the publish as pending (-1) meanwhile, never as
+        // success. That asymmetry is why this errs toward leaving the send alive.
         if (error == ETIMEDOUT && BRPeerCompletedHandshake(peer) &&
             (peer != manager->downloadPeer || manager->syncStartHeight == 0 ||
-             array_count(manager->connectedPeers) == 1)) txError = ETIMEDOUT;
+             array_count(manager->connectedPeers) == 1)) {
+#ifdef PUBLISH_SURVIVOR_UNFIXED
+            size_t survivors = 0;   // red arm: the pre-fix contract — any timeout cancels
+#else
+            size_t survivors = _BRPeerManagerLivePublishPeerCount(manager, peer);
+#endif
+
+            if (survivors == 0) txError = ETIMEDOUT;
+            else peer_log(peer, "publish timeout, but %zu live peer(s) still hold the inv — "
+                          "NOT cancelling %zu pending publish(es)", survivors,
+                          array_count(manager->publishedTx));
+        }
         else if (error == ETIMEDOUT) {
             peer_log(peer, "connect timeout on a peer that never handshook — NOT cancelling "
                      "%zu pending publish(es)", array_count(manager->publishedTx));
@@ -6912,7 +6978,12 @@ void BRPeerManagerPublishTx(BRPeerManager *manager, BRTransaction *tx, void *inf
         size_t i, count = 0;
         
         tx->timestamp = (uint32_t)time(NULL); // set timestamp to publish time
-        _BRPeerManagerAddTxToPublishList(manager, tx, info, callback);
+
+        // This function owns `tx` (the JNI bridge hands it over and registers its own copy in
+        // the wallet). When an equal transaction is already pending, the list keeps the copy it
+        // has and adopts our callback — so ours has no owner left and would leak. Nothing below
+        // reads tx; the inv still goes out to every peer, which is the whole point of a retry.
+        if (! _BRPeerManagerAddTxToPublishList(manager, tx, info, callback)) BRTransactionFree(tx);
 
         for (i = array_count(manager->connectedPeers); i > 0; i--) {
             if (BRPeerConnectStatus(manager->connectedPeers[i - 1]) == BRPeerStatusConnected) count++;

@@ -1756,9 +1756,35 @@ static void _peerDisconnected(void *info, int error)
         manager->connectFailureCount++;
         
         // if it's a timeout and there's pending tx publish callbacks, the tx publish timed out
-        // BUG: XXX what if it's a connect timeout and not a publish timeout?
-        if (error == ETIMEDOUT && (peer != manager->downloadPeer || manager->syncStartHeight == 0 ||
-                                   array_count(manager->connectedPeers) == 1)) txError = ETIMEDOUT;
+        //
+        // The upstream "BUG: XXX what if it's a connect timeout and not a publish timeout?"
+        // that used to sit here was real, and it cost a live user their DigiAsset sends.
+        // Measured 2026-08-23 on an S25 Ultra:
+        //
+        //   04:55:47.678  64.20.49.248  sending inv          <- tx published to a HEALTHY peer
+        //   04:55:49.685  192.42.116.14 disconnected
+        //                   cause=CONNECT_FAIL err=110 life=0.0s handshake=0 in=0b/0msg
+        //   04:55:49.685  192.42.116.14 transaction canceled: Connection timed out
+        //   04:55:51.855  64.20.49.248  got getdata with 1 item(s)   <- 2s TOO LATE, tx freed
+        //
+        // An unrelated address that never even completed a handshake failed to dial, and its
+        // connect timeout cancelled a publish sitting on a different, working peer — which
+        // then asked for the transaction and found it gone. That is the whole "my send needs
+        // an app restart to go through" report: the wallet dials constantly, so a failed dial
+        // inside the publish window is common, and rebroadcastStrandedSends only runs at sync
+        // start, so a restart was the only thing that re-sent it.
+        //
+        // A peer that never handshook was never sent an inv, so its timeout says nothing
+        // about any publish. Requiring BRPeerCompletedHandshake() keeps the genuine
+        // publish-timeout case (a peer we really did publish to, going quiet) while removing
+        // the connect-failure case entirely.
+        if (error == ETIMEDOUT && BRPeerCompletedHandshake(peer) &&
+            (peer != manager->downloadPeer || manager->syncStartHeight == 0 ||
+             array_count(manager->connectedPeers) == 1)) txError = ETIMEDOUT;
+        else if (error == ETIMEDOUT) {
+            peer_log(peer, "connect timeout on a peer that never handshook — NOT cancelling "
+                     "%zu pending publish(es)", array_count(manager->publishedTx));
+        }
     }
     
     // REDIAL COOLDOWN — every disconnect, clean or not. Only the `error` branch above

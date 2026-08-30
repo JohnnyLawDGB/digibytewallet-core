@@ -879,6 +879,84 @@ int BRTransactionSign(BRTransaction *tx, int forkId, BRKey keys[], size_t keysCo
             }
         }
 
+        // --- P2SH-wrapped segwit (BIP49): scriptPubKey == {OP_HASH160, 20, h, OP_EQUAL} ---
+        // Handled here, before the BRScriptPKH match below, for the same reason the
+        // taproot branch is: that match compares the script's hash160 against
+        // hash160(pubkey), but a BIP49 scriptPubKey commits hash160(REDEEMSCRIPT). No key
+        // ever matched, so the input fell through unsigned and recovery refused the whole
+        // profile.
+        //
+        // Unlike every other input type, BIP49 carries BOTH halves: the scriptSig is a
+        // single push of the redeemScript, and the signature rides in the witness.
+        //
+        // The sighash is BIP143 — identical to native P2WPKH, per the BIP — so rather than
+        // writing a second sighash we point input->script at the redeemScript for the
+        // duration of the call. _BRTransactionWitnessData's scriptCode rule fires on
+        // `scriptLen == 22 && script[0] == OP_0` and builds the correct P2PKH scriptCode
+        // from it. The pointer is restored immediately; nothing outside this block sees
+        // the swap, and the input's own scriptPubKey is not serialized anyway.
+        {
+            const uint8_t *shElems[BRScriptElements(NULL, 0, input->script, input->scriptLen)];
+            size_t shCount = BRScriptElements(shElems, sizeof(shElems)/sizeof(*shElems),
+                                              input->script, input->scriptLen);
+
+            if (shCount == 3 && *shElems[0] == OP_HASH160 && *shElems[1] == 20 &&
+                *shElems[2] == OP_EQUAL) {
+                size_t shDataLen0 = 0;
+                const uint8_t *scriptHash = BRScriptData(shElems[1], &shDataLen0);
+                size_t sj = 0;
+                uint8_t redeem[22] = { OP_0, 20 };
+
+                // Match on hash160(redeemScript), which is what the script actually commits.
+                for (sj = 0; sj < keysCount; sj++) {
+                    UInt160 rh;
+                    memcpy(&redeem[2], pkh[sj].u8, 20);
+                    BRHash160(&rh, redeem, sizeof(redeem));
+                    if (scriptHash && shDataLen0 == 20 && UInt160Eq(rh, UInt160Get(scriptHash))) break;
+                }
+
+                if (sj < keysCount) {
+                    uint8_t shPubKey[BRKeyPubKey(&keys[sj], NULL, 0)];
+                    size_t shPkLen = BRKeyPubKey(&keys[sj], shPubKey, sizeof(shPubKey));
+                    memcpy(&redeem[2], pkh[sj].u8, 20);
+
+                    // Swap in the redeemScript so BIP143 commits the right scriptCode.
+                    const uint8_t *savedScript = input->script;
+                    size_t savedScriptLen = input->scriptLen;
+                    input->script = redeem;
+                    input->scriptLen = sizeof(redeem);
+
+                    uint8_t shData[_BRTransactionWitnessData(tx, NULL, 0, i, forkId | SIGHASH_ALL)];
+                    size_t shDataLen = _BRTransactionWitnessData(tx, shData, sizeof(shData), i,
+                                                                 forkId | SIGHASH_ALL);
+                    input->script = savedScript;
+                    input->scriptLen = savedScriptLen;
+
+                    UInt256 shMd = UINT256_ZERO;
+                    BRSHA256_2(&shMd, shData, shDataLen);
+
+                    uint8_t shSig[73];
+                    size_t shSigLen = BRKeySign(&keys[sj], shSig, sizeof(shSig) - 1, shMd);
+                    shSig[shSigLen++] = forkId | SIGHASH_ALL;
+
+                    // witness = push(sig) || push(pubkey)
+                    uint8_t shWit[1 + sizeof(shSig) + 1 + 65];
+                    size_t shWitLen = BRScriptPushData(shWit, sizeof(shWit), shSig, shSigLen);
+                    shWitLen += BRScriptPushData(&shWit[shWitLen], sizeof(shWit) - shWitLen,
+                                                 shPubKey, shPkLen);
+                    BRTxInputSetWitness(input, shWit, shWitLen);
+
+                    // scriptSig = a single push of the redeemScript
+                    uint8_t shScriptSig[1 + sizeof(redeem)];
+                    size_t shScriptSigLen = BRScriptPushData(shScriptSig, sizeof(shScriptSig),
+                                                             redeem, sizeof(redeem));
+                    BRTxInputSetSignature(input, shScriptSig, shScriptSigLen);
+                }
+
+                continue; // P2SH fully handled (signed, or no matching key) — do not fall through
+            }
+        }
+
         const uint8_t *hash = BRScriptPKH(input->script, input->scriptLen);
         j = 0;
         while (j < keysCount && (! hash || ! UInt160Eq(pkh[j], UInt160Get(hash)))) j++;

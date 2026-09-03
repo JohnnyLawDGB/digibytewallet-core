@@ -594,7 +594,7 @@ struct BRPeerManagerStruct {
 #ifndef CF_SLOW_WLOG
 #if defined(__ANDROID__)
 #define CF_SLOW_WLOG(...) __android_log_print(ANDROID_LOG_WARN, "bread", __VA_ARGS__)
-#elif defined(TARGET_OS_MAC)
+#elif defined(TARGET_OS_MAC) && defined(__OBJC__)
 #define CF_SLOW_WLOG(...) NSLog(__VA_ARGS__)
 #else
 #define CF_SLOW_WLOG(...) do { fprintf(stderr, __VA_ARGS__); fputc('\n', stderr); } while (0)
@@ -2153,7 +2153,7 @@ static void _peerRejectedTx(void *info, UInt256 txHash, uint8_t code)
 #ifndef CF_RETENTION_WLOG
 #if defined(__ANDROID__)
 #define CF_RETENTION_WLOG(...) __android_log_print(ANDROID_LOG_WARN, "bread", __VA_ARGS__)
-#elif defined(TARGET_OS_MAC)
+#elif defined(TARGET_OS_MAC) && defined(__OBJC__)
 #define CF_RETENTION_WLOG(...) NSLog(__VA_ARGS__)
 #else
 #define CF_RETENTION_WLOG(...) printf(__VA_ARGS__)

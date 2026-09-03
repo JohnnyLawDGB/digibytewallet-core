@@ -35,7 +35,7 @@
 #define _va_first(first, ...) first
 #define _va_rest(first, ...) __VA_ARGS__
 
-#if defined(TARGET_OS_MAC)
+#if defined(TARGET_OS_MAC) && defined(__OBJC__)
 #include <Foundation/Foundation.h>
 #define _wallet_log(...) NSLog(__VA_ARGS__)
 #elif defined(__ANDROID__)
@@ -50,7 +50,7 @@
     #endif
 #endif
 
-#if defined(TARGET_OS_MAC)
+#if defined(TARGET_OS_MAC) && defined(__OBJC__)
     #include <Foundation/Foundation.h>
     #define debug_log(...) NSLog(__VA_ARGS__)
 #elif defined(__ANDROID__)

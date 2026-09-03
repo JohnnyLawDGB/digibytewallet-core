@@ -29,7 +29,7 @@
 #include <stddef.h>
 #include <inttypes.h>
 
-#if defined(TARGET_OS_MAC)
+#if defined(TARGET_OS_MAC) && defined(__OBJC__)
 #include <Foundation/Foundation.h>
 #define digi_log(...) NSLog(__VA_ARGS__)
 #elif defined(__ANDROID__)

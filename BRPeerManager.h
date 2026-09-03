@@ -613,7 +613,9 @@ void BRPeerManagerConnect(BRPeerManager *manager);
 
 // disconnect from bitcoin peer-to-peer network (may cause syncStopped() or savePeers() callbacks to fire; NOT
 // saveBlocks() — in this codebase saveBlocks fires only from _peerRelayedBlock, never from a disconnect)
-void BRPeerManagerDisconnect(BRPeerManager *manager);
+// Returns 1 when every peer/dns thread had exited, 0 when the bounded wait (PEER_DISCONNECT_WAIT_SECS)
+// gave up with threads still running. A 0 here means BRPeerManagerFree() will defer (see below).
+int BRPeerManagerDisconnect(BRPeerManager *manager);
 
 // send a keepalive ping to every connected peer so idle CF filter-peer connections don't get
 // dropped by the remote node / NAT inactivity timeout (call periodically, e.g. every ~10-20s)
@@ -972,7 +974,10 @@ uint32_t BRPeerManagerConvoyRearmMax(void);
 size_t BRPeerManagerSerializePenalties(BRPeerManager *manager, uint8_t *buf, size_t bufLen);
 size_t BRPeerManagerLoadPenalties(BRPeerManager *manager, const uint8_t *buf, size_t bufLen);
 
-void BRPeerManagerFree(BRPeerManager *manager);
+// Returns 1 if the manager was freed now. Returns 0 if peer/dns threads are still alive: the manager
+// is then parked (no dials, no reconnects) and the LAST thread to exit frees it. The caller must drop
+// its pointer either way -- after this call the manager is not the caller's to touch.
+int BRPeerManagerFree(BRPeerManager *manager);
 	
 /*
  * The following two methods sync the blockchain beginning from startBlock.

@@ -265,6 +265,10 @@ struct BRPeerManagerStruct {
     const BRChainParams *params;
     BRWallet *wallet;
     int isConnected, connectFailureCount, misbehavinCount, dnsThreadCount, maxConnectCount, peerThreadCount;
+    // BRPeerManagerFree was called while peer/dns threads were still alive (BRPeerManagerDisconnect
+    // gave up its bounded wait). The manager stays allocated as a zombie and the LAST thread to
+    // exit frees it -- see _BRPeerManagerDeferredFreeDue. Guarded by manager->lock.
+    int freeDeferred;
     // DISCONNECT LEDGER (BRPeer.h). Running histogram of WHO closed each connection, so an
     // overnight run answers "are we being evicted, or are we hanging up on ourselves?" from
     // one summary line instead of a hand-count over thousands of scattered log lines.
@@ -1081,12 +1085,17 @@ static UInt128 *_addressLookup(const char *hostname)
     return addrList;
 }
 
+// Deferred-free plumbing (defined next to BRPeerManagerFree, used by every thread-exit path).
+static int  _BRPeerManagerDeferredFreeDue(BRPeerManager *manager);
+static void _BRPeerManagerFreeNow(BRPeerManager *manager);
+
 static void *_findPeersThreadRoutine(void *arg)
 {
     BRPeerManager *manager = ((BRFindPeersInfo *)arg)->manager;
     uint64_t services = ((BRFindPeersInfo *)arg)->services;
     UInt128 *addrList, *addr;
     time_t now = time(NULL), age;
+    int freeNow;
     
     pthread_cleanup_push(manager->threadCleanup, manager->info);
     addrList = _addressLookup(((BRFindPeersInfo *)arg)->hostname);
@@ -1100,9 +1109,11 @@ static void *_findPeersThreadRoutine(void *arg)
     }
 
     manager->dnsThreadCount--;
+    freeNow = _BRPeerManagerDeferredFreeDue(manager);
     MGR_UNLOCK(manager);
     if (addrList) free(addrList);
-    pthread_cleanup_pop(1);
+    pthread_cleanup_pop(1); // runs the callback captured at push time; does not touch manager
+    if (freeNow) _BRPeerManagerFreeNow(manager); // last thread out of a parked manager
     return NULL;
 }
 
@@ -3528,13 +3539,19 @@ static int _peerNetworkIsReachable(void *info)
 static void _peerThreadCleanup(void *info)
 {
     BRPeerManager *manager = ((BRPeerCallbackInfo *)info)->manager;
+    void (*threadCleanup)(void *) = manager->threadCleanup;
+    void *managerInfo = manager->info;
+    int freeNow;
 
     MGR_LOCK(manager);
     manager->peerThreadCount--;
+    freeNow = _BRPeerManagerDeferredFreeDue(manager);
     MGR_UNLOCK(manager);
     
     free(info);
-    if (manager->threadCleanup) manager->threadCleanup(manager->info);
+    // Last thread out of a parked manager (see BRPeerManagerFree): nothing else can reach it now.
+    if (freeNow) _BRPeerManagerFreeNow(manager);
+    if (threadCleanup) threadCleanup(managerInfo);
 }
 
 static void _dummyThreadCleanup(void *info)
@@ -6542,9 +6559,10 @@ void BRPeerManagerKeepAlive(BRPeerManager *manager)
     MGR_UNLOCK(manager);
 }
 
-void BRPeerManagerDisconnect(BRPeerManager *manager)
+int BRPeerManagerDisconnect(BRPeerManager *manager)
 {
     struct timespec ts;
+    int drained = 1;
     // SIGNED, matching the struct fields (BRPeerManagerStruct declares peerThreadCount,
     // dnsThreadCount and maxConnectCount as `int`). These were `size_t` locals, which turned a
     // transient NEGATIVE count into an infinite wait: copying int -1 into a size_t yields
@@ -6575,14 +6593,13 @@ void BRPeerManagerDisconnect(BRPeerManager *manager)
         p = manager->connectedPeers[i - 1];
         manager->connectFailureCount = MAX_CONNECT_FAILURES; // prevent futher automatic reconnect attempts
         BRPeerDisconnectTagged(p, BR_DISC_TAG_MANAGER_STOP);
-        // "Waiting for network": a peer still in Connecting has a thread parked in connect(), which
-        // this pre-decrement assumes will not decrement itself on the way out. If that assumption
-        // is ever wrong the count goes negative — historically an infinite wait, because the loop
-        // below read it through a size_t local. Clamped so the count can never go below zero
-        // regardless of who else decrements.
-        if (BRPeerConnectStatus(p) == BRPeerStatusConnecting && manager->peerThreadCount > 0) {
-            manager->peerThreadCount--;
-        }
+        // NO pre-decrement for peers still in Connecting. This used to knock peerThreadCount down
+        // for each such peer on the theory that a thread parked in connect() never exits on its
+        // own. It does: BRPeerDisconnect close()s the socket, _BRPeerWaitConnect's poll() returns,
+        // and the thread runs _peerThreadCleanup -- which decrements AGAIN. That double count was
+        // merely a negative number under the old unbounded wait (the size_t hang); under the
+        // deferred free in BRPeerManagerFree it is an UNDERCOUNT of live threads, i.e. a free
+        // under a running thread -- exactly the crash the deferral exists to prevent.
     }
 
     // Defensive: if any other path has already driven these negative, treat them as drained rather
@@ -6636,6 +6653,7 @@ void BRPeerManagerDisconnect(BRPeerManager *manager)
                          "holding the peer-manager guard forever",
                          (unsigned)PEER_DISCONNECT_WAIT_SECS,
                          peerThreadCount, dnsThreadCount);
+            drained = 0;
 
             // WHERE are they stuck?
             //
@@ -6704,6 +6722,7 @@ void BRPeerManagerDisconnect(BRPeerManager *manager)
     MGR_LOCK(manager);
     manager->maxConnectCount = maxConnectCount;
     MGR_UNLOCK(manager);
+    return drained;
 }
 
 // rescans blocks and transactions after earliestKeyTime (a new random download peer is also selected due to the
@@ -7064,9 +7083,21 @@ size_t BRPeerManagerLoadPenalties(BRPeerManager *manager, const uint8_t *buf, si
     return loaded;
 }
 
-void BRPeerManagerFree(BRPeerManager *manager)
+// Caller holds manager->lock and has JUST decremented a thread count. Returns 1 when this was
+// the last thread out of a manager whose free was deferred: the caller must drop the lock and
+// then call _BRPeerManagerFreeNow. Clears the flag so exactly one thread ever gets the 1.
+static int _BRPeerManagerDeferredFreeDue(BRPeerManager *manager)
 {
-    assert(manager != NULL);
+    if (! manager->freeDeferred) return 0;
+    if (manager->peerThreadCount > 0 || manager->dnsThreadCount > 0) return 0;
+    manager->freeDeferred = 0;
+    return 1;
+}
+
+// The unconditional teardown. Only reachable when no peer/dns thread can still call into the
+// manager: either BRPeerManagerFree observed zero threads, or the last thread out is running it.
+static void _BRPeerManagerFreeNow(BRPeerManager *manager)
+{
     MGR_LOCK(manager);
     array_free(manager->peers);
     for (size_t i = array_count(manager->connectedPeers); i > 0; i--) BRPeerFree(manager->connectedPeers[i - 1]);
@@ -7095,6 +7126,43 @@ void BRPeerManagerFree(BRPeerManager *manager)
     MGR_UNLOCK(manager);
     pthread_mutex_destroy(&manager->lock);
     free(manager);
+}
+
+// Frees manager. Returns 1 if it was freed now. Returns 0 if peer/dns threads are still alive --
+// which happens when BRPeerManagerDisconnect gave up its bounded wait (PEER_DISCONNECT_WAIT_SECS)
+// on threads still in dispatch. Those threads are DETACHED and still hold this manager and their
+// BRPeer through every callback and their own teardown (the pong drain locks the peer's pongLock;
+// _peerDisconnected locks manager->lock and frees the peer). Freeing under them is the 2026-09-01
+// Ultra crash: two peer threads, two destroyed pongLocks in the same millisecond, SIGABRT in
+// _peerThreadRoutine's drain, unclean death, tx cache lost. So instead the manager is parked as a
+// zombie: no new connections, no reconnects, and the last thread to exit frees it. A thread that
+// truly never exits leaks one manager -- bounded, and strictly preferable to the abort.
+int BRPeerManagerFree(BRPeerManager *manager)
+{
+    int alive;
+
+    assert(manager != NULL);
+    MGR_LOCK(manager);
+#ifdef PEER_FREE_UNDEFERRED
+    // RED ARM ONLY (peer_free_live_thread_kat) -- never defined in a production build.
+    // Restores the pre-fix shape: free regardless of who is still running.
+    alive = 0;
+#else
+    alive = manager->peerThreadCount + manager->dnsThreadCount;
+#endif
+    if (alive > 0) {
+        manager->freeDeferred = 1;
+        manager->maxConnectCount = 0;                       // no new dials from a zombie
+        manager->connectFailureCount = MAX_CONNECT_FAILURES; // and no auto-reconnect on its way out
+        CF_SLOW_WLOG("[CF-SLOW] BRPeerManagerFree: %d peer + %d dns thread(s) still alive -- "
+                     "parking the manager; the last thread out frees it",
+                     manager->peerThreadCount, manager->dnsThreadCount);
+        MGR_UNLOCK(manager);
+        return 0;
+    }
+    MGR_UNLOCK(manager);
+    _BRPeerManagerFreeNow(manager);
+    return 1;
 }
 
 // --- BIP 158 public API ---------------------------------------------------

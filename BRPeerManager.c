@@ -124,6 +124,13 @@ typedef struct {
     BRTransaction *tx;
     void *info;
     void (*callback)(void *info, int error);
+    // Which owner this entry's object belongs to. 1: the publish list owns the object and is the
+    // one that releases it. 0: the object is a record the wallet owns (walked in as a send's
+    // parent input, or re-added from the wallet by the relay path) — the wallet releases it, and
+    // the publish list never does. An entry's owner does not change when its callback does. When
+    // the wallet becomes the owner of a listed object, the entry follows it to owned = 0. The
+    // invariant: every object has exactly one owner, and each owner releases only what it owns.
+    int owned;
 } BRPublishedTx;
 
 typedef struct {
@@ -283,6 +290,19 @@ struct BRPeerManagerStruct {
     BRSet *blocks, *orphans, *checkpoints;
     BRMerkleBlock *lastBlock, *lastOrphan;
     BRMerkleBlock *startSyncFrom;
+    // Bound on the parentless-header ("orphan") set -- see ORPHAN_SET_* in BRPeerManager.h.
+    // orphanBytes is the resident byte total across manager->orphans. Every path that adds a
+    // header to the set or takes one out adjusts it (_BRPeerManagerStoreOrphanLocked and
+    // _BRPeerManagerOrphanLeftSetLocked), so it always equals the resident sum and the byte
+    // limit needs no full walk. orphanReanchorClocks holds the last orphan re-anchor time per
+    // peer (keyed by addr/port) so the request is spaced per peer; orphanChainAsked records
+    // whether the chain lastOrphan belongs to has had its request; orphanReanchorRequests
+    // counts authorized requests so a host KAT can observe the spacing. All guarded by
+    // manager->lock.
+    size_t   orphanBytes;
+    struct { UInt128 addr; uint16_t port; time_t last; } orphanReanchorClocks[PEER_MAX_CONNECTIONS];
+    int      orphanChainAsked;
+    uint64_t orphanReanchorRequests;
     BRTxPeerList *txRelays, *txRequests;
     BRPublishedTx *publishedTx;
     UInt256 *publishedTxHashes;
@@ -756,8 +776,17 @@ static void _BRPeerManagerSyncStopped(BRPeerManager *manager)
 // rest of the process's life. This matters more now than it used to: a peer timeout no longer
 // clears the entry, so the 90-second stranded-send sweep re-publishing a still-pending send is
 // the normal path rather than a corner case.
-static int _BRPeerManagerAddTxToPublishList(BRPeerManager *manager, BRTransaction *tx, void *info,
-                                            void (*callback)(void *, int))
+//
+// Each new entry records who owns its object (see BRPublishedTx). `owned` is 1 when the object is
+// the publish list's to release and 0 when it is a record the wallet owns. The parent-input walk
+// below, and _peerRelayedTx, add wallet records straight from BRWalletTransactionForHash and pass
+// owned = 0; a caller handing a transaction over for broadcast passes owned = 1 through the wrapper.
+//
+// A duplicate only adopts the fresh callback and keeps the existing entry's owner: an entry's
+// owner never changes when its callback does, so a wallet-owned entry stays the wallet's alone
+// to release.
+static int _BRPeerManagerAddTxToPublishListOwned(BRPeerManager *manager, BRTransaction *tx, void *info,
+                                                 void (*callback)(void *, int), int owned)
 {
     if (tx && tx->blockHeight == TX_UNCONFIRMED) {
         for (size_t i = array_count(manager->publishedTx); i > 0; i--) {
@@ -770,18 +799,40 @@ static int _BRPeerManagerAddTxToPublishList(BRPeerManager *manager, BRTransactio
 #endif
             return 0;
         }
-        
-        array_add(manager->publishedTx, ((BRPublishedTx) { tx, info, callback }));
+
+        array_add(manager->publishedTx, ((BRPublishedTx) { tx, info, callback, owned }));
         array_add(manager->publishedTxHashes, tx->txHash);
 
         for (size_t i = 0; i < tx->inCount; i++) {
-            _BRPeerManagerAddTxToPublishList(manager, BRWalletTransactionForHash(manager->wallet, tx->inputs[i].txHash),
-                                             NULL, NULL);
+            // A parent input is read from the wallet, so the wallet owns it: owned = 0.
+            _BRPeerManagerAddTxToPublishListOwned(manager,
+                BRWalletTransactionForHash(manager->wallet, tx->inputs[i].txHash), NULL, NULL, 0);
         }
         return 1;
     }
-    
+
     return 0;
+}
+
+// The object handed here is one a caller relinquishes for broadcast, so the publish list owns it.
+// Wallet records re-added from inside the manager call ...Owned(.., 0) directly instead.
+static int _BRPeerManagerAddTxToPublishList(BRPeerManager *manager, BRTransaction *tx, void *info,
+                                            void (*callback)(void *, int))
+{
+    return _BRPeerManagerAddTxToPublishListOwned(manager, tx, info, callback, 1);
+}
+
+// Caller holds manager->lock. Registering a listed object into the wallet makes the wallet that
+// object's owner, so the listed entry follows the object to owned = 0: the wallet is its one
+// owner and releases it, and the publish list never does. Ownership following the object keeps
+// every object released exactly once. A no-op when the wallet's record for txHash is a separate
+// object (the list keeps ownership of its own), or when no entry points at the wallet's record.
+static void _BRPeerManagerOwnershipFollowsObject(BRPeerManager *manager, UInt256 txHash)
+{
+    BRTransaction *rec = BRWalletTransactionForHash(manager->wallet, txHash);
+    for (size_t i = array_count(manager->publishedTx); rec && i > 0; i--) {
+        if (manager->publishedTx[i - 1].tx == rec) manager->publishedTx[i - 1].owned = 0;
+    }
 }
 
 static size_t _BRPeerManagerBlockLocators(BRPeerManager *manager, UInt256 locators[], size_t locatorsCount)
@@ -871,11 +922,19 @@ static void _BRPeerManagerUpdateTx(BRPeerManager *manager, const UInt256 txHashe
         for (size_t i = 0; i < txCount; i++) {
             for (size_t j = array_count(manager->publishedTx); j > 0; j--) {
                 BRTransaction *tx = manager->publishedTx[j - 1].tx;
-                
+                int owned = manager->publishedTx[j - 1].owned;
+
                 if (! UInt256Eq(txHashes[i], tx->txHash)) continue;
                 array_rm(manager->publishedTx, j - 1);
                 array_rm(manager->publishedTxHashes, j - 1);
+                // Release the object iff the publish list owns it AND the wallet holds no record
+                // of its hash: the list releases only its own object, and only when the wallet
+                // keeps nothing equal. The wallet's own equal-hash record is always the wallet's.
+#ifdef PUBLISH_LIST_OWNERSHIP_UNFIXED
                 if (! BRWalletTransactionForHash(manager->wallet, tx->txHash)) BRTransactionFree(tx);
+#else
+                if (owned && ! BRWalletTransactionForHash(manager->wallet, tx->txHash)) BRTransactionFree(tx);
+#endif
             }
             
             for (size_t j = array_count(manager->txRelays); j > 0; j--) {
@@ -1902,7 +1961,14 @@ static void _peerDisconnected(void *info, int error)
             txInfo[txCount] = manager->publishedTx[i - 1].info;
             txCallback[txCount] = manager->publishedTx[i - 1].callback;
             txCount++;
+            // Release only what the publish list owns. A wallet-owned entry (owned == 0) is
+            // dropped from the list here but never released — the wallet is its one owner and
+            // releases it.
+#ifdef PUBLISH_LIST_OWNERSHIP_UNFIXED
             BRTransactionFree(manager->publishedTx[i - 1].tx);
+#else
+            if (manager->publishedTx[i - 1].owned) BRTransactionFree(manager->publishedTx[i - 1].tx);
+#endif
             array_rm(manager->publishedTxHashes, i - 1);
             array_rm(manager->publishedTx, i - 1);
         }
@@ -2020,7 +2086,13 @@ static void _peerRelayedTx(void *info, BRTransaction *tx)
         }
         
         if (BRWalletAmountSentByTx(manager->wallet, tx) > 0 && BRWalletTransactionIsValid(manager->wallet, tx)) {
-            _BRPeerManagerAddTxToPublishList(manager, tx, NULL, NULL); // add valid send tx to mempool
+            // tx is the wallet's registered record (reassigned from BRWalletTransactionForHash
+            // above), so the wallet owns it: owned = 0.
+#ifdef PUBLISH_OWNED_FOLLOWS_UNFIXED
+            _BRPeerManagerAddTxToPublishListOwned(manager, tx, NULL, NULL, 1); // add valid send tx to mempool
+#else
+            _BRPeerManagerAddTxToPublishListOwned(manager, tx, NULL, NULL, 0); // add valid send tx to mempool
+#endif
         }
 
         // keep track of how many peers have or relay a tx, this indicates how likely the tx is to confirm
@@ -2086,6 +2158,10 @@ static void _peerHasTx(void *info, UInt256 txHash)
     if (tx) {
         isWalletTx = BRWalletRegisterTransaction(manager->wallet, tx);
         if (isWalletTx) tx = BRWalletTransactionForHash(manager->wallet, tx->txHash);
+        // If the wallet took a listed object here, the entry follows it to the wallet's ownership.
+#ifndef PUBLISH_OWNED_FOLLOWS_UNFIXED
+        _BRPeerManagerOwnershipFollowsObject(manager, txHash);
+#endif
 
         // reschedule sync timeout
         if (manager->syncStartHeight > 0 && peer == manager->downloadPeer && isWalletTx) {
@@ -2807,6 +2883,175 @@ static void _BRPeerManagerClearSolicitedBlocksLocked(BRPeerManager *manager)
     manager->cfSolicitedSeq = 0;
 }
 
+// ---- PARENTLESS-HEADER ("orphan") SET DISCIPLINE ---------------------------
+// The set of headers whose parent is not yet in our chain has a fixed upper limit, its byte
+// total always equals what is resident, and every header that leaves the set has exactly one
+// owner afterwards: the chain it connected to, or nobody (it is freed unless the checkpoint
+// array still references that exact object). See ORPHAN_SET_* in BRPeerManager.h.
+
+// Resident byte cost of a header, for the orphan-set byte bound.
+static size_t _BRMerkleBlockResidentBytes(const BRMerkleBlock *b)
+{
+    return sizeof(*b) + b->hashesCount*sizeof(UInt256) + b->flagsLen;
+}
+
+// A parentless header is worth storing only if it could plausibly connect near the tip:
+// not more than a week behind (it cannot belong to a near-tip reorg) and not stamped past
+// the network's clock-drift tolerance (consensus would reject it anyway).
+static int _BRPeerManagerOrphanIsPlausible(const BRMerkleBlock *block, time_t now)
+{
+    if ((time_t)block->timestamp + 7*24*60*60 < now) return 0;
+    if ((time_t)block->timestamp > now + BLOCK_MAX_TIME_DRIFT) return 0;
+    return 1;
+}
+
+// Account for a header that has just left manager->orphans, by ANY route: connected to the
+// chain, displaced by an insert sharing its parent, evicted by the limit, or removed because
+// the same object is also resident in manager->blocks. Keeps orphanBytes equal to the resident
+// sum, and clears lastOrphan if it named this object, so neither outlives the header's
+// membership of the set. Does not free: the caller decides who owns the header next.
+// Caller holds manager->lock.
+static void _BRPeerManagerOrphanLeftSetLocked(BRPeerManager *manager, const BRMerkleBlock *orphan)
+{
+    size_t b = _BRMerkleBlockResidentBytes(orphan);
+
+    manager->orphanBytes = (manager->orphanBytes > b) ? manager->orphanBytes - b : 0;
+    if (manager->lastOrphan == orphan) manager->lastOrphan = NULL;
+}
+
+// Give up ownership of a header that has left manager->orphans and is not going anywhere
+// else -- displaced by an insert sharing its parent, or evicted by the limit. Same alias
+// discipline the main block set uses: it is freed UNLESS the checkpoint set still references
+// this exact pointer, in which case that set stays its one owner. An orphan is never a
+// checkpoint in practice; the guard is the same defence-in-depth the prune path keeps.
+static void _BRPeerManagerReclaimOrphanLocked(BRPeerManager *manager, BRMerkleBlock *orphan)
+{
+    _BRPeerManagerOrphanLeftSetLocked(manager, orphan);
+    if (BRSetGet(manager->checkpoints, orphan) != orphan) BRMerkleBlockFree(orphan);
+}
+
+// qsort comparator: order headers oldest (lowest timestamp) first.
+static int _orphanTimestampAsc(const void *a, const void *b)
+{
+    uint32_t ta = (*(const BRMerkleBlock *const *)a)->timestamp;
+    uint32_t tb = (*(const BRMerkleBlock *const *)b)->timestamp;
+    return (ta < tb) ? -1 : (ta > tb) ? 1 : 0;
+}
+
+// Bring the orphan set back under both limits by evicting the oldest headers, oldest first,
+// down to a low-water mark of 3/4 of each limit, so the next pass is about limit/4 inserts
+// away and the cost per stored header stays small (the same amortisation
+// _BRPeerManagerClearMemory uses for the main block set). Works from a fixed scratch array
+// and allocates nothing, so the limit holds whatever the state of the heap. A set larger than
+// the scratch array (possible only for what a resume left resident) is brought down over
+// several passes. Never evicts `keep` (the just-stored header). Caller holds manager->lock.
+// noinline: the scratch array stays out of _peerRelayedBlock's own frame, which nests once per
+// connecting header (see the sizing note at ORPHAN_SET_COUNT_MAX).
+__attribute__((noinline))
+static void _BRPeerManagerEvictOrphansLocked(BRPeerManager *manager, const BRMerkleBlock *keep)
+{
+    const size_t countLow = (ORPHAN_SET_COUNT_MAX * 3) / 4;
+    const size_t bytesLow = (ORPHAN_SET_BYTES_MAX / 4) * 3;
+    BRMerkleBlock *all[ORPHAN_SET_COUNT_MAX + 1];
+
+    while (BRSetCount(manager->orphans) > countLow || manager->orphanBytes > bytesLow) {
+        size_t got = BRSetAll(manager->orphans, (void **)all, sizeof(all)/sizeof(*all)), evicted = 0;
+
+        qsort(all, got, sizeof(*all), _orphanTimestampAsc);
+
+        for (size_t i = 0; i < got &&
+             (BRSetCount(manager->orphans) > countLow || manager->orphanBytes > bytesLow); i++) {
+            if (all[i] == keep) continue;   // never evict the header we just stored
+            BRSetRemove(manager->orphans, all[i]);
+            _BRPeerManagerReclaimOrphanLocked(manager, all[i]);
+            evicted++;
+        }
+
+        if (! evicted) break;   // only `keep` is left to consider
+    }
+}
+
+// Store a parentless header, keeping the set within its COUNT and BYTES limits with
+// oldest-first eviction, and giving every header the store displaces or evicts its one owner.
+// Ownership of `block` passes to the set. Caller holds manager->lock.
+static void _BRPeerManagerStoreOrphanLocked(BRPeerManager *manager, BRMerkleBlock *block)
+{
+#if defined(ORPHAN_SET_LIMITS_UNFIXED) && ORPHAN_SET_LIMITS_UNFIXED
+    // Reference arm for orphan_set_limits_kat only; never defined in a production build.
+    // The earlier store: a plain insert.
+    BRSetAdd(manager->orphans, block);
+    manager->lastOrphan = block;
+#else
+    BRMerkleBlock *displaced = BRSetAdd(manager->orphans, block);
+
+    if (displaced != block) {   // (the same object stored again changes nothing)
+        manager->orphanBytes += _BRMerkleBlockResidentBytes(block);
+        if (displaced) _BRPeerManagerReclaimOrphanLocked(manager, displaced);   // it shared this parent
+    }
+
+    manager->lastOrphan = block;
+
+    if (BRSetCount(manager->orphans) > ORPHAN_SET_COUNT_MAX ||
+        manager->orphanBytes > ORPHAN_SET_BYTES_MAX) {
+        _BRPeerManagerEvictOrphansLocked(manager, block);
+    }
+#endif
+}
+
+// Decide whether an orphan re-anchor getheaders should go to `peer` now. The request is made
+// once per chain of parentless headers (the lastOrphan/prevBlock link identifies a chain) and
+// at most once per ORPHAN_REANCHOR_MIN_INTERVAL_SECS per peer. A chain counts as asked-for
+// only when a request was really authorized for it, so a chain whose first member arrived
+// inside the peer's interval is asked for by a later member, and one peer is always enough
+// to make progress. A clock that has stepped backwards counts as an elapsed interval. Stamps
+// the per-peer clock and counts the request when it authorizes one. Caller holds
+// manager->lock.
+static int _BRPeerManagerShouldReanchorForOrphanLocked(BRPeerManager *manager, BRPeer *peer,
+                                                       const BRMerkleBlock *orphan, time_t now)
+{
+    int sameChain = (manager->lastOrphan &&
+                     UInt256Eq(manager->lastOrphan->blockHash, orphan->prevBlock));
+
+#if defined(ORPHAN_SET_LIMITS_UNFIXED) && ORPHAN_SET_LIMITS_UNFIXED
+    // Reference arm for orphan_set_limits_kat only: the earlier rule, the chain link alone.
+    (void)peer; (void)now;
+    if (sameChain) return 0;
+    manager->orphanReanchorRequests++;
+    return 1;
+#else
+    if (sameChain && manager->orphanChainAsked) return 0;   // this chain has had its request
+    if (! sameChain) manager->orphanChainAsked = 0;         // a new chain starts un-asked
+
+    UInt128  addr = peer ? peer->address : UINT128_ZERO;
+    uint16_t port = peer ? peer->port : 0;
+
+    int match = -1, lru = 0;
+    for (int i = 0; i < PEER_MAX_CONNECTIONS; i++) {
+        if (manager->orphanReanchorClocks[i].last != 0 &&
+            UInt128Eq(manager->orphanReanchorClocks[i].addr, addr) &&
+            manager->orphanReanchorClocks[i].port == port) { match = i; break; }
+        if (manager->orphanReanchorClocks[i].last < manager->orphanReanchorClocks[lru].last) lru = i;
+    }
+
+    if (match >= 0) {
+        time_t last = manager->orphanReanchorClocks[match].last;
+
+        if (now >= last && now - last < ORPHAN_REANCHOR_MIN_INTERVAL_SECS)
+            return 0;   // inside this peer's interval; a later member of the chain asks
+        manager->orphanReanchorClocks[match].last = now;
+    }
+    else {   // first request from this peer (or its slot was reused): take the least recent slot
+        manager->orphanReanchorClocks[lru].addr = addr;
+        manager->orphanReanchorClocks[lru].port = port;
+        manager->orphanReanchorClocks[lru].last = now;
+    }
+
+    manager->orphanChainAsked = 1;
+    manager->orphanReanchorRequests++;
+    return 1;
+#endif
+}
+
 static void _peerRelayedBlock(void *info, BRMerkleBlock *block)
 {
     BRPeer *peer = ((BRPeerCallbackInfo *)info)->peer;
@@ -2847,7 +3092,8 @@ static void _peerRelayedBlock(void *info, BRMerkleBlock *block)
                  log_u256_hex_encode(block->blockHash), log_u256_hex_encode(block->prevBlock), log_u256_hex_encode(manager->lastBlock->blockHash),
                  manager->lastBlock->height);
         
-        if (block->timestamp + 7*24*60*60 < time(NULL)) { // ignore orphans older than one week ago
+        time_t nowT = time(NULL);
+        if (! _BRPeerManagerOrphanIsPlausible(block, nowT)) { // cannot connect near the tip
             BRMerkleBlockFree(block);
             block = NULL;
         }
@@ -2867,11 +3113,14 @@ static void _peerRelayedBlock(void *info, BRMerkleBlock *block)
             // continuation in BRPeer.c only ever walks toward the tip, never back to the
             // fork). The bloom path used to self-heal forks via its inv/getblocks/
             // merkleblock machinery, excised in v4.0.0 — this restores the equivalent
-            // for CF-only. Drop the precondition; keep the lastOrphan/prevBlock dedup as
-            // the throttle so only the FIRST orphan of each new orphan-chain triggers a
-            // request (no storm). Use getheaders, not the dead getblocks/inv detour —
-            // CF-only pulls plain headers (mirrors the sync-start path above).
-            if (! manager->lastOrphan || ! UInt256Eq(manager->lastOrphan->blockHash, block->prevBlock)) {
+            // for CF-only. Use getheaders, not the dead getblocks/inv detour — CF-only
+            // pulls plain headers (mirrors the sync-start path above).
+            //
+            // The request is spaced two ways (see
+            // _BRPeerManagerShouldReanchorForOrphanLocked): once per chain of orphans (the
+            // lastOrphan/prevBlock link), and at most once per minimum interval per peer,
+            // since each request builds the full block locators under the lock.
+            if (_BRPeerManagerShouldReanchorForOrphanLocked(manager, peer, block, nowT)) {
                 UInt256 locators[_BRPeerManagerBlockLocators(manager, NULL, 0)];
                 size_t locatorsCount = _BRPeerManagerBlockLocators(manager, locators,
                                                                    sizeof(locators)/sizeof(*locators));
@@ -2880,8 +3129,9 @@ static void _peerRelayedBlock(void *info, BRMerkleBlock *block)
                 BRPeerSendGetheaders(peer, locators, locatorsCount, UINT256_ZERO);
             }
 
-            BRSetAdd(manager->orphans, block); // BUG: limit total orphans to avoid memory exhaustion attack
-            manager->lastOrphan = block;
+            // Store within the set's fixed upper limit; a header the insert displaces (one
+            // sharing this parent) or the limit evicts (oldest first) gets its one owner.
+            _BRPeerManagerStoreOrphanLocked(manager, block);
         }
     }
     else if (! _BRPeerManagerVerifyBlock(manager, block, prev, peer)) { // block is invalid
@@ -3018,7 +3268,10 @@ static void _peerRelayedBlock(void *info, BRMerkleBlock *block)
             }
 #endif
             // remove the block from orphans, if it exists
-            if (BRSetGet(manager->orphans, b) == b) BRSetRemove(manager->orphans, b);
+            if (BRSetGet(manager->orphans, b) == b) {
+                BRSetRemove(manager->orphans, b);
+                _BRPeerManagerOrphanLeftSetLocked(manager, b);   // the byte total follows every exit
+            }
             if (manager->lastOrphan == b) manager->lastOrphan = NULL;
 
             // ...and re-point lastBlock, for exactly the same reason lastOrphan is cleared above.
@@ -3062,8 +3315,7 @@ static void _peerRelayedBlock(void *info, BRMerkleBlock *block)
     else if (manager->lastBlock->height < BRPeerLastBlock(peer) &&
              block->height > manager->lastBlock->height + 1) { // special case, new block mined durring rescan
         peer_log(peer, "marking new block #%"PRIu32" as orphan until rescan completes", block->height);
-        BRSetAdd(manager->orphans, block); // mark as orphan til we're caught up
-        manager->lastOrphan = block;
+        _BRPeerManagerStoreOrphanLocked(manager, block); // same bounded, reclaimed orphan store
     }
     else if (block->height <= manager->params->checkpoints[manager->params->checkpointsCount - 1].height) { // old fork
         peer_log(peer, "ignoring block on fork older than most recent checkpoint, block #%"PRIu32", hash: %s",
@@ -3158,6 +3410,11 @@ static void _peerRelayedBlock(void *info, BRMerkleBlock *block)
         // check if the next block was received as an orphan
         orphan.prevBlock = block->blockHash;
         next = BRSetRemove(manager->orphans, &orphan);
+#if !(defined(ORPHAN_SET_LIMITS_UNFIXED) && ORPHAN_SET_LIMITS_UNFIXED)   // (the reference arm keeps the bare remove)
+        // `next` has left the set and belongs to this pass from here on: take it out of the
+        // byte total, and out of lastOrphan, which only ever names a member of the set.
+        if (next) _BRPeerManagerOrphanLeftSetLocked(manager, next);
+#endif
     }
     
     BRMerkleBlock **saveBlocks = saveCount ? calloc(saveCount, sizeof(*saveBlocks)) : NULL;
@@ -3182,15 +3439,23 @@ static void _peerRelayedBlock(void *info, BRMerkleBlock *block)
      * unlock, not in the callback after it — is the fix for the lock-release-
      * then-use UAF. Only the immutable bytes cross the unlock in THE SAVE PATH —
      * no saveBlocks[]/manager->blocks pointer is serialized after the lock drops.
-     * (NB: the pre-existing `block->height` read below at the txStatusUpdate gate
-     * is the SAME UAF class but predates this fix and its exposure is unchanged —
-     * out of scope here; tracked as a follow-up.) */
+     * The same discipline applies to the txStatusUpdate gate below: the header's
+     * height it needs is copied into a local WHILE THE LOCK STILL PROTECTS IT (see
+     * relayedHeight just below), so nothing read from a manager-owned header
+     * outlives the lock that protects it. */
     uint8_t *saveBuf = NULL;
     size_t   saveLen = 0;
     if (i > 0 && manager->saveBlocks) {
         debug_log("[STATS]: orphan_count = %ld, block_count = %ld\n", BRSetCount(manager->orphans), BRSetCount(manager->blocks));
         saveBuf = _serializeSavedBlocks(saveBlocks, i, &saveLen); // malloc'd under the lock
     }
+
+    /* Everything the code past the unlock needs from the relayed header is copied into
+     * locals here, while manager->lock is held. From this point `block` belongs to the
+     * manager's sets and its lifetime is governed by that lock, so it is not dereferenced
+     * again below (relayed_header_lifetime_kat holds this, in behaviour and in source). */
+    int      relayedHeightKnown = (block && block->height != BLOCK_UNKNOWN_HEIGHT);
+    uint32_t relayedHeight      = relayedHeightKnown ? block->height : 0;
 
     MGR_UNLOCK(manager);
     free(saveBlocks);
@@ -3200,9 +3465,16 @@ static void _peerRelayedBlock(void *info, BRMerkleBlock *block)
         manager->saveBlocks(manager->info, REPLACE_SAVED_BLOCKS, saveBuf, saveLen, (uint64_t*) &stackIntegrityCheck);
         free(saveBuf);
     }
-    
+
+#if defined(RELAYED_HEADER_LIFETIME_UNFIXED) && RELAYED_HEADER_LIFETIME_UNFIXED
+    // Reference arm for relayed_header_lifetime_kat only; never defined in a production build.
+    // The earlier form of the gate, which takes its operands from the header at this point.
     if (block && block->height != BLOCK_UNKNOWN_HEIGHT && block->height >= BRPeerLastBlock(peer) &&
         manager->txStatusUpdate) {
+#else
+    if (relayedHeightKnown && relayedHeight >= BRPeerLastBlock(peer) &&
+        manager->txStatusUpdate) {
+#endif
         manager->txStatusUpdate(manager->info); // notify that transaction confirmations may have changed
     }
     
@@ -3491,18 +3763,29 @@ static BRTransaction *_peerRequestedTx(void *info, UInt256 txHash)
             tx = manager->publishedTx[i - 1].tx;
             txInfo = manager->publishedTx[i - 1].info;
             txCallback = manager->publishedTx[i - 1].callback;
+            int owned = manager->publishedTx[i - 1].owned;
             manager->publishedTx[i - 1].info = NULL;
             manager->publishedTx[i - 1].callback = NULL;
-        
+
             if (tx && ! BRWalletTransactionIsValid(manager->wallet, tx)) {
                 error = EINVAL;
                 array_rm(manager->publishedTx, i - 1);
                 array_rm(manager->publishedTxHashes, i - 1);
-                
+
+                // Release the object iff the publish list owns it AND the wallet holds no record
+                // of its hash — the same rule the confirmation path uses. The wallet's own
+                // equal-hash record, if any, is always left to the wallet.
+#ifdef PUBLISH_LIST_OWNERSHIP_UNFIXED
                 if (! BRWalletTransactionForHash(manager->wallet, txHash)) {
                     BRTransactionFree(tx);
                     tx = NULL;
                 }
+#else
+                if (owned && ! BRWalletTransactionForHash(manager->wallet, txHash)) {
+                    BRTransactionFree(tx);
+                    tx = NULL;
+                }
+#endif
             }
         }
         else if (manager->publishedTx[i - 1].callback != NULL) hasPendingCallbacks = 1;
@@ -3516,8 +3799,12 @@ static BRTransaction *_peerRequestedTx(void *info, UInt256 txHash)
     if (tx && ! error) {
         _BRTxPeerListAddPeer(&manager->txRelays, txHash, peer);
         BRWalletRegisterTransaction(manager->wallet, tx);
+        // If the wallet took the listed object here, the entry follows it to the wallet's ownership.
+#ifndef PUBLISH_OWNED_FOLLOWS_UNFIXED
+        _BRPeerManagerOwnershipFollowsObject(manager, txHash);
+#endif
     }
-    
+
 //    pingInfo = calloc(1, sizeof(*pingInfo));
 //    assert(pingInfo != NULL);
 //    pingInfo->peer = peer;
@@ -3762,6 +4049,15 @@ BRPeerManager *BRPeerManagerNewEx(const BRChainParams *params, BRWallet *wallet,
         BRSetFree(savedByHash);
     }
 #endif  // RESUME_FLOOR_UNFIXED
+
+    // Seed the orphan-bound byte accounting from whatever the resume left resident in
+    // manager->orphans, so the running total the relay path maintains starts exact.
+    manager->orphanBytes = 0;
+    {
+        BRMerkleBlock *ob = NULL;
+        while ((ob = BRSetIterate(manager->orphans, ob)) != NULL)
+            manager->orphanBytes += _BRMerkleBlockResidentBytes(ob);
+    }
 
     if (startSyncFrom) {
         manager->lastBlock = startSyncFrom;

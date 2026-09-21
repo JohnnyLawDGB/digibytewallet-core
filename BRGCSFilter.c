@@ -258,6 +258,18 @@ BRGCSFilter *BRGCSFilterParse(const uint8_t *bytes, size_t len,
     // Pre-decode values into a sorted array. Each Golomb-Rice value is
     // a delta from the previous running sum, so cumulative += delta
     // yields the sorted series directly.
+#ifndef WIRE_COUNT_BOUNDS_UNFIXED
+    // invariant: the element count is bounded, before anything is allocated, by
+    // both the allocation size and the bits that remain in the stream. The size
+    // computation must fit size_t so it cannot wrap, and each Golomb-Rice value
+    // occupies at least one bit, so a count larger than the remaining bit budget
+    // cannot be encoded in the payload.
+    if ((size_t)N > SIZE_MAX / sizeof(uint64_t) ||
+        (uint64_t)N > (uint64_t)(len - cursor) * 8) {
+        BRGCSFilterFree(f);
+        return NULL;
+    }
+#endif
     f->values = (uint64_t *)malloc((size_t)N * sizeof(uint64_t));
     if (!f->values) { BRGCSFilterFree(f); return NULL; }
 

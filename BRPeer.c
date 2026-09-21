@@ -582,7 +582,13 @@ static int _BRPeerAcceptVersionMessage(BRPeer *peer, const uint8_t *msg, size_t 
         strLen = (size_t)BRVarInt(&msg[off], (off <= msgLen ? msgLen - off : 0), &len);
         off += len;
 
+#ifdef WIRE_COUNT_BOUNDS_UNFIXED
         if (off + strLen + sizeof(uint32_t) > msgLen) {
+#else
+        // invariant: the declared user-agent length is bounded by the bytes that
+        // remain, with no addition performed on the wrapping side of the compare.
+        if (off > msgLen || strLen > msgLen - off || sizeof(uint32_t) > msgLen - off - strLen) {
+#endif
             peer_log(peer, "malformed version message, length is %zu, should be %zu", msgLen,
                      off + strLen + sizeof(uint32_t));
             r = 0;
@@ -843,7 +849,14 @@ static int _BRPeerAcceptHeadersMessage(BRPeer *peer, const uint8_t *msg, size_t 
     size_t off = 0, count = (size_t)BRVarInt(msg, msgLen, &off);
     int r = 1;
 
+#ifdef WIRE_COUNT_BOUNDS_UNFIXED
     if (off == 0 || off + 81*count > msgLen) {
+#else
+    // invariant: the header count is bounded by the bytes that remain before the
+    // count is trusted. Each header entry occupies 81 bytes on the wire, so a
+    // larger count cannot be present in the message.
+    if (off == 0 || count > (msgLen - off) / 81) {
+#endif
         peer_log(peer, "malformed headers message, length is %zu, should be %zu for %zu header(s)", msgLen,
                  BRVarIntSize(count) + 81*count, count);
         r = 0;
@@ -1115,8 +1128,14 @@ static int _BRPeerAcceptRejectMessage(BRPeer *peer, const uint8_t *msg, size_t m
     BRPeerContext *ctx = (BRPeerContext *)peer;
     size_t off = 0, strLen = (size_t)BRVarInt(msg, msgLen, &off);
     int r = 1;
-    
+
+#ifdef WIRE_COUNT_BOUNDS_UNFIXED
     if (off + strLen + sizeof(uint8_t) > msgLen) {
+#else
+    // invariant: the declared string length is bounded by the bytes that remain,
+    // with no addition performed on the wrapping side of the compare.
+    if (off > msgLen || strLen > msgLen - off || sizeof(uint8_t) > msgLen - off - strLen) {
+#endif
         peer_log(peer, "malformed reject message, length is %zu, should be >= %zu", msgLen,
                  off + strLen + sizeof(uint8_t));
         r = 0;
@@ -1133,8 +1152,14 @@ static int _BRPeerAcceptRejectMessage(BRPeer *peer, const uint8_t *msg, size_t m
         strLen = (size_t)BRVarInt(&msg[off], (off <= msgLen ? msgLen - off : 0), &len);
         off += len;
         if (strncmp(type, MSG_TX, sizeof(type)) == 0) hashLen = sizeof(UInt256);
-        
+
+#ifdef WIRE_COUNT_BOUNDS_UNFIXED
         if (off + strLen + hashLen > msgLen) {
+#else
+        // invariant: the declared reason length is bounded by the bytes that
+        // remain, with no addition performed on the wrapping side of the compare.
+        if (off > msgLen || strLen > msgLen - off || hashLen > msgLen - off - strLen) {
+#endif
             peer_log(peer, "malformed reject message, length is %zu, should be >= %zu", msgLen, off + strLen + hashLen);
             r = 0;
         }

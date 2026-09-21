@@ -53,25 +53,46 @@ static int _ddReadScriptNum(const uint8_t *data, size_t len, int64_t *out)
 
 // Advance a script-push cursor. On entry *pos indexes an opcode in script[0..scriptLen).
 // On success sets *dataOff/*dataLen for the pushed bytes, advances *pos past the push,
-// returns 1. Returns 0 at end-of-script or on a non-push / OP_PUSHDATA it can't read.
-// Handles direct pushes 0x01..0x4b and OP_PUSHDATA1 (0x4c). An empty push (OP_0/0x00)
-// yields dataLen 0. (DD metadata never uses larger pushdata; reject them = fail closed.)
+// returns 1. Returns 0 at end-of-script or on a non-push opcode.
+//
+// Understands all four standard push encodings — direct pushes 0x01..0x4b, OP_PUSHDATA1
+// (0x4c), OP_PUSHDATA2 (0x4d) and OP_PUSHDATA4 (0x4e) — so a transfer another wallet built
+// with any of them decodes the same. An empty push (OP_0/0x00) yields dataLen 0.
+//
+// In every case the declared length is compared against the bytes that remain after the opcode
+// and its length header: `avail` is computed only once the header itself is known to fit, and
+// the test is `l > avail`. A push that does not fit fails closed.
 static int _ddNextPush(const uint8_t *script, size_t scriptLen, size_t *pos,
                        size_t *dataOff, size_t *dataLen)
 {
     if (*pos >= scriptLen) return 0;
     uint8_t op = script[*pos];
     if (op == 0x00) { *dataOff = *pos + 1; *dataLen = 0; *pos += 1; return 1; } // OP_0 / empty
-    if (op >= 0x01 && op <= 0x4b) {
-        size_t l = op;
-        if (*pos + 1 + l > scriptLen) return 0;
+    if (op >= 0x01 && op <= 0x4b) {                  // direct push: the opcode is the length
+        size_t l = op, avail = scriptLen - (*pos + 1);
+        if (l > avail) return 0;
         *dataOff = *pos + 1; *dataLen = l; *pos += 1 + l; return 1;
     }
-    if (op == 0x4c) { // OP_PUSHDATA1
-        if (*pos + 2 > scriptLen) return 0;
-        size_t l = script[*pos + 1];
-        if (*pos + 2 + l > scriptLen) return 0;
+    if (op == 0x4c) {                                // OP_PUSHDATA1: one length byte
+        if (*pos + 2 > scriptLen) return 0;         // room for opcode + length byte
+        size_t l = script[*pos + 1], avail = scriptLen - (*pos + 2);
+        if (l > avail) return 0;
         *dataOff = *pos + 2; *dataLen = l; *pos += 2 + l; return 1;
+    }
+    if (op == 0x4d) {                                // OP_PUSHDATA2: two length bytes, little-endian
+        if (*pos + 3 > scriptLen) return 0;         // room for opcode + 2 length bytes
+        size_t l = (size_t)script[*pos + 1] | ((size_t)script[*pos + 2] << 8);
+        size_t avail = scriptLen - (*pos + 3);
+        if (l > avail) return 0;
+        *dataOff = *pos + 3; *dataLen = l; *pos += 3 + l; return 1;
+    }
+    if (op == 0x4e) {                                // OP_PUSHDATA4: four length bytes, little-endian
+        if (*pos + 5 > scriptLen) return 0;         // room for opcode + 4 length bytes
+        size_t l = (size_t)script[*pos + 1] | ((size_t)script[*pos + 2] << 8) |
+                   ((size_t)script[*pos + 3] << 16) | ((size_t)script[*pos + 4] << 24);
+        size_t avail = scriptLen - (*pos + 5);
+        if (l > avail) return 0;
+        *dataOff = *pos + 5; *dataLen = l; *pos += 5 + l; return 1;
     }
     return 0; // any other opcode (incl OP_N numeric) is not a DD metadata push
 }
@@ -120,22 +141,66 @@ int BRDigiDollarDecodeAmounts(const BRTransaction *tx, int64_t *amounts, size_t 
     return count;
 }
 
+// Returns the DD cent amount at DD-output ordinal `ordinal` (0-based) by walking the "DD"
+// OP_RETURN's amount pushes. It needs no buffer, so it places no cap on how many outputs a
+// transfer may carry.
+//
+// It accepts exactly the lists BRDigiDollarDecodeAmounts accepts, so the two public readers
+// always agree about a transaction: the WHOLE list is validated, not only the part up to
+// `ordinal`. The value at `ordinal` is remembered and the walk continues to the end of the
+// list; any amount anywhere in it that is not minimal and positive refuses the list as a
+// whole (fail closed), and then no output of that transaction binds to an amount.
+//
+// Returns 1 and sets *out on success; 0 if `tx` is not a DD tx, the list is refused, or the
+// ordinal is past the end of the list.
+static int _ddAmountAtOrdinal(const BRTransaction *tx, size_t ordinal, int64_t *out)
+{
+    int type = BRDigiDollarTxType(tx);
+    if (type == 0) return 0;
+    long ri = _ddFindDDOpReturn(tx);
+    if (ri < 0) return 0;
+    const BRTxOutput *o = &tx->outputs[ri];
+
+    size_t pos = 1, off = 0, len = 0;
+    if (! _ddNextPush(o->script, o->scriptLen, &pos, &off, &len)) return 0; // push 0: "DD"
+    if (! _ddNextPush(o->script, o->scriptLen, &pos, &off, &len)) return 0; // push 1: txType
+    int64_t tt;
+    if (! _ddReadScriptNum(o->script + off, len, &tt) || (int)tt != type) return 0;
+
+    size_t k = 0;
+    int found = 0;
+    int64_t atOrdinal = 0;
+    while (_ddNextPush(o->script, o->scriptLen, &pos, &off, &len)) {
+        if (len == 0) continue;                    // empty push consumes no slot (spec §3.2)
+        int64_t v;
+        if (! _ddReadScriptNum(o->script + off, len, &v)) return 0; // non-minimal -> fail closed
+        if (v <= 0) return 0;                      // amounts must be positive
+        if (k == ordinal) { atOrdinal = v; found = 1; } // remember it; keep validating the rest
+        k++;
+        if (type != DD_TYPE_TRANSFER) break;       // MINT/REDEEM: first push only
+    }
+    if (! found) return 0;                          // ordinal past the amount list
+    *out = atOrdinal;                               // set only once the whole list has been accepted
+    return 1;
+}
+
 int64_t BRDigiDollarOutputAmount(const BRTransaction *tx, size_t voutIndex)
 {
     if (! tx || voutIndex >= tx->outCount) return -1;
-    int64_t amounts[64];
-    int n = BRDigiDollarDecodeAmounts(tx, amounts, 64);
-    if (n < 0) return -1;
+    if (BRDigiDollarTxType(tx) == 0 || _ddFindDDOpReturn(tx) < 0) return -1;
 
     size_t k = 0;
     for (size_t i = 0; i < tx->outCount; i++) {
         const BRTxOutput *o = &tx->outputs[i];
         if (o->scriptLen >= 1 && o->script && o->script[0] == OP_RETURN) continue; // skip metadata
         if (o->amount != 0) continue;                                              // skip DGB/collateral
-        if (o->scriptLen == 34 && o->script && o->script[0] == 0x51) {             // a DD (zero-value P2TR) output
+        // A DD token output is Core's canonical zero-value P2TR: OP_1 (0x51) followed by a
+        // 32-byte push (0x20). Requiring the second byte too keeps a 34-byte OP_1 script that
+        // is not that exact form from binding to an amount slot.
+        if (o->scriptLen == 34 && o->script && o->script[0] == 0x51 && o->script[1] == 0x20) {
             if (i == voutIndex) {
-                if (k < (size_t)n) return amounts[k];
-                return -1;                                                         // ordinal past amount list
+                int64_t amt;
+                return _ddAmountAtOrdinal(tx, k, &amt) ? amt : -1;                 // walk to this ordinal
             }
             k++;                                                                   // advance for every DD output
         } else if (i == voutIndex) {

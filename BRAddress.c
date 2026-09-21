@@ -145,7 +145,14 @@ size_t BRScriptElements(const uint8_t *elems[], size_t elemsCount, const uint8_t
                 off++;
                 break;
         }
-        
+
+#ifndef SCRIPT_PUSH_BOUND_UNFIXED
+        // invariant: a push never extends past the script. The declared length is compared
+        // with the bytes that remain, so the sum below cannot pass scriptLen or wrap in any
+        // word size. A script whose push does not fit has no elements -- the answer this
+        // function already gives for it whenever the sum does not wrap.
+        if (off > scriptLen || len > scriptLen - off) return 0;
+#endif
         off += len;
         i++;
     }

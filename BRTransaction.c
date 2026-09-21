@@ -570,8 +570,31 @@ BRTransaction *BRTransactionParse(const uint8_t *buf, size_t bufLen)
         off += len;
     }
 
+#ifndef WIRE_COUNT_BOUNDS_UNFIXED
+    // invariant: the input count is bounded by the bytes that remain before the
+    // array is sized. Each input occupies at least 41 bytes on the wire (36-byte
+    // outpoint + a 1-byte script-length + a 4-byte sequence), so a count larger
+    // than that cannot be present in the message.
+    if (tx->inCount > (off <= bufLen ? (bufLen - off) / 41 : 0)) {
+        tx->inCount = 0; // no inputs have been populated yet; keep the free walk in range
+        BRTransactionFree(tx);
+        return NULL;
+    }
+#endif
+
     array_set_count(tx->inputs, tx->inCount);
-    
+
+#ifndef WIRE_STORE_CHECK_UNFIXED
+    // invariant: the loop below fills tx->inCount entries, so the store must hold
+    // exactly that many. A grow the allocator could not satisfy leaves the store at
+    // its previous size (BRArray.h), and the message is then rejected.
+    if (array_count(tx->inputs) != tx->inCount) {
+        tx->inCount = 0; // no inputs have been populated yet; keep the free walk in range
+        BRTransactionFree(tx);
+        return NULL;
+    }
+#endif
+
     for (i = 0; off <= bufLen && i < tx->inCount; i++) {
         input = &tx->inputs[i];
         input->txHash = (off + sizeof(UInt256) <= bufLen) ? UInt256Get(&buf[off]) : UINT256_ZERO;
@@ -596,8 +619,28 @@ BRTransaction *BRTransactionParse(const uint8_t *buf, size_t bufLen)
     
     tx->outCount = (size_t)BRVarInt(&buf[off], (off <= bufLen ? bufLen - off : 0), &len);
     off += len;
+#ifndef WIRE_COUNT_BOUNDS_UNFIXED
+    // invariant: the output count is bounded by the bytes that remain before the
+    // array is sized. Each output occupies at least 9 bytes on the wire (8-byte
+    // amount + a 1-byte script-length), so a larger count cannot be present.
+    if (tx->outCount > (off <= bufLen ? (bufLen - off) / 9 : 0)) {
+        tx->outCount = 0; // no outputs have been populated yet; keep the free walk in range
+        BRTransactionFree(tx);
+        return NULL;
+    }
+#endif
     array_set_count(tx->outputs, tx->outCount);
-    
+
+#ifndef WIRE_STORE_CHECK_UNFIXED
+    // invariant: as for the inputs -- the store holds exactly tx->outCount entries
+    // before the loop below fills them.
+    if (array_count(tx->outputs) != tx->outCount) {
+        tx->outCount = 0; // no outputs have been populated yet; keep the free walk in range
+        BRTransactionFree(tx);
+        return NULL;
+    }
+#endif
+
     for (i = 0; off <= bufLen && i < tx->outCount; i++) {
         output = &tx->outputs[i];
         output->amount = (off + sizeof(uint64_t) <= bufLen) ? UInt64GetLE(&buf[off]) : 0;
@@ -612,12 +655,41 @@ BRTransaction *BRTransactionParse(const uint8_t *buf, size_t bufLen)
         input = &tx->inputs[i];
         count = (size_t)BRVarInt(&buf[off], (off <= bufLen ? bufLen - off : 0), &len);
         off += len;
-        
+
+#ifndef WIRE_WITNESS_COUNT_UNFIXED
+        // invariant: the number of witness items declared for this input is bounded
+        // by the bytes that remain before they are walked. Each item carries at
+        // least a one-byte length prefix, so a count larger than the bytes left
+        // cannot be present in the message. The comparison performs no addition on
+        // the side that could wrap; tx->inCount and tx->outCount already describe the
+        // populated inputs and outputs, so BRTransactionFree's walk stays in range.
+        if (count > (off <= bufLen ? bufLen - off : 0)) {
+            BRTransactionFree(tx);
+            return NULL;
+        }
+#endif
+
         for (j = 0, sLen = 0; j < count; j++) {
+#ifdef WIRE_WITNESS_COUNT_UNFIXED
             sLen += (size_t)BRVarInt(&buf[off + sLen], (off + sLen <= bufLen ? bufLen - (off + sLen) : 0), &len);
             sLen += len;
+#else
+            // invariant: the accumulated witness length stays within the bytes that
+            // remain, so the walk never passes the end of the buffer. Each item is a
+            // length prefix (len bytes) then that many bytes; both are compared
+            // against the bytes still available, with no addition on the side that
+            // could wrap.
+            size_t witItem = (size_t)BRVarInt(&buf[off + sLen], (off + sLen <= bufLen ? bufLen - (off + sLen) : 0), &len);
+            size_t witRem = (off + sLen <= bufLen) ? bufLen - (off + sLen) : 0;
+            if (len > witRem || witItem > witRem - len) {
+                BRTransactionFree(tx);
+                return NULL;
+            }
+            sLen += witItem;
+            sLen += len;
+#endif
         }
-        
+
         if (off + sLen <= bufLen) BRTxInputSetWitness(input, &buf[off], sLen);
         off += sLen;
     }

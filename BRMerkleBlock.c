@@ -126,6 +126,13 @@ BRMerkleBlock *BRMerkleBlockParse(const uint8_t *buf, size_t bufLen)
             off += sizeof(uint32_t);
             block->hashesCount = (size_t)BRVarInt(&buf[off], (off <= bufLen ? bufLen - off : 0), &len);
             off += len;
+#ifndef WIRE_COUNT_BOUNDS_UNFIXED
+            // invariant: the hash count is bounded by the bytes that remain, so
+            // the size computation below cannot wrap. Each hash is 32 bytes on
+            // the wire; a larger count cannot be present in the buffer.
+            if (block->hashesCount > (off <= bufLen ? (bufLen - off) / sizeof(UInt256) : 0))
+                block->hashesCount = 0;
+#endif
             len = block->hashesCount*sizeof(UInt256);
             block->hashes = (off + len <= bufLen) ? malloc(len) : NULL;
             if (block->hashes) memcpy(block->hashes, &buf[off], len);

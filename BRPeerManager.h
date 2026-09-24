@@ -685,6 +685,19 @@ const char *BRPeerManagerDownloadPeerName(BRPeerManager *manager);
 void BRPeerManagerPublishTx(BRPeerManager *manager, BRTransaction *tx, void *info,
                             void (*callback)(void *info, int error));
 
+// Removes a transaction (and any dependants) from the wallet and keeps the publish list in
+// agreement with it: for every entry whose object the WALLET owns, no entry is left naming a record
+// the wallet has released. This is the one path a wallet-side removal takes.
+//
+// An entry whose object the LIST owns is kept and its object is left untouched. A caller that hands
+// the list the very object it registered with the wallet therefore keeps that entry, and keeps the
+// single-owner contract of BRPeerManagerPublishTx ("do not free tx afterward"): this call never
+// releases an object the list owns, and never assumes one.
+//
+// The wallet's own balanceChanged / txDeleted callbacks fire from here with the manager lock still
+// held, so a consumer must not call back into a BRPeerManager* function from them.
+void BRPeerManagerRemoveTransaction(BRPeerManager *manager, UInt256 txHash);
+
 // number of connected peers that have relayed the given unconfirmed transaction
 size_t BRPeerManagerRelayCount(BRPeerManager *manager, UInt256 txHash);
 

@@ -3811,6 +3811,15 @@ static BRTransaction *_peerRequestedTx(void *info, UInt256 txHash)
 //    pingInfo->manager = manager;
 //    pingInfo->hash = txHash;
 //    BRPeerSendPing(peer, pingInfo, _peerRequestedTxPingDone);
+
+    // Hand the caller a private copy made under the lock, not the object the list or the wallet
+    // owns. The caller reads and serialises the returned object after this lock is dropped, so a
+    // pointer whose lifetime belongs to another owner could be released out from under that read;
+    // a copy has exactly one owner — the caller — which releases it once it has been sent. The copy
+    // is the list's own new allocation, so this adds no release of any object the base released.
+#ifndef PUBLISH_SERVED_COPY_UNFIXED
+    if (tx) tx = BRTransactionCopy(tx);
+#endif
     MGR_UNLOCK(manager);
     if (txCallback) txCallback(txInfo, error);
     return tx;
@@ -7324,6 +7333,44 @@ void BRPeerManagerPublishTx(BRPeerManager *manager, BRTransaction *tx, void *inf
 
         MGR_UNLOCK(manager);
     }
+}
+
+// A wallet-side removal of a transaction keeps the publish list in agreement with the wallet: for
+// every entry whose object the WALLET owns, no entry may name a record the wallet has released.
+// This is the one path a wallet-side removal takes. Under the manager lock it removes the
+// transaction (and any dependants) from the wallet, then drops every wallet-owned entry the wallet
+// no longer holds a record of. The entry to drop is chosen by the hash cached in the entry, never by
+// dereferencing the entry's object — the wallet may already have released that object.
+//
+// The list releases nothing here: every record the wallet released is the wallet's own. An entry the
+// list owns is kept and its object is left untouched, so this call never releases an object the list
+// owns and never assumes one. That is the conservative half of the rule, and it is why the guarantee
+// above is scoped to wallet-owned entries: a caller may have published the very object it registered
+// with the wallet, and such an entry stays that caller's business under the single-owner contract of
+// BRPeerManagerPublishTx ("do not free tx afterward").
+void BRPeerManagerRemoveTransaction(BRPeerManager *manager, UInt256 txHash)
+{
+    assert(manager != NULL);
+    assert(! UInt256IsZero(txHash));
+    MGR_LOCK(manager);
+
+    if (manager->wallet) {
+        BRWalletRemoveTransaction(manager->wallet, txHash);
+
+#ifndef PUBLISH_REMOVE_PURGE_UNFIXED
+        for (size_t i = array_count(manager->publishedTx); i > 0; i--) {
+            if (manager->publishedTx[i - 1].owned) continue;   // the list owns it: kept, untouched
+            // Decided by the cached hash: the entry's object may already be released, so it is
+            // never read here. An entry the wallet still has an equal-hash record of still names a
+            // live wallet record and is kept.
+            if (BRWalletTransactionForHash(manager->wallet, manager->publishedTxHashes[i - 1])) continue;
+            array_rm(manager->publishedTx, i - 1);
+            array_rm(manager->publishedTxHashes, i - 1);
+        }
+#endif
+    }
+
+    MGR_UNLOCK(manager);
 }
 
 // number of connected peers that have relayed the given unconfirmed transaction

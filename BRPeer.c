@@ -969,22 +969,30 @@ static int _BRPeerAcceptGetdataMessage(BRPeer *peer, const uint8_t *msg, size_t 
             
             switch (type) {
                 case inv_tx:
-                    if (ctx->requestedTx) tx = ctx->requestedTx(ctx->info, hash);
+                    // Reset per item: requestedTx hands back a private copy this handler owns, so a
+                    // value left over from a previous item must not be read or sent for this one.
+                    tx = ctx->requestedTx ? ctx->requestedTx(ctx->info, hash) : NULL;
 
                     if (tx && BRTransactionSize(tx) < TX_MAX_SIZE) {
                         uint8_t buf[BRTransactionSerialize(tx, NULL, 0)];
                         size_t bufLen = BRTransactionSerialize(tx, buf, sizeof(buf));
                         char txHex[bufLen*2 + 1];
-                        
+
                         for (size_t j = 0; j < bufLen; j++) {
                             sprintf(&txHex[j*2], "%02x", buf[j]);
                         }
-                        
+
                         peer_log(peer, "publishing tx: %s", txHex);
                         BRPeerSendMessage(peer, buf, bufLen, tx->is_dandelion ? MSG_DANDELION_TX : MSG_TX);
+                        // The served object is a private copy made under the manager lock; it is
+                        // this handler's to release once it has been sent.
+                        BRTransactionFree(tx);
+                        tx = NULL;
                         break;
                     }
-                    
+
+                    if (tx) { BRTransactionFree(tx); tx = NULL; }   // too large to serve: still our copy
+
                     // fall through
                 default:
                     if (! notfound) array_new(notfound, 1);

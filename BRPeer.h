@@ -168,7 +168,9 @@ BRPeer *BRPeerNew(uint32_t magicNumber);
 //     responds by pulling plain headers (getheaders) so the header connects and re-kicks the cfheaders/cfilter
 //     driver. Not fired in BLOOM_ONLY/BOTH, which use the inv -> getdata(merkleblock) path.
 // void notfound(void *, const UInt256[], size_t, const UInt256[], size_t) - called when "notfound" message is received
-// BRTransaction *requestedTx(void *, UInt256) - called when "getdata" message with a tx hash is received from peer
+// BRTransaction *requestedTx(void *, UInt256) - called when "getdata" message with a tx hash is received from peer.
+//     The object returned becomes the handler's to release: it is released once the item has been answered, on every
+//     path out. So a provider returns a private copy, never a record it or anyone else keeps.
 // int networkIsReachable(void *) - must return true when networking is available, false otherwise
 // void threadCleanup(void *) - called before a thread terminates to faciliate any needed cleanup
 void BRPeerSetCallbacks(BRPeer *peer, void *info,

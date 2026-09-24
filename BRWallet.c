@@ -1423,6 +1423,113 @@ BRTransaction *BRWalletForceCreateTxForOutputs(BRWallet *wallet, const BRTxOutpu
 #define DD_MIN_OUTPUT_CENTS 100LL       // $1.00 per-output minimum (consensus minOutputAmount)
 #define DD_MAX_OUTPUT_CENTS 10000000LL  // $100,000 per-transfer-output max (digidollar/validation.cpp:1150)
 
+// Allocation for the transfer builder's per-call working sets, sized with a checked multiply:
+// returns NULL if count*size would wrap or the request is refused. A count of 0 still allocates one
+// slot so the returned pointer is always valid to free.
+static void *_ddAllocWork(size_t count, size_t size)
+{
+    size_t bytes;
+    if (count == 0) count = 1;
+    if (__builtin_mul_overflow(count, size, &bytes)) return NULL;
+    return malloc(bytes);
+}
+
+// A DigiDollar change amount is acceptable when there is no change at all, or the change is itself a
+// valid stand-alone output amount in [DD_MIN_OUTPUT_CENTS, DD_MAX_OUTPUT_CENTS]. Change below the
+// $1.00 output floor, or above the per-output cap, is not acceptable.
+static int _ddChangeAcceptable(uint64_t ddChange)
+{
+    if (ddChange == 0) return 1;
+    return (int64_t)ddChange >= DD_MIN_OUTPUT_CENTS && (int64_t)ddChange <= DD_MAX_OUTPUT_CENTS;
+}
+
+// The widest coin that can never carry a running total from below the acceptable change band's floor
+// to above its ceiling in one step -- the band is DD_MAX_OUTPUT_CENTS - DD_MIN_OUTPUT_CENTS + 1 cents
+// wide, so a coin no wider than that always lands a total that reaches the floor inside the band.
+#define DD_LOW_COIN_MAX (DD_MAX_OUTPUT_CENTS - DD_MIN_OUTPUT_CENTS + 1)
+
+// One snapshotted DigiDollar coin of the transfer builder's working set (value by copy, so the set
+// is usable after the wallet lock is dropped).
+struct _ddSel { UInt256 hash; uint32_t n; int64_t c; uint8_t script[42]; size_t scriptLen; };
+
+// Chooses a selection out of the working set `sel[0..m)` -- sorted ascending by cents -- that covers
+// `cents` with an acceptable change, compacts the chosen coins to the front of the array in
+// largest-first order, and sets *outCount to how many were chosen. Returns 1 on a selection, 0 when
+// the holding admits none.
+//
+// THE INVARIANT THIS ESTABLISHES, together with the smallest-first prefix its caller has already
+// tried: 0 is returned only where NO subset of the working set covers `cents` with an acceptable
+// change -- for every holding whose coins are each at least DD_MIN_OUTPUT_CENTS, which is what a
+// DigiDollar output amount always is. Two steps here, and why between them they account for every
+// subset:
+//   (1) a coin worth more than cents + DD_MAX_OUTPUT_CENTS is set aside. Every subset holding one
+//       totals past that, so its change is above the cap: setting it aside cannot lose a selection.
+//       The `hi` coins left each fit under that ceiling on their own.
+//   (2) largest-first accumulation, taking the first running total whose change is acceptable.
+//   (3) failing that: the largest "high part" that itself fits under the ceiling -- nothing at all,
+//       the single largest coin, or the highest-summing pair -- topped up with "low" coins (each at
+//       most DD_LOW_COIN_MAX) largest-first until the total reaches the band's floor. A low coin is
+//       never wider than the band, so the first total to reach the floor is still under the ceiling
+//       and that selection is acceptable. Three or more coins wider than DD_LOW_COIN_MAX already sum
+//       past the ceiling, so those three candidates are every high part a selection can have; the
+//       largest of them is the one that gets nearest the floor, so if it cannot reach it none can.
+//   and that is all that is needed: if step (3) cannot reach the floor then every subset totals below
+//   it, so the only acceptable change left is none at all -- and a selection with no change is every
+//   low coin plus at most one high coin (two high coins already sum past `cents`), which is exactly
+//   what the caller's smallest-first prefix takes, so the caller never reaches here for one.
+static int _ddSelectAcceptable(struct _ddSel *sel, size_t m, uint64_t cents, size_t *outCount)
+{
+    uint64_t lim   = cents + (uint64_t)DD_MAX_OUTPUT_CENTS;   // no acceptable selection totals more
+    uint64_t least = cents + (uint64_t)DD_MIN_OUTPUT_CENTS;   // ... and none with change totals less
+    size_t hi = m;
+    while (hi > 0 && (uint64_t)sel[hi - 1].c > lim) hi--;                                      // (1)
+    size_t nlow = hi;                                         // low coins are sel[0..nlow)
+    while (nlow > 0 && sel[nlow - 1].c > DD_LOW_COIN_MAX) nlow--;
+    uint64_t tlow = 0;
+    for (size_t i = 0; i < nlow; i++) tlow += (uint64_t)sel[i].c;
+
+    size_t r0 = 0, r1 = 0, e0 = m, e1 = m;   // chosen = the range sel[r0,r1) plus sel[e0] and sel[e1]
+    int found = 0;
+
+    uint64_t s = 0;                                                                            // (2)
+    for (size_t k = hi; k > 0 && ! found; k--) {
+        s += (uint64_t)sel[k - 1].c;
+        if (s >= cents && _ddChangeAcceptable(s - cents)) { r0 = k - 1; r1 = hi; found = 1; }
+    }
+
+    if (! found) {                                                                             // (3)
+        uint64_t g = 0; size_t h0 = m, h1 = m;
+        if (hi > nlow) { g = (uint64_t)sel[hi - 1].c; h0 = hi - 1; }          // the largest single
+        if (hi > nlow + 1) {                                                 // the best-summing pair
+            size_t i = nlow, j = hi - 1;
+            while (i < j) {
+                uint64_t t = (uint64_t)sel[i].c + (uint64_t)sel[j].c;
+                if (t > lim) j--;
+                else { if (t > g) { g = t; h0 = i; h1 = j; } i++; }
+            }
+        }
+        if (g + tlow >= least) {
+            uint64_t t = g; size_t i = nlow;
+            while (t < least && i > 0) { i--; t += (uint64_t)sel[i].c; }      // low coins, largest-first
+            r0 = i; r1 = nlow; e0 = h0; e1 = h1; found = 1;
+        }
+    }
+
+    if (! found) return 0;
+
+    size_t w = 0;                            // compact the chosen coins to the front in array order
+    for (size_t i = 0; i < hi; i++) {        // (w <= i throughout, so nothing is overwritten unread)
+        if (i != e0 && i != e1 && (i < r0 || i >= r1)) continue;
+        if (w != i) sel[w] = sel[i];
+        w++;
+    }
+    for (size_t i = 0, j = w; i + 1 < j; i++) {                       // ... then reverse the front,
+        j--; struct _ddSel t = sel[i]; sel[i] = sel[j]; sel[j] = t;   // so the coins go largest-first
+    }
+    *outCount = w;
+    return 1;
+}
+
 // Builds an UNSIGNED DigiDollar transfer paying `cents` to `recipientKey32`. Selects DD UTXOs to cover
 // `cents` and DGB UTXOs for the fee, emits recipient DD + DD change + DGB change + OP_RETURN, version
 // 0x02000770. Returns the unsigned tx (caller signs with BRWalletSignTransaction), or NULL on failure.
@@ -1435,14 +1542,16 @@ BRTransaction *BRWalletCreateDigiDollarTransfer(BRWallet *wallet, const uint8_t 
     if (! wallet->hasTaprootKey) return NULL;
     if ((int64_t)cents < DD_MIN_OUTPUT_CENTS || (int64_t)cents > DD_MAX_OUTPUT_CENTS) return NULL;
 
-    struct _ddSel  { UInt256 hash; uint32_t n; int64_t c; uint8_t script[42]; size_t scriptLen; };
     struct _feeSel { UInt256 hash; uint32_t n; uint64_t amt; uint8_t script[42]; size_t scriptLen; };
 
     pthread_mutex_lock(&wallet->lock);
 
-    // --- snapshot our DD UTXOs (hash, n, cents, scriptPubKey bytes), sort smallest-first ---
+    // --- snapshot our DD UTXOs (hash, n, cents, scriptPubKey bytes) on the HEAP, sort smallest-first.
+    // The working set is sized on the heap with a checked multiply and released on EVERY return path
+    // below -- including the early returns taken while wallet->lock is held. ---
     size_t ddN = array_count(wallet->ddUtxos);
-    struct _ddSel ddsel[ddN > 0 ? ddN : 1];
+    struct _ddSel *ddsel = _ddAllocWork(ddN, sizeof(*ddsel));
+    if (! ddsel) { pthread_mutex_unlock(&wallet->lock); return NULL; }              // allocation refused
     size_t m = 0;
     for (size_t i = 0; i < ddN; i++) {
         BRTransaction *dt = BRSetGet(wallet->allTx, &wallet->ddUtxos[i].hash);
@@ -1463,16 +1572,29 @@ BRTransaction *BRWalletCreateDigiDollarTransfer(BRWallet *wallet, const uint8_t 
     }
     uint64_t selDD = 0; size_t ddIn = 0;
     for (size_t i = 0; i < m && selDD < cents; i++) { selDD += (uint64_t)ddsel[i].c; ddIn++; }
-    if (selDD < cents) { pthread_mutex_unlock(&wallet->lock); return NULL; }        // insufficient DD
+    if (selDD < cents) { free(ddsel); pthread_mutex_unlock(&wallet->lock); return NULL; }   // insufficient DD
     uint64_t ddChange = selDD - cents;
-    if (ddChange != 0 && ((int64_t)ddChange < DD_MIN_OUTPUT_CENTS ||
-                          (int64_t)ddChange > DD_MAX_OUTPUT_CENTS)) {
-        pthread_mutex_unlock(&wallet->lock); return NULL;   // sub-$1 dust or >$100k change -- fail closed
+
+    // The smallest-first prefix is what the wallet has always selected; keep it byte-for-byte when
+    // its change is acceptable. Only when that change would fall in a refused band (below the $1.00
+    // output floor, or above the per-output cap) does the builder look for another selection before
+    // it refuses -- and it then refuses only where the holding admits no acceptable selection at all
+    // (see _ddSelectAcceptable). This path is reached ONLY where the prior builder returned NULL, so
+    // a send that already builds is untouched.
+    if (! _ddChangeAcceptable(ddChange)) {
+        size_t altIn = 0;
+        if (! _ddSelectAcceptable(ddsel, m, cents, &altIn)) {
+            free(ddsel); pthread_mutex_unlock(&wallet->lock); return NULL;   // no acceptable selection
+        }
+        selDD = 0;
+        for (size_t i = 0; i < altIn; i++) selDD += (uint64_t)ddsel[i].c;
+        ddIn = altIn; ddChange = selDD - cents;
     }
 
-    // --- snapshot DGB fee UTXOs; DD_MIN_FEE floor dominates the size-based estimate ---
+    // --- snapshot DGB fee UTXOs on the HEAP; DD_MIN_FEE floor dominates the size-based estimate ---
     size_t feeN = array_count(wallet->utxos);
-    struct _feeSel feesel[feeN > 0 ? feeN : 1];
+    struct _feeSel *feesel = _ddAllocWork(feeN, sizeof(*feesel));
+    if (! feesel) { free(ddsel); pthread_mutex_unlock(&wallet->lock); return NULL; }    // allocation refused
     size_t fm = 0; uint64_t dgbIn = 0, fee = DD_MIN_FEE, feePerKb = wallet->feePerKb;
     for (size_t i = 0; i < feeN; i++) {
         BRUTXO *o = &wallet->utxos[i];
@@ -1486,7 +1608,7 @@ BRTransaction *BRWalletCreateDigiDollarTransfer(BRWallet *wallet, const uint8_t 
         fee = _txFee(feePerKb, est); if (fee < DD_MIN_FEE) fee = DD_MIN_FEE;
         if (dgbIn >= fee) break;
     }
-    if (dgbIn < fee) { pthread_mutex_unlock(&wallet->lock); return NULL; }          // insufficient DGB for fee
+    if (dgbIn < fee) { free(ddsel); free(feesel); pthread_mutex_unlock(&wallet->lock); return NULL; } // insufficient DGB for fee
     uint64_t dgbChange = dgbIn - fee;
 
     pthread_mutex_unlock(&wallet->lock);
@@ -1496,7 +1618,7 @@ BRTransaction *BRWalletCreateDigiDollarTransfer(BRWallet *wallet, const uint8_t 
     BRAddress ddCa = BR_ADDRESS_NONE, dgbCa = BR_ADDRESS_NONE;
     if (ddChange > 0) {
         BRWalletUnusedAddrs(wallet, &ddCa, 1, 1, 2);                 // internal taproot change (we own it)
-        if (ddCa.s[0] == '\0') return NULL;                          // change addr must resolve -- fail closed
+        if (ddCa.s[0] == '\0') { free(ddsel); free(feesel); return NULL; }  // change addr must resolve -- fail closed
     }
     int emitDgb = (dgbChange >= dust);
     if (emitDgb) { BRWalletUnusedAddrs(wallet, &dgbCa, 1, 1, 1); emitDgb = (dgbCa.s[0] != '\0'); }
@@ -1514,12 +1636,19 @@ BRTransaction *BRWalletCreateDigiDollarTransfer(BRWallet *wallet, const uint8_t 
         uint8_t dspk[42]; size_t dl = BRAddressScriptPubKey(dspk, sizeof(dspk), dgbCa.s);
         BRTransactionAddOutput(tx, dgbChange, dspk, dl);            // DGB change
     }
-    uint8_t orr[32]; size_t ol = 0;                                  // OP_RETURN LAST
+    // OP_RETURN LAST. Each variable-length push is bounded to orr's capacity before it is written, so
+    // the metadata is never written past the buffer (a guard: with the two amounts the maximum is 26
+    // bytes, well within the 32-byte capacity today; the bound holds if more amounts are ever added).
+    uint8_t orr[32]; size_t ol = 0;
     orr[ol++]=0x6a; orr[ol++]=0x02; orr[ol++]=0x44; orr[ol++]=0x44; orr[ol++]=0x01; orr[ol++]=0x02;
     uint8_t enc[9]; size_t el = BRDigiDollarWriteScriptNum((int64_t)cents, enc);
+    if (ol + 1 + el > sizeof(orr)) { BRTransactionFree(tx); free(ddsel); free(feesel); return NULL; }
     orr[ol++] = (uint8_t)el; memcpy(orr + ol, enc, el); ol += el;
-    if (ddChange > 0) { el = BRDigiDollarWriteScriptNum((int64_t)ddChange, enc);
-                        orr[ol++] = (uint8_t)el; memcpy(orr + ol, enc, el); ol += el; }
+    if (ddChange > 0) {
+        el = BRDigiDollarWriteScriptNum((int64_t)ddChange, enc);
+        if (ol + 1 + el > sizeof(orr)) { BRTransactionFree(tx); free(ddsel); free(feesel); return NULL; }
+        orr[ol++] = (uint8_t)el; memcpy(orr + ol, enc, el); ol += el;
+    }
     BRTransactionAddOutput(tx, 0, orr, ol);
 
     for (size_t i = 0; i < ddIn; i++)                                // DD inputs at value 0
@@ -1529,6 +1658,7 @@ BRTransaction *BRWalletCreateDigiDollarTransfer(BRWallet *wallet, const uint8_t 
         BRTransactionAddInput(tx, feesel[i].hash, feesel[i].n, feesel[i].amt, feesel[i].script,
                               feesel[i].scriptLen, NULL, 0, NULL, 0, TXIN_SEQUENCE);
 
+    free(ddsel); free(feesel);
     return tx;   // NO shuffle (output order is consensus-significant)
 }
 

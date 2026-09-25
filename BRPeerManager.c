@@ -131,6 +131,12 @@ typedef struct {
     // the wallet becomes the owner of a listed object, the entry follows it to owned = 0. The
     // invariant: every object has exactly one owner, and each owner releases only what it owns.
     int owned;
+    // Dandelion stem phase (BRPeerManagerStemPublishTx until BRPeerManagerFluffTx): the tx may be
+    // announced to, and asked of, its stem peer only — anything else tells that peer this wallet
+    // originated it. See _BRPeerManagerStemHidesFrom.
+    int stemming;
+    UInt128 stemAddress;
+    uint16_t stemPort;
 } BRPublishedTx;
 
 typedef struct {
@@ -1018,6 +1024,27 @@ static void _requestUnrelayedTxGetdataDone(void *info, int success)
     MGR_UNLOCK(manager);
 }
 
+// caller must hold manager->lock. True while txHash is in its stem phase.
+static int _BRPeerManagerIsStemming(BRPeerManager *manager, UInt256 txHash)
+{
+    for (size_t i = array_count(manager->publishedTx); i > 0; i--) {
+        if (manager->publishedTx[i - 1].stemming && UInt256Eq(manager->publishedTxHashes[i - 1], txHash)) return 1;
+    }
+    return 0;
+}
+
+// caller must hold manager->lock. True while txHash is a stem this wallet is holding back from peer:
+// in its stem phase, and peer is not the stem peer it was handed to.
+static int _BRPeerManagerStemHidesFrom(BRPeerManager *manager, UInt256 txHash, const BRPeer *peer)
+{
+    for (size_t i = array_count(manager->publishedTx); i > 0; i--) {
+        const BRPublishedTx *p = &manager->publishedTx[i - 1];
+        if (! p->stemming || ! UInt256Eq(manager->publishedTxHashes[i - 1], txHash)) continue;
+        return ! (UInt128Eq(p->stemAddress, peer->address) && p->stemPort == peer->port);
+    }
+    return 0;
+}
+
 static void _BRPeerManagerRequestUnrelayedTx(BRPeerManager *manager, BRPeer *peer)
 {
     BRPeerCallbackInfo *info;
@@ -1028,6 +1055,7 @@ static void _BRPeerManagerRequestUnrelayedTx(BRPeerManager *manager, BRPeer *pee
     txCount = BRWalletTxUnconfirmedBefore(manager->wallet, tx, txCount, TX_UNCONFIRMED);
     
     for (size_t i = 0; i < txCount; i++) {
+        if (_BRPeerManagerStemHidesFrom(manager, tx[i]->txHash, peer)) continue;  // asking reveals it
         if (! _BRTxPeerListHasPeer(manager->txRelays, tx[i]->txHash, peer) &&
             ! _BRTxPeerListHasPeer(manager->txRequests, tx[i]->txHash, peer)) {
             txHashes[hashCount++] = tx[i]->txHash;
@@ -1057,7 +1085,14 @@ static void _BRPeerManagerPublishPendingTx(BRPeerManager *manager, BRPeer *peer)
         break;
     }
     
-    BRPeerSendInv(peer, manager->publishedTxHashes, array_count(manager->publishedTxHashes));
+    size_t count = array_count(manager->publishedTxHashes), n = 0;
+    UInt256 hashes[count > 0 ? count : 1];
+
+    for (size_t i = 0; i < count; i++) {
+        if (_BRPeerManagerStemHidesFrom(manager, manager->publishedTxHashes[i], peer)) continue;
+        hashes[n++] = manager->publishedTxHashes[i];
+    }
+    BRPeerSendInv(peer, hashes, n);
 }
 
 static void _postSyncDone(void *info, int success)
@@ -3797,7 +3832,9 @@ static BRTransaction *_peerRequestedTx(void *info, UInt256 txHash)
     }
 
     if (tx && ! error) {
-        _BRTxPeerListAddPeer(&manager->txRelays, txHash, peer);
+        // The stem peer taking a stem is not the network relaying it back: counting it would tell
+        // the wallet's embargo the stem propagated when the stem peer may yet drop it.
+        if (! _BRPeerManagerIsStemming(manager, txHash)) _BRTxPeerListAddPeer(&manager->txRelays, txHash, peer);
         BRWalletRegisterTransaction(manager->wallet, tx);
         // If the wallet took the listed object here, the entry follows it to the wallet's ownership.
 #ifndef PUBLISH_OWNED_FOLLOWS_UNFIXED
@@ -7225,7 +7262,15 @@ int BRPeerManagerStemPublishTx(BRPeerManager *manager, BRTransaction *tx, void *
 
     tx->is_dandelion = 1;
     tx->timestamp = (uint32_t)time(NULL);
+    UInt256 txHash = tx->txHash;
     _BRPeerManagerAddTxToPublishList(manager, tx, info, callback);
+    for (size_t i = array_count(manager->publishedTx); i > 0; i--) {
+        if (! UInt256Eq(manager->publishedTxHashes[i - 1], txHash)) continue;
+        manager->publishedTx[i - 1].stemming = 1;
+        manager->publishedTx[i - 1].stemAddress = stem->address;
+        manager->publishedTx[i - 1].stemPort = stem->port;
+        break;
+    }
 
     BRPeerCallbackInfo *peerInfo = calloc(1, sizeof(*peerInfo));
     assert(peerInfo != NULL);
@@ -7252,6 +7297,9 @@ void BRPeerManagerFluffTx(BRPeerManager *manager, UInt256 txHash)
     }
     if (! tx) { MGR_UNLOCK(manager); return; }
     tx->is_dandelion = 0;   // fluff: a normal tx from here on
+    for (size_t i = array_count(manager->publishedTx); i > 0; i--) {
+        if (UInt256Eq(manager->publishedTxHashes[i - 1], txHash)) manager->publishedTx[i - 1].stemming = 0;
+    }
 
     for (size_t i = array_count(manager->connectedPeers); i > 0; i--) {
         BRPeer *peer = manager->connectedPeers[i - 1];
@@ -7301,6 +7349,14 @@ void BRPeerManagerPublishTx(BRPeerManager *manager, BRTransaction *tx, void *inf
     if (tx) {
         size_t i, count = 0;
         
+        // An explicit flood (e.g. the wallet recovering a stranded send) ends any stem phase of
+        // this tx: from here it is announced to every peer and served as an ordinary tx.
+        for (i = array_count(manager->publishedTx); i > 0; i--) {
+            if (! UInt256Eq(manager->publishedTxHashes[i - 1], tx->txHash)) continue;
+            manager->publishedTx[i - 1].stemming = 0;
+            if (manager->publishedTx[i - 1].tx) manager->publishedTx[i - 1].tx->is_dandelion = 0;
+        }
+
         tx->timestamp = (uint32_t)time(NULL); // set timestamp to publish time
 
         // This function owns `tx` (the JNI bridge hands it over and registers its own copy in

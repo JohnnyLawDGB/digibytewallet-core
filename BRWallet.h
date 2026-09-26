@@ -252,6 +252,11 @@ uint64_t BRWalletBalance(BRWallet *wallet);
 // wallet DigiDollar balance in cents (USD) — separate from the satoshi balance
 uint64_t BRWalletDigiDollarBalance(BRWallet *wallet);
 
+// value of the wallet's coin-generation outputs that are not yet spendable: the chain tip is below
+// coin height + maturity (8 below height 145,000 on mainnet, else 100). Not part of BRWalletBalance
+// or BRWalletUTXOs; it moves into them as the tip pushed by BRWalletSetBlockHeight advances.
+uint64_t BRWalletImmatureBalance(BRWallet *wallet);
+
 // total amount spent from the wallet (exluding change)
 uint64_t BRWalletTotalSent(BRWallet *wallet);
 
@@ -326,6 +331,14 @@ void BRWalletUpdateTransactions(BRWallet *wallet, const UInt256 txHashes[], size
     
 // marks all transactions confirmed after blockHeight as unconfirmed (useful for chain re-orgs)
 void BRWalletSetTxUnconfirmedAfter(BRWallet *wallet, uint32_t blockHeight);
+
+// records the chain tip as the peer manager knows it. Pass the height of the last VERIFIED block
+// (BRPeerManagerLastBlockHeight), never an estimate. Not monotonic: a lower tip is accepted (reorg,
+// rescan). O(1) unless a held coin-generation output crosses its maturity boundary or the tip falls,
+// in which case the balance is rebuilt; balanceChanged fires only if the spendable balance changed,
+// after the wallet lock is released. Safe to call with the peer manager's lock held (manager -> wallet
+// order); it never calls back into the peer manager.
+void BRWalletSetBlockHeight(BRWallet *wallet, uint32_t blockHeight);
 
 // returns the amount received by the wallet from the transaction (total outputs to change and/or receive addresses)
 uint64_t BRWalletAmountReceivedFromTx(BRWallet *wallet, const BRTransaction *tx);

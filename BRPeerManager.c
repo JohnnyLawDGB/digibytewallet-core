@@ -1843,6 +1843,43 @@ static size_t _BRPeerManagerLivePublishPeerCount(BRPeerManager *manager, const B
     return live;
 }
 
+// caller must hold manager->lock. The connected, handshaken peer (other than `gone`) to download the
+// chain from: the same rule _peerConnected uses — the highest reported chain, then the lowest ping.
+static BRPeer *_BRPeerManagerNextDownloadPeer(BRPeerManager *manager, const BRPeer *gone)
+{
+    BRPeer *best = NULL;
+
+    for (size_t i = array_count(manager->connectedPeers); i > 0; i--) {
+        BRPeer *p = manager->connectedPeers[i - 1];
+
+        if (p == gone || BRPeerConnectStatus(p) != BRPeerStatusConnected || ! BRPeerCompletedHandshake(p)) continue;
+        if (! best || BRPeerLastBlock(p) > BRPeerLastBlock(best) ||
+            (BRPeerLastBlock(p) == BRPeerLastBlock(best) && BRPeerPingTime(p) < BRPeerPingTime(best))) best = p;
+    }
+
+    return best;
+}
+
+// caller must hold manager->lock. Make an already-connected peer the download peer: what
+// _peerConnected does for a newly selected one, minus the mempool request it already had.
+static void _BRPeerManagerAdoptDownloadPeer(BRPeerManager *manager, BRPeer *peer)
+{
+    manager->downloadPeer = peer;
+    manager->isConnected = 1;
+    manager->estimatedHeight = BRPeerLastBlock(peer);
+    BRPeerSetCurrentBlockHeight(peer, manager->lastBlock->height);
+    peer_log(peer, "download peer dropped: continuing with this connected peer");
+    _BRPeerManagerPublishPendingTx(manager, peer);
+
+    if (manager->lastBlock->height < BRPeerLastBlock(peer) && _cfConvoyCanStartHeaderRequest(manager)) {
+        UInt256 locators[_BRPeerManagerBlockLocators(manager, NULL, 0)];
+        size_t count = _BRPeerManagerBlockLocators(manager, locators, sizeof(locators)/sizeof(*locators));
+
+        BRPeerScheduleDisconnectTagged(peer, PROTOCOL_TIMEOUT, BR_DISC_TAG_SYNC); // schedule sync timeout
+        BRPeerSendGetheaders(peer, locators, count, UINT256_ZERO);
+    }
+}
+
 static void _peerDisconnected(void *info, int error)
 {
     BRPeer *peer = ((BRPeerCallbackInfo *)info)->peer;
@@ -1976,6 +2013,13 @@ static void _peerDisconnected(void *info, int error)
         manager->isConnected = 0;
         manager->downloadPeer = NULL;
         if (manager->connectFailureCount > MAX_CONNECT_FAILURES) manager->connectFailureCount = MAX_CONNECT_FAILURES;
+
+        // B237: another peer that is still connected takes over. Only a NEWLY connecting peer used
+        // to be promoted, and nothing dials while the pool is full, so with connectFailureCount at
+        // its cap (ordinary churn gets it there) the branch below declared the sync failed and
+        // every send was refused with ENOTCONN while other peers stayed connected.
+        BRPeer *next = _BRPeerManagerNextDownloadPeer(manager, peer);
+        if (next) _BRPeerManagerAdoptDownloadPeer(manager, next);
     }
 
     if (! manager->isConnected && manager->connectFailureCount == MAX_CONNECT_FAILURES) {

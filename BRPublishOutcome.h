@@ -11,7 +11,9 @@
 //
 //  ## Why ETIMEDOUT is the interesting one
 //
-//  Peers do not announce rejections -- BIP61 reject messages are long gone -- so
+//  Current nodes do not announce rejections -- BIP61 reject messages are long gone
+//  (an older peer's "reject" for invalid/non-standard/dust bytes does resolve the
+//  publish with EINVAL, see below, but nothing may rely on one arriving) -- so
 //  SILENCE IS THE ONLY EVIDENCE a transaction was refused. That is exactly the
 //  live failure this work came from: an asset transfer that published, reported
 //  six relays, and existed in no mempool and no block, because it spent an output
@@ -106,10 +108,21 @@ typedef struct {
 // Map a publish errno -- as delivered by BRPeerManagerPublishTx and its
 // cancellation paths -- to an action.
 //
-//   0          a peer relayed the transaction back: genuine acceptance
-//   EINVAL     the transaction is not signed / malformed
-//   ENOTCONN   not connected, or a disconnect cancelled the pending publish
+//   0          a peer relayed the transaction back, or a block confirmed it:
+//              genuine acceptance
+//   EINVAL     the transaction is not signed / malformed, the wallet judged it
+//              invalid when a peer asked for it, or a peer rejected it for a
+//              reason every honest node shares (invalid, non-standard, dust)
+//              while no other peer had relayed it back
+//   ENOTCONN   not connected, a disconnect cancelled the pending publish, or the
+//              peer manager was torn down with the publish still pending
 //   ETIMEDOUT  it went out and NO peer echoed it back before the timeout
+//   ECANCELED  the wallet itself removed the transaction while the publish was
+//              pending (takes the default action; the record is gone, so a retry
+//              finds nothing to send and is harmless)
+//   EALREADY   this publish duplicated one still pending; the earlier publish's
+//              callback carries the verdict. The bridge consumes it as "no
+//              verdict" and never records it, so it does not reach this table.
 //
 // ENOTCONN is listed explicitly even though it shares the default's action: the
 // two mean different things to a reader, and collapsing them would hide that the

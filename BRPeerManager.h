@@ -680,18 +680,39 @@ size_t BRPeerManagerPeerCount(BRPeerManager *manager);
 // description of the peer most recently used to sync blockchain data
 const char *BRPeerManagerDownloadPeerName(BRPeerManager *manager);
 
-// publishes tx to bitcoin network (do not call BRTransactionFree() on tx afterward)
+// Publishes tx to the network. The manager takes ownership of tx: do not call BRTransactionFree()
+// on it afterward. tx may have been registered with the wallet BEFORE this call (it is then the
+// wallet's record; the manager never releases it) but must not be registered afterwards — a
+// consumer that keeps its own record registers first, or registers an independent copy.
+//
+// callback is answered EXACTLY ONCE, never under the manager lock, with:
+//   0          a peer relayed or requested the transaction, or a block confirmed it
+//   EINVAL     not signed; judged invalid by the wallet when a peer asked for it; or a peer
+//              rejected it as invalid / non-standard / dust while no other peer had relayed it
+//   ENOTCONN   not connected, a disconnect cancelled it, or the manager was freed while pending
+//   ETIMEDOUT  no peer echoed it back before the publish timeout
+//   ECANCELED  the wallet removed the transaction (BRPeerManagerRemoveTransaction) while pending
+//   EALREADY   a publish of a transaction whose earlier publish is still pending is answered at
+//              once with EALREADY; the earlier publish's callback carries the verdict
+// The callback may be invoked from a peer thread, from the caller's own thread (synchronous
+// failures and EALREADY), and from whichever thread frees the manager.
+//
+// A transaction the wallet judges invalid when a peer asks for it (a confirmed conflict spends one of
+// its inputs) is not served, even when the wallet still holds a record of it: the entry is dropped
+// and the publish answered EINVAL. The publish-time timestamp is written only on an object the
+// manager took as its own distinct copy; an object the wallet already holds keeps the timestamp its
+// owner gave it.
 void BRPeerManagerPublishTx(BRPeerManager *manager, BRTransaction *tx, void *info,
                             void (*callback)(void *info, int error));
 
 // Removes a transaction (and any dependants) from the wallet and keeps the publish list in
-// agreement with it: for every entry whose object the WALLET owns, no entry is left naming a record
-// the wallet has released. This is the one path a wallet-side removal takes.
-//
-// An entry whose object the LIST owns is kept and its object is left untouched. A caller that hands
-// the list the very object it registered with the wallet therefore keeps that entry, and keeps the
-// single-owner contract of BRPeerManagerPublishTx ("do not free tx afterward"): this call never
-// releases an object the list owns, and never assumes one.
+// agreement with it: every entry whose hash the wallet held before the removal and does not hold
+// after it — the removed transaction and the dependants released with it — leaves the list, and a
+// publish still pending on it is answered ECANCELED once (after the lock is released). The manager's
+// own distinct copy of such a send is released here (nothing else holds it; it will not be announced
+// or served again); a wallet-owned entry's object was the wallet's release. An entry for a hash the
+// wallet never held is untouched. This is the one path a wallet-side removal takes; the manager's
+// own unrelayed-transaction cleanup keeps the list in agreement the same way.
 //
 // The wallet's own balanceChanged / txDeleted callbacks fire from here with the manager lock still
 // held, so a consumer must not call back into a BRPeerManager* function from them.
@@ -710,15 +731,19 @@ void BRPeerManagerAddDandelionPeer(BRPeerManager *manager, UInt128 address);
 // 1 if Dandelion is enabled AND a connected peer is Dandelion-capable.
 int BRPeerManagerHasDandelionPeer(BRPeerManager *manager);
 
-// Stem-submit a signed tx to ONE Dandelion-capable peer (sets is_dandelion=1 and
-// invs only that peer; the peer's getdata then pulls the dandeliontx). Returns 1
-// if stemmed, 0 if no capable peer was available (caller should then fall back to
-// BRPeerManagerPublishTx for a normal flood). Do not BRTransactionFree(tx) after.
+// Stem-submit a signed tx to ONE Dandelion-capable peer: the entry is marked as stemming and
+// announced to that peer only; while it is, a getdata is answered as a Dandelion transaction
+// (the type is stamped on the served copy, never on the object handed here). Returns 1 if
+// stemmed, 0 if no capable peer was available (the caller then falls back to
+// BRPeerManagerPublishTx for a normal flood; the manager took nothing). When it returns 1 the
+// manager owns tx — do not BRTransactionFree(tx) after — and callback follows the same
+// exactly-once contract as BRPeerManagerPublishTx (EALREADY if an earlier publish is pending).
 int BRPeerManagerStemPublishTx(BRPeerManager *manager, BRTransaction *tx, void *info,
                                void (*callback)(void *info, int error));
 
-// Re-broadcast (flood) a previously stem-submitted tx to all connected peers,
-// clearing the dandelion flag. Idempotent; no-op if the tx isn't in the publish list.
+// Re-broadcast (flood) a previously stem-submitted tx to all connected peers, ending its stem
+// phase: from here a getdata is answered as an ordinary transaction. Idempotent; no-op if the
+// tx isn't in the publish list.
 void BRPeerManagerFluffTx(BRPeerManager *manager, UInt256 txHash);
 
 // ----------- BIP 158 compact-filter sync (opt-in) -----------

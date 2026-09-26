@@ -139,6 +139,15 @@ typedef struct {
     uint16_t stemPort;
 } BRPublishedTx;
 
+// A publish verdict taken from an entry under manager->lock and delivered after the lock is
+// released (_BRPeerManagerFlushAnswers). Every callback is answered exactly once, and never
+// under the lock: a consumer's callback may re-enter the manager.
+typedef struct {
+    void *info;
+    void (*callback)(void *info, int error);
+    int error;
+} BRPublishAnswer;
+
 typedef struct {
     UInt256 txHash;
     BRPeer *peers;
@@ -312,6 +321,9 @@ struct BRPeerManagerStruct {
     BRTxPeerList *txRelays, *txRequests;
     BRPublishedTx *publishedTx;
     UInt256 *publishedTxHashes;
+    // Verdicts taken from publish entries under the lock, delivered by the next
+    // _BRPeerManagerFlushAnswers after the lock is released. Guarded by manager->lock.
+    BRPublishAnswer *pendingAnswers;
     void *info;
     void (*syncStarted)(void *info);
     void (*syncStopped)(void *info, int error);
@@ -788,24 +800,45 @@ static void _BRPeerManagerSyncStopped(BRPeerManager *manager)
 // below, and _peerRelayedTx, add wallet records straight from BRWalletTransactionForHash and pass
 // owned = 0; a caller handing a transaction over for broadcast passes owned = 1 through the wrapper.
 //
+// Ownership is decided exactly, at add time: a caller may hand over the very object it registered
+// with the wallet (the classic register-then-publish shape), and that object is the wallet's, so
+// owned = 1 is kept only when the wallet's record for the hash is a DIFFERENT object. After this,
+// owned == 1 means precisely "a distinct object the list must release", and every drop site
+// releases by ownership alone (_BRPeerManagerDropEntry).
+//
 // A duplicate only adopts the fresh callback and keeps the existing entry's owner: an entry's
 // owner never changes when its callback does, so a wallet-owned entry stays the wallet's alone
 // to release.
+//
+// Returns PUBLISH_ADD_TAKEN when a new entry took the object; PUBLISH_ADD_DUPLICATE when an
+// equal entry already existed (the caller keeps the object it passed; a fresh callback was adopted
+// if the entry had none); PUBLISH_ADD_PENDING when an equal entry exists whose own callback is
+// still pending, so the fresh callback was NOT adopted — the caller answers it (EALREADY).
+#define PUBLISH_ADD_TAKEN      1
+#define PUBLISH_ADD_DUPLICATE  0
+#define PUBLISH_ADD_PENDING  (-1)
 static int _BRPeerManagerAddTxToPublishListOwned(BRPeerManager *manager, BRTransaction *tx, void *info,
                                                  void (*callback)(void *, int), int owned)
 {
     if (tx && tx->blockHeight == TX_UNCONFIRMED) {
         for (size_t i = array_count(manager->publishedTx); i > 0; i--) {
-            if (! BRTransactionEq(manager->publishedTx[i - 1].tx, tx)) continue;
+            // Decided by the cached hash, never by reading the listed object.
+            if (! UInt256Eq(manager->publishedTxHashes[i - 1], tx->txHash)) continue;
 #ifndef PUBLISH_SURVIVOR_UNFIXED
             if (callback && manager->publishedTx[i - 1].callback == NULL) {
                 manager->publishedTx[i - 1].info = info;
                 manager->publishedTx[i - 1].callback = callback;
             }
+            else if (callback) return PUBLISH_ADD_PENDING;
 #endif
-            return 0;
+            return PUBLISH_ADD_DUPLICATE;
         }
 
+#if ! defined(PUBLISH_OWNED_AT_ADD_UNFIXED) && ! defined(PUBLISH_OWNED_FOLLOWS_UNFIXED)
+        // Ownership follows the object: an object the wallet already holds as its record is the
+        // wallet's, whatever the caller believed.
+        if (owned) owned = (BRWalletTransactionForHash(manager->wallet, tx->txHash) != tx);
+#endif
         array_add(manager->publishedTx, ((BRPublishedTx) { tx, info, callback, owned }));
         array_add(manager->publishedTxHashes, tx->txHash);
 
@@ -814,18 +847,132 @@ static int _BRPeerManagerAddTxToPublishListOwned(BRPeerManager *manager, BRTrans
             _BRPeerManagerAddTxToPublishListOwned(manager,
                 BRWalletTransactionForHash(manager->wallet, tx->inputs[i].txHash), NULL, NULL, 0);
         }
-        return 1;
+        return PUBLISH_ADD_TAKEN;
     }
 
-    return 0;
+    return PUBLISH_ADD_DUPLICATE;
 }
 
-// The object handed here is one a caller relinquishes for broadcast, so the publish list owns it.
-// Wallet records re-added from inside the manager call ...Owned(.., 0) directly instead.
+// The object handed here is one a caller relinquishes for broadcast, so the publish list owns it
+// (unless the wallet already holds that very object — see above). Wallet records re-added from
+// inside the manager call ...Owned(.., 0) directly instead.
 static int _BRPeerManagerAddTxToPublishList(BRPeerManager *manager, BRTransaction *tx, void *info,
                                             void (*callback)(void *, int))
 {
     return _BRPeerManagerAddTxToPublishListOwned(manager, tx, info, callback, 1);
+}
+
+// Caller holds manager->lock. Queues a verdict for delivery by the next _BRPeerManagerFlushAnswers.
+static void _BRPeerManagerQueueAnswer(BRPeerManager *manager, void *info, void (*callback)(void *, int),
+                                      int error)
+{
+    if (! callback) return;
+    array_add(manager->pendingAnswers, ((BRPublishAnswer) { info, callback, error }));
+}
+
+// Caller holds manager->lock. THE one place an entry leaves the publish list. Its callback, if
+// still pending, is answered exactly once with `error` (queued; delivered after the unlock), and
+// its object is released iff the list owns it. The entry's object is never read here: the cached
+// hash decides everything, so an entry whose wallet record is already gone is safe to drop.
+//
+//   error 0          the transaction confirmed (the truthful verdict)
+//   EINVAL           the wallet judged it invalid when a peer asked for it
+//   ENOTCONN/ETIMEDOUT  a disconnect cancelled it; ENOTCONN also at manager teardown
+//   ECANCELED        the wallet itself removed the transaction
+static void _BRPeerManagerDropEntry(BRPeerManager *manager, size_t idx, int error)
+{
+    BRPublishedTx e = manager->publishedTx[idx];
+    int release;
+
+#ifdef PUBLISH_LIST_OWNERSHIP_UNFIXED
+    // Comparison arm only: the shape before ownership was recorded per entry — a cancellation
+    // released every entry's object; confirmation and an invalid request released whenever the
+    // wallet held no equal hash.
+    release = (error == 0 || error == EINVAL) ?
+              ! BRWalletTransactionForHash(manager->wallet, manager->publishedTxHashes[idx]) :
+              (error == ECANCELED) ? 0 : 1;
+#else
+    release = e.owned;
+#endif
+#ifdef PUBLISH_ANSWER_ONCE_UNFIXED
+    // Comparison arm only: the shape where confirmation and a wallet-side removal dropped the
+    // entry without answering its callback.
+    if (error == 0 || error == ECANCELED) e.callback = NULL;
+#endif
+    _BRPeerManagerQueueAnswer(manager, e.info, e.callback, error);
+    array_rm(manager->publishedTx, idx);
+    array_rm(manager->publishedTxHashes, idx);
+    if (release) BRTransactionFree(e.tx);
+}
+
+// Delivers every queued verdict. Called by each function that may have dropped or answered an
+// entry, AFTER it has released manager->lock — a callback fired under the lock would deadlock a
+// consumer that re-enters the manager from it. Cheap when nothing is queued.
+static void _BRPeerManagerFlushAnswers(BRPeerManager *manager)
+{
+    BRPublishAnswer *answers;
+
+    MGR_LOCK(manager);
+    if (array_count(manager->pendingAnswers) == 0) { MGR_UNLOCK(manager); return; }
+    answers = manager->pendingAnswers;
+    array_new(manager->pendingAnswers, 4);
+    MGR_UNLOCK(manager);
+
+    for (size_t i = 0; i < array_count(answers); i++) answers[i].callback(answers[i].info, answers[i].error);
+    array_free(answers);
+}
+
+// Caller holds manager->lock. Answers the entry for txHash — once — without dropping it: the entry
+// stays under the existing rules (confirmation, cancellation, removal, teardown find it already
+// answered and drop it without a second answer). Returns 1 if a pending callback was taken.
+static int _BRPeerManagerAnswerEntry(BRPeerManager *manager, UInt256 txHash, int error)
+{
+    for (size_t i = array_count(manager->publishedTx); i > 0; i--) {
+        if (! UInt256Eq(manager->publishedTxHashes[i - 1], txHash)) continue;
+        if (manager->publishedTx[i - 1].callback == NULL) return 0;
+        _BRPeerManagerQueueAnswer(manager, manager->publishedTx[i - 1].info, manager->publishedTx[i - 1].callback,
+                                  error);
+        manager->publishedTx[i - 1].info = NULL;
+        manager->publishedTx[i - 1].callback = NULL;
+        return 1;
+    }
+    return 0;
+}
+
+// Caller holds manager->lock. Records, for every entry, whether the wallet holds a record of its hash
+// right now. Taken immediately before a wallet-side removal, so the purge below can tell a record the
+// removal released from a hash the wallet never held. held[] has array_count(publishedTx) slots.
+static void _BRPeerManagerSnapshotHeld(BRPeerManager *manager, int held[])
+{
+    for (size_t i = array_count(manager->publishedTx); i > 0; i--) {
+        held[i - 1] = BRWalletTransactionForHash(manager->wallet, manager->publishedTxHashes[i - 1]) != NULL;
+    }
+}
+
+// Caller holds manager->lock, and the wallet has just removed one or more transactions; held[] is the
+// snapshot _BRPeerManagerSnapshotHeld took right before. Drops every entry whose hash the wallet held
+// before the removal and does not hold now — the removed transaction and every dependant the wallet
+// released with it — answering a pending publish with ECANCELED once. The object is released iff the
+// list owns it: a wallet-owned entry's object was the wallet's to release (and it has), and the
+// list's own distinct copy of a send the wallet just discarded has no purpose left and nothing else
+// holds it. Decided by the cached hash: the entry's object may already be released, so it is never
+// read here. An entry for a hash the wallet never held is untouched.
+static void _BRPeerManagerPurgeReleasedRecords(BRPeerManager *manager, const int held[])
+{
+#ifndef PUBLISH_REMOVE_PURGE_UNFIXED
+    for (size_t i = array_count(manager->publishedTx); i > 0; i--) {
+#ifdef PUBLISH_REMOVE_OWNED_SKIP_UNFIXED
+        // Comparison arm only: the shape that kept every entry the list owned — which is every
+        // publish the wallet's own bridge makes — so a removed send stayed listed and pending.
+        if (manager->publishedTx[i - 1].owned) continue;
+#endif
+        if (! held[i - 1]) continue;
+        if (BRWalletTransactionForHash(manager->wallet, manager->publishedTxHashes[i - 1])) continue;
+        _BRPeerManagerDropEntry(manager, i - 1, ECANCELED);
+    }
+#else
+    (void)manager; (void)held;
+#endif
 }
 
 // Caller holds manager->lock. Registering a listed object into the wallet makes the wallet that
@@ -927,20 +1074,11 @@ static void _BRPeerManagerUpdateTx(BRPeerManager *manager, const UInt256 txHashe
     if (blockHeight != TX_UNCONFIRMED) { // remove confirmed tx from publish list and relay counts
         for (size_t i = 0; i < txCount; i++) {
             for (size_t j = array_count(manager->publishedTx); j > 0; j--) {
-                BRTransaction *tx = manager->publishedTx[j - 1].tx;
-                int owned = manager->publishedTx[j - 1].owned;
-
-                if (! UInt256Eq(txHashes[i], tx->txHash)) continue;
-                array_rm(manager->publishedTx, j - 1);
-                array_rm(manager->publishedTxHashes, j - 1);
-                // Release the object iff the publish list owns it AND the wallet holds no record
-                // of its hash: the list releases only its own object, and only when the wallet
-                // keeps nothing equal. The wallet's own equal-hash record is always the wallet's.
-#ifdef PUBLISH_LIST_OWNERSHIP_UNFIXED
-                if (! BRWalletTransactionForHash(manager->wallet, tx->txHash)) BRTransactionFree(tx);
-#else
-                if (owned && ! BRWalletTransactionForHash(manager->wallet, tx->txHash)) BRTransactionFree(tx);
-#endif
+                // Decided by the cached hash, never by reading the listed object. A confirmed
+                // transaction is the truthful verdict 0 for a still-pending publish; the list's own
+                // object is released here (ownership is exact, see _BRPeerManagerAddTxToPublishListOwned).
+                if (! UInt256Eq(txHashes[i], manager->publishedTxHashes[j - 1])) continue;
+                _BRPeerManagerDropEntry(manager, j - 1, 0);
             }
             
             for (size_t j = array_count(manager->txRelays); j > 0; j--) {
@@ -978,20 +1116,31 @@ static void _requestUnrelayedTxGetdataDone(void *info, int success)
     // relaying their mempools
     if (count >= manager->maxConnectCount) {
         size_t txCount = BRWalletTxUnconfirmedBefore(manager->wallet, NULL, 0, TX_UNCONFIRMED);
-        BRTransaction *tx[(txCount < 10000) ? txCount : 10000];
+        BRTransaction *txs[(txCount < 10000) ? txCount : 10000];
+        UInt256 hashes[(txCount < 10000) ? txCount : 10000];
         
-        txCount = BRWalletTxUnconfirmedBefore(manager->wallet, tx, sizeof(tx)/sizeof(*tx), TX_UNCONFIRMED);
+        txCount = BRWalletTxUnconfirmedBefore(manager->wallet, txs, sizeof(txs)/sizeof(*txs), TX_UNCONFIRMED);
+        // Walk a snapshot of HASHES, not of pointers: a removal below also releases the record's
+        // dependants, which may sit later in this list, so each record is looked up again at its turn
+        // and skipped once the wallet no longer holds it.
+        for (size_t i = 0; i < txCount; i++) hashes[i] = txs[i]->txHash;
 
         for (size_t i = 0; i < txCount; i++) {
+#ifdef UNRELAYED_SWEEP_RELOOKUP_UNFIXED
+            BRTransaction *tx = txs[i];   // comparison arm only: today's walk over pointers a removal may have released
+#else
+            BRTransaction *tx = BRWalletTransactionForHash(manager->wallet, hashes[i]);
+            if (! tx) continue;           // released as a dependant of a record removed above
+#endif
             isPublishing = 0;
             
             for (size_t j = array_count(manager->publishedTx); ! isPublishing && j > 0; j--) {
-                if (BRTransactionEq(manager->publishedTx[j - 1].tx, tx[i]) &&
+                if (UInt256Eq(manager->publishedTxHashes[j - 1], tx->txHash) &&
                     manager->publishedTx[j - 1].callback != NULL) isPublishing = 1;
             }
             
-            if (! isPublishing && _BRTxPeerListCount(manager->txRelays, tx[i]->txHash) == 0 &&
-                _BRTxPeerListCount(manager->txRequests, tx[i]->txHash) == 0) {
+            if (! isPublishing && _BRTxPeerListCount(manager->txRelays, tx->txHash) == 0 &&
+                _BRTxPeerListCount(manager->txRequests, tx->txHash) == 0) {
                 // Don't remove unconfirmed transactions while still syncing.
                 // Saved transactions are loaded with blockHeight=TX_UNCONFIRMED
                 // (BRTransactionSerialize doesn't persist block heights). The
@@ -1008,20 +1157,26 @@ static void _requestUnrelayedTxGetdataDone(void *info, int success)
                     // or received coins in them. Removing them here is what
                     // caused users to see their sends flash into history on
                     // app launch and then vanish the moment the sync hit tip.
-                    if (BRWalletAmountSentByTx(manager->wallet, tx[i]) == 0 &&
-                        BRWalletAmountReceivedFromTx(manager->wallet, tx[i]) == 0) {
-                        BRWalletRemoveTransaction(manager->wallet, tx[i]->txHash);
+                    if (BRWalletAmountSentByTx(manager->wallet, tx) == 0 &&
+                        BRWalletAmountReceivedFromTx(manager->wallet, tx) == 0) {
+                        // The wallet releases a record: no entry may go on naming it.
+                        size_t listed = array_count(manager->publishedTx);
+                        int held[listed > 0 ? listed : 1];
+                        _BRPeerManagerSnapshotHeld(manager, held);
+                        BRWalletRemoveTransaction(manager->wallet, tx->txHash);
+                        _BRPeerManagerPurgeReleasedRecords(manager, held);
                     }
                 }
             }
-            else if (! isPublishing && _BRTxPeerListCount(manager->txRelays, tx[i]->txHash) < manager->maxConnectCount){
+            else if (! isPublishing && _BRTxPeerListCount(manager->txRelays, tx->txHash) < manager->maxConnectCount){
                 // set timestamp 0 to mark as unverified
-                _BRPeerManagerUpdateTx(manager, &tx[i]->txHash, 1, TX_UNCONFIRMED, 0);
+                _BRPeerManagerUpdateTx(manager, &tx->txHash, 1, TX_UNCONFIRMED, 0);
             }
         }
     }
 
     MGR_UNLOCK(manager);
+    _BRPeerManagerFlushAnswers(manager);
 }
 
 // caller must hold manager->lock. True while txHash is in its stem phase.
@@ -1886,7 +2041,6 @@ static void _peerDisconnected(void *info, int error)
     BRPeerManager *manager = ((BRPeerCallbackInfo *)info)->manager;
     BRTxPeerList *peerList;
     int willSave = 0, willReconnect = 0, txError = 0;
-    size_t txCount = 0;
 
     //free(info);
     MGR_LOCK(manager);
@@ -1931,9 +2085,6 @@ static void _peerDisconnected(void *info, int error)
         }
     }
 
-    void *txInfo[array_count(manager->publishedTx)];
-    void (*txCallback[array_count(manager->publishedTx)])(void *, int);
-    
     if (error == EPROTO) { // if it's protocol error, the peer isn't following standard policy
         _BRPeerManagerPeerMisbehavin(manager, peer);
     }
@@ -2037,19 +2188,9 @@ static void _peerDisconnected(void *info, int error)
         for (size_t i = array_count(manager->publishedTx); i > 0; i--) {
             if (manager->publishedTx[i - 1].callback == NULL) continue;
             peer_log(peer, "transaction canceled: %s", strerror(txError));
-            txInfo[txCount] = manager->publishedTx[i - 1].info;
-            txCallback[txCount] = manager->publishedTx[i - 1].callback;
-            txCount++;
-            // Release only what the publish list owns. A wallet-owned entry (owned == 0) is
-            // dropped from the list here but never released — the wallet is its one owner and
-            // releases it.
-#ifdef PUBLISH_LIST_OWNERSHIP_UNFIXED
-            BRTransactionFree(manager->publishedTx[i - 1].tx);
-#else
-            if (manager->publishedTx[i - 1].owned) BRTransactionFree(manager->publishedTx[i - 1].tx);
-#endif
-            array_rm(manager->publishedTxHashes, i - 1);
-            array_rm(manager->publishedTx, i - 1);
+            // Answered once with txError after the unlock below; the object is released only if
+            // the publish list owns it — a wallet-owned entry is dropped, never released.
+            _BRPeerManagerDropEntry(manager, i - 1, txError);
         }
     }
     
@@ -2070,10 +2211,8 @@ static void _peerDisconnected(void *info, int error)
     _BRPeerManagerRefreshCachedStatus(manager);
     MGR_UNLOCK(manager);
 
-    for (size_t i = 0; i < txCount; i++) {
-        txCallback[i](txInfo[i], txError);
-    }
-    
+    _BRPeerManagerFlushAnswers(manager);   // the cancelled publishes, answered outside the lock
+
     if (willSave && manager->savePeers) manager->savePeers(manager->info, 1, NULL, 0);
     if (willSave && manager->syncStopped) manager->syncStopped(manager->info, error);
     if (willReconnect) BRPeerManagerConnect(manager); // try connecting to another peer
@@ -2151,7 +2290,20 @@ static void _peerRelayedTx(void *info, BRTransaction *tx)
 
     if (manager->syncStartHeight == 0 || BRWalletContainsTransaction(manager->wallet, tx)) {
         isWalletTx = BRWalletRegisterTransaction(manager->wallet, tx);
+#ifdef PUBLISH_RELAY_OBJECT_UNFIXED
+        // Comparison arm only: the shape that left the parsed object unreleased whenever the
+        // wallet already held a record of its hash.
         if (isWalletTx) tx = BRWalletTransactionForHash(manager->wallet, tx->txHash);
+#else
+        // This function owns the parsed object it was handed. The wallet takes it only when it
+        // held no record of the hash; when the wallet's record is a different object (it already
+        // held the hash — a peer echoing one of this wallet's own sends, or a block delivering
+        // it), the parsed object has no owner left and is released here. Nothing else holds it:
+        // the relay and request lists hold hashes.
+        BRTransaction *rec = BRWalletTransactionForHash(manager->wallet, tx->txHash);
+        if (rec != tx) { BRTransactionFree(tx); tx = NULL; }
+        if (isWalletTx) tx = rec;
+#endif
     }
     else {
         BRTransactionFree(tx);
@@ -2198,9 +2350,10 @@ static void _peerRelayedTx(void *info, BRTransaction *tx)
     if (tx && relayCount >= manager->maxConnectCount && tx->blockHeight == TX_UNCONFIRMED && tx->timestamp == 0) {
         _BRPeerManagerUpdateTx(manager, &tx->txHash, 1, TX_UNCONFIRMED, (uint32_t)time(NULL));
     }
-    
+
     MGR_UNLOCK(manager);
     if (txCallback) txCallback(txInfo, 0);
+    _BRPeerManagerFlushAnswers(manager);
 }
 
 static void _peerHasTx(void *info, UInt256 txHash)
@@ -2258,9 +2411,10 @@ static void _peerHasTx(void *info, UInt256 txHash)
 
         _BRTxPeerListRemovePeer(manager->txRequests, txHash, peer);
     }
-    
+
     MGR_UNLOCK(manager);
     if (txCallback) txCallback(txInfo, 0);
+    _BRPeerManagerFlushAnswers(manager);
 }
 
 static void _peerRejectedTx(void *info, UInt256 txHash, uint8_t code)
@@ -2268,14 +2422,28 @@ static void _peerRejectedTx(void *info, UInt256 txHash, uint8_t code)
     BRPeer *peer = ((BRPeerCallbackInfo *)info)->peer;
     BRPeerManager *manager = ((BRPeerCallbackInfo *)info)->manager;
     BRTransaction *tx, *t;
+    int wasRelaying;
 
     MGR_LOCK(manager);
     peer_log(peer, "rejected tx: %s", u256hex(txHash));
     tx = BRWalletTransactionForHash(manager->wallet, txHash);
     _BRTxPeerListRemovePeer(manager->txRequests, txHash, peer);
+    wasRelaying = _BRTxPeerListRemovePeer(manager->txRelays, txHash, peer);   // a rejecting peer is not relaying it
+
+#ifndef PUBLISH_REJECT_UNFIXED
+    // A rejection that every honest node would give for these bytes (invalid, non-standard, dust)
+    // resolves a pending publish of this transaction with EINVAL — once, and only while no OTHER
+    // peer has relayed it back: if the network already has it, one peer's rejection is that peer's
+    // opinion and the publish stays pending. Policy rejections (already spent, fee) and unknown
+    // codes never resolve it. The entry stays; nothing is released here.
+    if ((code == REJECT_INVALID || code == REJECT_NONSTANDARD || code == REJECT_DUST) &&
+        _BRTxPeerListCount(manager->txRelays, txHash) == 0) {
+        _BRPeerManagerAnswerEntry(manager, txHash, EINVAL);
+    }
+#endif
 
     if (tx) {
-        if (_BRTxPeerListRemovePeer(manager->txRelays, txHash, peer) && tx->blockHeight == TX_UNCONFIRMED) {
+        if (wasRelaying && tx->blockHeight == TX_UNCONFIRMED) {
             // set timestamp 0 to mark tx as unverified
             _BRPeerManagerUpdateTx(manager, &txHash, 1, TX_UNCONFIRMED, 0);
         }
@@ -2294,6 +2462,7 @@ static void _peerRejectedTx(void *info, UInt256 txHash, uint8_t code)
     }
 
     MGR_UNLOCK(manager);
+    _BRPeerManagerFlushAnswers(manager);
     if (manager->txStatusUpdate) manager->txStatusUpdate(manager->info);
 }
 
@@ -3553,6 +3722,7 @@ static BRMerkleBlock *_peerRelayedBlockOnce(void *info, BRMerkleBlock *block)
     uint32_t relayedHeight      = relayedHeightKnown ? block->height : 0;
 
     MGR_UNLOCK(manager);
+    _BRPeerManagerFlushAnswers(manager);   // publishes the block's transactions confirmed
     free(saveBlocks);
 
     /* Hand the immutable BYTES to the (lock-free) JNI upcall, then free them. */
@@ -3731,6 +3901,7 @@ static void _peerRelayedBlockTxns(void *info, UInt256 blockHash, UInt256 merkleR
 
     free(walletHashes);
     MGR_UNLOCK(manager);
+    _BRPeerManagerFlushAnswers(manager);   // publishes the block's transactions confirmed
 
     // notify outside the lock, matching _peerRelayedBlock's txStatusUpdate call below
     if (confirmed && manager->txStatusUpdate) manager->txStatusUpdate(manager->info);
@@ -3863,31 +4034,19 @@ static BRTransaction *_peerRequestedTx(void *info, UInt256 txHash)
     for (size_t i = array_count(manager->publishedTx); i > 0; i--) {
         if (UInt256Eq(manager->publishedTxHashes[i - 1], txHash)) {
             tx = manager->publishedTx[i - 1].tx;
-            txInfo = manager->publishedTx[i - 1].info;
-            txCallback = manager->publishedTx[i - 1].callback;
-            int owned = manager->publishedTx[i - 1].owned;
-            manager->publishedTx[i - 1].info = NULL;
-            manager->publishedTx[i - 1].callback = NULL;
 
             if (tx && ! BRWalletTransactionIsValid(manager->wallet, tx)) {
+                // The entry leaves the list through the one drop site: its callback is answered
+                // EINVAL once (after the unlock), and its object is released iff the list owns it.
                 error = EINVAL;
-                array_rm(manager->publishedTx, i - 1);
-                array_rm(manager->publishedTxHashes, i - 1);
-
-                // Release the object iff the publish list owns it AND the wallet holds no record
-                // of its hash — the same rule the confirmation path uses. The wallet's own
-                // equal-hash record, if any, is always left to the wallet.
-#ifdef PUBLISH_LIST_OWNERSHIP_UNFIXED
-                if (! BRWalletTransactionForHash(manager->wallet, txHash)) {
-                    BRTransactionFree(tx);
-                    tx = NULL;
-                }
-#else
-                if (owned && ! BRWalletTransactionForHash(manager->wallet, txHash)) {
-                    BRTransactionFree(tx);
-                    tx = NULL;
-                }
-#endif
+                _BRPeerManagerDropEntry(manager, i - 1, EINVAL);
+                tx = NULL;
+            }
+            else {
+                txInfo = manager->publishedTx[i - 1].info;
+                txCallback = manager->publishedTx[i - 1].callback;
+                manager->publishedTx[i - 1].info = NULL;
+                manager->publishedTx[i - 1].callback = NULL;
             }
         }
         else if (manager->publishedTx[i - 1].callback != NULL) hasPendingCallbacks = 1;
@@ -3923,9 +4082,17 @@ static BRTransaction *_peerRequestedTx(void *info, UInt256 txHash)
     // is the list's own new allocation, so this adds no release of any object the base released.
 #ifndef PUBLISH_SERVED_COPY_UNFIXED
     if (tx) tx = BRTransactionCopy(tx);
+#ifndef PUBLISH_STEM_TYPE_UNFIXED
+    // The served copy carries the stem decision: while the entry is in its stem phase the copy
+    // goes out as a Dandelion transaction, afterwards as an ordinary one. The decision lives on
+    // the entry (stemming) and is stamped on the caller's copy only — no listed or wallet-owned
+    // object is ever written. The message type is a snapshot taken here, by design.
+    if (tx) tx->is_dandelion = _BRPeerManagerIsStemming(manager, txHash);
+#endif
 #endif
     MGR_UNLOCK(manager);
-    if (txCallback) txCallback(txInfo, error);
+    if (txCallback) txCallback(txInfo, 0);
+    _BRPeerManagerFlushAnswers(manager);   // an invalid request's EINVAL, if the entry was dropped
     return tx;
 }
 
@@ -4223,6 +4390,7 @@ BRPeerManager *BRPeerManagerNewEx(const BRChainParams *params, BRWallet *wallet,
     array_new(manager->txRequests, 10);
     array_new(manager->publishedTx, 10);
     array_new(manager->publishedTxHashes, 10);
+    array_new(manager->pendingAnswers, 4);
     array_new(manager->dandelionPeers, 4);
     manager->dandelionEnabled = 1;   // default on; Kotlin overrides from the saved setting
     pthread_mutex_init(&manager->lock, NULL);
@@ -7365,10 +7533,38 @@ int BRPeerManagerStemPublishTx(BRPeerManager *manager, BRTransaction *tx, void *
     BRPeer *stem = manager->dandelionEnabled ? _BRPeerManagerAnyDandelionPeer(manager) : NULL;
     if (! stem) { MGR_UNLOCK(manager); return 0; }   // caller floods instead
 
-    tx->is_dandelion = 1;
-    tx->timestamp = (uint32_t)time(NULL);
     UInt256 txHash = tx->txHash;
-    _BRPeerManagerAddTxToPublishList(manager, tx, info, callback);
+    // This function owns `tx`. When an equal transaction is already listed the list keeps the
+    // object it has and ours has no owner left: release it. If the earlier publish is still
+    // pending, this publish is answered EALREADY (after the unlock) and the earlier one carries
+    // the verdict — in the mode it was published in: the live entry is neither re-marked as a stem
+    // nor re-announced. Otherwise the stem phase is marked on the entry by hash, whichever object
+    // it holds. The message type a getdata is answered with is stamped on the served copy
+    // (_peerRequestedTx) from that mark; the handed object is not written. The publish-time
+    // timestamp is written only on an object the list took as its own distinct copy: an object
+    // the wallet already holds keeps the timestamp its owner gave it.
+    int added = _BRPeerManagerAddTxToPublishList(manager, tx, info, callback);
+#ifdef PUBLISH_STEM_TYPE_UNFIXED
+    // Comparison arm only: the shape that wrote the type on the handed object and ignored the
+    // add's answer, so a duplicate's object had no owner.
+    tx->timestamp = (uint32_t)time(NULL);
+    tx->is_dandelion = 1;
+    (void)added;
+#else
+    // A duplicate that is the wallet's own record is the wallet's to release, never ours.
+    if (added != PUBLISH_ADD_TAKEN && BRWalletTransactionForHash(manager->wallet, txHash) != tx) BRTransactionFree(tx);
+    if (added == PUBLISH_ADD_PENDING) {
+#ifndef PUBLISH_ANSWER_ONCE_UNFIXED
+        _BRPeerManagerQueueAnswer(manager, info, callback, EALREADY);
+#endif
+        MGR_UNLOCK(manager);
+        _BRPeerManagerFlushAnswers(manager);
+        return 1;   // taken (and released) — the earlier publish carries the verdict
+    }
+    if (added == PUBLISH_ADD_TAKEN && BRWalletTransactionForHash(manager->wallet, txHash) != tx) {
+        tx->timestamp = (uint32_t)time(NULL);
+    }
+#endif
     for (size_t i = array_count(manager->publishedTx); i > 0; i--) {
         if (! UInt256Eq(manager->publishedTxHashes[i - 1], txHash)) continue;
         manager->publishedTx[i - 1].stemming = 1;
@@ -7384,8 +7580,9 @@ int BRPeerManagerStemPublishTx(BRPeerManager *manager, BRTransaction *tx, void *
     _BRPeerManagerPublishPendingTx(manager, stem);      // inv(inv_tx) to the stem peer only
     BRPeerSendPing(stem, peerInfo, _publishTxInvDone);  // ping→pong confirms the inv was sent
 
-    peer_log(stem, "dandelion: stem-submitted tx %s to single peer", u256hex(tx->txHash));
+    peer_log(stem, "dandelion: stem-submitted tx %s to single peer", u256hex(txHash));
     MGR_UNLOCK(manager);
+    _BRPeerManagerFlushAnswers(manager);
     return 1;
 }
 
@@ -7394,17 +7591,18 @@ void BRPeerManagerFluffTx(BRPeerManager *manager, UInt256 txHash)
     assert(manager != NULL);
     MGR_LOCK(manager);
 
-    BRTransaction *tx = NULL;
+    // Found by the cached hash, never by reading a listed object. Ending the stem phase is a
+    // change to the entry alone: a getdata from here on is answered with an ordinary tx.
+    int listed = 0;
     for (size_t i = array_count(manager->publishedTx); i > 0; i--) {
-        if (UInt256Eq(manager->publishedTx[i - 1].tx->txHash, txHash)) {
-            tx = manager->publishedTx[i - 1].tx; break;
-        }
+        if (! UInt256Eq(manager->publishedTxHashes[i - 1], txHash)) continue;
+        manager->publishedTx[i - 1].stemming = 0;
+#ifdef PUBLISH_STEM_TYPE_UNFIXED
+        manager->publishedTx[i - 1].tx->is_dandelion = 0;   // comparison arm only: written on the listed object
+#endif
+        listed = 1;
     }
-    if (! tx) { MGR_UNLOCK(manager); return; }
-    tx->is_dandelion = 0;   // fluff: a normal tx from here on
-    for (size_t i = array_count(manager->publishedTx); i > 0; i--) {
-        if (UInt256Eq(manager->publishedTxHashes[i - 1], txHash)) manager->publishedTx[i - 1].stemming = 0;
-    }
+    if (! listed) { MGR_UNLOCK(manager); return; }
 
     for (size_t i = array_count(manager->connectedPeers); i > 0; i--) {
         BRPeer *peer = manager->connectedPeers[i - 1];
@@ -7433,7 +7631,9 @@ void BRPeerManagerPublishTx(BRPeerManager *manager, BRTransaction *tx, void *inf
     
     if (tx && ! BRTransactionIsSigned(tx)) {
         MGR_UNLOCK(manager);
-        BRTransactionFree(tx);
+        // Ours to release unless the caller handed us the very object it registered with the
+        // wallet (the classic register-then-publish caller): that one is the wallet's.
+        if (BRWalletTransactionForHash(manager->wallet, tx->txHash) != tx) BRTransactionFree(tx);
         tx = NULL;
         if (callback) callback(info, EINVAL); // transaction not signed
     }
@@ -7444,7 +7644,7 @@ void BRPeerManagerPublishTx(BRPeerManager *manager, BRTransaction *tx, void *inf
 
         if (connectFailureCount >= MAX_CONNECT_FAILURES ||
             (manager->networkIsReachable && ! manager->networkIsReachable(manager->info))) {
-            BRTransactionFree(tx);
+            if (BRWalletTransactionForHash(manager->wallet, tx->txHash) != tx) BRTransactionFree(tx);   // see above
             tx = NULL;
             if (callback) callback(info, ENOTCONN); // not connected to bitcoin network
         }
@@ -7459,16 +7659,29 @@ void BRPeerManagerPublishTx(BRPeerManager *manager, BRTransaction *tx, void *inf
         for (i = array_count(manager->publishedTx); i > 0; i--) {
             if (! UInt256Eq(manager->publishedTxHashes[i - 1], tx->txHash)) continue;
             manager->publishedTx[i - 1].stemming = 0;
-            if (manager->publishedTx[i - 1].tx) manager->publishedTx[i - 1].tx->is_dandelion = 0;
+#ifdef PUBLISH_STEM_TYPE_UNFIXED
+            if (manager->publishedTx[i - 1].tx) manager->publishedTx[i - 1].tx->is_dandelion = 0;   // comparison arm only
+#endif
         }
 
-        tx->timestamp = (uint32_t)time(NULL); // set timestamp to publish time
-
         // This function owns `tx` (the JNI bridge hands it over and registers its own copy in
-        // the wallet). When an equal transaction is already pending, the list keeps the copy it
-        // has and adopts our callback — so ours has no owner left and would leak. Nothing below
-        // reads tx; the inv still goes out to every peer, which is the whole point of a retry.
-        if (! _BRPeerManagerAddTxToPublishList(manager, tx, info, callback)) BRTransactionFree(tx);
+        // the wallet). When an equal transaction is already listed, the list keeps the object it
+        // has — so ours has no owner left and is released. If the entry had no callback it adopts
+        // ours; if its earlier publish is still pending, ours is answered EALREADY after the unlock
+        // and the earlier publish carries the verdict. Nothing below reads tx; the inv still goes
+        // out to every peer, which is the whole point of a retry. The publish-time timestamp is
+        // written only on an object the list took as its own distinct copy: an object the wallet
+        // already holds (the classic register-then-publish caller) keeps the timestamp its owner
+        // gave it, and is never written without the wallet's lock.
+        int added = _BRPeerManagerAddTxToPublishList(manager, tx, info, callback);
+        int isWalletsObject = (BRWalletTransactionForHash(manager->wallet, tx->txHash) == tx);
+        if (added == PUBLISH_ADD_TAKEN && ! isWalletsObject) tx->timestamp = (uint32_t)time(NULL);
+        // A duplicate that is the wallet's own record (the classic caller re-publishing the object
+        // it registered) is the wallet's to release, never ours.
+        if (added != PUBLISH_ADD_TAKEN && ! isWalletsObject) BRTransactionFree(tx);
+#ifndef PUBLISH_ANSWER_ONCE_UNFIXED
+        if (added == PUBLISH_ADD_PENDING) _BRPeerManagerQueueAnswer(manager, info, callback, EALREADY);
+#endif
 
         for (i = array_count(manager->connectedPeers); i > 0; i--) {
             if (BRPeerConnectStatus(manager->connectedPeers[i - 1]) == BRPeerStatusConnected) count++;
@@ -7493,45 +7706,38 @@ void BRPeerManagerPublishTx(BRPeerManager *manager, BRTransaction *tx, void *inf
         }
 
         MGR_UNLOCK(manager);
+        _BRPeerManagerFlushAnswers(manager);
     }
 }
 
-// A wallet-side removal of a transaction keeps the publish list in agreement with the wallet: for
-// every entry whose object the WALLET owns, no entry may name a record the wallet has released.
-// This is the one path a wallet-side removal takes. Under the manager lock it removes the
-// transaction (and any dependants) from the wallet, then drops every wallet-owned entry the wallet
-// no longer holds a record of. The entry to drop is chosen by the hash cached in the entry, never by
-// dereferencing the entry's object — the wallet may already have released that object.
+// A wallet-side removal of a transaction keeps the publish list in agreement with the wallet: no
+// entry may go on naming a transaction the wallet has just discarded. Under the manager lock it
+// records which listed hashes the wallet holds, removes the transaction (and any dependants) from
+// the wallet, then drops every entry whose hash was held before and is not held now, answering a
+// pending publish callback with ECANCELED once — after the lock is released. The entry to drop is
+// chosen by the hash cached in the entry, never by dereferencing the entry's object. The same purge
+// follows the manager's own unrelayed-transaction cleanup (_requestUnrelayedTxGetdataDone), so both
+// wallet-side removals keep the list in agreement.
 //
-// The list releases nothing here: every record the wallet released is the wallet's own. An entry the
-// list owns is kept and its object is left untouched, so this call never releases an object the list
-// owns and never assumes one. That is the conservative half of the rule, and it is why the guarantee
-// above is scoped to wallet-owned entries: a caller may have published the very object it registered
-// with the wallet, and such an entry stays that caller's business under the single-owner contract of
-// BRPeerManagerPublishTx ("do not free tx afterward").
+// Releases: a wallet-owned entry's object was the wallet's, released by the wallet; the list's own
+// distinct copy of the discarded send (the wallet's bridge always publishes such a copy) is
+// released by the list here — nothing else holds it, and serving or announcing a send the wallet
+// discarded would bring it back. An entry for a hash the wallet never held is untouched.
 void BRPeerManagerRemoveTransaction(BRPeerManager *manager, UInt256 txHash)
 {
     assert(manager != NULL);
     assert(! UInt256IsZero(txHash));
     MGR_LOCK(manager);
+    assert(manager->wallet != NULL);   // set once in BRPeerManagerNewEx, never cleared
 
-    if (manager->wallet) {
-        BRWalletRemoveTransaction(manager->wallet, txHash);
-
-#ifndef PUBLISH_REMOVE_PURGE_UNFIXED
-        for (size_t i = array_count(manager->publishedTx); i > 0; i--) {
-            if (manager->publishedTx[i - 1].owned) continue;   // the list owns it: kept, untouched
-            // Decided by the cached hash: the entry's object may already be released, so it is
-            // never read here. An entry the wallet still has an equal-hash record of still names a
-            // live wallet record and is kept.
-            if (BRWalletTransactionForHash(manager->wallet, manager->publishedTxHashes[i - 1])) continue;
-            array_rm(manager->publishedTx, i - 1);
-            array_rm(manager->publishedTxHashes, i - 1);
-        }
-#endif
-    }
+    size_t listed = array_count(manager->publishedTx);
+    int held[listed > 0 ? listed : 1];
+    _BRPeerManagerSnapshotHeld(manager, held);
+    BRWalletRemoveTransaction(manager->wallet, txHash);
+    _BRPeerManagerPurgeReleasedRecords(manager, held);
 
     MGR_UNLOCK(manager);
+    _BRPeerManagerFlushAnswers(manager);
 }
 
 // number of connected peers that have relayed the given unconfirmed transaction
@@ -7602,7 +7808,19 @@ static int _BRPeerManagerDeferredFreeDue(BRPeerManager *manager)
 // manager: either BRPeerManagerFree observed zero threads, or the last thread out is running it.
 static void _BRPeerManagerFreeNow(BRPeerManager *manager)
 {
+    BRPublishAnswer *answers;
+
     MGR_LOCK(manager);
+    // Every entry still listed leaves through the one drop site: a pending publish is answered
+    // ENOTCONN (the same verdict a disconnect-cancellation gives) and the list's own objects are
+    // released. Ownership alone decides the release — the wallet is not consulted, because the
+    // consumer may already have freed it. The answers are delivered after the manager is gone,
+    // from this (last) context, so a callback never meets a manager mid-teardown.
+#ifndef PUBLISH_ANSWER_ONCE_UNFIXED
+    for (size_t i = array_count(manager->publishedTx); i > 0; i--) _BRPeerManagerDropEntry(manager, i - 1, ENOTCONN);
+#endif
+    answers = manager->pendingAnswers;
+    manager->pendingAnswers = NULL;
     array_free(manager->peers);
     for (size_t i = array_count(manager->connectedPeers); i > 0; i--) BRPeerFree(manager->connectedPeers[i - 1]);
     array_free(manager->connectedPeers);
@@ -7630,6 +7848,9 @@ static void _BRPeerManagerFreeNow(BRPeerManager *manager)
     MGR_UNLOCK(manager);
     pthread_mutex_destroy(&manager->lock);
     free(manager);
+
+    for (size_t i = 0; i < array_count(answers); i++) answers[i].callback(answers[i].info, answers[i].error);
+    array_free(answers);
 }
 
 // Frees manager. Returns 1 if it was freed now. Returns 0 if peer/dns threads are still alive --

@@ -106,7 +106,12 @@ void BRGroestl(const char* input, char* output);
 
 void BRQubit(const char* input, char* output);
     
-void BROdocrypt(const char* input, const uint32_t nTime, uint8_t* output);
+// Odocrypt key for a header timestamp: the start of the shapechange interval that contains nTime
+// (interval: ODOCRYPT_CHAPECHANGE_INTERVAL on mainnet, ODOCRYPT_SHAPECHANGE_INTERVAL_TESTNET on testnet)
+uint32_t OdoKey(uint32_t nTime, uint32_t interval);
+
+// Odocrypt hash of the 80-byte header in input, keyed by OdoKey(nTime, interval); output is 32 bytes
+void BROdocrypt(const char* input, const uint32_t nTime, uint32_t interval, uint8_t* output);
 
 // zeros out memory in a way that can't be optimized out by the compiler
 inline static void mem_clean(void *ptr, size_t len)

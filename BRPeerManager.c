@@ -3092,6 +3092,21 @@ static int _BRPeerManagerVerifyBlock(BRPeerManager *manager, BRMerkleBlock *bloc
         prevBlock = b->prevBlock;
     }
 
+#if DGB_HEADER_POW_CHECK >= 1
+    // verify the header names an algorithm the chain allows at its height (block->height was stamped from prev)
+    if (r) {
+        int algo = BRMerkleBlockAlgo(block);
+
+        if (! BRChainParamsAlgoAllowed(manager->params, block->height, algo)) {
+            peer_log(peer, "algo-by-height v=%08" PRIx32 " h=%" PRIu32 " algo=%s blockHash: %s", block->version,
+                     block->height, BRMerkleBlockAlgoName(algo), u256hex(block->blockHash));
+#if DGB_HEADER_POW_CHECK >= 2
+            r = 0;
+#endif
+        }
+    }
+#endif
+
     // verify block difficulty
     if (r && ! manager->params->verifyDifficulty(block, prev, transitionTime)) {
         peer_log(peer, "relayed block with invalid difficulty target %x, blockHash: %s", block->target,
@@ -3502,6 +3517,7 @@ static BRMerkleBlock *_peerRelayedBlockOnce(void *info, BRMerkleBlock *block)
         
         _BRPeerManagerInstallSavedBlock(manager, block);
         manager->lastBlock = block;
+        BRWalletSetBlockHeight(manager->wallet, block->height);   // the verified tip, never the estimate
 
         // Paced-convoy: lastBlock just advanced, so the header window changed —
         // recompute it once and re-push the verdict to every connected peer
@@ -4471,6 +4487,8 @@ BRPeerManager *BRPeerManagerNewEx(const BRChainParams *params, BRWallet *wallet,
     if (startSyncFrom) {
         manager->lastBlock = startSyncFrom;
     }
+
+    BRWalletSetBlockHeight(manager->wallet, manager->lastBlock->height);   // the initial verified tip
     
     printf("BITCOIN_TESTNET=%d\n", BITCOIN_TESTNET);
     
@@ -7468,6 +7486,8 @@ void BRPeerManagerRescan(BRPeerManager *manager)
                 }
             }
         }
+
+        BRWalletSetBlockHeight(manager->wallet, manager->lastBlock->height);   // the tip moved back; the wallet follows
         
         if (manager->downloadPeer) { // disconnect the current download peer so a new random one will be selected
             for (size_t i = array_count(manager->peers); i > 0; i--) {

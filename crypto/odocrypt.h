@@ -8,7 +8,10 @@
 
 #include <stdlib.h>
 
-#define ODOCRYPT_CHAPECHANGE_INTERVAL (10*24*60*60)
+// key shapechange interval per chain (the reference client's Consensus::Params::nOdoShapechangeInterval):
+// mainnet 10 days (name kept as spelled for the existing callers), testnet 1 day
+#define ODOCRYPT_CHAPECHANGE_INTERVAL         (10*24*60*60)
+#define ODOCRYPT_SHAPECHANGE_INTERVAL_TESTNET (1*24*60*60)
 #define ODOCRYPT_DIGEST_SIZE          (80)
 
 // Number of rounds.

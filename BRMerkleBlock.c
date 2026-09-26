@@ -26,15 +26,16 @@
 #include "BRCrypto.h"
 #include "BRAddress.h"
 #include "BRNetwork.h"
+#include "crypto/odocrypt.h"
 #include <stdlib.h>
 #include <inttypes.h>
 #include <limits.h>
 #include <string.h>
 #include <assert.h>
+#include <stdatomic.h>
 
 #define MAX_PROOF_OF_WORK 0x1e0fffff    // highest value for difficulty target (higher values are less difficult)
 #define TARGET_TIMESPAN (0.10*24*60*60) // the targeted timespan between difficulty target adjustments
-#define BLOCK_VERSION_ALGO (7 << 9)
 
 inline static int _ceil_log2(int x)
 {
@@ -145,50 +146,27 @@ BRMerkleBlock *BRMerkleBlockParse(const uint8_t *buf, size_t bufLen)
         }
         
         BRSHA256_2(&block->blockHash, buf, 80);
-
-	return block;
-
-        switch (block->version & BLOCK_VERSION_ALGO) {
-            case BLOCK_VERSION_SHA256D:
-                // void BRSHA256_2(void *md32, const void *data, size_t len)
-                BRSHA256_2(&block->powHash, buf, 80);
-                break;
-
-            case BLOCK_VERSION_SKEIN:
-                // void BRSkein(const char* input, char* output)
-                BRSkein((const char*) buf, (char*) &block->powHash.u8[0]);
-                break;
-
-            case BLOCK_VERSION_QUBIT:
-                // void BRQubit(const char* input, char* output)
-                BRQubit((const char*) buf, (char*) &block->powHash.u8[0]);
-                break;
-
-            case BLOCK_VERSION_ODO:
-                // void BROdocrypt(const char* input, const uint32_t nTime, uint8_t* output)
-                BROdocrypt((const char*) buf, block->timestamp, &block->powHash.u8[0]);
-                break;
-                
-            case BLOCK_VERSION_GROESTL:
-                // void BRGroestl(const char* input, char* output)
-                BRGroestl((const char*) buf, (char*) &block->powHash.u8[0]);
-                break;
-
-            case BLOCK_VERSION_SCRYPT:
-                // void BRScrypt(void *dk, size_t dkLen, const void *pw, size_t pwLen, const void *salt, size_t saltLen, unsigned n, unsigned r, unsigned p)
-                BRScrypt(&block->powHash, sizeof(block->powHash), buf, 80, buf, 80, 1024, 1, 1);
-                break;
-                
-            default:
-#if DEBUG
-                assert(0 && "Invalid algorithm");
-#else
-                break;
-#endif
-        }
     }
     
     return block;
+}
+
+// writes the 80-byte block header (version, prevBlock, merkleRoot, timestamp, target, nonce) in wire order
+static void _BRMerkleBlockHeaderBytes(const BRMerkleBlock *block, uint8_t buf[80])
+{
+    size_t off = 0;
+
+    UInt32SetLE(&buf[off], block->version);
+    off += sizeof(uint32_t);
+    UInt256Set(&buf[off], block->prevBlock);
+    off += sizeof(UInt256);
+    UInt256Set(&buf[off], block->merkleRoot);
+    off += sizeof(UInt256);
+    UInt32SetLE(&buf[off], block->timestamp);
+    off += sizeof(uint32_t);
+    UInt32SetLE(&buf[off], block->target);
+    off += sizeof(uint32_t);
+    UInt32SetLE(&buf[off], block->nonce);
 }
 
 // returns number of bytes written to buf, or total bufLen needed if buf is NULL (block->height is not serialized)
@@ -204,18 +182,8 @@ size_t BRMerkleBlockSerialize(const BRMerkleBlock *block, uint8_t *buf, size_t b
     }
     
     if (buf && len <= bufLen) {
-        UInt32SetLE(&buf[off], block->version);
-        off += sizeof(uint32_t);
-        UInt256Set(&buf[off], block->prevBlock);
-        off += sizeof(UInt256);
-        UInt256Set(&buf[off], block->merkleRoot);
-        off += sizeof(UInt256);
-        UInt32SetLE(&buf[off], block->timestamp);
-        off += sizeof(uint32_t);
-        UInt32SetLE(&buf[off], block->target);
-        off += sizeof(uint32_t);
-        UInt32SetLE(&buf[off], block->nonce);
-        off += sizeof(uint32_t);
+        _BRMerkleBlockHeaderBytes(block, buf);
+        off = 80;
     
         if (block->totalTx > 0) {
             UInt32SetLE(&buf[off], block->totalTx);
@@ -359,6 +327,94 @@ static UInt256 _BRMerkleBlockRootR(const BRMerkleBlock *block, size_t *hashIdx, 
     return md;
 }
 
+// the proof-of-work algorithm named by the header's version field, or BLOCK_ALGO_UNKNOWN
+// mask (15 << 8) as in the reference client: a version with bit 8 set names no algorithm
+int BRMerkleBlockAlgo(const BRMerkleBlock *block)
+{
+    assert(block != NULL);
+
+    switch (block->version & BLOCK_VERSION_ALGO) {
+        case BLOCK_VERSION_SCRYPT:  return BLOCK_VERSION_SCRYPT;
+        case BLOCK_VERSION_SHA256D: return BLOCK_VERSION_SHA256D;
+        case BLOCK_VERSION_GROESTL: return BLOCK_VERSION_GROESTL;
+        case BLOCK_VERSION_SKEIN:   return BLOCK_VERSION_SKEIN;
+        case BLOCK_VERSION_QUBIT:   return BLOCK_VERSION_QUBIT;
+        case BLOCK_VERSION_ODO:     return BLOCK_VERSION_ODO;
+        default:                    return BLOCK_ALGO_UNKNOWN;
+    }
+}
+
+const char *BRMerkleBlockAlgoName(int algo)
+{
+    switch (algo) {
+        case BLOCK_VERSION_SCRYPT:  return "scrypt";
+        case BLOCK_VERSION_SHA256D: return "sha256d";
+        case BLOCK_VERSION_GROESTL: return "groestl";
+        case BLOCK_VERSION_SKEIN:   return "skein";
+        case BLOCK_VERSION_QUBIT:   return "qubit";
+        case BLOCK_VERSION_ODO:     return "odo";
+        default:                    return "unknown";
+    }
+}
+
+// computes the proof-of-work hash of the 80-byte header with the algorithm its version names
+// returns 1 and writes *out, or returns 0 (leaving *out untouched) for an unknown algorithm
+// the struct's powHash field is never written; nothing is cached
+int BRMerkleBlockPoWHash(const BRMerkleBlock *block, UInt256 *out)
+{
+    uint8_t buf[80];
+    UInt256 h;
+
+    assert(block != NULL);
+    assert(out != NULL);
+    _BRMerkleBlockHeaderBytes(block, buf);
+
+    switch (BRMerkleBlockAlgo(block)) {
+        case BLOCK_VERSION_SHA256D:
+            BRSHA256_2(&h, buf, 80);
+            break;
+
+        case BLOCK_VERSION_SCRYPT:
+            BRScrypt(&h, sizeof(h), buf, 80, buf, 80, 1024, 1, 1);
+            break;
+
+        case BLOCK_VERSION_GROESTL:
+            BRGroestl((const char *)buf, (char *)h.u8);
+            break;
+
+        case BLOCK_VERSION_SKEIN:
+            BRSkein((const char *)buf, (char *)h.u8);
+            break;
+
+        case BLOCK_VERSION_QUBIT:
+            BRQubit((const char *)buf, (char *)h.u8);
+            break;
+
+        case BLOCK_VERSION_ODO:
+            // the key changes once per shapechange interval of the header's own timestamp; the
+            // interval is a chain parameter (10 days on mainnet, 1 day on testnet)
+            BROdocrypt((const char *)buf, block->timestamp,
+                       BRNetworkIsTestnet() ? ODOCRYPT_SHAPECHANGE_INTERVAL_TESTNET : ODOCRYPT_CHAPECHANGE_INTERVAL,
+                       h.u8);
+            break;
+
+        default:
+            return 0;
+    }
+
+    *out = h;
+    return 1;
+}
+
+// headers whose computed proof-of-work hash did not meet the header's target, or whose algorithm was unknown;
+// counted only when DGB_HEADER_POW_CHECK >= 1 (peer threads validate concurrently, hence atomic)
+static atomic_uint _powMismatchCount = 0;
+
+uint32_t BRMerkleBlockPoWMismatchCount(void)
+{
+    return atomic_load(&_powMismatchCount);
+}
+
 // true if merkle tree and timestamp are valid, and proof-of-work matches the stated difficulty target
 // NOTE: this only checks if the block difficulty matches the difficulty target in the header, it does not check if the
 // target is correct for the block's height in the chain - use BRMerkleBlockVerifyDifficulty() for that
@@ -395,17 +451,34 @@ int BRMerkleBlockIsValid(const BRMerkleBlock *block, uint32_t currentTime)
         digi_log("target is out of range: %x - %x - %x - %x", target, maxtarget, size, maxsize);
     }
     
-    if (size > 3) UInt32SetLE(&t.u8[size - 3], target);
-    else UInt32SetLE(t.u8, target >> (3 - size)*8);
+#if DGB_HEADER_POW_CHECK >= 1
+    // check proof-of-work: the hash computed with the header's own algorithm must not exceed the target
+    // (only for a header that passed the checks above, so a header already refused is not hashed)
+    if (r) {
+        UInt256 pow;
+        int algo = BRMerkleBlockAlgo(block), meets = BRMerkleBlockPoWHash(block, &pow);
 
-    for (int i = sizeof(t) - 1; r && i >= 0; i--) { // check proof-of-work
-        if (block->powHash.u8[i] < t.u8[i]) break;
-        if (block->powHash.u8[i] > t.u8[i]) {
+        if (size > 3) UInt32SetLE(&t.u8[size - 3], target);
+        else UInt32SetLE(t.u8, target >> (3 - size)*8);
+
+        for (int i = sizeof(t) - 1; meets && i >= 0; i--) {
+            if (pow.u8[i] < t.u8[i]) break;
+            if (pow.u8[i] > t.u8[i]) meets = 0;
+        }
+
+        if (! meets) {
+            atomic_fetch_add(&_powMismatchCount, 1);
+            digi_log("pow-mismatch v=%08" PRIx32 " h=%" PRIu32 " algo=%s hash=%s pow=%s target=%08" PRIx32,
+                     block->version, block->height, BRMerkleBlockAlgoName(algo), u256hex(block->blockHash),
+                     (algo != BLOCK_ALGO_UNKNOWN) ? u256hex(pow) : "-", block->target);
+#if DGB_HEADER_POW_CHECK >= 2
             r = 0;
-
-            digi_log("invalid blockHash[%d]: %x - %x, %s", i, block->powHash.u8[i], t.u8[i], log_u256_hex_encode(block->blockHash));
+#endif
         }
     }
+#else
+    (void)t;   // level 0: no proof-of-work hash is computed and the target is not compared
+#endif
 
     return r;
 }

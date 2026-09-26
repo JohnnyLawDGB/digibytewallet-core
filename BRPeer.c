@@ -45,6 +45,7 @@
 #include <sys/socket.h>
 #include <poll.h>
 #include <sys/time.h>
+#include <time.h>
 #include <netinet/in.h> 
 #include <arpa/inet.h>
 #include <netdb.h>
@@ -942,6 +943,11 @@ static int _BRPeerAcceptHeadersMessage(BRPeer *peer, const uint8_t *msg, size_t 
             else peer_log(peer, "paced convoy: holding header continuation (header frontier a full window ahead of the CF scan)");
 #endif
 
+#if DGB_HEADER_POW_CHECK >= 1
+            struct timespec powBatchStart;
+            clock_gettime(CLOCK_MONOTONIC, &powBatchStart);
+#endif
+
             for (size_t i = 0; r && i < count; i++) {
                 BRMerkleBlock *block = BRMerkleBlockParse(&msg[off + 81*i], 81);
                 
@@ -955,6 +961,18 @@ static int _BRPeerAcceptHeadersMessage(BRPeer *peer, const uint8_t *msg, size_t 
                 }
                 else BRMerkleBlockFree(block);
             }
+
+#if DGB_HEADER_POW_CHECK >= 1
+            // wall time of the loop above (parse, validate with the proof-of-work hash, relay) for this
+            // headers message, so the cost of the check can be read from the log per batch
+            {
+                struct timespec powBatchEnd;
+                clock_gettime(CLOCK_MONOTONIC, &powBatchEnd);
+                peer_log(peer, "pow-batch n=%zu ms=%u", count,
+                         (unsigned)((powBatchEnd.tv_sec - powBatchStart.tv_sec)*1000 +
+                                    (powBatchEnd.tv_nsec - powBatchStart.tv_nsec)/1000000));
+            }
+#endif
 
 #ifndef BRPEER_HEADERS_CONTINUE_BEFORE_RELAY
             // relayedBlock recomputes and pushes convoyHdrGated as each header

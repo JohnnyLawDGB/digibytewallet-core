@@ -57,6 +57,16 @@
 #define PEER_FLAG_SYNCED      0x01
 #define PEER_FLAG_NEEDSUPDATE 0x02
 
+// Agreed sync target (_BRPeerManagerRecomputeEstimatedHeight). estimatedHeight is the lower median
+// of the heights the connected, handshaken peers reported, bounded above by how far the chain can
+// plausibly have grown since the last verified header: at least ESTIMATED_HEIGHT_GROWTH_FLOOR blocks
+// (the 2-hour timestamp tolerance _peerConnected already grants a peer, in 15 s blocks), otherwise
+// twice the elapsed seconds divided by the target block spacing (the x2 leaves real growth a full
+// margin). The floor is deliberately small: a wider one lets a single high report hold the target
+// that far above the tip for as long as its peer stays connected.
+#define ESTIMATED_HEIGHT_GROWTH_FLOOR 480
+#define ESTIMATED_HEIGHT_BLOCK_SECS   15
+
 // Session-scoped "don't re-dial this peer yet" penalty (churn fix). A peer
 // rejected by _peerConnected as "node isn't synced" (BRPeerManager.c ~914)
 // goes on this list so the filter-first dial loop (BRPeerManagerConnect,
@@ -395,8 +405,10 @@ struct BRPeerManagerStruct {
     uint32_t convoyLastHdrTip;
     // ...and a frozen tip alone is NOT sufficient: BRPeer.c issues its continuation
     // BEFORE the relay loop, so lastBlock stays put until the whole ~440 KB batch is
-    // parsed, and a stale-HIGH estimatedHeight (only ever raised) keeps a synced
-    // wallet permanently "frozen below the network tip". So the re-kick is also
+    // parsed, and an estimatedHeight still above every reachable header (it follows
+    // the connected peers' agreed height and the growth bound, but only on peer
+    // events and KeepAlive ticks) keeps a synced wallet "frozen below the network
+    // tip" until the next recompute. So the re-kick is also
     // rate-limited: convoyLastHdrKickAt stamps the last one, convoyHdrKickBackoff is
     // the interval before the next (doubling while unproductive, capped at
     // CF_CONVOY_HDR_REKICK_MAX_SECS, RESET to CF_CONVOY_HDR_REKICK_BASE_SECS the
@@ -1797,6 +1809,8 @@ static BRPeer *_BRPeerManagerCompactFilterCallbackPeer(BRPeerCallbackInfo *info,
 #endif
 }
 
+static void _BRPeerManagerRecomputeEstimatedHeight(BRPeerManager *manager); // defined with the download-peer helpers below
+
 static void _peerConnected(void *info)
 {
     BRPeer *peer = ((BRPeerCallbackInfo *)info)->peer;
@@ -1869,10 +1883,15 @@ static void _peerConnected(void *info)
                 BRPeerSendPing(peer, peerInfo, _postSyncDone);
             }
         }
+#ifndef ESTIMATED_HEIGHT_QUORUM_UNFIXED
+        // One more sample: a peer that arrives after the target was set can move it down as well as up.
+        _BRPeerManagerRecomputeEstimatedHeight(manager);
+#endif
     }
     else { // select the peer with the lowest ping time to download the chain from if we're behind
-        // BUG: XXX a malicious peer can report a higher lastblock to make us select them as the download peer, if
-        // two peers agree on lastblock, use one of those two instead
+        // A single higher report buys only the download-peer role (bounded by the PROTOCOL_TIMEOUT
+        // sync timeout below and by the promotion in _peerDisconnected), never the sync target: that
+        // is the connected peers' agreed height, see _BRPeerManagerRecomputeEstimatedHeight.
         for (size_t i = array_count(manager->connectedPeers); i > 0; i--) {
             BRPeer *p = manager->connectedPeers[i - 1];
             
@@ -1884,7 +1903,11 @@ static void _peerConnected(void *info)
         if (manager->downloadPeer) BRPeerDisconnectTagged(manager->downloadPeer, BR_DISC_TAG_DOWNLOAD_SWAP);
         manager->downloadPeer = peer;
         manager->isConnected = 1;
-        manager->estimatedHeight = BRPeerLastBlock(peer);
+#ifdef ESTIMATED_HEIGHT_QUORUM_UNFIXED
+        manager->estimatedHeight = BRPeerLastBlock(peer);   // comparison arm: one peer's report is the target
+#else
+        _BRPeerManagerRecomputeEstimatedHeight(manager);
+#endif
         BRPeerSetCurrentBlockHeight(peer, manager->lastBlock->height);
         _BRPeerManagerPublishPendingTx(manager, peer);
             
@@ -2015,13 +2038,78 @@ static BRPeer *_BRPeerManagerNextDownloadPeer(BRPeerManager *manager, const BRPe
     return best;
 }
 
+// caller must hold manager->lock. Sets manager->estimatedHeight to the height the connected,
+// handshaken peers AGREE on (the same peer filter _BRPeerManagerNextDownloadPeer uses): the lower
+// median of their reported heights, bounded above by how far the chain can plausibly have grown
+// since lastBlock (ESTIMATED_HEIGHT_GROWTH_FLOOR blocks at least, else 2 x elapsed seconds /
+// ESTIMATED_HEIGHT_BLOCK_SECS), and never below lastBlock->height, which BRPeerManagerEstimatedBlockHeight
+// already guarantees to its readers. Called on every change of the peer set and once per KeepAlive tick,
+// so the estimate moves DOWN as well as up: one peer's report is one sample, not the target, and it stops
+// counting the moment that peer leaves. With one peer (a fixed or pinned node) the sample is its report,
+// bounded the same way; an honest report always fits the bound, so single-peer sync completes as before.
+// Nothing to sample (no handshaken peer left) keeps the current value: the next peer event recomputes.
+//
+// Completion is `block->height == estimatedHeight` in _peerRelayedBlock and fires only on a relayed
+// block. When a recompute moves the estimate DOWN onto the height already held while a sync is in
+// progress, no future block can equal it (the next one is +1, and the high-water line there raises the
+// estimate with it), so the completion action runs here: the same _BRPeerManagerLoadMempools call, in
+// the same locking state, that the two equality sites make. Any other move leaves completion to those
+// sites exactly as before, and an unchanged value never repeats it.
+static void _BRPeerManagerRecomputeEstimatedHeight(BRPeerManager *manager)
+{
+    size_t total = array_count(manager->connectedPeers), n = 0;
+    uint32_t claims[total > 0 ? total : 1];
+    uint32_t tip, median, cap, agreed, prev = manager->estimatedHeight;
+    time_t now = time(NULL);
+    uint64_t growth = 0;
+
+    if (! manager->lastBlock) return;
+    tip = manager->lastBlock->height;
+
+    for (size_t i = 0; i < total; i++) { // insertion sort, n is at most the connection count
+        BRPeer *p = manager->connectedPeers[i];
+        uint32_t c;
+        size_t j;
+
+        if (BRPeerConnectStatus(p) != BRPeerStatusConnected || ! BRPeerCompletedHandshake(p)) continue;
+        c = BRPeerLastBlock(p);
+        for (j = n; j > 0 && claims[j - 1] > c; j--) claims[j] = claims[j - 1];
+        claims[j] = c;
+        n++;
+    }
+
+    if (n == 0) return;
+    median = claims[(n - 1)/2]; // lower median: with two samples the lower one, with one that one
+
+    if (now > (time_t)manager->lastBlock->timestamp) {
+        growth = 2*(uint64_t)(now - (time_t)manager->lastBlock->timestamp)/ESTIMATED_HEIGHT_BLOCK_SECS;
+    }
+    if (growth < ESTIMATED_HEIGHT_GROWTH_FLOOR) growth = ESTIMATED_HEIGHT_GROWTH_FLOOR;
+    cap = (growth < (uint64_t)(UINT32_MAX - tip)) ? tip + (uint32_t)growth : UINT32_MAX;
+    agreed = (median < cap) ? median : cap;
+    if (agreed < tip) agreed = tip;
+
+    manager->estimatedHeight = agreed;
+    _peer_log("estimated height: agreed=%"PRIu32" from %zu peer(s), median=%"PRIu32" cap=%"PRIu32"\n",
+              agreed, n, median, cap);
+
+    if (manager->syncStartHeight > 0 && agreed == tip && prev > agreed) {
+        _peer_log("estimated height: agreed height is the held tip, chain download is complete\n");
+        _BRPeerManagerLoadMempools(manager);
+    }
+}
+
 // caller must hold manager->lock. Make an already-connected peer the download peer: what
 // _peerConnected does for a newly selected one, minus the mempool request it already had.
 static void _BRPeerManagerAdoptDownloadPeer(BRPeerManager *manager, BRPeer *peer)
 {
     manager->downloadPeer = peer;
     manager->isConnected = 1;
-    manager->estimatedHeight = BRPeerLastBlock(peer);
+#ifdef ESTIMATED_HEIGHT_QUORUM_UNFIXED
+    manager->estimatedHeight = BRPeerLastBlock(peer);   // comparison arm: the promoted peer's report is the target
+#else
+    _BRPeerManagerRecomputeEstimatedHeight(manager);    // the promoted peer's report is one sample, not the answer
+#endif
     BRPeerSetCurrentBlockHeight(peer, manager->lastBlock->height);
     peer_log(peer, "download peer dropped: continuing with this connected peer");
     _BRPeerManagerPublishPendingTx(manager, peer);
@@ -2206,6 +2294,9 @@ static void _peerDisconnected(void *info, int error)
     BRCFScanLedgerReArmPeer(&manager->cfLedger, peer->address, peer->port);
 
     BRPeerFree(peer);
+#ifndef ESTIMATED_HEIGHT_QUORUM_UNFIXED
+    _BRPeerManagerRecomputeEstimatedHeight(manager); // the sample changed: the target follows the peers still here
+#endif
     // Peer left connectedPeers (and possibly was the downloadPeer) — refresh the
     // mirrors so the overlay's peer count reflects the drop without taking the lock.
     _BRPeerManagerRefreshCachedStatus(manager);
@@ -6312,6 +6403,14 @@ void BRPeerManagerKeepAlive(BRPeerManager *manager)
         }
     }
 
+#ifndef ESTIMATED_HEIGHT_QUORUM_UNFIXED
+    // Agreed sync target, once per tick: the growth bound tightens as lastBlock->timestamp advances
+    // even when no peer comes or goes, and the convoy legs below read estimatedHeight. Mirror it,
+    // since nothing else on this tick refreshes the lock-free status the UI polls.
+    _BRPeerManagerRecomputeEstimatedHeight(manager);
+    _BRPeerManagerRefreshCachedStatus(manager);
+#endif
+
 #ifndef CONVOY_C1_UNFIXED
     // ---- UNSERVABLE-HOLE backstop (paced-convoy fix wave, C-1 variant) ------
     //
@@ -7047,11 +7146,13 @@ void BRPeerManagerKeepAlive(BRPeerManager *manager)
         //        (BRPeer.c issues its continuation BEFORE the relay loop). Without
         //        it a slow link gets one injected getheaders per ~10 s tick, each
         //        reply spawning its own persistent lockstep continuation chain
-        //        (N x ~2.2 MB of duplicate headers per window-open period), and a
-        //        stale-HIGH estimatedHeight -- which is only ever RAISED, never
-        //        lowered -- leaves a fully-synced wallet permanently "below the
-        //        network tip" with the window permanently open, i.e. ~10 MB/day of
-        //        0-header round trips forever. The interval doubles while
+        //        (N x ~2.2 MB of duplicate headers per window-open period), and an
+        //        estimatedHeight above every reachable header -- it is recomputed
+        //        from the connected peers' agreed height on peer events and once per
+        //        tick, but the high-water line in _peerRelayedBlock only ever raises
+        //        it -- leaves a fully-synced wallet "below the network tip" with the
+        //        window open until the next recompute lowers it, i.e. 0-header round
+        //        trips meanwhile. The interval doubles while
         //        unproductive and RESETS on real tip progress below, so an ordinary
         //        descent always pays only BASE.
         uint32_t hdrTip    = manager->lastBlock ? manager->lastBlock->height : 0;
@@ -8075,7 +8176,8 @@ int BRPeerManagerReanchorCompactFilterChainAtFloor(BRPeerManager *manager)
 
 // Proactively re-issue a FULL-LOCATOR getheaders to every connected peer. All
 // getheaders senders are otherwise reactive (sync-start, relayed inv/orphan,
-// headers-continuation), so once the wallet reaches its stale estimatedHeight it
+// headers-continuation), so once the wallet reaches its estimatedHeight (the
+// connected peers' agreed height, recomputed on peer events and KeepAlive ticks) it
 // goes idle — a tip with live-but-silent peers (half-dead socket answering pings,
 // non-announcing/lagging download peer) then freezes forever and stops confirming
 // txs. The Kotlin tip-stall watchdog calls this on a clock (peers>0 AND blockTip

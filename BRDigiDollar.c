@@ -52,12 +52,15 @@ static int _ddReadScriptNum(const uint8_t *data, size_t len, int64_t *out)
 }
 
 // Advance a script-push cursor. On entry *pos indexes an opcode in script[0..scriptLen).
-// On success sets *dataOff/*dataLen for the pushed bytes, advances *pos past the push,
-// returns 1. Returns 0 at end-of-script or on a non-push opcode.
+// On success sets *dataOff/*dataLen for the pushed bytes, advances *pos past the opcode,
+// returns 1. Returns 0 at end-of-script or on a push that does not fit.
 //
 // Understands all four standard push encodings — direct pushes 0x01..0x4b, OP_PUSHDATA1
 // (0x4c), OP_PUSHDATA2 (0x4d) and OP_PUSHDATA4 (0x4e) — so a transfer another wallet built
-// with any of them decodes the same. An empty push (OP_0/0x00) yields dataLen 0.
+// with any of them decodes the same. An empty push (OP_0/0x00) yields dataLen 0, and so does
+// any opcode that is not a push (OP_1NEGATE, OP_1..OP_16, OP_NOP, ...): the reference reader's
+// GetOp presents those with no data and its loop passes over them, and both readers here do the
+// same, so they agree with the reference about every byte sequence that reaches the list.
 //
 // In every case the declared length is compared against the bytes that remain after the opcode
 // and its length header: `avail` is computed only once the header itself is known to fit, and
@@ -94,7 +97,25 @@ static int _ddNextPush(const uint8_t *script, size_t scriptLen, size_t *pos,
         if (l > avail) return 0;
         *dataOff = *pos + 5; *dataLen = l; *pos += 5 + l; return 1;
     }
-    return 0; // any other opcode (incl OP_N numeric) is not a DD metadata push
+#ifdef DD_PUSH_LIST_OPCODE_UNFIXED
+    return 0; // any other opcode ends the list
+#else
+    // invariant: any other opcode carries no data and is passed over, as the reference does.
+    *dataOff = *pos + 1; *dataLen = 0; *pos += 1; return 1;
+#endif
+}
+
+// The type push, read as the reference reads it: a script number of at most 4 bytes (CScriptNum's
+// default width; a longer push is refused before it is decoded) and compared at full width against
+// the type the version carries. Returns 1 when the push matches `type`.
+static int _ddTypePushMatches(const uint8_t *data, size_t len, int type)
+{
+    int64_t tt;
+#ifdef DD_TYPE_WIDTH_UNFIXED
+    return _ddReadScriptNum(data, len, &tt) && (int)tt == type;
+#else
+    return len <= 4 && _ddReadScriptNum(data, len, &tt) && tt == (int64_t)type;
+#endif
 }
 
 // Find the first output that is an OP_RETURN whose FIRST push is the 2 bytes "DD" (44 44).
@@ -124,8 +145,7 @@ int BRDigiDollarDecodeAmounts(const BRTransaction *tx, int64_t *amounts, size_t 
     if (! _ddNextPush(o->script, o->scriptLen, &pos, &off, &len)) return -1;
     // push 1: txType
     if (! _ddNextPush(o->script, o->scriptLen, &pos, &off, &len)) return -1;
-    int64_t tt;
-    if (! _ddReadScriptNum(o->script + off, len, &tt) || (int)tt != type) return -1;
+    if (! _ddTypePushMatches(o->script + off, len, type)) return -1;
 
     int count = 0;
     while (_ddNextPush(o->script, o->scriptLen, &pos, &off, &len)) {
@@ -164,8 +184,7 @@ static int _ddAmountAtOrdinal(const BRTransaction *tx, size_t ordinal, int64_t *
     size_t pos = 1, off = 0, len = 0;
     if (! _ddNextPush(o->script, o->scriptLen, &pos, &off, &len)) return 0; // push 0: "DD"
     if (! _ddNextPush(o->script, o->scriptLen, &pos, &off, &len)) return 0; // push 1: txType
-    int64_t tt;
-    if (! _ddReadScriptNum(o->script + off, len, &tt) || (int)tt != type) return 0;
+    if (! _ddTypePushMatches(o->script + off, len, type)) return 0;
 
     size_t k = 0;
     int found = 0;

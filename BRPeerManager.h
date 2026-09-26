@@ -177,12 +177,11 @@ Remarks:
    total always equals what is resident; and every header that leaves it has exactly one
    owner afterwards.
 
-   The count is sized from both sides. It sits well above what a near-tip reorg holds (a
-   multi-algo reorg strands a few tens of headers). And because the headers of one held
-   chain connect in a single pass that nests one _peerRelayedBlock frame per header, it is
-   also small enough for a full set to connect well inside a peer thread's default stack:
-   about 1.3 KB per frame on arm64 at -O2, so 256 frames take roughly a third of 1 MB. The
-   byte limit holds the worst case for headers that carry a hashes/flags payload.
+   The count sits well above what a near-tip reorg holds (a multi-algo reorg strands a few
+   tens of headers). It is a memory bound, not a stack budget: the headers of one held chain
+   connect in a loop (_peerRelayedBlock runs _peerRelayedBlockOnce once per header, each pass
+   on the same stack), so connecting a full set costs one frame however many connect at once.
+   The byte limit holds the worst case for headers that carry a hashes/flags payload.
 
    One header always suffices to make progress: the connecting header connects the chain
    however full the set is, and a header the set no longer holds is fetched again in order

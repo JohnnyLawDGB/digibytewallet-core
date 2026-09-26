@@ -3024,8 +3024,8 @@ static int _orphanTimestampAsc(const void *a, const void *b)
 // and allocates nothing, so the limit holds whatever the state of the heap. A set larger than
 // the scratch array (possible only for what a resume left resident) is brought down over
 // several passes. Never evicts `keep` (the just-stored header). Caller holds manager->lock.
-// noinline: the scratch array stays out of _peerRelayedBlock's own frame, which nests once per
-// connecting header (see the sizing note at ORPHAN_SET_COUNT_MAX).
+// noinline: the scratch array stays out of _peerRelayedBlockOnce's own frame, which runs on
+// the peer thread's stack once per relayed header (see the sizing note at ORPHAN_SET_COUNT_MAX).
 __attribute__((noinline))
 static void _BRPeerManagerEvictOrphansLocked(BRPeerManager *manager, const BRMerkleBlock *keep)
 {
@@ -3131,7 +3131,23 @@ static int _BRPeerManagerShouldReanchorForOrphanLocked(BRPeerManager *manager, B
 #endif
 }
 
+static BRMerkleBlock *_peerRelayedBlockOnce(void *info, BRMerkleBlock *block);
+
+// A relayed header, and then every held header it connects, one pass each. The connect step
+// is a loop, not a nested call: the next pass starts exactly where the nested one used to --
+// after the unlock, the save callback and the status callback of the pass before it -- and
+// costs no more stack than the first, so the size of the parentless-header set is a memory
+// bound only (see ORPHAN_SET_COUNT_MAX).
 static void _peerRelayedBlock(void *info, BRMerkleBlock *block)
+{
+    while (block) block = _peerRelayedBlockOnce(info, block);
+}
+
+// One pass of the relayed-header path for `block`. Returns the held header that `block`
+// connected (taken out of manager->orphans by this pass and owned by the caller from here),
+// or NULL. _peerRelayedBlock runs these passes in a loop, so a chain of held headers connects
+// on a fixed stack however long it is.
+static BRMerkleBlock *_peerRelayedBlockOnce(void *info, BRMerkleBlock *block)
 {
     BRPeer *peer = ((BRPeerCallbackInfo *)info)->peer;
     BRPeerManager *manager = ((BRPeerCallbackInfo *)info)->manager;
@@ -3556,8 +3572,15 @@ static void _peerRelayedBlock(void *info, BRMerkleBlock *block)
 #endif
         manager->txStatusUpdate(manager->info); // notify that transaction confirmations may have changed
     }
-    
+
+#if defined(RELAY_CONNECT_RECURSION_UNFIXED) && RELAY_CONNECT_RECURSION_UNFIXED
+    // Reference arm for orphan_set_limits_kat only; never defined in a production build.
+    // The earlier connect step: one nested pass per connecting header.
     if (next) _peerRelayedBlock(info, next);
+    return NULL;
+#else
+    return next;
+#endif
 }
 
 // Confirms wallet txs delivered via a compact-filter-driven full "block" message (see BRPeer.c
@@ -3986,6 +4009,29 @@ static void _BRPeerManagerInstallSavedBlock(BRPeerManager *manager, BRMerkleBloc
         // dangling in manager->checkpoints.
     }
 #endif
+#if !(defined(RESIDENT_REPLACE_OWNER_UNFIXED) && RESIDENT_REPLACE_OWNER_UNFIXED)   // (the reference arm leaves `replaced` unowned)
+    else if (replaced && replaced != block) {
+        // A resident header of the same hash that is NOT a checkpoint stub: the chain above a
+        // moved-back tip, delivered again. `block` has just taken its place in manager->blocks,
+        // so `replaced` is owned by nothing from here and is released -- after every other
+        // pointer the manager may keep to it is made to follow, exactly as the "we already
+        // have the block" branch of _peerRelayedBlockOnce does for the header it displaces
+        // (keep the two lists identical): the parentless set and its byte total, lastOrphan,
+        // lastBlock and the floor memo it keys, startSyncFrom.
+        if (BRSetGet(manager->orphans, replaced) == replaced) {
+            BRSetRemove(manager->orphans, replaced);
+            _BRPeerManagerOrphanLeftSetLocked(manager, replaced);
+        }
+        if (manager->lastOrphan == replaced) manager->lastOrphan = NULL;
+        if (manager->lastBlock == replaced) {
+            manager->lastBlock = block;
+            manager->floorMemoValid = 0;
+        }
+        if (manager->floorMemoTip == replaced) manager->floorMemoValid = 0;
+        if (manager->startSyncFrom == replaced) manager->startSyncFrom = block;
+        BRMerkleBlockFree(replaced);
+    }
+#endif
 }
 
 // returns a newly allocated BRPeerManager struct that must be freed by calling BRPeerManagerFree()
@@ -4135,6 +4181,21 @@ BRPeerManager *BRPeerManagerNewEx(const BRChainParams *params, BRWallet *wallet,
             }
 
         }
+
+#if !(defined(RESIDENT_REPLACE_OWNER_UNFIXED) && RESIDENT_REPLACE_OWNER_UNFIXED)   // (the reference arm leaves a displaced sibling unowned)
+        // Every saved header was adopted above. One that the walk did not make resident and
+        // that the parentless set no longer holds -- a saved header sharing a parent with a
+        // later one in the array, displaced by it at the insert above -- is in savedByHash
+        // only, which frees nothing. Give it its one owner now: pointer identity, so a header
+        // that IS resident in a set (or that replaced a checkpoint stub) is never touched.
+        for (size_t i = 0; blocks && i < blocksCount; i++) {
+            if (BRSetGet(manager->blocks, blocks[i]) != blocks[i] &&
+                BRSetGet(manager->orphans, blocks[i]) != blocks[i] &&
+                BRSetGet(manager->checkpoints, blocks[i]) != blocks[i]) {
+                BRMerkleBlockFree(blocks[i]);
+            }
+        }
+#endif
 
         BRSetFree(savedByHash);
     }

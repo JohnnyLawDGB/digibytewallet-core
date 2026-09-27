@@ -566,6 +566,16 @@ struct BRPeerManagerStruct {
     UInt256  cfDisagreedPrev[CF_DISAGREED_CAP];
     uint8_t  cfDisagreedCount;
     uint8_t  cfReanchorCount;            // continuity-triggered re-anchors this session
+    // Second-source corroboration of the filter-header chain (observe-only).
+    // Every filter peer is asked for its cfcheckpt on connect; the answer is
+    // compared with OUR chain at each 1000-multiple above the top compiled
+    // checkpoint. Nothing here feeds a decision — no re-anchor, no ban, no
+    // watchdog input — the two counters are read by the bridge for logcat /
+    // Network Info only. Atomic so the getters are lock-free mirrors like
+    // cachedCFTip; written only under manager->lock. Not persisted (0 at start).
+    _Atomic uint32_t cfCorroboratedThrough;  // highest 1000-multiple above the compiled table a
+                                             // peer OTHER than the cfheaders source confirmed
+    _Atomic uint32_t cfCheckptDisagreeCount; // cfcheckpt replies that disagreed with our chain
 
     // ── Abandoned-band backfill (2026-08-21) ──────────────────────────────
     // Re-fetching the block headers under an abandoned band so the band can be
@@ -5755,15 +5765,93 @@ static void _peerRelayedCFilter(void *info, uint8_t filterType, UInt256 blockHas
     MGR_UNLOCK(manager);
 }
 
-// B2 stub: cfcheckpt is informational at the moment. C1+ may use checkpoints
-// to bootstrap a chain anchor from a height other than 0.
+// cfcheckpt: a peer's filter headers at every 1000-multiple up to the stop block,
+// requested once per filter-capable connect (see the connect hook below) with a
+// 1000-multiple block we hold and the peer has announced as the stop. OBSERVE-ONLY corroboration of the range above the top
+// compiled checkpoint: each returned header that lies inside our chain is compared
+// with BRCompactFilterChainHeader. A match from a peer whose address differs from
+// the current cfheaders source (cfHeadersPeerAddr — the peer whose batches are
+// building the chain) raises cfCorroboratedThrough; a mismatch raises
+// cfCheckptDisagreeCount and is logged. Nothing else moves: no re-anchor, no
+// disconnect, no ban, no watchdog input, no change to the quorum path. Same
+// staging as the compiled-checkpoint table (an observe pass preceded enforcement).
+//
+// Bounds: the stop block must be one we hold (we asked for a block from our own
+// set; anything else is unsolicited) and the count may not exceed the number of 1000-multiples at or
+// below that height (BRPeer.c already caps the wire count at MAX_CFCHECKPT_RESULTS).
+// Headers at or below the top compiled checkpoint are skipped — that region is
+// pinned by the table, not by peers. Comparison stops at the first mismatch, so a
+// reply can advance corroboration only through a contiguous agreeing prefix.
 static void _peerRelayedCFCheckpt(void *info, uint8_t filterType, UInt256 stopHash,
                                   const UInt256 *filterHeaders, size_t count)
 {
     BRPeer *peer = ((BRPeerCallbackInfo *)info)->peer;
+    BRPeerManager *manager = ((BRPeerCallbackInfo *)info)->manager;
     peer_log(peer, "cfcheckpt: received %zu header(s) for filter type %u, stop %s",
              count, (unsigned)filterType, log_u256_hex_encode(stopHash));
+#ifdef CF_CORROBORATION_UNFIXED
+    (void)manager; (void)filterHeaders;   // pre-corroboration shape: informational only
+#else
+    MGR_LOCK(manager);
+    BRMerkleBlock *stopBlock = BRSetGet(manager->blocks, &stopHash);
+    if (! stopBlock) {
+        peer_log(peer, "cf-corroborate: stop block unknown — ignoring cfcheckpt");
+        MGR_UNLOCK(manager);
+        return;
+    }
+    if (count > (size_t)(stopBlock->height / 1000u)) {
+        peer_log(peer, "cf-corroborate: %zu header(s) exceeds the %u expected for stop height %u — refusing cfcheckpt",
+                 count, stopBlock->height / 1000u, stopBlock->height);
+        MGR_UNLOCK(manager);
+        return;
+    }
+    if (! manager->compactFilterChain || BRCompactFilterChainCount(manager->compactFilterChain) == 0 ||
+        filterType != BRCompactFilterChainType(manager->compactFilterChain)) {
+        MGR_UNLOCK(manager);
+        return;
+    }
+
+    const BRCompactFilterChain *chain = manager->compactFilterChain;
+    uint32_t topCompiled = (manager->params->standardPort == BRMainNetParams.standardPort)
+                           ? BRCFTopCheckpointHeight() : 0;
+    uint32_t start = BRCompactFilterChainStartHeight(chain);
+    uint32_t tip = BRCompactFilterChainNextHeight(chain) - 1;
+    int fromSource = UInt128Eq(peer->address, manager->cfHeadersPeerAddr);
+    uint32_t matched = 0, compared = 0;
+
+    for (size_t i = 0; i < count; i++) {
+        uint32_t h = (uint32_t)(i + 1) * 1000u;
+        if (h <= topCompiled || h < start) continue;
+        if (h > tip) break;
+        compared++;
+        if (UInt256Eq(BRCompactFilterChainHeader(chain, h), filterHeaders[i])) {
+            matched = h;
+            continue;
+        }
+        atomic_store_explicit(&manager->cfCheckptDisagreeCount,
+                              atomic_load_explicit(&manager->cfCheckptDisagreeCount, memory_order_relaxed) + 1u,
+                              memory_order_relaxed);
+        peer_log(peer, "cf-corroborate: height %u MISMATCH ours=%s peer=%s (disagreements %u)", h,
+                 log_u256_hex_encode(BRCompactFilterChainHeader(chain, h)), log_u256_hex_encode(filterHeaders[i]),
+                 atomic_load_explicit(&manager->cfCheckptDisagreeCount, memory_order_relaxed));
+        break;
+    }
+
+    if (matched > 0 && ! fromSource &&
+        matched > atomic_load_explicit(&manager->cfCorroboratedThrough, memory_order_relaxed)) {
+        atomic_store_explicit(&manager->cfCorroboratedThrough, matched, memory_order_relaxed);
+    }
+    peer_log(peer, "cf-corroborate: compared %u height(s) above %u, matched through %u%s; corroborated through %u",
+             compared, topCompiled, matched, fromSource ? " (cfheaders source — not counted)" : "",
+             atomic_load_explicit(&manager->cfCorroboratedThrough, memory_order_relaxed));
+    MGR_UNLOCK(manager);
+#endif
 }
+
+// Blocks kept between the cfcheckpt stop and min(our tip, the peer's announced
+// tip) — the peer must hold the stop block or it closes the connection; the
+// margin covers a tip that is still settling. See the hook below.
+#define CF_CORROBORATE_STOP_MARGIN 6u
 
 // Public-facing hook called from _peerConnected when a filter-capable peer
 // finishes handshake.
@@ -5785,6 +5873,37 @@ static void _BRPeerManagerOnFilterCapablePeerConnected(BRPeerManager *manager, v
     // fresh restore, and the first filter peer after a fleet-wide drop). Gating
     // it would leave the convoy with no starter — a permanent 0-progress wedge.
     _BRPeerManagerRequestNextCFHeaders(manager, peer, /*isConvoyAdvance=*/0);
+#ifndef CF_CORROBORATION_UNFIXED
+    // Ask this peer for its filter-header checkpoints so the range above the compiled
+    // table gets a second opinion (observe-only — see _peerRelayedCFCheckpt).
+    //
+    // The stop must be a block the PEER holds: a node that lacks the stop block closes
+    // the connection, which would turn this probe into a peer drop (the connect gate
+    // admits peers up to 10 blocks behind us). So the stop is the highest 1000-multiple
+    // at or below min(our tip, the peer's announced tip) less a small margin —
+    // cfcheckpt carries only 1000-multiples, so this loses at most one step against
+    // our own tip — resolved through our own block set and skipped when that height is
+    // below the blocks we hold. Also skipped once the reply would exceed the entry
+    // count the parser accepts (MAX_CFCHECKPT_RESULTS): soliciting a reply we would
+    // refuse would make us hang up on every honest filter peer. One request per
+    // connect; a reply that never comes costs nothing and nothing waits on it.
+    if (manager->lastBlock) {
+        uint32_t ceiling = manager->lastBlock->height;
+        if (BRPeerLastBlock(peer) < ceiling) ceiling = BRPeerLastBlock(peer);
+        uint32_t stopHeight = (ceiling > CF_CORROBORATE_STOP_MARGIN)
+                              ? ((ceiling - CF_CORROBORATE_STOP_MARGIN) / 1000u) * 1000u : 0;
+        if (stopHeight > 0 && stopHeight / 1000u <= MAX_CFCHECKPT_RESULTS) {
+            UInt256 stopHash = _BRPeerManagerBlockHashAtHeight(manager, stopHeight);
+            if (! UInt256IsZero(stopHash)) {
+                BRPeerSendGetCFCheckpt(peer, manager->compactFilterChain
+                                             ? BRCompactFilterChainType(manager->compactFilterChain)
+                                             : FILTER_TYPE_BASIC,
+                                       stopHash);
+            }
+            else peer_log(peer, "cf-corroborate: no held block at stop height %u — not requesting cfcheckpt", stopHeight);
+        }
+    }
+#endif
 }
 
 // not thread-safe, set callbacks once before calling BRPeerManagerConnect()
@@ -8045,6 +8164,20 @@ uint32_t BRPeerManagerCFChainTipHeight(BRPeerManager *manager)
     // the tip is one below that. 0 means no chain yet.
     uint32_t next = atomic_load_explicit(&manager->cachedCFTip, memory_order_relaxed);
     return next > 0 ? next - 1 : 0;
+}
+
+// Lock-free like BRPeerManagerCFChainTipHeight: both fields are atomics written
+// under manager->lock by _peerRelayedCFCheckpt and read here without it.
+uint32_t BRPeerManagerCFCorroboratedThrough(BRPeerManager *manager)
+{
+    if (!manager) return 0;
+    return atomic_load_explicit(&manager->cfCorroboratedThrough, memory_order_relaxed);
+}
+
+uint32_t BRPeerManagerCFCheckptDisagreeCount(BRPeerManager *manager)
+{
+    if (!manager) return 0;
+    return atomic_load_explicit(&manager->cfCheckptDisagreeCount, memory_order_relaxed);
 }
 
 // Lowest contiguous block height reachable by walking prevBlock links from

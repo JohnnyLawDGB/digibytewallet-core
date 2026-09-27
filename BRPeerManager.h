@@ -775,6 +775,15 @@ BRSyncMode BRPeerManagerGetSyncMode(BRPeerManager *manager);
 // the watchdog to detect "filter peers connected but not making progress."
 uint32_t BRPeerManagerCFChainTipHeight(BRPeerManager *manager);
 
+// Second-source corroboration of the filter-header chain, observe-only readouts
+// (lock-free). CorroboratedThrough: the highest 1000-multiple above the top
+// compiled checkpoint at which a filter peer OTHER than the current cfheaders
+// source returned the same filter header we hold (0 = none yet this session).
+// CheckptDisagreeCount: cfcheckpt replies this session that disagreed with our
+// chain at some height. Neither value drives any decision in the manager.
+uint32_t BRPeerManagerCFCorroboratedThrough(BRPeerManager *manager);
+uint32_t BRPeerManagerCFCheckptDisagreeCount(BRPeerManager *manager);
+
 // Re-anchor the compact-filter chain at the block floor when cfTip is stuck
 // below the downloaded chain (legacy deficit). Returns 1 if re-anchored.
 int BRPeerManagerReanchorCompactFilterChainAtFloor(BRPeerManager *manager);

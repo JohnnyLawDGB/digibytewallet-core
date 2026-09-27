@@ -29,6 +29,7 @@
 #include "BRBech32.h"
 #include "BRDigiAsset.h"
 #include "BRDigiDollar.h"
+#include "BRNetwork.h"
 #include <stdlib.h>
 #include <inttypes.h>
 #include <limits.h>
@@ -49,6 +50,15 @@ struct BRWalletStruct {
     BRUTXO *assetOverrides;
     BRUTXO *ddUtxos;      // DigiDollar token UTXOs (zero-value P2TR, cents-denominated)
     uint64_t ddBalance;   // DigiDollar balance in CENTS (never mixed with the sat balance)
+    // Coin-generation outputs paid to this wallet are spendable only once the chain tip is at
+    // least the maturity depth past the coin's own height. Until then their value is carried
+    // here and NOT in balance/utxos. nextMaturityHeight is the lowest tip at which one of them
+    // becomes spendable (UINT32_MAX when none is held); coinbaseOutputs counts every owned
+    // coin-generation output, mature or not, so BRWalletSetBlockHeight can decide in O(1)
+    // whether a new tip can change the balance at all. All three are refilled by every rebuild.
+    uint64_t immatureBalance;
+    uint32_t nextMaturityHeight;
+    size_t coinbaseOutputs;
     BRTransaction **transactions;
     BRMasterPubKey masterPubKey;
     BRAddress *internalChain, *externalChain;
@@ -227,16 +237,46 @@ static int _BRWalletIsAssetOverride(BRWallet *wallet, UInt256 txHash, uint32_t n
     return 0;
 }
 
+// A coin-generation transaction: exactly one input whose previous output is the null outpoint
+// (all-zero hash, index 0xffffffff). Same shape as the reference client's IsCoinBase().
+static int _BRTxIsCoinbase(const BRTransaction *tx)
+{
+    return tx->inCount == 1 && UInt256IsZero(tx->inputs[0].txHash) && tx->inputs[0].index == 0xffffffff;
+}
+
+// Blocks a coin-generation output must be buried under before it may be spent, keyed on the
+// coin's OWN height (consensus/consensus.h COINBASE_MATURITY = 8 below 145,000, else 100).
+// Testnet's mempool applies 100 at every height, so the wallet never assumes less there: a coin
+// the wallet counted as spendable must never be one the network refuses to relay.
+static uint32_t _BRCoinbaseMaturity(uint32_t coinHeight)
+{
+    return (coinHeight < 145000 && ! BRNetworkIsTestnet()) ? 8 : 100;
+}
+
+#ifdef WALLET_KAT_COUNT_REBUILD
+// Host-KAT-only: counts full balance rebuilds so a gate can assert the rebuild is SKIPPED when a
+// pushed tip cannot change any balance. A gate on wall-clock could not tell a skipped rebuild
+// from a fast machine. Never defined in production.
+unsigned long _walletKatRebuilds = 0;
+#endif
+
 static void _BRWalletUpdateBalance(BRWallet *wallet)
 {
-    int isInvalid, isPending;
+    int isInvalid, isPending, isCoinbase, immature;
     uint64_t balance = 0, prevBalance = 0;
     uint64_t ddBalance = 0;
+    uint64_t immatureBalance = 0;
+    uint32_t matureAt = 0, nextMaturity = UINT32_MAX;
+    uint32_t ddFloor = BRNetworkDigiDollarActivationHeight();
+    size_t coinbaseOutputs = 0;
     time_t now = time(NULL);
     size_t i, j;
     BRTransaction *tx, *t;
     BRTxOutput o;
 
+#ifdef WALLET_KAT_COUNT_REBUILD
+    _walletKatRebuilds++;   // host-KAT only; never defined in production
+#endif
     array_clear(wallet->utxos);
     array_clear(wallet->assetUtxos);
     array_clear(wallet->ddUtxos);
@@ -314,22 +354,60 @@ static void _BRWalletUpdateBalance(BRWallet *wallet)
             }
         }
 
+        // A coin-generation output is spendable only once the tip is at least the maturity
+        // depth past the coin's own height (tip >= H + maturity; the reference wallet's
+        // convention). An unconfirmed one is immature by definition. Decided once per tx.
+#ifdef COINBASE_MATURITY_UNFIXED
+        isCoinbase = 0;   // comparison arm: coin-generation outputs credited like any other
+#else
+        isCoinbase = _BRTxIsCoinbase(tx);
+#endif
+        immature = 0;
+        if (isCoinbase) {
+            if (tx->blockHeight == TX_UNCONFIRMED) {
+                immature = 1;
+            }
+            else {
+                matureAt = tx->blockHeight + _BRCoinbaseMaturity(tx->blockHeight);
+                immature = (wallet->blockHeight < matureAt) ? 1 : 0;
+            }
+        }
+
         // add outputs to UTXO set
         // TODO: don't add outputs below TX_MIN_OUTPUT_AMOUNT
-        // TODO: don't add coin generation outputs < 100 blocks deep
-        // NOTE: balance/UTXOs will then need to be recalculated when last block changes
         for (j = 0; j < tx->outCount; j++) {
             if (tx->outputs[j].address[0] != '\0') {
                 BRSetAdd(wallet->usedAddrs, tx->outputs[j].address);
-                
+
                 if (BRSetContains(wallet->allAddrs, tx->outputs[j].address)) {
+                    if (isCoinbase) {
+                        coinbaseOutputs++;
+
+                        if (immature) {
+                            // carried separately; never in utxos/ddUtxos/assetUtxos or balance.
+                            // The address is still recorded as used (above).
+                            immatureBalance += tx->outputs[j].amount;
+                            if (tx->blockHeight != TX_UNCONFIRMED && matureAt < nextMaturity) nextMaturity = matureAt;
+                            continue;
+                        }
+                    }
+
                     // If the tx contains an asset, we will skip the DUST transactions,
                     // otherwise there would be a chance of burning the received assets.
                     // Hence, skip adding the 600 dsatoshi transactions to the utxos.
 #if DEBUG
                     printf("ASSETS: Checking %s:%d\n", u256hex(UInt256Reverse(tx->txHash)), j);
 #endif
-                    int64_t ddCents = BRDigiDollarOutputAmount(tx, (uint32_t)j);
+                    // A DigiDollar-shaped output is credited only when confirmed at or above the
+                    // network's DigiDollar activation floor (BRNetworkDigiDollarActivationHeight,
+                    // keyed on the coin's height like the reference client). Below it the output
+                    // is ordinary history: it falls through to the asset and plain branches.
+#ifdef DD_ACTIVATION_FLOOR_UNFIXED
+                    int64_t ddCents = BRDigiDollarOutputAmount(tx, (uint32_t)j);   // comparison arm: no floor
+#else
+                    int64_t ddCents = (tx->blockHeight != TX_UNCONFIRMED && tx->blockHeight >= ddFloor) ?
+                                      BRDigiDollarOutputAmount(tx, (uint32_t)j) : -1;
+#endif
                     if (ddCents >= 0) {
                         array_add(wallet->ddUtxos, ((BRUTXO) { tx->txHash, (uint32_t)j }));
                         ddBalance += (uint64_t)ddCents;
@@ -378,7 +456,23 @@ static void _BRWalletUpdateBalance(BRWallet *wallet)
         }
     }
     wallet->ddBalance = ddBalance;
+    wallet->immatureBalance = immatureBalance;
+    wallet->nextMaturityHeight = nextMaturity;
+    wallet->coinbaseOutputs = coinbaseOutputs;
     wallet->balance = balance;
+}
+
+// Raises wallet->blockHeight to the highest confirmed height among the loaded transactions so a
+// restored wallet evaluates maturity against a tip it has evidence for, rather than 0, until the
+// peer manager pushes the real tip. Never lowers it. Caller holds wallet->lock (or is inside
+// BRWalletNew before the wallet is shared).
+static void _BRWalletSeedBlockHeight(BRWallet *wallet)
+{
+    for (size_t i = 0; i < array_count(wallet->transactions); i++) {
+        uint32_t h = wallet->transactions[i]->blockHeight;
+
+        if (h != TX_UNCONFIRMED && h > wallet->blockHeight) wallet->blockHeight = h;
+    }
 }
 
 // allocates and populates a BRWallet struct which must be freed by calling BRWalletFree()
@@ -430,7 +524,9 @@ BRWallet *BRWalletNew(BRTransaction *transactions[], size_t txCount, BRMasterPub
             if (tx->outputs[j].address[0] != '\0') BRSetAdd(wallet->usedAddrs, tx->outputs[j].address);
         }
     }
-    
+
+    _BRWalletSeedBlockHeight(wallet);
+
     // +100 buffer past each chain's standard gap limit so in-flight
     // change addresses generated by a publishTransaction that happened
     // *after* the last saved_transactions snapshot are still in
@@ -545,6 +641,7 @@ BRWallet *BRWalletNewDual(BRTransaction *transactions[], size_t txCount,
                 if (tx->outputs[j].address[0] != '\0') BRSetAdd(wallet->usedAddrs, tx->outputs[j].address);
             }
         }
+        _BRWalletSeedBlockHeight(wallet);
         pthread_mutex_unlock(&wallet->lock);
 
         // Extend BIP84 chains past every used address before computing balance.
@@ -839,6 +936,19 @@ uint64_t BRWalletDigiDollarBalance(BRWallet *wallet)
     assert(wallet != NULL);
     pthread_mutex_lock(&wallet->lock);
     b = wallet->ddBalance;
+    pthread_mutex_unlock(&wallet->lock);
+    return b;
+}
+
+// value of the wallet's coin-generation outputs that are not yet spendable (the chain tip is
+// below coin height + maturity). Not part of BRWalletBalance; moves into it as the tip advances.
+uint64_t BRWalletImmatureBalance(BRWallet *wallet)
+{
+    uint64_t b;
+
+    assert(wallet != NULL);
+    pthread_mutex_lock(&wallet->lock);
+    b = wallet->immatureBalance;
     pthread_mutex_unlock(&wallet->lock);
     return b;
 }
@@ -2100,16 +2210,25 @@ void BRWalletUpdateTransactions(BRWallet *wallet, const UInt256 txHashes[], size
     BRTransaction *tx;
     UInt256 hashes[txCount];
     int needsUpdate = 0;
+    uint32_t oldHeight;
     size_t i, j, k;
-    
+
     assert(wallet != NULL);
     assert(txHashes != NULL || txCount == 0);
     pthread_mutex_lock(&wallet->lock);
-    if (blockHeight > wallet->blockHeight) wallet->blockHeight = blockHeight;
-    
+
+    // TX_UNCONFIRMED (INT32_MAX) is a stamp, not a height: the peer manager uses it to set or clear
+    // an unconfirmed tx's timestamp, and it must never become the wallet's notion of the tip.
+    if (blockHeight != TX_UNCONFIRMED && blockHeight > wallet->blockHeight) {
+        wallet->blockHeight = blockHeight;
+        // a held coin-generation output may have reached maturity at this height
+        if (wallet->coinbaseOutputs > 0 && blockHeight >= wallet->nextMaturityHeight) needsUpdate = 1;
+    }
+
     for (i = 0, j = 0; txHashes && i < txCount; i++) {
         tx = BRSetGet(wallet->allTx, &txHashes[i]);
         if (! tx || (tx->blockHeight == blockHeight && tx->timestamp == timestamp)) continue;
+        oldHeight = tx->blockHeight;
         tx->timestamp = timestamp;
         tx->blockHeight = blockHeight;
         
@@ -2122,7 +2241,11 @@ void BRWalletUpdateTransactions(BRWallet *wallet, const UInt256 txHashes[], size
             }
             
             hashes[j++] = txHashes[i];
-            if (BRSetContains(wallet->pendingTx, tx) || BRSetContains(wallet->invalidTx, tx)) needsUpdate = 1;
+            // re-evaluate the balance when the tx was withheld (pending/invalid), when it is a
+            // coin-generation tx (its maturity is keyed on the height just stamped), or when an
+            // already-confirmed tx moved to a different height (height-keyed credit rules).
+            if (BRSetContains(wallet->pendingTx, tx) || BRSetContains(wallet->invalidTx, tx) ||
+                _BRTxIsCoinbase(tx) || (oldHeight != TX_UNCONFIRMED && oldHeight != blockHeight)) needsUpdate = 1;
         }
         else if (blockHeight != TX_UNCONFIRMED && ! wallet->hasLegacyKey) {
             // Remove confirmed non-wallet tx — but NOT in dual-key wallets.
@@ -2162,6 +2285,36 @@ void BRWalletSetTxUnconfirmedAfter(BRWallet *wallet, uint32_t blockHeight)
     if (count > 0) _BRWalletUpdateBalance(wallet);
     pthread_mutex_unlock(&wallet->lock);
     if (count > 0 && wallet->txUpdated) wallet->txUpdated(wallet->callbackInfo, hashes, count, TX_UNCONFIRMED, 0);
+}
+
+// records the chain tip as the peer manager knows it: the height of its last verified block, never
+// an estimate. Not monotonic -- a lower tip is accepted (reorg, rescan) and simply makes a young
+// coin-generation output unspendable again, the safe side. The balance is rebuilt only when the new
+// tip can change it: no coin-generation output held -> O(1) return (the common case, so a batch of
+// thousands of headers costs nothing here); tip did not fall and no held output reached maturity ->
+// return; otherwise rebuild. balanceChanged fires only if the spendable balance actually changed,
+// after the wallet lock is released. May be called with the peer manager's lock held (the existing
+// manager -> wallet order); never calls back into the caller while holding wallet->lock.
+void BRWalletSetBlockHeight(BRWallet *wallet, uint32_t blockHeight)
+{
+    uint64_t oldBalance = 0, newBalance = 0;
+    uint32_t oldHeight;
+    int changed = 0;
+
+    assert(wallet != NULL);
+    pthread_mutex_lock(&wallet->lock);
+    oldHeight = wallet->blockHeight;
+    wallet->blockHeight = blockHeight;
+
+    if (wallet->coinbaseOutputs > 0 && ! (blockHeight >= oldHeight && blockHeight < wallet->nextMaturityHeight)) {
+        oldBalance = wallet->balance;
+        _BRWalletUpdateBalance(wallet);
+        newBalance = wallet->balance;
+        changed = (newBalance != oldBalance);
+    }
+
+    pthread_mutex_unlock(&wallet->lock);
+    if (changed && wallet->balanceChanged) wallet->balanceChanged(wallet->callbackInfo, newBalance);
 }
 
 // returns the amount received by the wallet from the transaction (total outputs to change and/or receive addresses)

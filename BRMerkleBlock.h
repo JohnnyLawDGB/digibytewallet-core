@@ -48,6 +48,17 @@ extern "C" {
 #define BLOCK_UNKNOWN_HEIGHT      INT32_MAX
 #define BLOCK_MAX_TIME_DRIFT      (2*60*60) // the furthest in the future a block is allowed to be timestamped
 
+// Compile-time level for the header proof-of-work check (BRMerkleBlockIsValid) and the
+// allowed-algorithm-by-height check (_BRPeerManagerVerifyBlock):
+//   0  neither check is compiled in; verdicts are those of the builds before the level existed
+//   1  both are computed; a header that fails either is logged ("pow-mismatch" / "algo-by-height")
+//      and counted (BRMerkleBlockPoWMismatchCount), but the verdict is unchanged
+//   2  a header that fails either is rejected
+// The app's native build sets the shipped level (native/build.gradle.kts); host KATs set it per arm.
+#ifndef DGB_HEADER_POW_CHECK
+#define DGB_HEADER_POW_CHECK 0
+#endif
+
 typedef struct {
     UInt256 blockHash;
     UInt256 powHash;
@@ -80,6 +91,10 @@ typedef enum {
     //BLOCK_VERSION_EQUIHASH       = (10 << 8),
     //BLOCK_VERSION_ETHASH         = (12 << 8),
     BLOCK_VERSION_ODO            = (14 << 8), // 3584
+
+    // returned by BRMerkleBlockAlgo() for any version whose algorithm bits are not one of the six
+    // above (including any value with bit 8 set); such a header has no proof-of-work hash
+    BLOCK_ALGO_UNKNOWN           = -1,
 } BLOCKHASH_ALGO;
 
 #define BR_MERKLE_BLOCK_NONE\
@@ -113,9 +128,28 @@ int BRMerkleRootFromTxHashes(UInt256 *root, const UInt256 *txHashes, size_t txCo
 void BRMerkleBlockSetTxHashes(BRMerkleBlock *block, const UInt256 hashes[], size_t hashesCount,
                               const uint8_t *flags, size_t flagsLen);
 
+// the proof-of-work algorithm named by the header's version field: one of BLOCK_VERSION_SCRYPT,
+// BLOCK_VERSION_SHA256D, BLOCK_VERSION_GROESTL, BLOCK_VERSION_SKEIN, BLOCK_VERSION_QUBIT, BLOCK_VERSION_ODO,
+// or BLOCK_ALGO_UNKNOWN. The mask is BLOCK_VERSION_ALGO (15 << 8), as in the reference client.
+int BRMerkleBlockAlgo(const BRMerkleBlock *block);
+
+// short lower-case name of an algorithm value from BRMerkleBlockAlgo(), for logs ("unknown" for any other value)
+const char *BRMerkleBlockAlgoName(int algo);
+
+// computes the proof-of-work hash of the 80-byte header with the algorithm its version names
+// (the Odocrypt key interval follows the selected network, see BRNetworkIsTestnet)
+// returns 1 and writes *out on success; returns 0 and leaves *out untouched for an unknown algorithm
+// nothing is cached: the powHash struct field is never written and stays zero
+int BRMerkleBlockPoWHash(const BRMerkleBlock *block, UInt256 *out);
+
+// number of headers whose computed proof-of-work hash did not meet the header's target or whose algorithm was
+// unknown, counted by BRMerkleBlockIsValid() when DGB_HEADER_POW_CHECK >= 1 (always 0 at level 0)
+uint32_t BRMerkleBlockPoWMismatchCount(void);
+
 // true if merkle tree and timestamp are valid, and proof-of-work matches the stated difficulty target
 // NOTE: this only checks if the block difficulty matches the difficulty target in the header, it does not check if the
 // target is correct for the block's height in the chain - use BRMerkleBlockVerifyDifficulty() for that
+// the proof-of-work hash is computed and compared only when DGB_HEADER_POW_CHECK >= 1 (rejected only at >= 2)
 int BRMerkleBlockIsValid(const BRMerkleBlock *block, uint32_t currentTime);
 
 // true if the given tx hash is known to be included in the block

@@ -39,6 +39,8 @@ int BRDigiDollarDecodeAmounts(const BRTransaction *tx, int64_t *amounts, size_t 
 // Returns the DD cent amount bound to output `voutIndex` by DD-output ordinal
 // (spec §3.2 Phase B), or -1 if that output is not a DD token output (OP_RETURN,
 // nonzero value, or not a 34-byte OP_1 P2TR) or if no amount slot binds to it.
+// Height-agnostic by design: the wallet credits the result only when the tx is confirmed
+// at or above BRNetworkDigiDollarActivationHeight() (BRNetwork.h).
 int64_t BRDigiDollarOutputAmount(const BRTransaction *tx, size_t voutIndex);
 
 // Decode a DigiDollar address (TD… testnet / DD… mainnet Base58Check) to its 32-byte taproot

@@ -59,6 +59,20 @@ uint32_t BRRand(uint32_t upperBound)
     return r % upperBound;
 }
 
+// A length field describes bytes its store holds: it takes the requested length only once the
+// store exists, so an object whose store the allocator did not provide reads as empty rather than
+// as a length with nothing behind it. WIRE_STORE_CHECK_UNFIXED keeps the earlier form for the host
+// KAT's comparison arm only; it is never defined by a shipped build.
+static size_t _BRTxStoreLen(const void *store, size_t len)
+{
+#ifdef WIRE_STORE_CHECK_UNFIXED
+    (void)store;
+    return len;
+#else
+    return (store) ? len : 0;
+#endif
+}
+
 void BRTxInputSetAddress(BRTxInput *input, const char *address)
 {
     assert(input != NULL);
@@ -69,9 +83,11 @@ void BRTxInputSetAddress(BRTxInput *input, const char *address)
     memset(input->address, 0, sizeof(input->address));
 
     if (address) {
+        size_t scriptLen = BRAddressScriptPubKey(NULL, 0, address);
+
         strncpy(input->address, address, sizeof(input->address) - 1);
-        input->scriptLen = BRAddressScriptPubKey(NULL, 0, address);
-        array_new(input->script, input->scriptLen);
+        array_new(input->script, scriptLen);
+        input->scriptLen = _BRTxStoreLen(input->script, scriptLen);
         array_set_count(input->script, input->scriptLen);
         BRAddressScriptPubKey(input->script, input->scriptLen, address);
     }
@@ -87,8 +103,8 @@ void BRTxInputSetScript(BRTxInput *input, const uint8_t *script, size_t scriptLe
     memset(input->address, 0, sizeof(input->address));
     
     if (script) {
-        input->scriptLen = scriptLen;
         array_new(input->script, scriptLen);
+        input->scriptLen = _BRTxStoreLen(input->script, scriptLen);
         array_add_array(input->script, script, scriptLen);
         BRAddressFromScriptPubKey(input->address, sizeof(input->address), script, scriptLen);
     }
@@ -103,8 +119,8 @@ void BRTxInputSetSignature(BRTxInput *input, const uint8_t *signature, size_t si
     input->sigLen = 0;
     
     if (signature) {
-        input->sigLen = sigLen;
         array_new(input->signature, sigLen);
+        input->sigLen = _BRTxStoreLen(input->signature, sigLen);
         array_add_array(input->signature, signature, sigLen);
         if (! input->address[0]) {
             BRAddressFromScriptSig(input->address, sizeof(input->address), signature, sigLen);
@@ -121,8 +137,8 @@ void BRTxInputSetWitness(BRTxInput *input, const uint8_t *witness, size_t witLen
     input->witLen = 0;
     
     if (witness) {
-        input->witLen = witLen;
         array_new(input->witness, witLen);
+        input->witLen = _BRTxStoreLen(input->witness, witLen);
         array_add_array(input->witness, witness, witLen);
         if (! input->address[0]) BRAddressFromWitness(input->address, sizeof(input->address), witness, witLen);
     }
@@ -160,9 +176,11 @@ void BRTxOutputSetAddress(BRTxOutput *output, const char *address)
     memset(output->address, 0, sizeof(output->address));
 
     if (address) {
+        size_t scriptLen = BRAddressScriptPubKey(NULL, 0, address);
+
         strncpy(output->address, address, sizeof(output->address) - 1);
-        output->scriptLen = BRAddressScriptPubKey(NULL, 0, address);
-        array_new(output->script, output->scriptLen);
+        array_new(output->script, scriptLen);
+        output->scriptLen = _BRTxStoreLen(output->script, scriptLen);
         array_set_count(output->script, output->scriptLen);
         BRAddressScriptPubKey(output->script, output->scriptLen, address);
     }
@@ -182,8 +200,8 @@ void BRTxOutputSetScript(BRTxOutput *output, const uint8_t *script, size_t scrip
     memset(output->address, 0, sizeof(output->address));
 
     if (script) {
-        output->scriptLen = scriptLen;
         array_new(output->script, scriptLen);
+        output->scriptLen = _BRTxStoreLen(output->script, scriptLen);
         array_add_array(output->script, script, scriptLen);
         BRAddressFromScriptPubKey(output->address, sizeof(output->address), script, scriptLen);
     }
@@ -545,6 +563,20 @@ BRTransaction *BRTransactionCopy(const BRTransaction *tx)
     return cpy;
 }
 
+// invariant: a store the parser asked a setter for exists before the object is used. Under the
+// BRArray.h policy a request the allocator did not satisfy leaves the store NULL; the message is
+// then rejected rather than carried on as a half-filled object. Returns 1 when the store is missing.
+// WIRE_STORE_CHECK_UNFIXED (host KAT comparison arm only) keeps the earlier form, which did not ask.
+static int _BRTransactionStoreMissing(const void *store)
+{
+#ifdef WIRE_STORE_CHECK_UNFIXED
+    (void)store;
+    return 0;
+#else
+    return (store == NULL);
+#endif
+}
+
 // buf must contain a serialized tx
 // retruns a transaction that must be freed by calling BRTransactionFree()
 BRTransaction *BRTransactionParse(const uint8_t *buf, size_t bufLen)
@@ -555,33 +587,35 @@ BRTransaction *BRTransactionParse(const uint8_t *buf, size_t bufLen)
     int isSigned = 1, witnessFlag = 0;
     uint8_t *sBuf;
     size_t i, j, off = 0, witnessOff = 0, sLen = 0, len = 0, count;
+    uint64_t n; // a declared count as the wire carried it; compared before it is narrowed to size_t
     BRTransaction *tx = BRTransactionNew();
     BRTxInput *input;
     BRTxOutput *output;
     
     tx->version = (off + sizeof(uint32_t) <= bufLen) ? UInt32GetLE(&buf[off]) : 0;
     off += sizeof(uint32_t);
-    tx->inCount = (size_t)BRVarInt(&buf[off], (off <= bufLen ? bufLen - off : 0), &len);
+    n = BRVarInt(&buf[off], (off <= bufLen ? bufLen - off : 0), &len);
     off += len;
-    if (tx->inCount == 0 && off + 1 <= bufLen) witnessFlag = buf[off++];
+    if (n == 0 && off + 1 <= bufLen) witnessFlag = buf[off++];
     
     if (witnessFlag) {
-        tx->inCount = (size_t)BRVarInt(&buf[off], (off <= bufLen ? bufLen - off : 0), &len);
+        n = BRVarInt(&buf[off], (off <= bufLen ? bufLen - off : 0), &len);
         off += len;
     }
 
 #ifndef WIRE_COUNT_BOUNDS_UNFIXED
     // invariant: the input count is bounded by the bytes that remain before the
-    // array is sized. Each input occupies at least 41 bytes on the wire (36-byte
+    // array is sized, and is compared as the 64-bit value the wire carried, before
+    // it is narrowed. Each input occupies at least 41 bytes on the wire (36-byte
     // outpoint + a 1-byte script-length + a 4-byte sequence), so a count larger
     // than that cannot be present in the message.
-    if (tx->inCount > (off <= bufLen ? (bufLen - off) / 41 : 0)) {
-        tx->inCount = 0; // no inputs have been populated yet; keep the free walk in range
-        BRTransactionFree(tx);
+    if (n > (off <= bufLen ? (bufLen - off) / 41 : 0)) {
+        BRTransactionFree(tx); // inCount is still 0: no inputs have been populated
         return NULL;
     }
 #endif
 
+    tx->inCount = (size_t)n;
     array_set_count(tx->inputs, tx->inCount);
 
 #ifndef WIRE_STORE_CHECK_UNFIXED
@@ -606,29 +640,37 @@ BRTransaction *BRTransactionParse(const uint8_t *buf, size_t bufLen)
         
         if (off + sLen <= bufLen && BRAddressFromScriptPubKey(NULL, 0, &buf[off], sLen) > 0) {
             BRTxInputSetScript(input, &buf[off], sLen);
+            if (_BRTransactionStoreMissing(input->script)) { BRTransactionFree(tx); return NULL; }
             input->amount = (off + sLen + sizeof(uint64_t) <= bufLen) ? UInt64GetLE(&buf[off + sLen]) : 0;
             off += sizeof(uint64_t);
             isSigned = 0;
         }
-        else if (off + sLen <= bufLen) BRTxInputSetSignature(input, &buf[off], sLen);
+        else if (off + sLen <= bufLen) {
+            BRTxInputSetSignature(input, &buf[off], sLen);
+            if (_BRTransactionStoreMissing(input->signature)) { BRTransactionFree(tx); return NULL; }
+        }
         off += sLen;
-        if (! witnessFlag) BRTxInputSetWitness(input, &buf[off], 0); // set witness to empty byte array
+        if (! witnessFlag) { // set witness to empty byte array
+            BRTxInputSetWitness(input, &buf[off], 0);
+            if (_BRTransactionStoreMissing(input->witness)) { BRTransactionFree(tx); return NULL; }
+        }
         input->sequence = (off + sizeof(uint32_t) <= bufLen) ? UInt32GetLE(&buf[off]) : 0;
         off += sizeof(uint32_t);
     }
     
-    tx->outCount = (size_t)BRVarInt(&buf[off], (off <= bufLen ? bufLen - off : 0), &len);
+    n = BRVarInt(&buf[off], (off <= bufLen ? bufLen - off : 0), &len);
     off += len;
 #ifndef WIRE_COUNT_BOUNDS_UNFIXED
     // invariant: the output count is bounded by the bytes that remain before the
-    // array is sized. Each output occupies at least 9 bytes on the wire (8-byte
-    // amount + a 1-byte script-length), so a larger count cannot be present.
-    if (tx->outCount > (off <= bufLen ? (bufLen - off) / 9 : 0)) {
-        tx->outCount = 0; // no outputs have been populated yet; keep the free walk in range
-        BRTransactionFree(tx);
+    // array is sized, compared as the 64-bit value the wire carried. Each output
+    // occupies at least 9 bytes on the wire (8-byte amount + a 1-byte script-length),
+    // so a larger count cannot be present.
+    if (n > (off <= bufLen ? (bufLen - off) / 9 : 0)) {
+        BRTransactionFree(tx); // outCount is still 0: no outputs have been populated
         return NULL;
     }
 #endif
+    tx->outCount = (size_t)n;
     array_set_count(tx->outputs, tx->outCount);
 
 #ifndef WIRE_STORE_CHECK_UNFIXED
@@ -647,30 +689,35 @@ BRTransaction *BRTransactionParse(const uint8_t *buf, size_t bufLen)
         off += sizeof(uint64_t);
         sLen = (size_t)BRVarInt(&buf[off], (off <= bufLen ? bufLen - off : 0), &len);
         off += len;
-        if (off + sLen <= bufLen) BRTxOutputSetScript(output, &buf[off], sLen);
+        if (off + sLen <= bufLen) {
+            BRTxOutputSetScript(output, &buf[off], sLen);
+            if (_BRTransactionStoreMissing(output->script)) { BRTransactionFree(tx); return NULL; }
+        }
         off += sLen;
     }
     
     for (i = 0, witnessOff = off; witnessFlag && off <= bufLen && i < tx->inCount; i++) {
         input = &tx->inputs[i];
-        count = (size_t)BRVarInt(&buf[off], (off <= bufLen ? bufLen - off : 0), &len);
+        n = BRVarInt(&buf[off], (off <= bufLen ? bufLen - off : 0), &len);
         off += len;
 
 #ifndef WIRE_WITNESS_COUNT_UNFIXED
         // invariant: the number of witness items declared for this input is bounded
-        // by the bytes that remain before they are walked. Each item carries at
-        // least a one-byte length prefix, so a count larger than the bytes left
-        // cannot be present in the message. The comparison performs no addition on
-        // the side that could wrap; tx->inCount and tx->outCount already describe the
-        // populated inputs and outputs, so BRTransactionFree's walk stays in range.
-        if (count > (off <= bufLen ? bufLen - off : 0)) {
+        // by the bytes that remain before they are walked, compared as the 64-bit
+        // value the wire carried. Each item carries at least a one-byte length
+        // prefix, so a count larger than the bytes left cannot be present in the
+        // message. The comparison performs no addition on the side that could wrap;
+        // tx->inCount and tx->outCount already describe the populated inputs and
+        // outputs, so BRTransactionFree's walk stays in range.
+        if (n > (off <= bufLen ? bufLen - off : 0)) {
             BRTransactionFree(tx);
             return NULL;
         }
 #endif
+        count = (size_t)n;
 
         for (j = 0, sLen = 0; j < count; j++) {
-#ifdef WIRE_WITNESS_COUNT_UNFIXED
+#ifdef WIRE_WITNESS_ITEM_UNFIXED
             sLen += (size_t)BRVarInt(&buf[off + sLen], (off + sLen <= bufLen ? bufLen - (off + sLen) : 0), &len);
             sLen += len;
 #else
@@ -690,7 +737,10 @@ BRTransaction *BRTransactionParse(const uint8_t *buf, size_t bufLen)
 #endif
         }
 
-        if (off + sLen <= bufLen) BRTxInputSetWitness(input, &buf[off], sLen);
+        if (off + sLen <= bufLen) {
+            BRTxInputSetWitness(input, &buf[off], sLen);
+            if (_BRTransactionStoreMissing(input->witness)) { BRTransactionFree(tx); return NULL; }
+        }
         off += sLen;
     }
     
@@ -1084,6 +1134,12 @@ int BRTransactionSign(BRTransaction *tx, int forkId, BRKey keys[], size_t keysCo
         size_t len = BRTransactionSerialize(tx, data, sizeof(data));
         BRTransaction *t = BRTransactionParse(data, len);
         
+#ifndef TX_SIGN_REPARSE_UNFIXED
+        // invariant: the hashes come from a re-parse that succeeded. When it could not be made,
+        // the signatures placed above stay (the object is consistent) and the caller learns the
+        // transaction is not signed, rather than publishing it under the hash it had before.
+        if (! t) return 0;
+#endif
         if (t) tx->txHash = t->txHash, tx->wtxHash = t->wtxHash;
         if (t) BRTransactionFree(t);
         return 1;

@@ -45,6 +45,7 @@
 #include <sys/socket.h>
 #include <poll.h>
 #include <sys/time.h>
+#include <time.h>
 #include <netinet/in.h> 
 #include <arpa/inet.h>
 #include <netdb.h>
@@ -637,15 +638,24 @@ static int _BRPeerAcceptVerackMessage(BRPeer *peer, const uint8_t *msg, size_t m
 static int _BRPeerAcceptAddrMessage(BRPeer *peer, const uint8_t *msg, size_t msgLen)
 {
     BRPeerContext *ctx = (BRPeerContext *)peer;
-    size_t off = 0, count = (size_t)BRVarInt(msg, msgLen, &off);
+    size_t off = 0, count = 0;
+    uint64_t n = BRVarInt(msg, msgLen, &off); // the count as the wire carried it; narrowed only once bounded
     int r = 1;
     
+#ifdef WIRE_COUNT_BOUNDS_UNFIXED
+    count = (size_t)n;
     if (off == 0 || off + count*30 > msgLen) {
-        peer_log(peer, "malformed addr message, length is %zu, should be %zu for %zu address(es)", msgLen,
-                 BRVarIntSize(count) + 30*count, count);
+#else
+    // invariant: the addr count is bounded by the bytes that remain before it is narrowed or
+    // multiplied. Each addr entry occupies 30 bytes on the wire, an offset past the end is rejected
+    // outright, and the comparison performs no arithmetic on the side that could wrap.
+    if (off == 0 || off > msgLen || n > (msgLen - off) / 30) {
+#endif
+        peer_log(peer, "malformed addr message, length is %zu for %llu address(es)", msgLen,
+                 (unsigned long long)n);
         r = 0;
     }
-    else if (count > 1000) {
+    else if ((count = (size_t)n) > 1000) { // exact: n passed the bound above
         peer_log(peer, "dropping addr message, %zu is too many addresses, max is 1000", count);
     }
     else if (ctx->sentGetaddr) { // simple anti-tarpitting tactic, don't accept unsolicited addresses
@@ -683,25 +693,38 @@ static int _BRPeerAcceptAddrMessage(BRPeer *peer, const uint8_t *msg, size_t msg
 static int _BRPeerAcceptInvMessage(BRPeer *peer, const uint8_t *msg, size_t msgLen)
 {
     BRPeerContext *ctx = (BRPeerContext *)peer;
-    size_t off = 0, count = (size_t)BRVarInt(msg, msgLen, &off);
+    size_t off = 0, count = 0;
+    uint64_t n = BRVarInt(msg, msgLen, &off); // the count as the wire carried it; narrowed only once bounded
     int r = 1;
     
+#ifdef WIRE_COUNT_BOUNDS_UNFIXED
+    count = (size_t)n;
     if (off == 0 || off + count*36 > msgLen) {
-        peer_log(peer, "malformed inv message, length is %zu, should be %zu for %zu item(s)", msgLen,
-                 BRVarIntSize(count) + 36*count, count);
+#else
+    // invariant: the inv count is bounded by the bytes that remain before it is narrowed or
+    // multiplied. Each inv entry occupies 36 bytes on the wire, an offset past the end is rejected
+    // outright, and the comparison performs no arithmetic on the side that could wrap.
+    if (off == 0 || off > msgLen || n > (msgLen - off) / 36) {
+#endif
+        peer_log(peer, "malformed inv message, length is %zu for %llu item(s)", msgLen,
+                 (unsigned long long)n);
         r = 0;
     }
-    else if (count > MAX_GETDATA_HASHES) {
+    else if ((count = (size_t)n) > MAX_GETDATA_HASHES) { // exact: n passed the bound above
         peer_log(peer, "dropping inv message, %zu is too many items, max is %d", count, MAX_GETDATA_HASHES);
     }
     else {
         inv_type type;
-        const uint8_t *transactions[count], *blocks[count];
+        // count is at most MAX_GETDATA_HASHES here. The two item tables live on the heap rather than
+        // the peer thread's stack; both are released at the single exit of this block, below.
+        const uint8_t **transactions = calloc(count ? count : 1, sizeof(*transactions));
+        const uint8_t **blocks = calloc(count ? count : 1, sizeof(*blocks));
         size_t i, j, txCount = 0, blockCount = 0;
         
         peer_log(peer, "got inv with %zu item(s)", count);
+        if (! transactions || ! blocks) peer_log(peer, "inv item tables could not be made, dropping inv message");
 
-        for (i = 0; i < count; i++) {
+        for (i = 0; transactions && blocks && i < count; i++) {
             type = UInt32GetLE(&msg[off]);
             
             switch (type) { // inv messages only use inv_tx or inv_block
@@ -752,7 +775,23 @@ static int _BRPeerAcceptInvMessage(BRPeer *peer, const uint8_t *msg, size_t msgL
             if (blockCount == 1 && UInt256Eq(ctx->lastBlockHash, UInt256Get(blocks[0]))) blockCount = 0;
             if (blockCount == 1) ctx->lastBlockHash = UInt256Get(blocks[0]);
 
+#ifdef WIRE_INV_HASH_STACK_UNFIXED
             UInt256 hash, blockHashes[blockCount], txHashes[txCount];
+#else
+            // invariant: the per-item hash tables scale with a peer-supplied count (up to the
+            // MAX_GETDATA_HASHES cap), so they live on the heap rather than the peer thread's
+            // stack; both are released at the single exit of this block, below. A table the
+            // allocator could not make drops the message (the counts go to 0, so the loops and
+            // the getdata below are no-ops), never dereferencing a store that is not there.
+            UInt256 hash;
+            UInt256 *blockHashes = calloc(blockCount ? blockCount : 1, sizeof(*blockHashes));
+            UInt256 *txHashes = calloc(txCount ? txCount : 1, sizeof(*txHashes));
+
+            if (! blockHashes || ! txHashes) {
+                peer_log(peer, "inv hash tables could not be made, dropping inv message");
+                blockCount = 0; txCount = 0;
+            }
+#endif
 
             for (i = 0; i < blockCount; i++) {
                 blockHashes[i] = UInt256Get(blocks[i]);
@@ -793,7 +832,15 @@ static int _BRPeerAcceptInvMessage(BRPeer *peer, const uint8_t *msg, size_t msgL
                 ctx->mempoolCallback = NULL;
                 ctx->mempoolTime = DBL_MAX;
             }
+
+#ifndef WIRE_INV_HASH_STACK_UNFIXED
+            free(blockHashes);
+            free(txHashes);
+#endif
         }
+
+        free(transactions);
+        free(blocks);
     }
     
     return r;
@@ -896,6 +943,11 @@ static int _BRPeerAcceptHeadersMessage(BRPeer *peer, const uint8_t *msg, size_t 
             else peer_log(peer, "paced convoy: holding header continuation (header frontier a full window ahead of the CF scan)");
 #endif
 
+#if DGB_HEADER_POW_CHECK >= 1
+            struct timespec powBatchStart;
+            clock_gettime(CLOCK_MONOTONIC, &powBatchStart);
+#endif
+
             for (size_t i = 0; r && i < count; i++) {
                 BRMerkleBlock *block = BRMerkleBlockParse(&msg[off + 81*i], 81);
                 
@@ -909,6 +961,18 @@ static int _BRPeerAcceptHeadersMessage(BRPeer *peer, const uint8_t *msg, size_t 
                 }
                 else BRMerkleBlockFree(block);
             }
+
+#if DGB_HEADER_POW_CHECK >= 1
+            // wall time of the loop above (parse, validate with the proof-of-work hash, relay) for this
+            // headers message, so the cost of the check can be read from the log per batch
+            {
+                struct timespec powBatchEnd;
+                clock_gettime(CLOCK_MONOTONIC, &powBatchEnd);
+                peer_log(peer, "pow-batch n=%zu ms=%u", count,
+                         (unsigned)((powBatchEnd.tv_sec - powBatchStart.tv_sec)*1000 +
+                                    (powBatchEnd.tv_nsec - powBatchStart.tv_nsec)/1000000));
+            }
+#endif
 
 #ifndef BRPEER_HEADERS_CONTINUE_BEFORE_RELAY
             // relayedBlock recomputes and pushes convoyHdrGated as each header
@@ -946,15 +1010,24 @@ static int _BRPeerAcceptGetaddrMessage(BRPeer *peer, const uint8_t *msg, size_t 
 static int _BRPeerAcceptGetdataMessage(BRPeer *peer, const uint8_t *msg, size_t msgLen)
 {
     BRPeerContext *ctx = (BRPeerContext *)peer;
-    size_t off = 0, count = (size_t)BRVarInt(msg, msgLen, &off);
+    size_t off = 0, count = 0;
+    uint64_t n = BRVarInt(msg, msgLen, &off); // the count as the wire carried it; narrowed only once bounded
     int r = 1;
     
+#ifdef WIRE_COUNT_BOUNDS_UNFIXED
+    count = (size_t)n;
     if (off == 0 || off + 36*count > msgLen) {
-        peer_log(peer, "malformed getdata message, length is %zu, should %zu for %zu item(s)", msgLen,
-                 BRVarIntSize(count) + 36*count, count);
+#else
+    // invariant: the getdata count is bounded by the bytes that remain before it is narrowed or
+    // multiplied. Each getdata entry occupies 36 bytes on the wire, an offset past the end is rejected
+    // outright, and the comparison performs no arithmetic on the side that could wrap.
+    if (off == 0 || off > msgLen || n > (msgLen - off) / 36) {
+#endif
+        peer_log(peer, "malformed getdata message, length is %zu for %llu item(s)", msgLen,
+                 (unsigned long long)n);
         r = 0;
     }
-    else if (count > MAX_GETDATA_HASHES) {
+    else if ((count = (size_t)n) > MAX_GETDATA_HASHES) { // exact: n passed the bound above
         peer_log(peer, "dropping getdata message, %zu is too many items, max is %d", count, MAX_GETDATA_HASHES);
     }
     else {
@@ -1023,15 +1096,24 @@ static int _BRPeerAcceptGetdataMessage(BRPeer *peer, const uint8_t *msg, size_t 
 static int _BRPeerAcceptNotfoundMessage(BRPeer *peer, const uint8_t *msg, size_t msgLen)
 {
     BRPeerContext *ctx = (BRPeerContext *)peer;
-    size_t off = 0, count = (size_t)BRVarInt(msg, msgLen, &off);
+    size_t off = 0, count = 0;
+    uint64_t n = BRVarInt(msg, msgLen, &off); // the count as the wire carried it; narrowed only once bounded
     int r = 1;
 
+#ifdef WIRE_COUNT_BOUNDS_UNFIXED
+    count = (size_t)n;
     if (off == 0 || off + 36*count > msgLen) {
-        peer_log(peer, "malformed notfound message, length is %zu, should be %zu for %zu item(s)", msgLen,
-                 BRVarIntSize(count) + 36*count, count);
+#else
+    // invariant: the notfound count is bounded by the bytes that remain before it is narrowed or
+    // multiplied. Each notfound entry occupies 36 bytes on the wire, an offset past the end is rejected
+    // outright, and the comparison performs no arithmetic on the side that could wrap.
+    if (off == 0 || off > msgLen || n > (msgLen - off) / 36) {
+#endif
+        peer_log(peer, "malformed notfound message, length is %zu for %llu item(s)", msgLen,
+                 (unsigned long long)n);
         r = 0;
     }
-    else if (count > MAX_GETDATA_HASHES) {
+    else if ((count = (size_t)n) > MAX_GETDATA_HASHES) { // exact: n passed the bound above
         peer_log(peer, "dropping notfound message, %zu is too many items, max is %d", count, MAX_GETDATA_HASHES);
     }
     else {
@@ -1975,7 +2057,9 @@ BRPeer *BRPeerNew(uint32_t magicNumber)
 //     list (see BRMerkleRootFromTxHashes). Without that check a peer can answer a getdata with the real header and
 //     a tx list with the wallet's payment stripped out.
 // void notfound(void *, const UInt256[], size_t, const UInt256[], size_t) - called when "notfound" message is received
-// BRTransaction *requestedTx(void *, UInt256) - called when "getdata" message with a tx hash is received from peer
+// BRTransaction *requestedTx(void *, UInt256) - called when "getdata" message with a tx hash is received from peer.
+//     The object returned becomes the handler's to release: it is released once the item has been answered, on every
+//     path out. So a provider returns a private copy, never a record it or anyone else keeps.
 // int networkIsReachable(void *) - must return true when networking is available, false otherwise
 // void threadCleanup(void *) - called before a thread terminates to faciliate any needed cleanup
 void BRPeerSetCallbacks(BRPeer *peer, void *info,

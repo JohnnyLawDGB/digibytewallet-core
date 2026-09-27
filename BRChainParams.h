@@ -43,7 +43,40 @@ typedef struct {
     int (*verifyDifficulty)(const BRMerkleBlock *block, const BRMerkleBlock *previous, uint32_t transitionTime);
     const BRCheckPoint *checkpoints;
     size_t checkpointsCount;
+
+    // Which proof-of-work algorithms a header at a given height may name (BRChainParamsAlgoAllowed).
+    // Heights below are BLOCK heights h; the reference client keys the same rule on the previous
+    // block's height (h - 1), which is how the values below were derived from its chainparams.
+    uint32_t multiAlgoHeight;       // last height that is scrypt-only (Core multiAlgoDiffChangeTarget: prev < T <=> h <= T)
+    uint32_t odoHeight;             // first height whose set is {sha256d, scrypt, skein, qubit, odo} rather than
+                                    // {sha256d, scrypt, groestl, skein, qubit}; Core: max(algoSwapChangeTarget + 1, OdoHeight)
+    uint32_t algoLockHeight;        // first height at which the set above is enforced; below it, from odoHeight up,
+                                    // any of the six is accepted (Core enforced nothing there: min(AlgoLockHeight,
+                                    // nGroestlDeactivationHeight))
+    uint32_t odoShapechangeInterval; // Odocrypt key interval in seconds (Core nOdoShapechangeInterval)
 } BRChainParams;
+
+// true if a header at block height `height` may name proof-of-work algorithm `algo` (a value from BRMerkleBlockAlgo)
+// mirrors the reference client's IsAlgoActive(prev, algo) with prev = height - 1, gated as ContextualCheckBlockHeader
+// gates it; an unknown algorithm is never allowed
+static inline int BRChainParamsAlgoAllowed(const BRChainParams *params, uint32_t height, int algo)
+{
+    if (algo == BLOCK_ALGO_UNKNOWN) return 0;
+    if (height <= params->multiAlgoHeight) return algo == BLOCK_VERSION_SCRYPT;
+
+    if (height < params->odoHeight) {
+        return algo == BLOCK_VERSION_SHA256D || algo == BLOCK_VERSION_SCRYPT || algo == BLOCK_VERSION_GROESTL ||
+               algo == BLOCK_VERSION_SKEIN || algo == BLOCK_VERSION_QUBIT;
+    }
+
+    if (height < params->algoLockHeight) {
+        return algo == BLOCK_VERSION_SHA256D || algo == BLOCK_VERSION_SCRYPT || algo == BLOCK_VERSION_GROESTL ||
+               algo == BLOCK_VERSION_SKEIN || algo == BLOCK_VERSION_QUBIT || algo == BLOCK_VERSION_ODO;
+    }
+
+    return algo == BLOCK_VERSION_SHA256D || algo == BLOCK_VERSION_SCRYPT || algo == BLOCK_VERSION_SKEIN ||
+           algo == BLOCK_VERSION_QUBIT || algo == BLOCK_VERSION_ODO;
+}
 
 static const char *BRMainNetDNSSeeds[] = {
         /* Bloom-filter-enabled nodes (priority — tried first by C core) */
@@ -621,7 +654,14 @@ static const BRChainParams BRMainNetParams = {
     0,          // services
     BRMerkleBlockVerifyDifficulty,
     BRMainNetCheckpoints,
-    sizeof(BRMainNetCheckpoints)/sizeof(*BRMainNetCheckpoints)
+    sizeof(BRMainNetCheckpoints)/sizeof(*BRMainNetCheckpoints),
+    // reference client kernel/chainparams.cpp (mainnet): multiAlgoDiffChangeTarget 145000, algoSwapChangeTarget 9100000,
+    // OdoHeight 9112320, nGroestlDeactivationHeight 23808000 (AlgoLockHeight 23869440 is later, so never governs),
+    // nOdoShapechangeInterval 10 days
+    145000,     // multiAlgoHeight: 145,000 is the last scrypt-only height; 145,001 is the first sha256d block
+    9112320,    // odoHeight
+    23808000,   // algoLockHeight: groestl exists on the chain through 23,807,995 and never at or after 23,808,000
+    864000      // odoShapechangeInterval
 };
 
 static const BRChainParams BRTestNetParams = {
@@ -631,7 +671,15 @@ static const BRChainParams BRTestNetParams = {
     0,          // services
     BRTestNetVerifyDifficulty,
     BRTestNetCheckpoints,
-    sizeof(BRTestNetCheckpoints)/sizeof(*BRTestNetCheckpoints)
+    sizeof(BRTestNetCheckpoints)/sizeof(*BRTestNetCheckpoints),
+    // reference client kernel/chainparams.cpp (testnet26): multiAlgoDiffChangeTarget 0, algoSwapChangeTarget 500,
+    // OdoHeight 500, AlgoLockHeight 0 (enforced from height 1), nOdoShapechangeInterval 1 day. With prev-height keying
+    // the groestl set applies while prev < 500 or h < 500, i.e. through h = 500 (the chain has groestl at 500 and
+    // its first Odo block at 519), so the first Odo-set height is 501.
+    0,          // multiAlgoHeight: only the genesis block is scrypt-only
+    501,        // odoHeight
+    0,          // algoLockHeight: no grandfathered band
+    86400       // odoShapechangeInterval
 };
 
 #endif // BRChainParams_h

@@ -230,6 +230,31 @@ typedef enum {
     inv_filtered_block = 3
 } inv_type;
 
+// ---- REQUESTED-HASH RECORDS ----
+// What this peer was asked for and has not yet answered. A "tx"/"dandeliontx" message is taken only
+// when its hash is in requestedTxHashes, and a full "block" message only when its hash is in
+// requestedBlockHashes (and its transactions hash to the merkle root its own header commits to).
+// BRPeerSendGetdata fills requestedTxHashes, BRPeerSendGetdataBlocks fills requestedBlockHashes; the
+// answer, or a notfound for it, takes the entry out.
+//
+// BOUND. Each record holds at most PEER_REQUESTED_HASHES_MAX hashes; adding one more drops the oldest.
+// The bound equals the most items one getdata may carry (MAX_GETDATA_HASHES), so a single request can
+// never push out its own entries, and an entry that has had a full getdata's worth of later requests
+// made after it is treated as unanswered: if its answer does arrive later it is not taken, and the
+// ordinary re-request paths ask again. Entries are only ever added by this wallet's own requests, so
+// the peer cannot grow a record past what the wallet chose to ask for.
+#define PEER_REQUESTED_HASHES_MAX MAX_GETDATA_HASHES
+
+typedef struct _BRPeerRequestEntry {
+    UInt256 hash; // FIRST member: the set hashes and compares an entry through it, and looks up by a bare UInt256
+    struct _BRPeerRequestEntry *older, *newer;
+} BRPeerRequestEntry;
+
+typedef struct {
+    BRSet *entries;                        // BRPeerRequestEntry *, keyed by hash
+    BRPeerRequestEntry *oldest, *newest;   // request order, for eviction
+} BRPeerRequestSet;
+
 typedef struct {
     BRPeer peer; // superstruct on top of BRPeer
     uint32_t magicNumber;
@@ -321,6 +346,15 @@ typedef struct {
     //
     // LEAF LOCK -- never held across ctx->hasTx or any socket send.
     pthread_mutex_t txHashLock;
+    // See REQUESTED-HASH RECORDS above. Written by whichever thread sends the getdata (the manager's,
+    // the JNI broadcast thread's, or this peer's own read thread from the inv path) and read and
+    // consumed by this peer's read thread, so both records are guarded by requestLock.
+    //
+    // LEAF LOCK, same discipline as txHashLock: never held across a callback or a socket send. The
+    // senders record under it, release it, THEN send, so an answer read on this peer's thread can
+    // never arrive ahead of its own record.
+    BRPeerRequestSet requestedTxHashes, requestedBlockHashes;
+    pthread_mutex_t requestLock;
     volatile int socket;
     void *info;
     void (*connected)(void *info);
@@ -531,6 +565,137 @@ static void _BRPeerAddKnownTxHashesInternal(const BRPeer *peer, const UInt256 tx
 static void _BRPeerAddKnownTxHashes(const BRPeer *peer, const UInt256 txHashes[], size_t txCount)
 {
     _BRPeerAddKnownTxHashesInternal(peer, txHashes, txCount, NULL, NULL);
+}
+
+// ---- requested-hash records (see REQUESTED-HASH RECORDS at BRPeerContext) ----
+// The *Locked helpers require ctx->requestLock; the others take it themselves.
+
+#define REQUEST_LOCK(c)    pthread_mutex_lock(&(c)->requestLock)
+#define REQUEST_UNLOCK(c)  pthread_mutex_unlock(&(c)->requestLock)
+
+static size_t _BRPeerRequestHash(const void *entry)
+{
+    return (size_t)((const UInt256 *)entry)->u32[0];
+}
+
+static int _BRPeerRequestEq(const void *a, const void *b)
+{
+    return (a == b || UInt256Eq(*(const UInt256 *)a, *(const UInt256 *)b));
+}
+
+static void _BRPeerRequestSetInit(BRPeerRequestSet *s)
+{
+    s->entries = BRSetNew(_BRPeerRequestHash, _BRPeerRequestEq, 16);
+    s->oldest = s->newest = NULL;
+}
+
+static void _BRPeerRequestUnlinkLocked(BRPeerRequestSet *s, BRPeerRequestEntry *e)
+{
+    if (e->older) e->older->newer = e->newer;
+    else s->oldest = e->newer;
+    if (e->newer) e->newer->older = e->older;
+    else s->newest = e->older;
+    e->older = e->newer = NULL;
+}
+
+// Records `hash` as the newest request. A hash already held is moved to newest (asked again); at the
+// bound the oldest entry is dropped first, so the record never holds more than the bound.
+static void _BRPeerRequestAddLocked(BRPeerRequestSet *s, UInt256 hash)
+{
+    BRPeerRequestEntry *e = BRSetGet(s->entries, &hash);
+
+    if (e) _BRPeerRequestUnlinkLocked(s, e);
+    else {
+        if (BRSetCount(s->entries) >= PEER_REQUESTED_HASHES_MAX && s->oldest) {
+            BRPeerRequestEntry *old = s->oldest;
+
+            BRSetRemove(s->entries, old);
+            _BRPeerRequestUnlinkLocked(s, old);
+            free(old);
+        }
+
+        e = calloc(1, sizeof(*e));
+        if (! e) return; // not recorded: its answer will not be taken, which is the safe direction
+        e->hash = hash;
+        BRSetAdd(s->entries, e);
+    }
+
+    e->older = s->newest;
+    e->newer = NULL;
+    if (s->newest) s->newest->newer = e;
+    else s->oldest = e;
+    s->newest = e;
+}
+
+// Removes `hash` if held. Returns 1 when it was held.
+static int _BRPeerRequestTakeLocked(BRPeerRequestSet *s, UInt256 hash)
+{
+    BRPeerRequestEntry *e = BRSetRemove(s->entries, &hash);
+
+    if (! e) return 0;
+    _BRPeerRequestUnlinkLocked(s, e);
+    free(e);
+    return 1;
+}
+
+static void _BRPeerRequestSetFree(BRPeerRequestSet *s)
+{
+    while (s->oldest) {
+        BRPeerRequestEntry *e = s->oldest;
+
+        _BRPeerRequestUnlinkLocked(s, e);
+        free(e);
+    }
+
+    if (s->entries) BRSetFree(s->entries);
+    s->entries = NULL;
+}
+
+static void _BRPeerNoteRequested(BRPeerContext *ctx, BRPeerRequestSet *s, const UInt256 hashes[], size_t count)
+{
+    REQUEST_LOCK(ctx);
+    for (size_t i = 0; i < count; i++) _BRPeerRequestAddLocked(s, hashes[i]);
+    REQUEST_UNLOCK(ctx);
+}
+
+static int _BRPeerWasRequested(BRPeerContext *ctx, BRPeerRequestSet *s, UInt256 hash)
+{
+    REQUEST_LOCK(ctx);
+    int held = BRSetContains(s->entries, &hash);
+    REQUEST_UNLOCK(ctx);
+    return held;
+}
+
+static int _BRPeerTakeRequested(BRPeerContext *ctx, BRPeerRequestSet *s, UInt256 hash)
+{
+    REQUEST_LOCK(ctx);
+    int held = _BRPeerRequestTakeLocked(s, hash);
+    REQUEST_UNLOCK(ctx);
+    return held;
+}
+
+static size_t _BRPeerRequestSetCount(BRPeerContext *ctx, BRPeerRequestSet *s)
+{
+    REQUEST_LOCK(ctx);
+    size_t n = BRSetCount(s->entries);
+    REQUEST_UNLOCK(ctx);
+    return n;
+}
+
+// Is `hash` one of the transactions the merkleblock currently being collected proved? Read on this
+// peer's own thread only (currentBlock and currentBlockTxHashes are never touched elsewhere).
+// No handler in this core sets currentBlock, so this is 0 in practice. It is only as strong as the
+// code that fills currentBlockTxHashes: a restored merkleblock handler must open a collection only
+// for a filtered block this peer was asked for (BRPeerSendGetdata does not record those items).
+static int _BRPeerCurrentBlockHasTx(const BRPeerContext *ctx, UInt256 hash)
+{
+    if (! ctx->currentBlock) return 0;
+
+    for (size_t i = array_count(ctx->currentBlockTxHashes); i > 0; i--) {
+        if (UInt256Eq(hash, ctx->currentBlockTxHashes[i - 1])) return 1;
+    }
+
+    return 0;
 }
 
 static void _BRPeerDidConnect(BRPeer *peer)
@@ -857,11 +1022,27 @@ static int _BRPeerAcceptTxMessage(BRPeer *peer, const uint8_t *msg, size_t msgLe
         peer_log(peer, "malformed tx message with length: %zu", msgLen);
         r = 0;
     }
+#ifdef BLOCK_DELIVERY_GATE_UNFIXED
+    // Comparison arm for block_delivery_gate_kat only; never defined in a production build. The
+    // earlier shape: any tx is taken once this peer was sent any getdata at all.
     else if (! ctx->sentFilter && ! ctx->sentGetdata) {
         peer_log(peer, "got tx message before loading filter");
         BRTransactionFree(tx);
         r = 0;
     }
+#else
+    // invariant: a transaction message is taken only as the answer to a request this wallet made of
+    // THIS peer (its hash is in requestedTxHashes; taking it closes the request), or as one of the
+    // transactions the merkleblock being collected proved. Anything else is released and ignored.
+    // The peer is kept (r stays 1): an honest peer's late or duplicate answer must not cost it the
+    // connection.
+    else if (! _BRPeerTakeRequested(ctx, &ctx->requestedTxHashes, tx->txHash) &&
+             ! _BRPeerCurrentBlockHasTx(ctx, tx->txHash)) {
+        peer_log(peer, "%s %s was not requested from this peer, ignoring", is_dandelion ? "dandeliontx" : "tx",
+                 log_u256_hex_encode(tx->txHash));
+        BRTransactionFree(tx);
+    }
+#endif
     else {
         txHash = tx->txHash;
         peer_log(peer, "got tx: %s", log_u256_hex_encode(txHash));
@@ -1137,7 +1318,17 @@ static int _BRPeerAcceptNotfoundMessage(BRPeer *peer, const uint8_t *msg, size_t
             
             off += 36;
         }
-        
+
+#ifndef BLOCK_DELIVERY_GATE_UNFIXED
+        // A notfound answers the request it names: close it, so a copy sent afterwards is not taken.
+        REQUEST_LOCK(ctx);
+        for (size_t i = 0; i < array_count(txHashes); i++) _BRPeerRequestTakeLocked(&ctx->requestedTxHashes, txHashes[i]);
+        for (size_t i = 0; i < array_count(blockHashes); i++) {
+            _BRPeerRequestTakeLocked(&ctx->requestedBlockHashes, blockHashes[i]);
+        }
+        REQUEST_UNLOCK(ctx);
+#endif
+
         if (ctx->notfound) {
             ctx->notfound(ctx->info, txHashes, array_count(txHashes), blockHashes, array_count(blockHashes));
         }
@@ -1294,19 +1485,69 @@ static int _BRPeerAcceptFeeFilterMessage(BRPeer *peer, const uint8_t *msg, size_
     return r;
 }
 
+// Walks the serialized transactions of a full "block" message that start at msg[off]. With
+// `deliver` 0 it parses each one, records its txid in txHashes[i] and releases it. With `deliver` 1 it
+// parses each one again and hands it to relayedTx (which takes ownership). Returns 1, or 0 on a
+// malformed message (the same bounds checks either way; the message bytes are not modified between
+// the two walks, so a message that passed the first walk passes the second).
+static int _BRPeerWalkBlockTxs(BRPeer *peer, const uint8_t *msg, size_t msgLen, size_t off, size_t txCount,
+                               UInt256 *txHashes, int deliver, size_t *delivered)
+{
+    BRPeerContext *ctx = (BRPeerContext *)peer;
+
+    for (size_t i = 0; i < txCount; i++) {
+        if (off >= msgLen) {
+            peer_log(peer, "malformed block: ran off end at tx %zu of %zu", i, txCount);
+            return 0;
+        }
+        BRTransaction *tx = BRTransactionParse(&msg[off], msgLen - off);
+        if (!tx) {
+            peer_log(peer, "malformed block: tx %zu failed to parse", i);
+            return 0;
+        }
+        size_t consumed = BRTransactionSerialize(tx, NULL, 0);
+        if (consumed == 0 || off + consumed > msgLen) {
+            peer_log(peer, "malformed block: tx %zu consumed %zu would overrun", i, consumed);
+            BRTransactionFree(tx);
+            return 0;
+        }
+        off += consumed;
+
+        if (txHashes) txHashes[i] = tx->txHash; // read before relayedTx takes ownership below
+
+        if (deliver && ctx->relayedTx) {
+            ctx->relayedTx(ctx->info, tx); // callback takes ownership
+            if (delivered) (*delivered)++;
+        }
+        else {
+            BRTransactionFree(tx);
+        }
+    }
+
+    return 1;
+}
+
 // Full-block message handler. The 80-byte block header is followed by a
-// CompactSize tx count, then serialized txs. Each tx is dispatched via the
-// existing relayedTx callback so the wallet's tx-registration path handles
-// it the same way it would a standalone "tx" message.
+// CompactSize tx count, then serialized txs.
 //
-// BIP 158 path: we ask for a full block (inv_block) after a cfilter match,
-// then this handler walks the txs to find the ones touching our wallet.
-// Chain extension is handled by the regular "headers"/"merkleblock" path
-// independent of this handler, so we deliberately do not call relayedBlock
-// from here. Instead, once all txs are parsed and handed to relayedTx, we
-// fire relayedBlockTxns with the block hash and the hashes of the txs we
-// just delivered, so the manager can confirm them into the block (whose
-// header/height it tracks separately via the headers path) once known.
+// BIP 158 path: we ask for a full block (inv_block, BRPeerSendGetdataBlocks) after a cfilter match,
+// then this handler walks the txs to find the ones touching our wallet. Chain extension is handled by
+// the regular "headers" path independent of this handler, so we deliberately do not call relayedBlock
+// from here.
+//
+// invariant: nothing from a block delivery reaches the wallet unless BOTH hold:
+//   1. this peer was asked for exactly this block (its hash is in requestedBlockHashes), and
+//   2. the transactions delivered hash to the merkle root committed by the block's own header
+//      (msg[36..68], inside the same 80 bytes blockHash is the double-SHA256 of). Because the hash
+//      was one this wallet chose to ask for, the header bytes, and with them that root, are fixed;
+//      matching it proves the delivered list is the block's actual, complete tx list.
+// Only then is each tx handed to relayedTx and relayedBlockTxns fired with the block hash, the
+// committed root and the txids, so the manager can confirm them into the block. A block that fails
+// either check is released and ignored (return 1: an honest peer is never disconnected for it), and
+// a block that passes closes its request, so a second copy is ignored too.
+//
+// The txs are walked twice (hash, check, then parse again to deliver) rather than held in a buffer,
+// so the peak memory stays one parsed tx, as it was before the check existed.
 static int _BRPeerAcceptBlockMessage(BRPeer *peer, const uint8_t *msg, size_t msgLen)
 {
     BRPeerContext *ctx = (BRPeerContext *)peer;
@@ -1341,6 +1582,14 @@ static int _BRPeerAcceptBlockMessage(BRPeer *peer, const uint8_t *msg, size_t ms
 
     peer_log(peer, "got block with %zu tx(s), %zu bytes", txCount, msgLen);
 
+#ifndef BLOCK_DELIVERY_GATE_UNFIXED
+    // 1. Asked for? Checked first, so a block nobody asked this peer for is not even parsed.
+    if (! _BRPeerWasRequested(ctx, &ctx->requestedBlockHashes, blockHash)) {
+        peer_log(peer, "block %s was not requested from this peer, ignoring", log_u256_hex_encode(blockHash));
+        return 1;
+    }
+#endif
+
     UInt256 *txHashes = NULL;
     if (txCount > 0) {
         txHashes = calloc(txCount, sizeof(UInt256));
@@ -1350,46 +1599,47 @@ static int _BRPeerAcceptBlockMessage(BRPeer *peer, const uint8_t *msg, size_t ms
         }
     }
 
+    // First walk: bounds-check every tx and collect its txid. Nothing is handed on.
+    if (! _BRPeerWalkBlockTxs(peer, msg, msgLen, off, txCount, txHashes, 0, NULL)) {
+        free(txHashes);
+        return 0;
+    }
+
+#ifndef BLOCK_DELIVERY_GATE_UNFIXED
+    // 2. Does the delivered list hash to the header's committed root? BRMerkleRootFromTxHashes
+    // refuses an empty list and a duplicate-subtree mutation, so either counts as a mismatch.
+    UInt256 root = UINT256_ZERO;
+
+    if (! BRMerkleRootFromTxHashes(&root, txHashes, txCount) || ! UInt256Eq(root, UInt256Get(&msg[36]))) {
+        peer_log(peer, "block %s tx list does not hash to its header's merkle root, ignoring",
+                 log_u256_hex_encode(blockHash));
+        free(txHashes);
+        return 1; // the request stays open: the honest block may still arrive
+    }
+
+    // Both hold: close the request. If it is gone (a notfound or an eviction ran in between), the
+    // block is no longer an answer to an open request and is ignored like any other.
+    if (! _BRPeerTakeRequested(ctx, &ctx->requestedBlockHashes, blockHash)) {
+        peer_log(peer, "block %s was not requested from this peer, ignoring", log_u256_hex_encode(blockHash));
+        free(txHashes);
+        return 1;
+    }
+#endif
+
+    // Second walk: hand each tx on.
     size_t delivered = 0;
-    for (size_t i = 0; i < txCount; i++) {
-        if (off >= msgLen) {
-            peer_log(peer, "malformed block: ran off end at tx %zu of %zu", i, txCount);
-            free(txHashes);
-            return 0;
-        }
-        BRTransaction *tx = BRTransactionParse(&msg[off], msgLen - off);
-        if (!tx) {
-            peer_log(peer, "malformed block: tx %zu failed to parse", i);
-            free(txHashes);
-            return 0;
-        }
-        size_t consumed = BRTransactionSerialize(tx, NULL, 0);
-        if (consumed == 0 || off + consumed > msgLen) {
-            peer_log(peer, "malformed block: tx %zu consumed %zu would overrun", i, consumed);
-            BRTransactionFree(tx);
-            free(txHashes);
-            return 0;
-        }
-        off += consumed;
 
-        txHashes[i] = tx->txHash; // read before relayedTx takes ownership below
-
-        if (ctx->relayedTx) {
-            ctx->relayedTx(ctx->info, tx); // callback takes ownership
-            delivered++;
-        }
-        else {
-            BRTransactionFree(tx);
-        }
+    if (! _BRPeerWalkBlockTxs(peer, msg, msgLen, off, txCount, NULL, 1, &delivered)) {
+        free(txHashes);
+        return 0;
     }
 
     if (ctx->relayedBlockTxns && txCount > 0) {
         // The merkle root COMMITTED BY THIS MESSAGE'S OWN HEADER, at msg[36..68] — inside the
         // same 80 bytes blockHash is the double-SHA256 of, so a peer cannot touch it without
-        // changing blockHash. Handing it up is what lets the manager prove the tx list below is
-        // the block's actual, complete list once it has resolved blockHash in its trusted header
-        // set: nothing in this function checks the tx list against anything, and the wallet's own
-        // resident header may be a hardcoded checkpoint stub carrying no merkleRoot of its own.
+        // changing blockHash. The manager re-checks the tx list against it once it has resolved
+        // blockHash in its trusted header set (its resident header may be a hardcoded checkpoint
+        // stub carrying no merkleRoot of its own).
         ctx->relayedBlockTxns(ctx->info, blockHash, UInt256Get(&msg[36]), txHashes, txCount);
     }
     free(txHashes);
@@ -2028,6 +2278,9 @@ BRPeer *BRPeerNew(uint32_t magicNumber)
     array_new(ctx->knownTxHashes, 10);
     ctx->knownTxHashSet = BRSetNew(BRTransactionHash, BRTransactionEq, 10);
     pthread_mutex_init(&ctx->txHashLock, NULL);
+    _BRPeerRequestSetInit(&ctx->requestedTxHashes);
+    _BRPeerRequestSetInit(&ctx->requestedBlockHashes);
+    pthread_mutex_init(&ctx->requestLock, NULL);
     array_new(ctx->pongInfo, 10);
     array_new(ctx->pongCallback, 10);
     pthread_mutex_init(&ctx->pongLock, NULL);
@@ -2680,6 +2933,11 @@ void BRPeerSendGetdata(BRPeer *peer, const UInt256 txHashes[], size_t txCount, c
             off += sizeof(UInt256);
         }
 
+        // Record what this peer is now asked for BEFORE the send, so the answer (read on the peer's
+        // own thread) can never arrive ahead of its record. Only the tx items: the block items here
+        // ask for a filtered block, which is answered by a "merkleblock", never by a full "block";
+        // a full block is taken only against BRPeerSendGetdataBlocks' record.
+        _BRPeerNoteRequested((BRPeerContext *)peer, &((BRPeerContext *)peer)->requestedTxHashes, txHashes, txCount);
         ((BRPeerContext *)peer)->sentGetdata = 1;
         BRPeerSendMessage(peer, msg, off, MSG_GETDATA);
         if (msg != stackbuf) free(msg);
@@ -2715,6 +2973,9 @@ void BRPeerSendGetdataBlocks(BRPeer *peer, const UInt256 blockHashes[], size_t b
         off += sizeof(UInt256);
     }
 
+    // Record the requested blocks BEFORE the send (see BRPeerSendGetdata): a full "block" message
+    // is taken only when its hash is in this peer's requestedBlockHashes.
+    _BRPeerNoteRequested((BRPeerContext *)peer, &((BRPeerContext *)peer)->requestedBlockHashes, blockHashes, blockCount);
     ((BRPeerContext *)peer)->sentGetdata = 1;
     BRPeerSendMessage(peer, msg, off, MSG_GETDATA);
     if (msg != stackbuf) free(msg);
@@ -2843,6 +3104,9 @@ void BRPeerFree(BRPeer *peer)
     if (ctx->knownTxHashes) array_free(ctx->knownTxHashes);
     if (ctx->knownTxHashSet) BRSetFree(ctx->knownTxHashSet);
     pthread_mutex_destroy(&ctx->txHashLock);
+    _BRPeerRequestSetFree(&ctx->requestedTxHashes);
+    _BRPeerRequestSetFree(&ctx->requestedBlockHashes);
+    pthread_mutex_destroy(&ctx->requestLock);
     // Reached from _peerDisconnected on the peer thread itself, AFTER the teardown drain
     // above and after the peer has been removed from manager->connectedPeers under
     // manager->lock -- so no other thread can still be inside a push/pop here.

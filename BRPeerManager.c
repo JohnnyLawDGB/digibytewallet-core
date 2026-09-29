@@ -3874,6 +3874,8 @@ static BRMerkleBlock *_peerRelayedBlockOnce(void *info, BRMerkleBlock *block)
 // _BRPeerAcceptBlockMessage). Chain extension for the block itself is handled entirely by the
 // regular headers/merkleblock path (_peerRelayedBlock above); this handler only fires once that
 // block's header is already known, so it can attach a confirmation height/timestamp to the txs.
+// BRPeer.c hands a block on only when that peer was asked for it and its txs hash to its header's
+// root; the confirmation below is still made only inside the solicited + merkle-verified branch.
 static void _peerRelayedBlockTxns(void *info, UInt256 blockHash, UInt256 merkleRoot,
                                   const UInt256 txHashes[], size_t txCount)
 {
@@ -3913,8 +3915,9 @@ static void _peerRelayedBlockTxns(void *info, UInt256 blockHash, UInt256 merkleR
     // is on the main chain. BRPeerManagerNewEx seeds every hardcoded checkpoint as a
     // stub into manager->blocks and never sets prevBlock, so each stub terminates the
     // walk at the zero hash while sitting millions of blocks below the retained
-    // window — and this handler is not request-gated, so any peer we dial can name
-    // one in an unsolicited "block" message. BRMerkleBlockEq (BRMerkleBlock.h) derefs
+    // window. BRPeer.c hands a block up only when this wallet asked that peer for it
+    // and its txids hash to its header's root, but this check must not rely on that:
+    // a requested hash can still name a stub. BRMerkleBlockEq (BRMerkleBlock.h) derefs
     // BOTH arguments, so reaching it with a NULL b2 is a remote NULL-deref crash.
     // Unprovable-main-chain is exactly as unconfirmable as on-a-fork, so both take
     // the same bail-out.
@@ -3933,10 +3936,16 @@ static void _peerRelayedBlockTxns(void *info, UInt256 blockHash, UInt256 merkleR
         if (BRWalletTransactionForHash(manager->wallet, txHashes[i])) walletHashes[walletCount++] = txHashes[i];
     }
 
+#if defined(BLOCK_DELIVERY_GATE_UNFIXED) || defined(CF_MATCH_MARK_ON_REQUEST_UNFIXED) || \
+    defined(CF_BLOCK_COMPLETION_UNGATED_UNFIXED)
+    // Comparison arms only (block_delivery_gate_kat, and the completion-gate arms of cf_confirm_kat,
+    // cf_scan_ledger_drive_kat and cf_block_completion_gate_kat); never defined in a production build. The earlier shape: the wallet's transactions are confirmed into any resident
+    // main-chain block named by a delivery, before (or without) the request and merkle checks below.
     if (walletCount > 0) {
         _BRPeerManagerUpdateTx(manager, walletHashes, walletCount, b->height, b->timestamp);
         confirmed = 1;
     }
+#endif
 
 #ifndef CF_MATCH_MARK_ON_REQUEST_UNFIXED
     // Every transaction in the full block was parsed and handed through relayedTx
@@ -3951,17 +3960,19 @@ static void _peerRelayedBlockTxns(void *info, UInt256 blockHash, UInt256 merkleR
     _BRPeerManagerPersistCFLedgerLocked(manager);
 #else
     // C1 (fund safety). Two things must hold before this delivery is allowed to retire a
-    // scan height, because BRPeer.c's `block` path proves NEITHER on its own:
+    // scan height (or confirm anything). BRPeer.c:_BRPeerAcceptBlockMessage now delivers
+    // only a block this wallet asked that peer for whose txids hash to the header's root;
+    // both are checked again here, against the manager's own solicitation table, so the
+    // manager never depends on the peer layer for either:
     //
-    //   1. WE asked for it. BRPeer.c:_BRPeerAcceptBlockMessage is dispatched with no
-    //      request-gating at all, and the callback is wired on every connected peer — so
-    //      without this, any peer can erase a hole another peer was asked to fill (and
+    //   1. WE asked for it. The callback is wired on every connected peer — so without
+    //      this, a peer could erase a hole another peer was asked to fill (and
     //      RecordRequested puts an ENTIRE requested range into `outstanding` at getcfilters
     //      time, so a peer that withholds its cfilters and sprays blocks could drive
     //      scannedThrough to requestedThrough with ZERO filters ever evaluated).
     //
-    //   2. The delivered tx list is the block's ACTUAL tx list. Nothing upstream checks it
-    //      against the header's committed merkle root, so the peer serving the height can
+    //   2. The delivered tx list is the block's ACTUAL tx list. Were the peer-layer root
+    //      check ever bypassed or removed, the peer serving the height could
     //      answer our own getdata with the real 80-byte header (correct blockHash, resolves
     //      here, passes the main-chain walk) and a tx list with the wallet's payment removed.
     //      Recomputing the root over the delivered txids is exactly what catches that.
@@ -4005,6 +4016,17 @@ static void _peerRelayedBlockTxns(void *info, UInt256 blockHash, UInt256 merkleR
         else {
             manager->cfSolicitedBlocks[solicited].used = 0; // consume ONLY on success
             manager->cfSolicitedBlocks[solicited].seq  = 0;
+#ifndef BLOCK_DELIVERY_GATE_UNFIXED
+            // invariant: a block delivery confirms the wallet's transactions only here, once this
+            // wallet solicited the block and its delivered list hashes to the root its header
+            // commits to. (BRPeer.c already refuses to hand on anything else; this holds on its own.)
+            // Confirmed BEFORE the height is marked evaluated, so a stop in between leaves the height
+            // to be scanned again rather than evaluated with its receive unconfirmed.
+            if (walletCount > 0) {
+                _BRPeerManagerUpdateTx(manager, walletHashes, walletCount, b->height, b->timestamp);
+                confirmed = 1;
+            }
+#endif
             BRCFScanLedgerMarkEvaluated(&manager->cfLedger, b->height);
             _BRPeerManagerPersistCFLedgerLocked(manager);
         }

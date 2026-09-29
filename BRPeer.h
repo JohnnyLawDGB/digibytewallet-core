@@ -150,12 +150,17 @@ BRPeer *BRPeerNew(uint32_t magicNumber);
 // void connected(void *) - called when peer handshake completes successfully
 // void disconnected(void *, int) - called when peer connection is closed, error is an errno.h code
 // void relayedPeers(void *, const BRPeer[], size_t) - called when an "addr" message is received from peer
-// void relayedTx(void *, BRTransaction *) - called when a "tx" message is received from peer
+// void relayedTx(void *, BRTransaction *) - called with a transaction this peer delivered, and only when this wallet
+//     asked THIS peer for it: a "tx"/"dandeliontx" whose hash was requested with BRPeerSendGetdata (or that the
+//     merkleblock being collected proved), or a transaction of a full "block" this peer was asked for with
+//     BRPeerSendGetdataBlocks whose transactions hash to the merkle root its own header commits to. Anything else
+//     a peer sends is released and ignored without reaching this callback, and the peer is kept.
 // void hasTx(void *, UInt256 txHash) - called when an "inv" message with an already-known tx hash is received from peer
 // void rejectedTx(void *, UInt256 txHash, uint8_t) - called when a "reject" message is received from peer
 // void relayedBlock(void *, BRMerkleBlock *) - called when a "merkleblock" or "headers" message is received from peer
 // void relayedBlockTxns(void *, UInt256 blockHash, UInt256 merkleRoot, const UInt256[], size_t) - called after a
-//     full "block" message's txs are all delivered via relayedTx, with the block hash, the merkle root COMMITTED BY
+//     full "block" message's txs are all delivered via relayedTx -- which happens only for a block this peer was
+//     asked for whose txids already hash to merkleRoot (see relayedTx) -- with the block hash, the merkle root COMMITTED BY
 //     THE DELIVERED HEADER, and the hashes of ALL the block's txs in order (BIP158 CF confirmation path: lets the
 //     manager confirm those txs into the block once its header/height is known).
 //     merkleRoot is msg[36..68] of the same 80 bytes blockHash is the double-SHA256 of, so it cannot be altered
@@ -377,6 +382,10 @@ void BRPeerSendMempool(BRPeer *peer, const UInt256 knownTxHashes[], size_t known
 void BRPeerSendGetheaders(BRPeer *peer, const UInt256 locators[], size_t locatorsCount, UInt256 hashStop);
 void BRPeerSendGetblocks(BRPeer *peer, const UInt256 locators[], size_t locatorsCount, UInt256 hashStop);
 void BRPeerSendInv(BRPeer *peer, const UInt256 txHashes[], size_t txCount);
+// Asks for txs (inv_tx) and filtered blocks (inv_filtered_block). The tx hashes are recorded, BEFORE the send, as
+// requested of this peer: a "tx"/"dandeliontx" is taken only against that record, and taking it (or a notfound for
+// it) closes the entry. The record is bounded (the most one getdata may carry), oldest dropped first. The filtered
+// block items are not recorded: they are answered by a "merkleblock", never by a full "block".
 void BRPeerSendGetdata(BRPeer *peer, const UInt256 txHashes[], size_t txCount, const UInt256 blockHashes[],
                        size_t blockCount);
 void BRPeerSendGetaddr(BRPeer *peer);
@@ -401,6 +410,9 @@ void BRPeerSendGetCFCheckpt(BRPeer *peer, uint8_t filterType, UInt256 stopHash);
 // BIP 158 full-block fetch. getdata with inv_block (vs the inv_filtered_block
 // used by BRPeerSendGetdata, which only makes sense once a bloom filter is
 // loaded). Triggered when a cfilter matches one of the wallet's elements.
+// The block hashes are recorded, BEFORE the send, as requested of this peer. A full "block" message is taken only
+// when its hash is in that record AND its transactions hash to the merkle root its own header commits to; taking it
+// (or a notfound for it) closes the entry, so a second copy is ignored. Same bound as BRPeerSendGetdata's record.
 void BRPeerSendGetdataBlocks(BRPeer *peer, const UInt256 blockHashes[], size_t blockCount);
 
 // Subscribe to BIP 157 reply messages. Callbacks are optional (pass NULL to

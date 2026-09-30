@@ -2,7 +2,7 @@
 // basic-filter-header checkpoints from an operator node (blockfilterindex=1).
 // Headers stored in the wallet's INTERNAL byte order (= byte-reversed
 // getblockfilter RPC hex; verified vs BIP157 dSHA256(filterHash||prevHeader)).
-// 484 checkpoints, 50000-block spacing.
+// 485 checkpoints, 50000-block spacing.
 #ifndef BRCompactFilterCheckpoints_h
 #define BRCompactFilterCheckpoints_h
 
@@ -495,6 +495,7 @@ static const BRCFCheckpoint BRMainNetCFCheckpoints[] = {
     { 24100000, uint256("8dfdb31a24c9c8fce9802adf5e1b328899ee1497ec3f2c09c2b3c75e9e199e98") },
     { 24150000, uint256("5e06d3c33aeed6f6b1cbeb6323fb0b6c9cefb185a2717e41f49cdababb10d061") },
     { 24200000, uint256("ba0c5af02e523137dabdfa4e2e9fa8ccd36e98a3613f44f80ef109bea00667e2") },
+    { 24250000, uint256("7a4cd233df80e3ee265bc76a46ffcdaf453d8f5bf6369e3657d26930abd5f5e6") },
 };
 
 static const size_t BRMainNetCFCheckpointsCount = sizeof(BRMainNetCFCheckpoints)/sizeof(BRMainNetCFCheckpoints[0]);

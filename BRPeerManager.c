@@ -1411,6 +1411,15 @@ static void _BRPeerManagerFindPeers(BRPeerManager *manager)
         manager->peers[0].services = services;
         manager->peers[0].timestamp = now;
     }
+#ifndef PROXY_DISCOVERY_LOOKUP_UNFIXED
+    else if (BRPeerHasSocksProxy()) {
+        // Peer connections go through a SOCKS proxy (Tor), so discovery makes no local name
+        // lookup: resolving the seed names would go to the device's resolver beside the proxy.
+        // The peers already held (the seeder list fetched through the proxy, the compiled-in
+        // priority peers, saved peers) are left as they are, ordered as below.
+        qsort(manager->peers, array_count(manager->peers), sizeof(*manager->peers), _peerTimestampCompare);
+    }
+#endif
     else {
         // Resolve EVERY DNS seed on a detached worker thread, index 0 included. Seed[0] used to
         // be resolved SYNCHRONOUSLY here (getaddrinfo) while holding manager->lock, so a slow or

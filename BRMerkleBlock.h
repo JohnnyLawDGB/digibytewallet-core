@@ -59,6 +59,66 @@ extern "C" {
 #define DGB_HEADER_POW_CHECK 0
 #endif
 
+// Compile-time level for the header difficulty-target check (_BRPeerManagerVerifyBlock): a header at a height the
+// reference client's MultiShield V4 rule governs must carry exactly the target (compact form) that rule computes
+// from the header's resident ancestors (BRDifficultyV4Target):
+//   0  not computed
+//   1  computed; a header whose target differs is logged ("diff-mismatch") and counted, the verdict is unchanged
+//   2  a header whose target differs is rejected; the peer is treated as misbehaving
+// At levels 1 and 2 a header whose ancestors are not resident far enough back to compute the target is not judged:
+// it is logged ("diff-skip") and counted, and is never rejected for that.
+// The app's native build sets the shipped level (native/build.gradle.kts); host KATs set it per arm.
+#ifndef DGB_HEADER_DIFF_CHECK
+#define DGB_HEADER_DIFF_CHECK 0
+#endif
+
+#define BR_DIFF_V4_NUM_ALGOS   5    // reference client NUM_ALGOS: the algorithms the averaging window spans
+#define BR_DIFF_V4_MEDIAN_SPAN 11   // reference client CBlockIndex::nMedianTimeSpan (median time past)
+
+// The reference client's consensus parameters for MultiShield V4, per network (BRChainParams carries one).
+typedef struct {
+    uint32_t workComputationHeight;    // V4 governs a header whose PREVIOUS block's height is >= this
+                                       // (reference client workComputationChangeTarget)
+    uint32_t averagingInterval;        // nAveragingInterval: the window is BR_DIFF_V4_NUM_ALGOS*this blocks
+    int64_t averagingTargetTimespan;   // nAveragingTargetTimespanV4 (seconds)
+    int64_t minActualTimespan;         // nMinActualTimespanV4
+    int64_t maxActualTimespan;         // nMaxActualTimespanV4
+    uint32_t localTargetAdjustment;    // nLocalTargetAdjustment (percent per block of distance)
+    uint32_t powLimitShift;            // powLimit = (2^256 - 1) >> powLimitShift
+    int allowMinDifficultyBlocks;      // fPowAllowMinDifficultyBlocks
+    int64_t targetSpacing;             // nTargetSpacing (read only when allowMinDifficultyBlocks is set)
+} BRDifficultyV4Params;
+
+// the reference client's arith_uint256::SetCompact: the 256-bit target (little-endian, u8[31] most significant) a
+// compact value encodes; *negative and *tooLarge (either may be NULL) receive its two flags: the sign bit set on a
+// nonzero mantissa, and a value wider than 256 bits
+UInt256 BRTargetFromCompact(uint32_t compact, int *negative, int *tooLarge);
+
+// the reference client's arith_uint256::GetCompact(negative)
+uint32_t BRTargetToCompact(UInt256 target, int negative);
+
+// the compact form of the network's powLimit
+uint32_t BRDifficultyV4PowLimitCompact(const BRDifficultyV4Params *params);
+
+// The reference client's GetNextWorkRequiredV4 with its inputs gathered by the caller from the header's ancestors:
+//   lastTimes[BR_DIFF_V4_MEDIAN_SPAN]   timestamps of the header's parent (pindexLast) and its 10 predecessors
+//   firstTimes[BR_DIFF_V4_MEDIAN_SPAN]  timestamps of pindexFirst (the parent's ancestor BR_DIFF_V4_NUM_ALGOS *
+//                                       averagingInterval blocks back) and its 10 predecessors
+//   prevAlgoTarget                      target of the last block of the header's own algorithm at or below the parent
+//   prevAlgoDistance                    the parent's height minus that block's height
+// returns the target, compact form, the header must carry
+uint32_t BRDifficultyV4Target(const BRDifficultyV4Params *params, const uint32_t lastTimes[],
+                              const uint32_t firstTimes[], uint32_t prevAlgoTarget, uint32_t prevAlgoDistance);
+
+// Difficulty-target verdicts counted by the manager when DGB_HEADER_DIFF_CHECK >= 1 (always 0 at level 0).
+// BR_DIFF_MATCH and BR_DIFF_MISMATCH are judged headers; BR_DIFF_SKIP is a header whose history is not resident.
+#define BR_DIFF_MATCH    0
+#define BR_DIFF_SKIP     1
+#define BR_DIFF_MISMATCH 2
+void BRMerkleBlockDiffCountAdd(int verdict);
+uint32_t BRMerkleBlockDiffCount(int verdict);        // process-wide total
+uint32_t BRMerkleBlockDiffThreadCount(int verdict);  // the calling thread's total (a headers batch reads the delta)
+
 typedef struct {
     UInt256 blockHash;
     UInt256 powHash;

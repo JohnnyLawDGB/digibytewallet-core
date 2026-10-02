@@ -54,6 +54,10 @@ typedef struct {
                                     // any of the six is accepted (Core enforced nothing there: min(AlgoLockHeight,
                                     // nGroestlDeactivationHeight))
     uint32_t odoShapechangeInterval; // Odocrypt key interval in seconds (Core nOdoShapechangeInterval)
+
+    // MultiShield V4 difficulty-target parameters (BRDifficultyV4Target), copied per network from the reference
+    // client's kernel/chainparams.cpp
+    BRDifficultyV4Params diffV4;
 } BRChainParams;
 
 // true if a header at block height `height` may name proof-of-work algorithm `algo` (a value from BRMerkleBlockAlgo)
@@ -662,7 +666,12 @@ static const BRChainParams BRMainNetParams = {
     145000,     // multiAlgoHeight: 145,000 is the last scrypt-only height; 145,001 is the first sha256d block
     9112320,    // odoHeight
     23808000,   // algoLockHeight: groestl exists on the chain through 23,807,995 and never at or after 23,808,000
-    864000      // odoShapechangeInterval
+    864000,     // odoShapechangeInterval
+    // reference client kernel/chainparams.cpp (mainnet): workComputationChangeTarget 1430000, nAveragingInterval 10,
+    // multiAlgoTargetSpacingV4 15*5 -> nAveragingTargetTimespanV4 750, nMaxAdjustUpV4 8 -> nMinActualTimespanV4
+    // 750*92/100, nMaxAdjustDownV4 16 -> nMaxActualTimespanV4 750*116/100, nLocalTargetAdjustment 4,
+    // powLimit ~0 >> 20, fPowAllowMinDifficultyBlocks false, nTargetSpacing 60
+    { 1430000, 10, 750, 750*(100 - 8)/100, 750*(100 + 16)/100, 4, 20, 0, 60 }
 };
 
 static const BRChainParams BRTestNetParams = {
@@ -680,7 +689,13 @@ static const BRChainParams BRTestNetParams = {
     0,          // multiAlgoHeight: only the genesis block is scrypt-only
     501,        // odoHeight
     0,          // algoLockHeight: no grandfathered band
-    86400       // odoShapechangeInterval
+    86400,      // odoShapechangeInterval
+    // reference client kernel/chainparams.cpp (testnet26): workComputationChangeTarget 400, nAveragingInterval 10,
+    // nAveragingTargetTimespanV4 750, nMinActualTimespanV4 750*(100 - nMaxAdjustUpV4 8)/100, and
+    // nMaxActualTimespanV4 750*(100 + nMaxAdjustUpV4 8)/100 -- testnet's maximum is built from nMaxAdjustUpV4, not
+    // nMaxAdjustDownV4 as on mainnet -- nLocalTargetAdjustment 4, powLimit ~0 >> 20, fPowAllowMinDifficultyBlocks
+    // false, nTargetSpacing 60
+    { 400, 10, 750, 750*(100 - 8)/100, 750*(100 + 8)/100, 4, 20, 0, 60 }
 };
 
 #endif // BRChainParams_h

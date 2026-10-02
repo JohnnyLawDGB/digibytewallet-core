@@ -3090,6 +3090,90 @@ static void _BRPeerManagerClearMemory(BRPeerManager* manager) {
                  manager->lastBlock ? manager->lastBlock->height : 0);
 }
 
+#if DGB_HEADER_DIFF_CHECK >= 1
+// The walk to the last block of the header's own algorithm may go this many blocks below the averaging window before
+// the history counts as not resident; each step is one lookup. On mainnet every algorithm appears far more often (no
+// gap above 30 blocks in the fixture ranges). An algorithm dormant for longer (testnet26 has gaps of thousands) is
+// one whose next target the reference client has long since eased to powLimit or near it.
+#define DIFF_V4_ALGO_WALK_MAX 1024
+
+// a resident block that carries no header fields (a checkpoint stub: hash, height, time and target only) ends the
+// resident history; so does a missing parent
+static const BRMerkleBlock *_BRPeerManagerResidentParentLocked(BRPeerManager *manager, const BRMerkleBlock *b)
+{
+    if (! b || UInt256IsZero(b->prevBlock)) return NULL;
+    b = BRSetGet(manager->blocks, &b->prevBlock);
+    return (b && ! UInt256IsZero(b->prevBlock)) ? b : NULL;
+}
+
+// the algorithm the reference client's CBlockIndex::GetAlgo gives a resident block: an unknown one reads as scrypt
+static int _BRPeerManagerResidentAlgo(const BRMerkleBlock *b)
+{
+    int algo = BRMerkleBlockAlgo(b);
+
+    return (algo == BLOCK_ALGO_UNKNOWN) ? BLOCK_VERSION_SCRYPT : algo;
+}
+
+// The target the reference client's GetNextWorkRequired gives `block` on top of `prev` at a height MultiShield V4
+// governs, computed from the resident ancestors (manager->blocks, walked by prevBlock from `prev`).
+// Returns 1 and writes *expected, or 0 if the ancestors the computation reads are not resident: the averaging window
+// with both median-time-past spans (NUM_ALGOS*averagingInterval + BR_DIFF_V4_MEDIAN_SPAN blocks ending at `prev`),
+// and the last block of the header's algorithm within DIFF_V4_ALGO_WALK_MAX blocks below the window. A partial
+// resident chain cannot tell "absent in the reference client" (where it falls back to the algorithm's initial
+// target) from "not resident here", so neither is judged.
+static int _BRPeerManagerDiffV4ExpectedLocked(BRPeerManager *manager, const BRMerkleBlock *block,
+                                              const BRMerkleBlock *prev, uint32_t *expected)
+{
+    const BRDifficultyV4Params *p = &manager->params->diffV4;
+    const uint32_t window = BR_DIFF_V4_NUM_ALGOS*p->averagingInterval;
+    uint32_t lastTimes[BR_DIFF_V4_MEDIAN_SPAN], firstTimes[BR_DIFF_V4_MEDIAN_SPAN];
+    int algo = BRMerkleBlockAlgo(block);
+
+    // testnet-style rule: a block more than two target spacings after its parent may carry the minimum difficulty
+    if (p->allowMinDifficultyBlocks && (int64_t)block->timestamp > (int64_t)prev->timestamp + 2*p->targetSpacing) {
+        *expected = BRDifficultyV4PowLimitCompact(p);
+        return 1;
+    }
+
+    // a header naming no algorithm: the reference client finds no block of it and returns powLimit, whatever the
+    // history (its initial target for an algorithm it has no entry for)
+    if (algo == BLOCK_ALGO_UNKNOWN) {
+        *expected = BRDifficultyV4PowLimitCompact(p);
+        return 1;
+    }
+
+    const BRMerkleBlock *b = (UInt256IsZero(prev->prevBlock)) ? NULL : prev, *prevAlgo = NULL;
+    uint32_t distance = 0, prevAlgoDistance = 0;
+
+    // one walk down from the parent: the window's timestamps, and the first block of the header's algorithm
+    for (distance = 0; b && distance < window + BR_DIFF_V4_MEDIAN_SPAN + DIFF_V4_ALGO_WALK_MAX; distance++) {
+        if (distance < BR_DIFF_V4_MEDIAN_SPAN) lastTimes[distance] = b->timestamp;
+        if (distance >= window && distance < window + BR_DIFF_V4_MEDIAN_SPAN)
+            firstTimes[distance - window] = b->timestamp;
+
+        if (! prevAlgo && _BRPeerManagerResidentAlgo(b) == algo) {
+            if (! p->allowMinDifficultyBlocks) prevAlgo = b;
+            else {
+                // the reference client skips a minimum-difficulty block of the algorithm when the rule above is on
+                const BRMerkleBlock *parent = _BRPeerManagerResidentParentLocked(manager, b);
+
+                if (! parent) break;   // cannot tell whether it is one
+                if ((int64_t)b->timestamp <= (int64_t)parent->timestamp + 2*p->targetSpacing) prevAlgo = b;
+            }
+
+            if (prevAlgo) prevAlgoDistance = distance;
+        }
+
+        if (prevAlgo && distance + 1 >= window + BR_DIFF_V4_MEDIAN_SPAN) break;   // everything read is in hand
+        b = _BRPeerManagerResidentParentLocked(manager, b);
+    }
+
+    if (! prevAlgo || ! b || distance + 1 < window + BR_DIFF_V4_MEDIAN_SPAN) return 0;
+    *expected = BRDifficultyV4Target(p, lastTimes, firstTimes, prevAlgo->target, prevAlgoDistance);
+    return 1;
+}
+#endif
+
 static int _BRPeerManagerVerifyBlock(BRPeerManager *manager, BRMerkleBlock *block, BRMerkleBlock *prev, BRPeer *peer)
 {
     uint32_t transitionTime = 0;
@@ -3121,6 +3205,31 @@ static int _BRPeerManagerVerifyBlock(BRPeerManager *manager, BRMerkleBlock *bloc
             r = 0;
 #endif
         }
+    }
+#endif
+
+#if DGB_HEADER_DIFF_CHECK >= 1
+    // verify the header carries exactly the target MultiShield V4 computes from its resident ancestors
+    // (block->height was stamped from prev; V4 governs from the parent's height up)
+    if (r && prev && prev->height != BLOCK_UNKNOWN_HEIGHT &&
+        prev->height >= manager->params->diffV4.workComputationHeight) {
+        uint32_t expected = 0;
+
+        if (! _BRPeerManagerDiffV4ExpectedLocked(manager, block, prev, &expected)) {
+            BRMerkleBlockDiffCountAdd(BR_DIFF_SKIP);
+            peer_log(peer, "diff-skip h=%" PRIu32 " algo=%s blockHash: %s (ancestors not resident)", block->height,
+                     BRMerkleBlockAlgoName(BRMerkleBlockAlgo(block)), u256hex(block->blockHash));
+        }
+        else if (block->target != expected) {
+            BRMerkleBlockDiffCountAdd(BR_DIFF_MISMATCH);
+            peer_log(peer, "diff-mismatch v=%08" PRIx32 " h=%" PRIu32 " algo=%s bits=%08" PRIx32 " expected=%08" PRIx32
+                     " blockHash: %s", block->version, block->height, BRMerkleBlockAlgoName(BRMerkleBlockAlgo(block)),
+                     block->target, expected, u256hex(block->blockHash));
+#if DGB_HEADER_DIFF_CHECK >= 2
+            r = 0;
+#endif
+        }
+        else BRMerkleBlockDiffCountAdd(BR_DIFF_MATCH);
     }
 #endif
 

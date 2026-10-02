@@ -777,7 +777,9 @@ void BRPeerManagerSetStartBlock(BRPeerManager* manager, BRMerkleBlock* start) {
     manager->startSyncFrom = start;
 }
 
-static void _BRPeerManagerPeerMisbehavin(BRPeerManager *manager, BRPeer *peer)
+// The misbehaving penalty, closing the peer with the given ledger tag (BR_DISC_TAG_MISBEHAVIN unless a more
+// specific rule applies, e.g. BR_DISC_TAG_HEADER_POW). The penalty itself does not depend on the tag.
+static void _BRPeerManagerPeerMisbehavinTagged(BRPeerManager *manager, BRPeer *peer, BRPeerDisconnectTag tag)
 {
     for (size_t i = array_count(manager->peers); i > 0; i--) {
         if (BRPeerEq(&manager->peers[i - 1], peer)) array_rm(manager->peers, i - 1);
@@ -788,7 +790,12 @@ static void _BRPeerManagerPeerMisbehavin(BRPeerManager *manager, BRPeer *peer)
         array_clear(manager->peers);
     }
 
-    BRPeerDisconnectTagged(peer, BR_DISC_TAG_MISBEHAVIN);
+    BRPeerDisconnectTagged(peer, tag);
+}
+
+static void _BRPeerManagerPeerMisbehavin(BRPeerManager *manager, BRPeer *peer)
+{
+    _BRPeerManagerPeerMisbehavinTagged(manager, peer, BR_DISC_TAG_MISBEHAVIN);
 }
 
 static void _BRPeerManagerSyncStopped(BRPeerManager *manager)
@@ -3516,9 +3523,15 @@ static BRMerkleBlock *_peerRelayedBlockOnce(void *info, BRMerkleBlock *block)
     }
     else if (! _BRPeerManagerVerifyBlock(manager, block, prev, peer)) { // block is invalid
         peer_log(peer, "relayed invalid block");
+        BRPeerDisconnectTag tag = BR_DISC_TAG_MISBEHAVIN;
+#if DGB_HEADER_POW_CHECK >= 2
+        // a header refused because its algorithm is not allowed at its height closes with its own tag
+        if (! BRChainParamsAlgoAllowed(manager->params, block->height, BRMerkleBlockAlgo(block)))
+            tag = BR_DISC_TAG_HEADER_POW;
+#endif
         BRMerkleBlockFree(block);
         block = NULL;
-        _BRPeerManagerPeerMisbehavin(manager, peer);
+        _BRPeerManagerPeerMisbehavinTagged(manager, peer, tag);
     }
     else if (UInt256Eq(block->prevBlock, manager->lastBlock->blockHash)) { // new block extends main chain
         if ((block->height % 500) == 0 || txCount > 0 || block->height >= BRPeerLastBlock(peer)) {

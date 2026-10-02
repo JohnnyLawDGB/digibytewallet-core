@@ -293,6 +293,9 @@ typedef enum {
     BR_DISC_TAG_UNUSABLE_PEER,  // capability reject at handshake (services / no SPV / no full blocks)
     BR_DISC_TAG_DOWNLOAD_SWAP,  // dropped to hand the download role to a better peer
     BR_DISC_TAG_CF_STALL,       // dropped by the cfheaders stall watchdog
+    BR_DISC_TAG_HEADER_POW,     // a header refused for its proof of work (DGB_HEADER_POW_CHECK >= 2): its hash does
+                                // not meet its own target (or the target is out of range), or its algorithm is
+                                // not allowed at its height
     BR_DISC_TAG_COUNT
 } BRPeerDisconnectTag;
 

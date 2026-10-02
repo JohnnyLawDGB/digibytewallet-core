@@ -1134,6 +1134,12 @@ static int _BRPeerAcceptHeadersMessage(BRPeer *peer, const uint8_t *msg, size_t 
                 
                 if (! BRMerkleBlockIsValid(block, (uint32_t)now)) {
                     peer_log(peer, "invalid block header: %s ", log_u256_hex_encode(block->blockHash));
+#if DGB_HEADER_POW_CHECK >= 2
+                    // At this level a header is refused for its proof of work as well as for its time. The
+                    // close that follows (verdict 0 -> EPROTO -> misbehaving) carries its own tag unless the
+                    // time check is what refused it.
+                    if (block->timestamp <= (uint32_t)now + BLOCK_MAX_TIME_DRIFT) _BRPeerNoteTag(ctx, BR_DISC_TAG_HEADER_POW);
+#endif
                     BRMerkleBlockFree(block);
                     r = 0;
                 }
@@ -2557,6 +2563,7 @@ const char *BRPeerDisconnectTagName(BRPeerDisconnectTag tag)
         case BR_DISC_TAG_UNUSABLE_PEER:return "unusable-peer";
         case BR_DISC_TAG_DOWNLOAD_SWAP:return "download-swap";
         case BR_DISC_TAG_CF_STALL:     return "cf-stall";
+        case BR_DISC_TAG_HEADER_POW:   return "header-pow";
         default:                       return "none";
     }
 }

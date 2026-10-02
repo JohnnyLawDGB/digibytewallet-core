@@ -160,10 +160,11 @@ size_t BRWalletAllAddrs(BRWallet *wallet, BRAddress addrs[], size_t addrsCount);
 
 // Where each address in a BRWalletCopyAllAddrs() snapshot came from. The snapshot is ordered
 // derived-chains-first, then the explicitly-watched tail, so entries [0, derived) are derived
-// and [derived, derived + watched) are watched pins.
+// and [derived, derived + watched) are watched pins. Every address appears once: a pin that is
+// also derived is emitted by its chain and not repeated in the tail.
 typedef struct {
     size_t derived;   // BIP84 primary + legacy m/0H + BIP86 taproot chains
-    size_t watched;   // explicitly-watched pins (BRWalletAddWatchedAddress)
+    size_t watched;   // explicitly-watched pins (BRWalletAddWatchedAddress) that are not derived
 } BRWalletAddrOrigins;
 
 // Snapshot every address the wallet knows, allocating the buffer internally under a SINGLE
@@ -182,8 +183,9 @@ BRAddress *BRWalletCopyAllAddrs(BRWallet *wallet, size_t *countOut, BRWalletAddr
 
 // How many addresses a BRWalletCopyAllAddrs() snapshot would contain, without building one.
 //
-// O(1): the sum of array_count over the derived chains and the watched pins — no allocation, no
-// address encoding, no crypto. It exists as a CHANGE DETECTOR for callers that cache anything
+// Cheap: the sum of array_count over the derived chains plus one set lookup per watched pin (the
+// pins that are also derived are not counted twice) — no allocation, no address encoding, no
+// crypto. It exists as a CHANGE DETECTOR for callers that cache anything
 // derived from the address set (see the compact-filter element cache in BRPeerManager), and it is
 // cheap enough to call on a per-message path.
 //

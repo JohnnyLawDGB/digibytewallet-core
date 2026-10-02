@@ -1153,11 +1153,32 @@ BRAddress BRWalletInternalChangeAddress(BRWallet *wallet)
     return addr;
 }
 
+// Is watched entry i emitted in the watched tail? CALLER MUST HOLD wallet->lock.
+//
+// Each address is listed once. BRWalletAddWatchedAddress first resolves a pin into the derived
+// set when it belongs to one of the wallet's chains, and a derived address is already emitted by
+// its chain, so the tail carries only pins that are NOT derived. allAddrs is exactly the union of
+// the derived chains enumerated below (legacy chains are populated only with the legacy key,
+// taproot chains only with the BIP86 key), so membership in it is "already emitted above"; a
+// skipped pin therefore loses no address and no filter element.
+static int _BRWalletWatchedTailEmitsLocked(BRWallet *wallet, size_t i)
+{
+#ifdef ADDR_SET_DISTINCT_UNFIXED
+    (void)wallet; (void)i;   // comparison arm only (host KAT): the tail emitted whole
+    return 1;
+#else
+    return BRSetContains(wallet->allAddrs, wallet->watchedAddrs[i].s) ? 0 : 1;
+#endif
+}
+
 // Enumerate every address chain in the canonical emission order:
 //   primary BIP84 (internal segwit, internal legacy, external segwit, external legacy),
 //   then the legacy m/0H chains, then the BIP86 taproot chains, then the explicitly-watched
 //   tail. The taproot chains are the SOLE source of P2TR (and therefore DigiDollar) filter
 //   elements, so they MUST be enumerated or a received P2TR is never watched/credited.
+//
+// Every address appears once: the watched tail holds only the pins that are not derived
+// (_BRWalletWatchedTailEmitsLocked). Pinned by addr_set_distinct_kat.
 //
 // CALLER MUST HOLD wallet->lock.
 //
@@ -1169,9 +1190,9 @@ BRAddress BRWalletInternalChangeAddress(BRWallet *wallet)
 static size_t _BRWalletCollectAddrsLocked(BRWallet *wallet, BRAddress *out, size_t outCount,
                                           BRWalletAddrOrigins *origins)
 {
-    BRAddress *chains[11];
-    size_t counts[11];
-    size_t nchains = 0, derivedChains, total = 0, derivedTotal = 0, c, i;
+    BRAddress *chains[10];
+    size_t counts[10];
+    size_t nchains = 0, total = 0, derivedTotal = 0, watchedTotal = 0, c, i;
 
     chains[nchains] = wallet->internalChainSegwit;
     counts[nchains++] = array_count(wallet->internalChainSegwit);
@@ -1200,18 +1221,15 @@ static size_t _BRWalletCollectAddrsLocked(BRWallet *wallet, BRAddress *out, size
         counts[nchains++] = array_count(wallet->taprootExternalChain);
     }
 
-    derivedChains = nchains; // everything enumerated so far is derived (and signable)
-
-    chains[nchains] = wallet->watchedAddrs;
-    counts[nchains++] = array_count(wallet->watchedAddrs);
-
-    for (c = 0; c < nchains; c++) {
-        total += counts[c];
-        if (c < derivedChains) derivedTotal += counts[c];
+    // everything enumerated so far is derived (and signable); the watched tail follows
+    for (c = 0; c < nchains; c++) derivedTotal += counts[c];
+    for (i = 0; i < array_count(wallet->watchedAddrs); i++) {
+        if (_BRWalletWatchedTailEmitsLocked(wallet, i)) watchedTotal++;
     }
+    total = derivedTotal + watchedTotal;
 
     if (! out) {
-        if (origins) { origins->derived = derivedTotal; origins->watched = total - derivedTotal; }
+        if (origins) { origins->derived = derivedTotal; origins->watched = watchedTotal; }
         return total;
     }
 
@@ -1219,8 +1237,11 @@ static size_t _BRWalletCollectAddrsLocked(BRWallet *wallet, BRAddress *out, size
     for (c = 0; c < nchains && written < outCount; c++) {
         for (i = 0; i < counts[c] && written < outCount; i++) {
             out[written++] = chains[c][i];
-            if (c < derivedChains) writtenDerived++;
+            writtenDerived++;
         }
+    }
+    for (i = 0; i < array_count(wallet->watchedAddrs) && written < outCount; i++) {
+        if (_BRWalletWatchedTailEmitsLocked(wallet, i)) out[written++] = wallet->watchedAddrs[i];
     }
 
     if (origins) { origins->derived = writtenDerived; origins->watched = written - writtenDerived; }

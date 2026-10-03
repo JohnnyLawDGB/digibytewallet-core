@@ -8630,9 +8630,40 @@ static int _BRPeerManagerReanchorAtFloorLocked(BRPeerManager *manager, int force
 // Caller holds manager->lock; manager->lastBlock is already the new tip.
 static void _BRPeerManagerCFFollowReorgLocked(BRPeerManager *manager, uint32_t forkNext, BRPeer *peer)
 {
-    if (manager->syncMode == BR_SYNC_MODE_BLOOM_ONLY || ! manager->compactFilterChain) return;
+    if (manager->syncMode == BR_SYNC_MODE_BLOOM_ONLY) return;
+#ifdef CF_REORG_CHAINLESS_UNFIXED
+    if (! manager->compactFilterChain) return;
+#endif
     if (forkNext == 0) forkNext = _BRPeerManagerBlockFloor(manager);
     if (forkNext == 0) return;
+
+    if (! manager->compactFilterChain) {
+        // No filter-header chain: a re-anchor dropped it and the next cfheaders batch
+        // anchors a new one at autoFetchCFiltersStart. The heights below that restart
+        // point were scanned against the old chain. Any of them the reorg replaced must
+        // be scanned again, so the restart point moves down to the fork. Nothing at or
+        // above the restart point has been scanned yet, so a fork there needs nothing.
+        if (! manager->autoFetchCFiltersEnabled || forkNext >= manager->autoFetchCFiltersStart) return;
+        uint32_t floor = _BRPeerManagerBlockFloor(manager);
+        if (forkNext < floor) forkNext = floor;   // no getcfilters stop hash below the resident blocks
+        if (forkNext >= manager->autoFetchCFiltersStart) return;
+        peer_log(peer, "cf-reorg: blocks from %u were replaced while the filter-header chain is being rebuilt "
+                 "— the rebuild starts at %u instead of %u", forkNext, forkNext, manager->autoFetchCFiltersStart);
+        if (_cfConvoyScanArmed(manager)) BRCFScanLedgerRewindTo(&manager->cfLedger, forkNext);
+        for (size_t i = 0; i < CF_SOLICITED_BLOCKS_MAX; i++) {
+            if (manager->cfSolicitedBlocks[i].used && manager->cfSolicitedBlocks[i].height >= forkNext) {
+                manager->cfSolicitedBlocks[i].used = 0;
+                manager->cfSolicitedBlocks[i].seq  = 0;
+            }
+        }
+        manager->autoFetchCFiltersStart    = forkNext;
+        manager->autoFetchCFiltersThrough  = forkNext - 1;
+        manager->cfHeadersRequestedThrough = 0;   // an in-flight batch starts at the old restart point
+        _BRPeerManagerPersistCFLedgerLocked(manager);
+        BRPeer *fp = _BRPeerManagerAnyFilterCapablePeer(manager);
+        if (fp) _BRPeerManagerRequestNextCFHeaders(manager, fp, /*isConvoyAdvance=*/0);
+        return;
+    }
 
     BRCompactFilterChain *chain = manager->compactFilterChain;
     uint32_t cfStart = BRCompactFilterChainStartHeight(chain);
@@ -8669,10 +8700,24 @@ static void _BRPeerManagerCFFollowReorgLocked(BRPeerManager *manager, uint32_t f
 
     peer_log(peer, "cf-reorg: fork at %u is below the filter-header chain's start %u — rebuilding the chain "
              "from the fork", forkNext, cfStart);
-    // A first call that finds the fork below the resident block floor surfaces
-    // [fork .. floor - 1] (no block left to scan there) and returns 0; the frontier then
-    // sits at the floor and the second call rebuilds the chain from there.
-    if (! _BRPeerManagerReanchorAtFloorLocked(manager, 1)) _BRPeerManagerReanchorAtFloorLocked(manager, 1);
+    // A first call that finds the scan below the resident block floor surfaces
+    // [frontier .. floor - 1] (no block left to scan there) and returns 0; the frontier
+    // then sits at the floor and the second call rebuilds the chain from there. That
+    // rebuild re-initialises the ledger, which would zero the abandonedBelow the first
+    // call just raised before the app has read it, so the band is carried over (the same
+    // state the cfheaders floor snap leaves: abandonedBelow == the ledger's start).
+    if (! _BRPeerManagerReanchorAtFloorLocked(manager, 1)) {
+        uint32_t surfaced = BRCFScanLedgerAbandonedBelow(&manager->cfLedger);
+        if (_BRPeerManagerReanchorAtFloorLocked(manager, 1)) {
+#ifndef CF_REORG_BAND_KEPT_UNFIXED
+            if (surfaced > manager->cfLedger.abandonedBelow &&
+                surfaced <= BRCFScanLedgerStartHeight(&manager->cfLedger))
+                manager->cfLedger.abandonedBelow = surfaced;
+#else
+            (void)surfaced;
+#endif
+        }
+    }
     _BRPeerManagerPersistCFLedgerLocked(manager);
 }
 

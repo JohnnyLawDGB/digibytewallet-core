@@ -322,6 +322,16 @@ Remarks:
 #define CF_CONTINUITY_REANCHOR_K   2
 #define CF_CONTINUITY_REANCHOR_MAX 3
 
+/* The re-anchor budget bounds a RUN of continuity failures, not the life of the
+   manager: this many clean cfheaders appends onto an existing chain after a
+   re-anchor restore the full CF_CONTINUITY_REANCHOR_MAX. Three is the evidence a
+   re-anchor itself demands (CF_CONTINUITY_REANCHOR_FLOOR agreeing disagreers, or
+   CF_SINGLE_PEER_REANCHOR_ROUNDS diverged rounds), so the refund needs as much
+   agreement as the spend. The batch that first anchors a freshly re-anchored
+   (NULL) chain is not counted: it is taken on trust and proves nothing. Any
+   continuity failure restarts the count. */
+#define CF_REANCHOR_REFUND_CLEAN_APPENDS 3
+
 /* Task 5 (cfcheckpt-active-rejection) — quorum-reliability. The old
    "CF_CONTINUITY_REANCHOR_K distinct disagreers, any complaint" trigger let
    TWO peers with UNRELATED complaints (different claimed prevFilterHeader —

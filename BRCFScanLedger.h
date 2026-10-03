@@ -781,6 +781,10 @@ uint32_t BRCFScanLedgerAbandonGaveUpBelow(BRCFScanLedger *l, uint32_t clamp,
 //   - `lo` is first clamped UP to the existing abandonedBelow, so history already
 //     surfaced by an earlier call is never counted or warned about twice. That is
 //     what makes *outCount > 0 hold EXACTLY when abandonedBelow advances.
+//   - `lo` is then clamped UP past the heights this ledger has already evaluated
+//     ([start .. scannedThrough]): a height the scan covered is not a gap, and
+//     reporting it as one sends the user to recover history that is complete.
+//     The band actually surfaced is therefore [floor - *outCount .. floor - 1].
 //   - No-op unless 0 < lo < floor: *outCount = 0 and abandonedBelow is UNCHANGED.
 //     There is no preemptive raise here either.
 //   - Otherwise raises abandonedBelow to `floor` (monotonic), drops every
@@ -794,6 +798,21 @@ uint32_t BRCFScanLedgerAbandonGaveUpBelow(BRCFScanLedger *l, uint32_t clamp,
 // Returns the new BRCFScanLedgerLowestNeededHeight.
 uint32_t BRCFScanLedgerAbandonUnscannableBelow(BRCFScanLedger *l, uint32_t lo, uint32_t floor,
                                                uint32_t *outCount);
+
+// The block chain reorganised and every block at or above `next` was replaced:
+// forget every evaluation and request at or above `next`, so those heights are
+// scanned again on the new branch.
+//   - scannedThrough and requestedThrough are lowered to at most next - 1;
+//   - outstanding[] and gaveUp[] entries at or above `next` are dropped (they
+//     named blocks of the abandoned branch; the forward fetch requests the new
+//     ones afresh);
+//   - when `next` is below the ledger's start, the start moves down to `next`
+//     (the heights in [next .. old start - 1] are new blocks as well);
+//   - abandonedBelow is left as it is (monotonic; heights below it stay
+//     surfaced, never silently treated as scanned).
+// A rewind to a height above requestedThrough + 1 changes nothing. next == 0 is
+// refused (genesis cannot be replaced). Returns 1 if anything changed.
+int      BRCFScanLedgerRewindTo(BRCFScanLedger *l, uint32_t next);
 
 // Coalesce the outstanding + gaveUp heights into ascending [start..end] ranges
 // for the JNI/UI hole report. Writes up to `cap` ranges into outStarts/outEnds

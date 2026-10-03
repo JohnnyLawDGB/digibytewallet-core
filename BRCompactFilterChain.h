@@ -20,10 +20,14 @@
 extern "C" {
 #endif
 
-// Hard cap on retained filter headers. A 2M-header window covers roughly
-// 23 days of DigiByte at 15-second blocks, or a wallet birth ~22 months
-// back. Callers that need to sync further back should re-anchor against
-// a recent cfcheckpt rather than grow the in-memory chain unbounded.
+// Hard cap on retained filter headers. 2^21 headers at DigiByte's 15-second
+// blocks is about 364 days of chain (2,097,152 x 15 s = 31,457,280 s). A wallet
+// whose filter scan starts further back than that reaches the cap during its
+// sync; the chain is never allowed to stop there. Reaching the cap is reported
+// by BRCompactFilterChainAppendEx as BR_CF_APPEND_LIMIT (distinct from a
+// continuity mismatch), and the owner then drops the headers the scan no longer
+// needs (BRCompactFilterChainDropBelow), keeping the header just below the new
+// start as the anchor, and appends again.
 #ifndef BR_COMPACT_FILTER_CHAIN_MAX
 #define BR_COMPACT_FILTER_CHAIN_MAX (2u * 1024u * 1024u)
 #endif
@@ -75,22 +79,65 @@ UInt256 BRCompactFilterChainTipHeader(const BRCompactFilterChain *chain);
 UInt256 BRCompactFilterChainHeader(const BRCompactFilterChain *chain, uint32_t height);
 
 /**
+ * Outcome of BRCompactFilterChainAppendEx. Only BR_CF_APPEND_MISMATCH says
+ * anything about the batch: the other two failures are the chain's own
+ * storage state, and the batch would have continued the chain.
+ */
+typedef enum {
+    BR_CF_APPEND_MISMATCH = 0,  // prevFilterHeader != tip (or no chain / no hashes)
+    BR_CF_APPEND_OK       = 1,  // appended
+    BR_CF_APPEND_LIMIT    = 2,  // continues the chain, but count would exceed BR_COMPACT_FILTER_CHAIN_MAX
+    BR_CF_APPEND_NOMEM    = 3,  // continues the chain, but growing the store failed
+} BRCompactFilterChainAppendResult;
+
+/**
  * Append a batch from a cfheaders response.
  *
  *   prevFilterHeader  must equal BRCompactFilterChainTipHeader(chain).
- *                     Otherwise this batch can't possibly continue the
- *                     chain — likely indicates a malicious or out-of-sync
- *                     peer.
+ *                     Otherwise this batch does not continue the chain.
  *   filterHashes      contiguous filter hashes starting at NextHeight().
  *   count             number of hashes; 0 is a no-op success.
  *
- * On success, computes filterHeader_i = dSHA256(filterHash_i || prev) for
- * each i and appends. Returns 1 on success, 0 on continuity failure or
- * cap overflow. On failure the chain is left unchanged.
+ * Continuity is checked first, so BR_CF_APPEND_LIMIT / BR_CF_APPEND_NOMEM are
+ * returned only for a batch that does continue the chain. On success, computes
+ * filterHeader_i = dSHA256(filterHash_i || prev) for each i and appends. On any
+ * other result the chain is left unchanged.
+ */
+BRCompactFilterChainAppendResult BRCompactFilterChainAppendEx(BRCompactFilterChain *chain,
+                                                              UInt256 prevFilterHeader,
+                                                              const UInt256 *filterHashes, size_t count);
+
+/**
+ * BRCompactFilterChainAppendEx collapsed to 1 (BR_CF_APPEND_OK) / 0 (anything
+ * else). Kept with this 0/1 contract for the callers that test it as a truth
+ * value; a caller that must tell the size limit from a mismatch calls
+ * BRCompactFilterChainAppendEx.
  */
 int BRCompactFilterChainAppend(BRCompactFilterChain *chain,
                                 UInt256 prevFilterHeader,
                                 const UInt256 *filterHashes, size_t count);
+
+/**
+ * Drop every header at or above `nextHeight`, so that NextHeight() == nextHeight
+ * afterwards. Used when the block chain reorganises: the headers above the fork
+ * describe blocks that are no longer on the best chain.
+ *
+ * Returns 1 when NextHeight() == nextHeight after the call (including the no-op
+ * case nextHeight == NextHeight()), 0 when nextHeight is below StartHeight() (the
+ * fork is below the anchor, which itself describes an abandoned block) or above
+ * NextHeight(); the chain is unchanged on 0. O(1).
+ */
+int BRCompactFilterChainTruncate(BRCompactFilterChain *chain, uint32_t nextHeight);
+
+/**
+ * Drop every header below `newStart`, keeping the header at newStart - 1 as the
+ * new anchor, so StartHeight() == newStart afterwards. Used at the size limit to
+ * keep only what the filter scan still needs.
+ *
+ * Requires StartHeight() < newStart <= NextHeight(); returns the number of
+ * headers dropped, or 0 (chain unchanged) otherwise. O(retained headers).
+ */
+size_t BRCompactFilterChainDropBelow(BRCompactFilterChain *chain, uint32_t newStart);
 
 /**
  * Check whether a pending cfheaders batch -- folded forward from the
@@ -123,8 +170,10 @@ int BRCompactFilterChainBatchViolatesCheckpoint(const BRCompactFilterChain *chai
  * Given the encoded filter bytes for a block at the named height, computes
  * dSHA256(encoded) and chains it onto the previous-height filter header.
  * Returns 1 if the recomputed header matches the chain at this height, 0
- * if it differs (filter is wrong, peer is lying, or height is outside the
- * chain's range).
+ * if it differs or the height is outside the chain's range. A caller that
+ * judges the peer by the result must first check the range itself
+ * (StartHeight() <= height < NextHeight()): a 0 for a height outside it says
+ * nothing about the filter.
  */
 int BRCompactFilterChainVerifyFilter(const BRCompactFilterChain *chain,
                                       uint32_t height,

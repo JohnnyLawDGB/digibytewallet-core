@@ -1128,12 +1128,24 @@ static int _BRPeerAcceptHeadersMessage(BRPeer *peer, const uint8_t *msg, size_t 
             struct timespec powBatchStart;
             clock_gettime(CLOCK_MONOTONIC, &powBatchStart);
 #endif
+#if DGB_HEADER_DIFF_CHECK >= 1
+            // this thread's difficulty-target verdicts so far: relayedBlock judges each header on this thread,
+            // so the difference after the loop is exactly this message's
+            uint32_t diffBefore[3];
+            for (int k = BR_DIFF_MATCH; k <= BR_DIFF_MISMATCH; k++) diffBefore[k] = BRMerkleBlockDiffThreadCount(k);
+#endif
 
             for (size_t i = 0; r && i < count; i++) {
                 BRMerkleBlock *block = BRMerkleBlockParse(&msg[off + 81*i], 81);
                 
                 if (! BRMerkleBlockIsValid(block, (uint32_t)now)) {
                     peer_log(peer, "invalid block header: %s ", log_u256_hex_encode(block->blockHash));
+#if DGB_HEADER_POW_CHECK >= 2
+                    // At this level a header is refused for its proof of work as well as for its time. The
+                    // close that follows (verdict 0 -> EPROTO -> misbehaving) carries its own tag unless the
+                    // time check is what refused it.
+                    if (block->timestamp <= (uint32_t)now + BLOCK_MAX_TIME_DRIFT) _BRPeerNoteTag(ctx, BR_DISC_TAG_HEADER_POW);
+#endif
                     BRMerkleBlockFree(block);
                     r = 0;
                 }
@@ -1152,6 +1164,17 @@ static int _BRPeerAcceptHeadersMessage(BRPeer *peer, const uint8_t *msg, size_t 
                 peer_log(peer, "pow-batch n=%zu ms=%u", count,
                          (unsigned)((powBatchEnd.tv_sec - powBatchStart.tv_sec)*1000 +
                                     (powBatchEnd.tv_nsec - powBatchStart.tv_nsec)/1000000));
+            }
+#endif
+#if DGB_HEADER_DIFF_CHECK >= 1
+            // difficulty-target verdicts for this headers message (judged = matched + mismatched)
+            {
+                uint32_t match = BRMerkleBlockDiffThreadCount(BR_DIFF_MATCH) - diffBefore[BR_DIFF_MATCH],
+                         skip = BRMerkleBlockDiffThreadCount(BR_DIFF_SKIP) - diffBefore[BR_DIFF_SKIP],
+                         mismatch = BRMerkleBlockDiffThreadCount(BR_DIFF_MISMATCH) - diffBefore[BR_DIFF_MISMATCH];
+
+                peer_log(peer, "diff-batch n=%zu judged=%" PRIu32 " skip=%" PRIu32 " mismatch=%" PRIu32, count,
+                         match + mismatch, skip, mismatch);
             }
 #endif
 
@@ -2557,6 +2580,7 @@ const char *BRPeerDisconnectTagName(BRPeerDisconnectTag tag)
         case BR_DISC_TAG_UNUSABLE_PEER:return "unusable-peer";
         case BR_DISC_TAG_DOWNLOAD_SWAP:return "download-swap";
         case BR_DISC_TAG_CF_STALL:     return "cf-stall";
+        case BR_DISC_TAG_HEADER_POW:   return "header-pow";
         default:                       return "none";
     }
 }

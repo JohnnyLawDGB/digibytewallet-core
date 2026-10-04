@@ -546,6 +546,270 @@ int BRMerkleBlockVerifyDifficulty(const BRMerkleBlock *block, const BRMerkleBloc
     return r;
 }
 
+// ---- 256-bit unsigned arithmetic for difficulty targets ------------------------------------------------------------
+// Eight 32-bit limbs, least significant first, with the reference client's arith_uint256 semantics: multiplication
+// wraps modulo 2^256, division floors, a left shift drops the bits it moves past bit 255.
+
+typedef struct { uint32_t w[8]; } _BRU256;
+
+static _BRU256 _u256FromUInt256(UInt256 v)
+{
+    _BRU256 a;
+
+    for (int i = 0; i < 8; i++) a.w[i] = UInt32GetLE(&v.u8[4*i]);
+    return a;
+}
+
+static UInt256 _u256ToUInt256(const _BRU256 *a)
+{
+    UInt256 v = UINT256_ZERO;
+
+    for (int i = 0; i < 8; i++) UInt32SetLE(&v.u8[4*i], a->w[i]);
+    return v;
+}
+
+static void _u256ShiftLeft(_BRU256 *a, unsigned bits)
+{
+    _BRU256 r = { { 0 } };
+    unsigned k = bits / 32, s = bits % 32;
+
+    for (unsigned i = 0; i < 8; i++) {
+        if (i + k + 1 < 8 && s != 0) r.w[i + k + 1] |= (a->w[i] >> (32 - s));
+        if (i + k < 8) r.w[i + k] |= (a->w[i] << s);
+    }
+
+    *a = r;
+}
+
+static void _u256ShiftRight(_BRU256 *a, unsigned bits)
+{
+    _BRU256 r = { { 0 } };
+    unsigned k = bits / 32, s = bits % 32;
+
+    for (unsigned i = 0; i < 8; i++) {
+        if (i >= k + 1 && s != 0) r.w[i - k - 1] |= (a->w[i] << (32 - s));
+        if (i >= k) r.w[i - k] |= (a->w[i] >> s);
+    }
+
+    *a = r;
+}
+
+static void _u256MulU32(_BRU256 *a, uint32_t m)
+{
+    uint64_t carry = 0;
+
+    for (int i = 0; i < 8; i++) {
+        uint64_t n = carry + (uint64_t)a->w[i]*m;
+
+        a->w[i] = (uint32_t)n;
+        carry = n >> 32;
+    }
+}
+
+static void _u256DivU32(_BRU256 *a, uint32_t d)
+{
+    uint64_t rem = 0;
+
+    assert(d != 0);
+
+    for (int i = 7; i >= 0; i--) {
+        uint64_t n = (rem << 32) | a->w[i];
+
+        a->w[i] = (uint32_t)(n / d);
+        rem = n % d;
+    }
+}
+
+static int _u256Cmp(const _BRU256 *a, const _BRU256 *b)
+{
+    for (int i = 7; i >= 0; i--) {
+        if (a->w[i] < b->w[i]) return -1;
+        if (a->w[i] > b->w[i]) return 1;
+    }
+
+    return 0;
+}
+
+static unsigned _u256Bits(const _BRU256 *a)
+{
+    for (int i = 7; i >= 0; i--) {
+        if (a->w[i] == 0) continue;
+
+        for (int b = 31; b >= 0; b--) {
+            if (a->w[i] & (1u << b)) return (unsigned)(32*i + b + 1);
+        }
+    }
+
+    return 0;
+}
+
+static _BRU256 _u256SetCompact(uint32_t compact, int *negative, int *tooLarge)
+{
+    _BRU256 a = { { 0 } };
+    unsigned size = compact >> 24;
+    uint32_t word = compact & 0x007fffff;
+
+    if (size <= 3) {
+        word >>= 8*(3 - size);
+        a.w[0] = word;
+    }
+    else {
+        a.w[0] = word;
+        _u256ShiftLeft(&a, 8*(size - 3));
+    }
+
+    if (negative) *negative = (word != 0 && (compact & 0x00800000) != 0);
+    if (tooLarge) *tooLarge = (word != 0 && (size > 34 || (word > 0xff && size > 33) || (word > 0xffff && size > 32)));
+    return a;
+}
+
+static uint32_t _u256GetCompact(const _BRU256 *a, int negative)
+{
+    unsigned size = (_u256Bits(a) + 7)/8;
+    uint32_t compact;
+
+    if (size <= 3) compact = a->w[0] << 8*(3 - size);
+    else {
+        _BRU256 b = *a;
+
+        _u256ShiftRight(&b, 8*(size - 3));
+        compact = b.w[0];
+    }
+
+    if (compact & 0x00800000) {   // the sign bit is not part of the mantissa: move to the next size
+        compact >>= 8;
+        size++;
+    }
+
+    compact |= size << 24;
+    if (negative && (compact & 0x007fffff)) compact |= 0x00800000;
+    return compact;
+}
+
+static _BRU256 _u256PowLimit(const BRDifficultyV4Params *params)
+{
+    _BRU256 a;
+
+    for (int i = 0; i < 8; i++) a.w[i] = 0xffffffff;
+    _u256ShiftRight(&a, params->powLimitShift);
+    return a;
+}
+
+UInt256 BRTargetFromCompact(uint32_t compact, int *negative, int *tooLarge)
+{
+    _BRU256 a = _u256SetCompact(compact, negative, tooLarge);
+
+    return _u256ToUInt256(&a);
+}
+
+uint32_t BRTargetToCompact(UInt256 target, int negative)
+{
+    _BRU256 a = _u256FromUInt256(target);
+
+    return _u256GetCompact(&a, negative);
+}
+
+uint32_t BRDifficultyV4PowLimitCompact(const BRDifficultyV4Params *params)
+{
+    assert(params != NULL);
+
+    _BRU256 limit = _u256PowLimit(params);
+
+    return _u256GetCompact(&limit, 0);
+}
+
+// the reference client's CBlockIndex::GetMedianTimePast over BR_DIFF_V4_MEDIAN_SPAN timestamps
+static int64_t _medianTimePast(const uint32_t times[])
+{
+    int64_t s[BR_DIFF_V4_MEDIAN_SPAN];
+
+    for (int i = 0; i < BR_DIFF_V4_MEDIAN_SPAN; i++) {
+        int64_t t = times[i];
+        int j = i;
+
+        while (j > 0 && s[j - 1] > t) { s[j] = s[j - 1]; j--; }
+        s[j] = t;
+    }
+
+    return s[BR_DIFF_V4_MEDIAN_SPAN/2];
+}
+
+// The reference client's GetNextWorkRequiredV4 (pow.cpp), statement for statement, on the gathered inputs.
+uint32_t BRDifficultyV4Target(const BRDifficultyV4Params *params, const uint32_t lastTimes[],
+                              const uint32_t firstTimes[], uint32_t prevAlgoTarget, uint32_t prevAlgoDistance)
+{
+    assert(params != NULL);
+    assert(lastTimes != NULL);
+    assert(firstTimes != NULL);
+    assert(params->averagingTargetTimespan > 0 && params->averagingTargetTimespan <= UINT32_MAX);
+    assert(params->minActualTimespan > 0 && params->minActualTimespan <= params->maxActualTimespan &&
+           params->maxActualTimespan <= UINT32_MAX);
+
+    // limit adjustment step: the median time past of both window ends, damped
+    int64_t actualTimespan = _medianTimePast(lastTimes) - _medianTimePast(firstTimes);
+
+#ifndef HEADER_DIFF_V4_UNFIXED
+    actualTimespan = params->averagingTargetTimespan + (actualTimespan - params->averagingTargetTimespan)/4;
+#endif
+
+    if (actualTimespan < params->minActualTimespan) actualTimespan = params->minActualTimespan;
+    if (actualTimespan > params->maxActualTimespan) actualTimespan = params->maxActualTimespan;
+
+    // global retarget from the previous block of the same algorithm
+    _BRU256 target = _u256SetCompact(prevAlgoTarget, NULL, NULL), limit = _u256PowLimit(params);
+
+    _u256MulU32(&target, (uint32_t)actualTimespan);
+    _u256DivU32(&target, (uint32_t)params->averagingTargetTimespan);
+
+    // per-algorithm retarget: harder for each block the algorithm is ahead of its share, easier for each it is behind
+    int64_t adjustments = (int64_t)BR_DIFF_V4_NUM_ALGOS - 1 - (int64_t)prevAlgoDistance;
+
+    if (adjustments > 0) {
+        for (int64_t i = 0; i < adjustments; i++) {
+            _u256MulU32(&target, 100);
+            _u256DivU32(&target, 100 + params->localTargetAdjustment);
+        }
+    }
+    else if (adjustments < 0) {
+        for (int64_t i = 0; i < -adjustments; i++) {
+            _u256MulU32(&target, 100 + params->localTargetAdjustment);
+            _u256DivU32(&target, 100);
+
+            if (_u256Cmp(&target, &limit) > 0) {
+                target = limit;
+                break;
+            }
+        }
+    }
+
+    if (_u256Cmp(&target, &limit) > 0) target = limit;
+    return _u256GetCompact(&target, 0);
+}
+
+// difficulty-target verdicts (BR_DIFF_MATCH, BR_DIFF_SKIP, BR_DIFF_MISMATCH): process-wide totals, and the calling
+// thread's totals so a peer thread can report the verdicts of one headers message
+static atomic_uint _diffCount[3];
+static _Thread_local uint32_t _diffThreadCount[3];
+
+void BRMerkleBlockDiffCountAdd(int verdict)
+{
+    assert(verdict >= BR_DIFF_MATCH && verdict <= BR_DIFF_MISMATCH);
+    atomic_fetch_add(&_diffCount[verdict], 1);
+    _diffThreadCount[verdict]++;
+}
+
+uint32_t BRMerkleBlockDiffCount(int verdict)
+{
+    assert(verdict >= BR_DIFF_MATCH && verdict <= BR_DIFF_MISMATCH);
+    return atomic_load(&_diffCount[verdict]);
+}
+
+uint32_t BRMerkleBlockDiffThreadCount(int verdict)
+{
+    assert(verdict >= BR_DIFF_MATCH && verdict <= BR_DIFF_MISMATCH);
+    return _diffThreadCount[verdict];
+}
+
 // frees memory allocated by BRMerkleBlockParse
 void BRMerkleBlockFree(BRMerkleBlock *block)
 {

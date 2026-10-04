@@ -36,12 +36,12 @@ struct BRCompactFilterChain {
 };
 
 // Reserve room for at least `need` total headers. Doubles capacity to
-// amortize. Returns 1 on success, 0 on allocation failure or overflow
-// past the hard cap.
-static int _chain_reserve(BRCompactFilterChain *chain, size_t need)
+// amortize. Returns BR_CF_APPEND_OK on success, BR_CF_APPEND_LIMIT when `need`
+// is past the hard cap, BR_CF_APPEND_NOMEM when the allocation fails.
+static BRCompactFilterChainAppendResult _chain_reserve(BRCompactFilterChain *chain, size_t need)
 {
-    if (need > BR_COMPACT_FILTER_CHAIN_MAX) return 0;
-    if (need <= chain->capacity) return 1;
+    if (need > BR_COMPACT_FILTER_CHAIN_MAX) return BR_CF_APPEND_LIMIT;
+    if (need <= chain->capacity) return BR_CF_APPEND_OK;
 
     size_t newCap = chain->capacity ? chain->capacity : 64;
     while (newCap < need) {
@@ -51,13 +51,13 @@ static int _chain_reserve(BRCompactFilterChain *chain, size_t need)
         }
         newCap *= 2;
     }
-    if (newCap < need) return 0;
+    if (newCap < need) return BR_CF_APPEND_LIMIT;
 
     UInt256 *resized = (UInt256 *)realloc(chain->headers, newCap * sizeof(UInt256));
-    if (!resized) return 0;
+    if (!resized) return BR_CF_APPEND_NOMEM;
     chain->headers = resized;
     chain->capacity = newCap;
-    return 1;
+    return BR_CF_APPEND_OK;
 }
 
 BRCompactFilterChain *BRCompactFilterChainNew(uint8_t filterType,
@@ -119,19 +119,28 @@ UInt256 BRCompactFilterChainHeader(const BRCompactFilterChain *chain, uint32_t h
     return chain->headers[idx];
 }
 
-int BRCompactFilterChainAppend(BRCompactFilterChain *chain,
-                                UInt256 prevFilterHeader,
-                                const UInt256 *filterHashes, size_t count)
+BRCompactFilterChainAppendResult BRCompactFilterChainAppendEx(BRCompactFilterChain *chain,
+                                                              UInt256 prevFilterHeader,
+                                                              const UInt256 *filterHashes, size_t count)
 {
-    if (!chain) return 0;
-    if (count == 0) return 1;
-    if (!filterHashes) return 0;
+    if (!chain) return BR_CF_APPEND_MISMATCH;
+    if (count == 0) return BR_CF_APPEND_OK;
+    if (!filterHashes) return BR_CF_APPEND_MISMATCH;
 
+    // Continuity first: LIMIT / NOMEM are only ever reported for a batch that
+    // would have continued the chain, so they can never hide a mismatch.
     UInt256 tip = BRCompactFilterChainTipHeader(chain);
-    if (!UInt256Eq(prevFilterHeader, tip)) return 0;
+    if (!UInt256Eq(prevFilterHeader, tip)) return BR_CF_APPEND_MISMATCH;
 
     size_t need = chain->count + count;
-    if (!_chain_reserve(chain, need)) return 0;
+#ifdef CF_CHAIN_LIMIT_UNFIXED
+    // Reference arm for cf_chain_limit_kat only; never defined in a production build.
+    // The earlier shape: the size limit reads exactly like a continuity mismatch.
+    if (_chain_reserve(chain, need) != BR_CF_APPEND_OK) return BR_CF_APPEND_MISMATCH;
+#else
+    BRCompactFilterChainAppendResult r = _chain_reserve(chain, need);
+    if (r != BR_CF_APPEND_OK) return r;
+#endif
 
     UInt256 prev = tip;
     for (size_t i = 0; i < count; i++) {
@@ -140,7 +149,41 @@ int BRCompactFilterChainAppend(BRCompactFilterChain *chain,
         prev = hdr;
     }
     chain->count = need;
+    return BR_CF_APPEND_OK;
+}
+
+int BRCompactFilterChainAppend(BRCompactFilterChain *chain,
+                                UInt256 prevFilterHeader,
+                                const UInt256 *filterHashes, size_t count)
+{
+    return BRCompactFilterChainAppendEx(chain, prevFilterHeader, filterHashes, count) == BR_CF_APPEND_OK;
+}
+
+int BRCompactFilterChainTruncate(BRCompactFilterChain *chain, uint32_t nextHeight)
+{
+    if (!chain) return 0;
+    if (nextHeight < chain->startHeight) return 0;               // the anchor itself is above the cut
+    size_t keep = (size_t)(nextHeight - chain->startHeight);
+    if (keep > chain->count) return 0;                           // nothing there to cut back to
+    chain->count = keep;
     return 1;
+}
+
+size_t BRCompactFilterChainDropBelow(BRCompactFilterChain *chain, uint32_t newStart)
+{
+    if (!chain) return 0;
+    if (newStart <= chain->startHeight) return 0;
+    size_t drop = (size_t)(newStart - chain->startHeight);
+    if (drop > chain->count) return 0;
+    // The header at newStart - 1 becomes the anchor; Header(newStart - 1) keeps
+    // answering it, and VerifyFilter(newStart) chains onto it.
+    chain->anchorPrevHeader = chain->headers[drop - 1];
+    if (chain->count > drop) {
+        memmove(chain->headers, chain->headers + drop, (chain->count - drop) * sizeof(UInt256));
+    }
+    chain->count -= drop;
+    chain->startHeight = newStart;
+    return drop;
 }
 
 // Core comparator: folds filterHashes forward from the chain's current tip
@@ -272,7 +315,7 @@ BRCompactFilterChain *BRCompactFilterChainDeserialize(const uint8_t *buf, size_t
     if (!chain) return NULL;
 
     if (count > 0) {
-        if (!_chain_reserve(chain, count)) {
+        if (_chain_reserve(chain, count) != BR_CF_APPEND_OK) {
             BRCompactFilterChainFree(chain);
             return NULL;
         }

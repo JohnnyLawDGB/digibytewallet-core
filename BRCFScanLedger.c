@@ -961,6 +961,14 @@ uint32_t BRCFScanLedgerAbandonUnscannableBelow(BRCFScanLedger *l, uint32_t lo, u
     // contract EXACT: *outCount > 0 now holds iff abandonedBelow actually advances,
     // so a caller's WARN is still precisely a WARN on every advance and nothing else.
     if (lo < l->abandonedBelow) lo = l->abandonedBelow;
+#ifndef CF_BAND_SCANNED_UNFIXED
+    // Heights this ledger already evaluated are not a gap. [start .. scannedThrough]
+    // is evaluated or already below abandonedBelow (handled just above), so a low
+    // edge inside it moves up to the first height not yet scanned. Without this a
+    // caller whose low edge comes from somewhere other than the scan frontier (a
+    // checkpoint, a cursor) surfaces history that is complete as a History gap.
+    if (lo >= l->start && lo <= l->scannedThrough) lo = l->scannedThrough + 1;
+#endif
     // No preemptive raise (same discipline as AbandonGaveUpBelow): a floor at or
     // below the low edge surfaces nothing, so abandonedBelow must not move and the
     // caller must not warn.
@@ -988,6 +996,26 @@ uint32_t BRCFScanLedgerAbandonUnscannableBelow(BRCFScanLedger *l, uint32_t lo, u
 
     if (outCount) *outCount = floor - lo;
     return BRCFScanLedgerLowestNeededHeight(l);
+}
+
+int BRCFScanLedgerRewindTo(BRCFScanLedger *l, uint32_t next)
+{
+    if (!l || next == 0) return 0;
+    int changed = 0;
+
+    if (next < l->start) { l->start = next; changed = 1; }
+    if (l->scannedThrough >= next)   { l->scannedThrough   = next - 1; changed = 1; }
+    if (l->requestedThrough >= next) { l->requestedThrough = next - 1; changed = 1; }
+
+    // Both hole lists are sorted ascending: the entries at or above `next` are a suffix.
+    size_t ko = _cfLedgerLowerBound(l, next);
+    if (ko < l->outstandingCount) { l->outstandingCount = ko; changed = 1; }
+    size_t kg = 0;
+    while (kg < l->gaveUpCount && l->gaveUp[kg] < next) kg++;
+    if (kg < l->gaveUpCount) { l->gaveUpCount = kg; changed = 1; }   // the parallel valve bytes are index-bound; nothing to shift
+
+    _cfLedgerAdvance(l);   // never raises past requestedThrough, which is now <= next - 1
+    return changed;
 }
 
 size_t BRCFScanLedgerHoleRanges(const BRCFScanLedger *l, uint32_t *outStarts, uint32_t *outEnds, size_t cap)

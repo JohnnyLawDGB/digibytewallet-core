@@ -319,9 +319,11 @@ int BRWalletContainsTransaction(BRWallet *wallet, const BRTransaction *tx);
 // adds a transaction to the wallet, or returns false if it isn't associated with the wallet
 int BRWalletRegisterTransaction(BRWallet *wallet, BRTransaction *tx);
 
-// The same, without checking an unconfirmed tx's signatures on the wallet's outputs. Only for a tx that
-// needs no check: one this wallet signed itself, or one delivered inside a block whose transaction list
-// hashes to its header. Every other caller uses BRWalletRegisterTransaction.
+// The same, accepting an unconfirmed tx's signatures on the wallet's outputs as they stand now, without
+// checking them. Only for a tx that needs no check: one this wallet signed itself, or one delivered inside
+// a block whose transaction list hashes to its header. The acceptance is not permanent: it is checked
+// again when the tx's wallet-owned inputs change, or when a reorg takes it back to unconfirmed. Every
+// other caller uses BRWalletRegisterTransaction.
 int BRWalletRegisterTransactionTrusted(BRWallet *wallet, BRTransaction *tx);
 
 // The same as BRWalletRegisterTransaction for a tx whose height the wallet has not proven itself (a

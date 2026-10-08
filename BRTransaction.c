@@ -570,6 +570,7 @@ BRTransaction *BRTransactionCopy(const BRTransaction *tx)
     cpy->inCount = cpy->outCount = 0;
     cpy->is_dandelion = tx->is_dandelion;
     cpy->walletSigCheck = 0;   // the wallet's bookkeeping belongs to the wallet's own record, not a copy
+    cpy->walletSigOwned = 0;
 
     for (size_t i = 0; i < tx->inCount; i++) {
         BRTransactionAddInput(cpy, tx->inputs[i].txHash, tx->inputs[i].index, tx->inputs[i].amount,

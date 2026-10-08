@@ -241,25 +241,33 @@ static size_t _BRTransactionWitnessData(const BRTransaction *tx, uint8_t *data, 
     if (data && off + sizeof(uint32_t) <= dataLen) UInt32SetLE(&data[off], tx->version); // tx version
     off += sizeof(uint32_t);
     
+    // The hashed field lists below are sized by the input count, which a relayed transaction sets: they
+    // go on the heap, never the stack (a peer's tx is checked against the wallet's coins on a peer thread).
     if (! anyoneCanPay) {
-        uint8_t buf[(sizeof(UInt256) + sizeof(uint32_t))*tx->inCount];
-        
+        size_t bufLen = (sizeof(UInt256) + sizeof(uint32_t))*tx->inCount;
+        uint8_t *buf = malloc(bufLen ? bufLen : 1);
+
+        if (! buf) return 0;
         for (i = 0; i < tx->inCount; i++) {
             UInt256Set(&buf[(sizeof(UInt256) + sizeof(uint32_t))*i], tx->inputs[i].txHash);
             UInt32SetLE(&buf[(sizeof(UInt256) + sizeof(uint32_t))*i + sizeof(UInt256)], tx->inputs[i].index);
         }
         
-        if (data && off + sizeof(UInt256) <= dataLen) BRSHA256_2(&data[off], buf, sizeof(buf)); // inputs hash
+        if (data && off + sizeof(UInt256) <= dataLen) BRSHA256_2(&data[off], buf, bufLen); // inputs hash
+        free(buf);
     }
     else if (data && off + sizeof(UInt256) <= dataLen) UInt256Set(&data[off], UINT256_ZERO); // anyone-can-pay
     
     off += sizeof(UInt256);
     
     if (! anyoneCanPay && sigHash != SIGHASH_SINGLE && sigHash != SIGHASH_NONE) {
-        uint8_t buf[sizeof(uint32_t)*tx->inCount];
-        
+        size_t bufLen = sizeof(uint32_t)*tx->inCount;
+        uint8_t *buf = malloc(bufLen ? bufLen : 1);
+
+        if (! buf) return 0;
         for (i = 0; i < tx->inCount; i++) UInt32SetLE(&buf[sizeof(uint32_t)*i], tx->inputs[i].sequence);
-        if (data && off + sizeof(UInt256) <= dataLen) BRSHA256_2(&data[off], buf, sizeof(buf)); // sequence hash
+        if (data && off + sizeof(UInt256) <= dataLen) BRSHA256_2(&data[off], buf, bufLen); // sequence hash
+        free(buf);
     }
     else if (data && off + sizeof(UInt256) <= dataLen) UInt256Set(&data[off], UINT256_ZERO);
     
@@ -285,10 +293,13 @@ static size_t _BRTransactionWitnessData(const BRTransaction *tx, uint8_t *data, 
         if (buf != _buf) free(buf);
     }
     else if (sigHash == SIGHASH_SINGLE && index < tx->outCount) {
-        uint8_t buf[_BRTransactionOutputData(tx, NULL, 0, index)];
-        size_t bufLen = _BRTransactionOutputData(tx, buf, sizeof(buf), index);
-        
+        size_t bufLen = _BRTransactionOutputData(tx, NULL, 0, index);
+        uint8_t *buf = malloc(bufLen ? bufLen : 1);
+
+        if (! buf) return 0;
+        bufLen = _BRTransactionOutputData(tx, buf, bufLen, index);
         if (data && off + sizeof(UInt256) <= dataLen) BRSHA256_2(&data[off], buf, bufLen); //SIGHASH_SINGLE outputs hash
+        free(buf);
     }
     else if (data && off + sizeof(UInt256) <= dataLen) UInt256Set(&data[off], UINT256_ZERO); // SIGHASH_NONE
     
@@ -350,22 +361,29 @@ static size_t _BRTransactionTaprootSighash(const BRTransaction *tx, uint8_t *dat
     }
 
     // sha_prevouts = SHA256( txHash(32) || index(4 LE) for each input )   [single SHA256]
+    // (each field list is sized by the input count a relayed tx sets: heap, never the stack)
     {
-        uint8_t buf[(sizeof(UInt256) + sizeof(uint32_t)) * tx->inCount];
+        size_t bufLen = (sizeof(UInt256) + sizeof(uint32_t)) * tx->inCount;
+        uint8_t *buf = malloc(bufLen ? bufLen : 1);
 
+        if (! buf) return 0;
         for (i = 0; i < tx->inCount; i++) {
             UInt256Set(&buf[(sizeof(UInt256) + sizeof(uint32_t))*i], tx->inputs[i].txHash);
             UInt32SetLE(&buf[(sizeof(UInt256) + sizeof(uint32_t))*i + sizeof(UInt256)], tx->inputs[i].index);
         }
-        BRSHA256(shaPrevouts.u8, buf, sizeof(buf));
+        BRSHA256(shaPrevouts.u8, buf, bufLen);
+        free(buf);
     }
 
     // sha_amounts = SHA256( amount(8 LE) for each input )   [single SHA256]
     {
-        uint8_t buf[sizeof(uint64_t) * tx->inCount];
+        size_t bufLen = sizeof(uint64_t) * tx->inCount;
+        uint8_t *buf = malloc(bufLen ? bufLen : 1);
 
+        if (! buf) return 0;
         for (i = 0; i < tx->inCount; i++) UInt64SetLE(&buf[sizeof(uint64_t)*i], tx->inputs[i].amount);
-        BRSHA256(shaAmounts.u8, buf, sizeof(buf));
+        BRSHA256(shaAmounts.u8, buf, bufLen);
+        free(buf);
     }
 
     // sha_scriptpubkeys = SHA256( varint(scriptLen) || scriptPubKey for each input )   [single SHA256]
@@ -389,10 +407,13 @@ static size_t _BRTransactionTaprootSighash(const BRTransaction *tx, uint8_t *dat
 
     // sha_sequences = SHA256( sequence(4 LE) for each input )   [single SHA256]
     {
-        uint8_t buf[sizeof(uint32_t) * tx->inCount];
+        size_t bufLen = sizeof(uint32_t) * tx->inCount;
+        uint8_t *buf = malloc(bufLen ? bufLen : 1);
 
+        if (! buf) return 0;
         for (i = 0; i < tx->inCount; i++) UInt32SetLE(&buf[sizeof(uint32_t)*i], tx->inputs[i].sequence);
-        BRSHA256(shaSequences.u8, buf, sizeof(buf));
+        BRSHA256(shaSequences.u8, buf, bufLen);
+        free(buf);
     }
 
     // sha_outputs = SHA256( value(8 LE) || varint(scriptLen) || script for each output )   [single SHA256]
@@ -548,6 +569,7 @@ BRTransaction *BRTransactionCopy(const BRTransaction *tx)
     cpy->outputs = outputs;
     cpy->inCount = cpy->outCount = 0;
     cpy->is_dandelion = tx->is_dandelion;
+    cpy->walletSigCheck = 0;   // the wallet's bookkeeping belongs to the wallet's own record, not a copy
 
     for (size_t i = 0; i < tx->inCount; i++) {
         BRTransactionAddInput(cpy, tx->inputs[i].txHash, tx->inputs[i].index, tx->inputs[i].amount,
@@ -1222,9 +1244,14 @@ int BRTransactionVerifyInput(const BRTransaction *tx, size_t index)
 {
     const BRTxInput *in;
     const uint8_t *s, *items[2];
-    size_t n, lens[2];
+    size_t n, lens[2], dataLen;
+    uint8_t *data;
     UInt256 md = UINT256_ZERO;
+    int r;
 
+    // Everything sized by the transaction -- its preimage, its input list -- goes on the heap: the tx can
+    // be a peer's, checked on a peer thread, and its input and output counts are the peer's to choose.
+    // The only stack arrays are over the scriptSig, whose length is bounded first.
     assert(tx != NULL);
     if (! tx || index >= tx->inCount) return 0;
     in = &tx->inputs[index];
@@ -1234,58 +1261,66 @@ int BRTransactionVerifyInput(const BRTransaction *tx, size_t index)
 
     if (n == 25 && s[0] == OP_DUP && s[1] == OP_HASH160 && s[2] == 20 && s[23] == OP_EQUALVERIFY &&
         s[24] == OP_CHECKSIG) { // P2PKH: scriptSig = <sig> <pubkey>
-        const uint8_t *elems[BRScriptElements(NULL, 0, in->signature, in->sigLen)];
-        size_t count = BRScriptElements(elems, sizeof(elems)/sizeof(*elems), in->signature, in->sigLen);
         size_t sigLen = 0, pkLen = 0;
         const uint8_t *sig, *pk;
 
-        if (in->sigLen == 0 || count != 2) return 0;
+        if (in->sigLen == 0 || in->sigLen > 1 + 73 + 1 + 65) return 0;   // two pushes: <= 73-byte sig, <= 65-byte key
+
+        const uint8_t *elems[BRScriptElements(NULL, 0, in->signature, in->sigLen)];
+        size_t count = BRScriptElements(elems, sizeof(elems)/sizeof(*elems), in->signature, in->sigLen);
+
+        if (count != 2) return 0;
         sig = BRScriptData(elems[0], &sigLen);
         pk = BRScriptData(elems[1], &pkLen);
         if (! sig || ! pk) return 0;
 
-        uint8_t data[_BRTransactionData(tx, NULL, 0, index, SIGHASH_ALL)];
-        size_t dataLen = _BRTransactionData(tx, data, sizeof(data), index, SIGHASH_ALL);
-
-        if (dataLen == 0) return 0;
-        BRSHA256_2(&md, data, dataLen);
-        return _BRVerifyEcdsa(sig, sigLen, pk, pkLen, &s[3], md);
+        dataLen = _BRTransactionData(tx, NULL, 0, index, SIGHASH_ALL);
+        data = (dataLen > 0) ? malloc(dataLen) : NULL;
+        if (! data) return 0;
+        dataLen = _BRTransactionData(tx, data, dataLen, index, SIGHASH_ALL);
+        if (dataLen > 0) BRSHA256_2(&md, data, dataLen);
+        free(data);
+        return (dataLen > 0) ? _BRVerifyEcdsa(sig, sigLen, pk, pkLen, &s[3], md) : 0;
     }
 
     if ((n == 22 && s[0] == OP_0 && s[1] == 20) ||                              // P2WPKH
         (n == 23 && s[0] == OP_HASH160 && s[1] == 20 && s[22] == OP_EQUAL)) {    // P2SH-P2WPKH
-        BRTxInput ins[tx->inCount];
         BRTransaction t = *tx;
+        BRTxInput *ins;
         uint8_t redeem[22] = { OP_0, 20 };
         const uint8_t *pkh = &s[2];
 
         if (_BRWitnessItems(in->witness, in->witLen, items, lens, 2) != 2) return 0;
-        memcpy(ins, tx->inputs, sizeof(ins));
-        t.inputs = ins;
 
-        if (n == 23) { // the scriptSig is one push of the redeemScript 0014<h>, and it must hash to s
-            const uint8_t *elems[BRScriptElements(NULL, 0, in->signature, in->sigLen)];
-            size_t count = BRScriptElements(elems, sizeof(elems)/sizeof(*elems), in->signature, in->sigLen);
-            size_t rLen = 0;
-            const uint8_t *r = (count == 1) ? BRScriptData(elems[0], &rLen) : NULL;
+        if (n == 23) { // the scriptSig is exactly one push of the redeemScript 0014<h>, and it must hash to s
             UInt160 rh;
 
-            if (! r || rLen != 22 || r[0] != OP_0 || r[1] != 20) return 0;
-            BRHash160(&rh, r, rLen);
+            if (in->sigLen != 23 || in->signature[0] != 22 || in->signature[1] != OP_0 || in->signature[2] != 20)
+                return 0;
+            BRHash160(&rh, &in->signature[1], 22);
             if (memcmp(rh.u8, &s[2], 20) != 0) return 0;
-            memcpy(&redeem[2], &r[2], 20);
-            ins[index].script = redeem;          // BIP143 scriptCode comes from the redeemScript
-            ins[index].scriptLen = sizeof(redeem);
-            pkh = &r[2];
+            memcpy(&redeem[2], &in->signature[3], 20);
+            pkh = &in->signature[3];
         }
         else if (in->sigLen != 0) return 0;      // native segwit: empty scriptSig
 
-        uint8_t data[_BRTransactionWitnessData(&t, NULL, 0, index, SIGHASH_ALL)];
-        size_t dataLen = _BRTransactionWitnessData(&t, data, sizeof(data), index, SIGHASH_ALL);
+        ins = malloc(sizeof(*ins)*tx->inCount);
+        if (! ins) return 0;
+        memcpy(ins, tx->inputs, sizeof(*ins)*tx->inCount);
+        t.inputs = ins;
+        if (n == 23) {
+            ins[index].script = redeem;          // BIP143 scriptCode comes from the redeemScript
+            ins[index].scriptLen = sizeof(redeem);
+        }
 
-        if (dataLen == 0) return 0;
-        BRSHA256_2(&md, data, dataLen);
-        return _BRVerifyEcdsa(items[0], lens[0], items[1], lens[1], pkh, md);
+        dataLen = _BRTransactionWitnessData(&t, NULL, 0, index, SIGHASH_ALL);
+        data = (dataLen > 0) ? malloc(dataLen) : NULL;
+        if (data) dataLen = _BRTransactionWitnessData(&t, data, dataLen, index, SIGHASH_ALL);
+        if (data && dataLen > 0) BRSHA256_2(&md, data, dataLen);
+        r = (data && dataLen > 0) ? _BRVerifyEcdsa(items[0], lens[0], items[1], lens[1], pkh, md) : 0;
+        free(data);
+        free(ins);
+        return r;
     }
 
     if (n == 34 && s[0] == OP_1 && s[1] == 32) { // P2TR key path: witness = one 64- or 65-byte signature

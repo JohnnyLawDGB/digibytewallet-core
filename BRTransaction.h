@@ -102,6 +102,7 @@ typedef struct {
     uint32_t blockHeight;
     uint32_t timestamp; // time interval since unix epoch
     uint8_t is_dandelion;
+    uint32_t walletSigCheck; // BRWallet bookkeeping for an unconfirmed tx's signatures on wallet coins; 0 = unchecked
 } BRTransaction;
 
 // returns a newly allocated empty transaction that must be freed by calling BRTransactionFree()

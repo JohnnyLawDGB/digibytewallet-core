@@ -66,7 +66,9 @@ extern "C" {
 //   1  computed; a header whose target differs is logged ("diff-mismatch") and counted, the verdict is unchanged
 //   2  a header whose target differs is rejected; the peer is treated as misbehaving
 // At levels 1 and 2 a header whose ancestors are not resident far enough back to compute the target is not judged:
-// it is logged ("diff-skip") and counted, and is never rejected for that.
+// it is logged ("diff-skip") and counted, and is never rejected for that. A resident chain that starts at a checkpoint
+// carrying a difficulty context (BRCheckPointContext, BRChainParams.h; the newest checkpoints) has that history from
+// its first header on, so the headers directly above such a checkpoint are judged, not skipped.
 // The app's native build sets the shipped level (native/build.gradle.kts); host KATs set it per arm.
 #ifndef DGB_HEADER_DIFF_CHECK
 #define DGB_HEADER_DIFF_CHECK 0

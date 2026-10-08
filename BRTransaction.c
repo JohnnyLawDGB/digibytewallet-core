@@ -637,7 +637,19 @@ BRTransaction *BRTransactionParse(const uint8_t *buf, size_t bufLen)
         off += sizeof(uint32_t);
         sLen = (size_t)BRVarInt(&buf[off], (off <= bufLen ? bufLen - off : 0), &len);
         off += len;
-        
+#ifndef WIRE_OFF_WRAP_UNFIXED
+        // invariant: the declared input-script length is bounded by the bytes that
+        // remain, compared with no addition on the side that could wrap (contrast the
+        // off + sLen <= bufLen gates below, which wrap when sLen is near the type
+        // maximum). An honest input's script fits in the bytes present, so this only
+        // rejects a malformed length; without it a wrapped off slips past the
+        // end-of-buffer gate and the parser reads or writes outside the message.
+        if (sLen > (off <= bufLen ? bufLen - off : 0)) {
+            BRTransactionFree(tx);
+            return NULL;
+        }
+#endif
+
         if (off + sLen <= bufLen && BRAddressFromScriptPubKey(NULL, 0, &buf[off], sLen) > 0) {
             BRTxInputSetScript(input, &buf[off], sLen);
             if (_BRTransactionStoreMissing(input->script)) { BRTransactionFree(tx); return NULL; }
@@ -689,6 +701,15 @@ BRTransaction *BRTransactionParse(const uint8_t *buf, size_t bufLen)
         off += sizeof(uint64_t);
         sLen = (size_t)BRVarInt(&buf[off], (off <= bufLen ? bufLen - off : 0), &len);
         off += len;
+#ifndef WIRE_OFF_WRAP_UNFIXED
+        // invariant: as for the input script -- the declared output-script length is
+        // bounded by the bytes that remain, with no addition on the side that could
+        // wrap, so the running offset cannot be carried past the end of the message.
+        if (sLen > (off <= bufLen ? bufLen - off : 0)) {
+            BRTransactionFree(tx);
+            return NULL;
+        }
+#endif
         if (off + sLen <= bufLen) {
             BRTxOutputSetScript(output, &buf[off], sLen);
             if (_BRTransactionStoreMissing(output->script)) { BRTransactionFree(tx); return NULL; }
@@ -752,6 +773,18 @@ BRTransaction *BRTransactionParse(const uint8_t *buf, size_t bufLen)
         tx = NULL;
     }
     else if (isSigned && witnessFlag) {
+#ifndef WIRE_OFF_WRAP_UNFIXED
+        // invariant: witnessOff marks the end of the non-witness body (it is the
+        // offset after inputs and outputs), so the sign-tail reads buf[4..witnessOff]
+        // and sizes sBuf from it. A segwit body carries at least the 4-byte version,
+        // the 2-byte marker/flag and the lock time, so witnessOff is between 6 and
+        // bufLen for any well-formed message; outside that range the length is the
+        // product of a wrap and the tail must not allocate or copy from it.
+        if (witnessOff < sizeof(uint32_t) + 2 || witnessOff > bufLen) {
+            BRTransactionFree(tx);
+            return NULL;
+        }
+#endif
         BRSHA256_2(&tx->wtxHash, buf, off);
         sBuf = malloc((witnessOff - 2) + sizeof(uint32_t));
         UInt32SetLE(sBuf, tx->version);

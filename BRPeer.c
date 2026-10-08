@@ -1889,7 +1889,7 @@ static int _BRPeerAcceptMessage(BRPeer *peer, const uint8_t *msg, size_t msgLen,
     int r = 1;
     
     if (ctx->currentBlock && strncmp(MSG_TX, type, 12) != 0) { // if we receive a non-tx message, merkleblock is done
-        peer_log(peer, "incomplete merkleblock %s, expected %zu more tx, got %s",
+        peer_log(peer, "incomplete merkleblock %s, expected %zu more tx, got %.12s",
                  log_u256_hex_encode(ctx->currentBlock->blockHash), array_count(ctx->currentBlockTxHashes), type);
         array_clear(ctx->currentBlockTxHashes);
         ctx->currentBlock = NULL;
@@ -1913,7 +1913,7 @@ static int _BRPeerAcceptMessage(BRPeer *peer, const uint8_t *msg, size_t msgLen,
     else if (strncmp(MSG_CFILTER, type, 12) == 0) r = _BRPeerAcceptCFilterMessage(peer, msg, msgLen);
     else if (strncmp(MSG_CFCHECKPT, type, 12) == 0) r = _BRPeerAcceptCFCheckptMessage(peer, msg, msgLen);
     else if (strncmp(MSG_BLOCK, type, 12) == 0) r = _BRPeerAcceptBlockMessage(peer, msg, msgLen);
-    else peer_log(peer, "dropping %s, length %zu, not implemented", type, msgLen);
+    else peer_log(peer, "dropping %.12s, length %zu, not implemented", type, msgLen);
 
     return r;
 }
@@ -2184,7 +2184,11 @@ static void *_peerThreadRoutine(void *arg)
                 _BRPeerNoteClose(ctx, BR_CLOSE_LOCAL_PROTOCOL); // LEDGER
             }
             else if (len == HEADER_LENGTH) {
-                const char *type = (const char *)(&header[4]);
+                // The command field is 12 bytes and a 12-character command has no terminator, so
+                // every use below (logs, dispatch, acceptType) reads this NUL-terminated copy.
+                char type[13];
+                memcpy(type, &header[4], 12);
+                type[12] = '\0';
                 uint32_t msgLen = UInt32GetLE(&header[16]);
                 uint32_t checksum = UInt32GetLE(&header[20]);
                 UInt256 hash;

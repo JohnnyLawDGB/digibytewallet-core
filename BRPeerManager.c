@@ -293,6 +293,11 @@ typedef struct {
     int      used;
 } BRCFSolicitedBlock;
 
+#if DGB_HEADER_DIFF_CHECK >= 1
+// the most checkpoint difficulty contexts (BRCheckPointContext) a manager uses; the newest are kept
+#define DIFF_V4_CONTEXTS_MAX 4
+#endif
+
 struct BRPeerManagerStruct {
     const BRChainParams *params;
     BRWallet *wallet;
@@ -315,6 +320,13 @@ struct BRPeerManagerStruct {
     BRSet *blocks, *orphans, *checkpoints;
     BRMerkleBlock *lastBlock, *lastOrphan;
     BRMerkleBlock *startSyncFrom;
+#if DGB_HEADER_DIFF_CHECK >= 1
+    // The checkpoint difficulty contexts of params that verified at construction (BRCheckPointContextVerify), and the
+    // block hash of the checkpoint each one ends at. Read-only after BRPeerManagerNewEx; they point into params.
+    const BRCheckPointContext *diffContexts[DIFF_V4_CONTEXTS_MAX];
+    UInt256 diffContextHashes[DIFF_V4_CONTEXTS_MAX];
+    size_t diffContextCount;
+#endif
     // Bound on the parentless-header ("orphan") set -- see ORPHAN_SET_* in BRPeerManager.h.
     // orphanBytes is the resident byte total across manager->orphans. Every path that adds a
     // header to the set or takes one out adjusts it (_BRPeerManagerStoreOrphanLocked and
@@ -3113,26 +3125,91 @@ static void _BRPeerManagerClearMemory(BRPeerManager* manager) {
 // one whose next target the reference client has long since eased to powLimit or near it.
 #define DIFF_V4_ALGO_WALK_MAX 1024
 
-// a resident block that carries no header fields (a checkpoint stub: hash, height, time and target only) ends the
-// resident history; so does a missing parent
-static const BRMerkleBlock *_BRPeerManagerResidentParentLocked(BRPeerManager *manager, const BRMerkleBlock *b)
-{
-    if (! b || UInt256IsZero(b->prevBlock)) return NULL;
-    b = BRSetGet(manager->blocks, &b->prevBlock);
-    return (b && ! UInt256IsZero(b->prevBlock)) ? b : NULL;
-}
+// One block of the history V4 reads below a header, walking down from its parent: a resident block that carries header
+// fields, or a row of a verified checkpoint difficulty context (BRCheckPointContext; row 0 is the checkpoint's own
+// header, row i the block i below it). A checkpoint stub (hash, height, time and target only, zero prevBlock) has no
+// algorithm and no ancestors: the walk continues into its context if it has one, and ends there otherwise; so does a
+// missing parent, unless the block itself is a checkpoint with a context (its real header replaced the stub).
+typedef struct {
+    const BRMerkleBlock *b;     // the resident block, or NULL while reading context rows
+    size_t ctx, row;            // the context (index into manager->diffContexts) and row, when b is NULL
+    uint32_t timestamp, target;
+    int algo;                   // as the reference client's CBlockIndex::GetAlgo: an unknown algorithm reads as scrypt
+} _BRDiffV4Step;
 
-// the algorithm the reference client's CBlockIndex::GetAlgo gives a resident block: an unknown one reads as scrypt
-static int _BRPeerManagerResidentAlgo(const BRMerkleBlock *b)
+// the algorithm the reference client's CBlockIndex::GetAlgo gives a block of version `version`: an unknown one reads as
+// scrypt
+static int _BRPeerManagerResidentAlgo(uint32_t version)
 {
-    int algo = BRMerkleBlockAlgo(b);
+    BRMerkleBlock b;
 
+    b.version = version;
+    int algo = BRMerkleBlockAlgo(&b);
     return (algo == BLOCK_ALGO_UNKNOWN) ? BLOCK_VERSION_SCRYPT : algo;
 }
 
+// the verified context ending at the checkpoint whose block hash is `hash`, or -1
+static int _BRPeerManagerDiffV4ContextLocked(BRPeerManager *manager, UInt256 hash)
+{
+    for (size_t i = 0; i < manager->diffContextCount; i++) {
+        if (UInt256Eq(manager->diffContextHashes[i], hash)) return (int)i;
+    }
+
+    return -1;
+}
+
+// positions *s at context `ctx`, row `row`; 0 if the context has no such row
+static int _BRPeerManagerDiffV4ContextStepLocked(BRPeerManager *manager, size_t ctx, size_t row, _BRDiffV4Step *s)
+{
+    uint8_t hdr[80];
+
+    if (! BRCheckPointContextRow(manager->diffContexts[ctx], row, hdr)) return 0;
+    s->b = NULL;
+    s->ctx = ctx;
+    s->row = row;
+    s->algo = _BRPeerManagerResidentAlgo(UInt32GetLE(&hdr[0]));
+    s->timestamp = UInt32GetLE(&hdr[68]);
+    s->target = UInt32GetLE(&hdr[72]);
+    return 1;
+}
+
+// positions *s at the resident block `b`; 0 if the history ends there (a stub without a context)
+static int _BRPeerManagerDiffV4StepAtLocked(BRPeerManager *manager, const BRMerkleBlock *b, _BRDiffV4Step *s)
+{
+    if (! b) return 0;
+
+    if (UInt256IsZero(b->prevBlock)) {   // a checkpoint stub: its header is row 0 of its context
+        int ctx = _BRPeerManagerDiffV4ContextLocked(manager, b->blockHash);
+
+        return (ctx >= 0) ? _BRPeerManagerDiffV4ContextStepLocked(manager, (size_t)ctx, 0, s) : 0;
+    }
+
+    s->b = b;
+    s->algo = _BRPeerManagerResidentAlgo(b->version);
+    s->timestamp = b->timestamp;
+    s->target = b->target;
+    return 1;
+}
+
+// moves *s one block down; 0 if the history ends
+static int _BRPeerManagerDiffV4StepDownLocked(BRPeerManager *manager, _BRDiffV4Step *s)
+{
+    if (! s->b) return _BRPeerManagerDiffV4ContextStepLocked(manager, s->ctx, s->row + 1, s);
+
+    const BRMerkleBlock *parent = BRSetGet(manager->blocks, &s->b->prevBlock);
+
+    if (parent) return _BRPeerManagerDiffV4StepAtLocked(manager, parent, s);
+
+    // the parent is not resident: if this block is a checkpoint with a context, its parent is row 1
+    int ctx = _BRPeerManagerDiffV4ContextLocked(manager, s->b->blockHash);
+
+    return (ctx >= 0) ? _BRPeerManagerDiffV4ContextStepLocked(manager, (size_t)ctx, 1, s) : 0;
+}
+
 // The target the reference client's GetNextWorkRequired gives `block` on top of `prev` at a height MultiShield V4
-// governs, computed from the resident ancestors (manager->blocks, walked by prevBlock from `prev`).
-// Returns 1 and writes *expected, or 0 if the ancestors the computation reads are not resident: the averaging window
+// governs, computed from the resident ancestors (manager->blocks, walked by prevBlock from `prev`) and, below a
+// checkpoint the chain starts at, that checkpoint's verified difficulty context.
+// Returns 1 and writes *expected, or 0 if the ancestors the computation reads are not in hand: the averaging window
 // with both median-time-past spans (NUM_ALGOS*averagingInterval + BR_DIFF_V4_MEDIAN_SPAN blocks ending at `prev`),
 // and the last block of the header's algorithm within DIFF_V4_ALGO_WALK_MAX blocks below the window. A partial
 // resident chain cannot tell "absent in the reference client" (where it falls back to the algorithm's initial
@@ -3158,34 +3235,38 @@ static int _BRPeerManagerDiffV4ExpectedLocked(BRPeerManager *manager, const BRMe
         return 1;
     }
 
-    const BRMerkleBlock *b = (UInt256IsZero(prev->prevBlock)) ? NULL : prev, *prevAlgo = NULL;
-    uint32_t distance = 0, prevAlgoDistance = 0;
+    _BRDiffV4Step s;
+    int have = _BRPeerManagerDiffV4StepAtLocked(manager, prev, &s), havePrevAlgo = 0;
+    uint32_t distance = 0, prevAlgoDistance = 0, prevAlgoTarget = 0;
 
     // one walk down from the parent: the window's timestamps, and the first block of the header's algorithm
-    for (distance = 0; b && distance < window + BR_DIFF_V4_MEDIAN_SPAN + DIFF_V4_ALGO_WALK_MAX; distance++) {
-        if (distance < BR_DIFF_V4_MEDIAN_SPAN) lastTimes[distance] = b->timestamp;
+    for (distance = 0; have && distance < window + BR_DIFF_V4_MEDIAN_SPAN + DIFF_V4_ALGO_WALK_MAX; distance++) {
+        if (distance < BR_DIFF_V4_MEDIAN_SPAN) lastTimes[distance] = s.timestamp;
         if (distance >= window && distance < window + BR_DIFF_V4_MEDIAN_SPAN)
-            firstTimes[distance - window] = b->timestamp;
+            firstTimes[distance - window] = s.timestamp;
 
-        if (! prevAlgo && _BRPeerManagerResidentAlgo(b) == algo) {
-            if (! p->allowMinDifficultyBlocks) prevAlgo = b;
+        if (! havePrevAlgo && s.algo == algo) {
+            if (! p->allowMinDifficultyBlocks) havePrevAlgo = 1;
             else {
                 // the reference client skips a minimum-difficulty block of the algorithm when the rule above is on
-                const BRMerkleBlock *parent = _BRPeerManagerResidentParentLocked(manager, b);
+                _BRDiffV4Step parent = s;
 
-                if (! parent) break;   // cannot tell whether it is one
-                if ((int64_t)b->timestamp <= (int64_t)parent->timestamp + 2*p->targetSpacing) prevAlgo = b;
+                if (! _BRPeerManagerDiffV4StepDownLocked(manager, &parent)) break;   // cannot tell whether it is one
+                if ((int64_t)s.timestamp <= (int64_t)parent.timestamp + 2*p->targetSpacing) havePrevAlgo = 1;
             }
 
-            if (prevAlgo) prevAlgoDistance = distance;
+            if (havePrevAlgo) {
+                prevAlgoDistance = distance;
+                prevAlgoTarget = s.target;
+            }
         }
 
-        if (prevAlgo && distance + 1 >= window + BR_DIFF_V4_MEDIAN_SPAN) break;   // everything read is in hand
-        b = _BRPeerManagerResidentParentLocked(manager, b);
+        if (havePrevAlgo && distance + 1 >= window + BR_DIFF_V4_MEDIAN_SPAN) break;   // everything read is in hand
+        have = _BRPeerManagerDiffV4StepDownLocked(manager, &s);
     }
 
-    if (! prevAlgo || ! b || distance + 1 < window + BR_DIFF_V4_MEDIAN_SPAN) return 0;
-    *expected = BRDifficultyV4Target(p, lastTimes, firstTimes, prevAlgo->target, prevAlgoDistance);
+    if (! havePrevAlgo || ! have || distance + 1 < window + BR_DIFF_V4_MEDIAN_SPAN) return 0;
+    *expected = BRDifficultyV4Target(p, lastTimes, firstTimes, prevAlgoTarget, prevAlgoDistance);
     return 1;
 }
 #endif
@@ -4537,7 +4618,41 @@ BRPeerManager *BRPeerManagerNewEx(const BRChainParams *params, BRWallet *wallet,
         if ((i == 0 && !startSyncFrom) || block->timestamp + 7*24*60*60 < manager->earliestKeyTime)
             manager->lastBlock = block;
     }
-    
+
+#if DGB_HEADER_DIFF_CHECK >= 1 && !defined(CHECKPOINT_DIFF_CONTEXT_UNFIXED)
+    // The difficulty context at the newest checkpoints: the real headers ending at each, so a resident chain that
+    // starts at one of those stubs has the history MultiShield V4 reads for its first headers. A run is used only if
+    // it verifies against this network's own checkpoint table and holds the whole averaging window; the newest
+    // DIFF_V4_CONTEXTS_MAX are kept. (The pre-fix shape, -DCHECKPOINT_DIFF_CONTEXT_UNFIXED, is built only by the host
+    // KAT's red arm: no context, so the first headers above a starting checkpoint are not judged.)
+    for (size_t i = 0; manager->params->checkpointContexts && i < manager->params->checkpointContextsCount; i++) {
+        const BRCheckPointContext *ctx = &manager->params->checkpointContexts[i];
+        UInt256 hash;
+
+        if (ctx->count < BR_DIFF_V4_NUM_ALGOS*manager->params->diffV4.averagingInterval + BR_DIFF_V4_MEDIAN_SPAN ||
+            ! BRCheckPointContextVerify(manager->params->checkpoints, manager->params->checkpointsCount, ctx, &hash)) {
+            debug_log("checkpoint difficulty context at %" PRIu32 " does not verify; not used\n", ctx->height);
+            continue;
+        }
+
+        if (manager->diffContextCount == DIFF_V4_CONTEXTS_MAX) {
+            size_t oldest = 0;
+
+            for (size_t j = 1; j < DIFF_V4_CONTEXTS_MAX; j++) {
+                if (manager->diffContexts[j]->height < manager->diffContexts[oldest]->height) oldest = j;
+            }
+
+            if (manager->diffContexts[oldest]->height >= ctx->height) continue;
+            manager->diffContexts[oldest] = ctx;
+            manager->diffContextHashes[oldest] = hash;
+        }
+        else {
+            manager->diffContexts[manager->diffContextCount] = ctx;
+            manager->diffContextHashes[manager->diffContextCount++] = hash;
+        }
+    }
+#endif
+
     block = NULL;
     
     for (size_t i = 0; blocks && i < blocksCount; i++) {

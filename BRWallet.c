@@ -260,6 +260,27 @@ static uint32_t _BRCoinbaseMaturity(uint32_t coinHeight)
 unsigned long _walletKatRebuilds = 0;
 #endif
 
+// Money range (MAX_MONEY, BRTransaction.h). A transaction whose outputs are out of range is not a
+// transaction any node accepts: no output above MAX_MONEY and outputs summing to at most MAX_MONEY.
+// Each output is bounded before it is added, so the running sum cannot wrap.
+static int _BRWalletTxMoneyRangeOK(const BRTransaction *tx)
+{
+    uint64_t total = 0;
+
+    for (size_t i = 0; i < tx->outCount; i++) {
+        if (tx->outputs[i].amount > MAX_MONEY) return 0;
+        total += tx->outputs[i].amount;
+        if (total > MAX_MONEY) return 0;
+    }
+
+    return 1;
+}
+
+// Sums of wallet amounts saturate instead of wrapping: a wallet total is never smaller than a part
+// of it, nor larger than its parts after a subtraction.
+static uint64_t _BRMoneyAdd(uint64_t a, uint64_t b) { return (b > UINT64_MAX - a) ? UINT64_MAX : a + b; }
+static uint64_t _BRMoneySub(uint64_t a, uint64_t b) { return (b > a) ? 0 : a - b; }
+
 static void _BRWalletUpdateBalance(BRWallet *wallet)
 {
     int isInvalid, isPending, isCoinbase, immature;
@@ -386,7 +407,7 @@ static void _BRWalletUpdateBalance(BRWallet *wallet)
                         if (immature) {
                             // carried separately; never in utxos/ddUtxos/assetUtxos or balance.
                             // The address is still recorded as used (above).
-                            immatureBalance += tx->outputs[j].amount;
+                            immatureBalance = _BRMoneyAdd(immatureBalance, tx->outputs[j].amount);
                             if (tx->blockHeight != TX_UNCONFIRMED && matureAt < nextMaturity) nextMaturity = matureAt;
                             continue;
                         }
@@ -419,7 +440,7 @@ static void _BRWalletUpdateBalance(BRWallet *wallet)
                     } else {
                         // Add the UTXO to the internal list of utxos and add the balance
                         array_add(wallet->utxos, ((BRUTXO) { tx->txHash, (uint32_t)j }));
-                        balance += tx->outputs[j].amount;
+                        balance = _BRMoneyAdd(balance, tx->outputs[j].amount);
                     }
                 }
             } else {
@@ -431,7 +452,7 @@ static void _BRWalletUpdateBalance(BRWallet *wallet)
             t = BRSetGet(wallet->allTx, &wallet->utxos[j - 1].hash);
             o = t->outputs[wallet->utxos[j - 1].n];
             if (BRSetContains(wallet->spentOutputs, &wallet->utxos[j - 1])) {
-                balance -= o.amount;
+                balance = _BRMoneySub(balance, o.amount);
                 array_rm(wallet->utxos, j - 1);
             }
         }
@@ -517,6 +538,7 @@ BRWallet *BRWalletNew(BRTransaction *transactions[], size_t txCount, BRMasterPub
     for (size_t i = 0; transactions && i < txCount; i++) {
         tx = transactions[i];
         if (! BRTransactionIsSigned(tx) || BRSetContains(wallet->allTx, tx)) continue;
+        if (! _BRWalletTxMoneyRangeOK(tx)) continue;   // never a valid transaction: not loaded
         BRSetAdd(wallet->allTx, tx);
         _BRWalletInsertTx(wallet, tx);
 
@@ -634,6 +656,7 @@ BRWallet *BRWalletNewDual(BRTransaction *transactions[], size_t txCount,
         for (size_t i = 0; i < txCount; i++) {
             BRTransaction *tx = transactions[i];
             if (! tx || ! BRTransactionIsSigned(tx) || BRSetContains(wallet->allTx, tx)) continue;
+            if (! _BRWalletTxMoneyRangeOK(tx)) continue;   // never a valid transaction: not loaded
             BRSetAdd(wallet->allTx, tx);
             _BRWalletInsertTx(wallet, tx);
 
@@ -1528,7 +1551,7 @@ BRTransaction *BRWalletCreateTxForOutputsEx(BRWallet *wallet, const BRTxOutput o
             break;
         }
         
-        balance += tx->outputs[o->n].amount;
+        balance = _BRMoneyAdd(balance, tx->outputs[o->n].amount);
         
         //        // size of unconfirmed, non-change inputs for child-pays-for-parent fee
         //        // don't include parent tx with more than 10 inputs or 10 outputs
@@ -1758,7 +1781,7 @@ BRTransaction *BRWalletCreateDigiDollarTransfer(BRWallet *wallet, const uint8_t 
         feesel[fm].hash = ut->txHash; feesel[fm].n = o->n; feesel[fm].amt = ut->outputs[o->n].amount;
         feesel[fm].scriptLen = ut->outputs[o->n].scriptLen;
         memcpy(feesel[fm].script, ut->outputs[o->n].script, feesel[fm].scriptLen);
-        dgbIn += feesel[fm].amt; fm++;
+        dgbIn = _BRMoneyAdd(dgbIn, feesel[fm].amt); fm++;
         size_t est = 10 + ddIn*57 + fm*68 + 3*TX_OUTPUT_SIZE + 32; // DD in + fee in + ~3 outs + OP_RETURN
         fee = _txFee(feePerKb, est); if (fee < DD_MIN_FEE) fee = DD_MIN_FEE;
         if (dgbIn >= fee) break;
@@ -2013,7 +2036,10 @@ int BRWalletRegisterTransaction(BRWallet *wallet, BRTransaction *tx)
         pthread_mutex_lock(&wallet->lock);
 
         if (! BRSetContains(wallet->allTx, tx)) {
-            if (_BRWalletContainsTx(wallet, tx)) {
+            // An out-of-range transaction is refused like one that is not the wallet's: it never
+            // reaches the balance, so its values cannot wrap the wallet's sums. (Ownership is as for
+            // any non-wallet tx, which callers already handle: kept in allTx only while unconfirmed.)
+            if (_BRWalletTxMoneyRangeOK(tx) && _BRWalletContainsTx(wallet, tx)) {
                 // TODO: verify signatures when possible
                 // TODO: handle tx replacement with input sequence numbers
                 //       (for now, replacements appear invalid until confirmation)
@@ -2162,6 +2188,7 @@ int BRWalletTransactionIsValid(BRWallet *wallet, const BRTransaction *tx)
     if (!BRTransactionIsSigned(tx)) {
         return 0;
     }
+    if (! _BRWalletTxMoneyRangeOK(tx)) return 0;
 
     // TODO: XXX attempted double spends should cause conflicted tx to remain unverified until they're confirmed
     // TODO: XXX conflicted tx with the same wallet outputs should be presented as the same tx to the user
@@ -2539,8 +2566,9 @@ uint64_t BRWalletMaxOutputAmount(BRWallet *wallet)
         o = &wallet->utxos[i - 1];
         tx = BRSetGet(wallet->allTx, &o->hash);
         if (! tx || o->n >= tx->outCount) continue;
+        if (! _BRWalletOutputSignable(&tx->outputs[o->n])) continue;   // what selection would skip
         inCount++;
-        amount += tx->outputs[o->n].amount;
+        amount = _BRMoneyAdd(amount, tx->outputs[o->n].amount);
         
 //        // size of unconfirmed, non-change inputs for child-pays-for-parent fee
 //        // don't include parent tx with more than 10 inputs or 10 outputs

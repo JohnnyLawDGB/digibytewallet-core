@@ -363,7 +363,15 @@ uint8_t BRTxOutputIsAsset(const BRTransaction* transaction, const BRTxOutput* ou
 #endif
             }
 
+#ifdef ASSET_BURN_MARKER_UNFIXED
+            /* UNFIXED arm, built only by the burn-marker KAT: index 31 read as a burn in every operation. */
             burn = (outputIdx == 31 && range == 0);
+#else
+            // Output 31 is the destroy marker only in a BURN (DigiAsset_Core DigiByteTransaction.cpp
+            // decodeAssetTransfer). In a transfer or an issuance it names a real output, which
+            // exists once a transaction has 32 or more, and is held like any other target.
+            burn = (outputIdx == 31 && range == 0 && DA_IS_BURN(type));
+#endif
 
             // An instruction targets output `idx` when it names it; a RANGE names every
             // output from 0 up to and including its endpoint.

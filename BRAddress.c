@@ -280,10 +280,15 @@ size_t BRAddressFromScriptPubKey(char *addr, size_t addrLen, const uint8_t *scri
     if (! script || scriptLen == 0 || scriptLen > MAX_SCRIPT_LENGTH) return 0;
 
     uint8_t data[21];
-    const uint8_t *d, *elems[BRScriptElements(NULL, 0, script, scriptLen)];
+    const uint8_t *elems[BRScriptElements(NULL, 0, script, scriptLen)];
     char a[91];
     size_t r = 0, l = 0, count = BRScriptElements(elems, sizeof(elems)/sizeof(*elems), script, scriptLen);
-    if ((count == 5 || count == 8) && *elems[0] == OP_DUP && *elems[1] == OP_HASH160 && *elems[2] == 20 && *elems[3] == OP_EQUALVERIFY
+    // Only scripts the wallet can sign map to an address: the wallet credits an output by its address,
+    // so an address for a script BRTransactionSign cannot spend is a balance that cannot be sent, and
+    // coin selection that picks it fails every send. Hence exactly five elements here (an extended
+    // P2PKH-shaped script is not P2PKH), and no address at all for pay-to-pubkey (BRScriptPKH has no
+    // hash for it, so it is never signed). This is the NOTE above, applied.
+    if (count == 5 && *elems[0] == OP_DUP && *elems[1] == OP_HASH160 && *elems[2] == 20 && *elems[3] == OP_EQUALVERIFY
         && *elems[4] == OP_CHECKSIG) {
         // pay-to-pubkey-hash scriptPubKey
         data[0] = BRNetworkIsTestnet() ? BITCOIN_PUBKEY_ADDRESS_TEST : DIGIBYTE_PUBKEY_LEGACY;
@@ -294,13 +299,6 @@ size_t BRAddressFromScriptPubKey(char *addr, size_t addrLen, const uint8_t *scri
         // pay-to-script-hash scriptPubKey
         data[0] = BRNetworkIsTestnet() ? BITCOIN_SCRIPT_ADDRESS_TEST : DIGIBYTE_SCRIPT_ADDRESS;
         memcpy(&data[1], BRScriptData(elems[1], &l), 20);
-        r = BRBase58CheckEncode(addr, addrLen, data, 21);
-    }
-    else if (count == 2 && (*elems[0] == 65 || *elems[0] == 33) && *elems[1] == OP_CHECKSIG) {
-        // pay-to-pubkey scriptPubKey
-        data[0] = BRNetworkIsTestnet() ? BITCOIN_PUBKEY_ADDRESS_TEST : DIGIBYTE_PUBKEY_LEGACY;
-        d = BRScriptData(elems[0], &l);
-        BRHash160(&data[1], d, l);
         r = BRBase58CheckEncode(addr, addrLen, data, 21);
     }
     else if (count == 2 && ((*elems[0] == OP_0 && (*elems[1] == 20 || *elems[1] == 32)) ||

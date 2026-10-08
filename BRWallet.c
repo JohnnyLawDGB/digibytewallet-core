@@ -329,7 +329,7 @@ static int _BRWalletTxMoneyRangeOK(const BRTransaction *tx)
 static uint64_t _BRMoneyAdd(uint64_t a, uint64_t b) { return (b > UINT64_MAX - a) ? UINT64_MAX : a + b; }
 static uint64_t _BRMoneySub(uint64_t a, uint64_t b) { return (b > a) ? 0 : a - b; }
 
-static int _BRWalletUnconfirmedSpendsSigned(BRWallet *wallet, BRTransaction *tx);
+static int _BRWalletSpendsSigned(BRWallet *wallet, BRTransaction *tx);
 
 static void _BRWalletUpdateBalance(BRWallet *wallet)
 {
@@ -370,13 +370,18 @@ static void _BRWalletUpdateBalance(BRWallet *wallet)
                     BRSetContains(wallet->invalidTx, &tx->inputs[j].txHash))
                     isInvalid = 1;
             }
-            if (! isInvalid && ! _BRWalletUnconfirmedSpendsSigned(wallet, tx)) isInvalid = 1;
+            if (! isInvalid && ! _BRWalletSpendsSigned(wallet, tx)) isInvalid = 1;
         
             if (isInvalid) {
                 BRSetAdd(wallet->invalidTx, tx);
                 array_add(wallet->balanceHist, balance);
                 continue;
             }
+        }
+        else if (! _BRWalletSpendsSigned(wallet, tx)) { // a height a server reported, checked the same way
+            BRSetAdd(wallet->invalidTx, tx);
+            array_add(wallet->balanceHist, balance);
+            continue;
         }
 
         // add inputs to spent output set
@@ -2248,7 +2253,11 @@ static int _BRWalletInputsSigned(BRWallet *wallet, const BRTransaction *tx)
 // were last found valid (0: never checked). Which inputs are wallet-owned can change after a tx is
 // registered -- its prevout arrives later, or the address set grows into the prevout's address -- so a
 // changed fingerprint means checking again.
+// WALLET_SIG_ALWAYS (a flag bit): the tx's height was not proven by this wallet -- a server reported it
+// (BRWalletRegisterTransactionUnproven) -- so it is checked at every height, not only while unconfirmed.
 #define WALLET_SIG_TRUSTED UINT32_MAX
+#define WALLET_SIG_ALWAYS  0x80000000u
+#define WALLET_SIG_PRINT   0x7fffffffu
 
 static uint32_t _BRWalletOwnedInputsPrint(BRWallet *wallet, const BRTransaction *tx)
 {
@@ -2262,22 +2271,31 @@ static uint32_t _BRWalletOwnedInputsPrint(BRWallet *wallet, const BRTransaction 
             fp += (uint32_t)(i + 1)*2654435761u + 0x9e3779b9u;
     }
 
-    return (fp == 0 || fp == WALLET_SIG_TRUSTED) ? 2 : fp;
+    fp &= WALLET_SIG_PRINT;
+    return fp ? fp : 1;
 }
 
-// True when an UNCONFIRMED tx validly signs every wallet output it spends, now -- or is trusted. Checked
-// at registration and again at every balance rebuild (cheaply: only when the set of wallet-owned inputs
-// changed), so neither the order transactions arrive in nor a load from storage lets an unsigned spend
-// mark a wallet coin spent. Caller holds wallet->lock.
-static int _BRWalletUnconfirmedSpendsSigned(BRWallet *wallet, BRTransaction *tx)
+// True when tx must validly sign the wallet coins it spends for them to count as spent: an unconfirmed
+// tx not registered through the trusted path, or any tx whose height the wallet did not prove itself.
+static int _BRWalletSpendsNeedSigning(const BRTransaction *tx)
+{
+    if (tx->walletSigCheck == WALLET_SIG_TRUSTED) return 0;
+    return tx->blockHeight == TX_UNCONFIRMED || (tx->walletSigCheck & WALLET_SIG_ALWAYS);
+}
+
+// True when tx validly signs every wallet output it spends, now -- or needs no check. Checked at
+// registration and again at every balance rebuild (cheaply: only when the set of wallet-owned inputs
+// changed), so neither the order transactions arrive in, nor the address window growing into a coin,
+// nor a load from storage lets an unsigned spend mark a wallet coin spent. Caller holds wallet->lock.
+static int _BRWalletSpendsSigned(BRWallet *wallet, BRTransaction *tx)
 {
     uint32_t fp;
 
-    if (tx->walletSigCheck == WALLET_SIG_TRUSTED) return 1;
+    if (! _BRWalletSpendsNeedSigning(tx)) return 1;
     fp = _BRWalletOwnedInputsPrint(wallet, tx);
-    if (fp == tx->walletSigCheck) return 1;
+    if (fp == (tx->walletSigCheck & WALLET_SIG_PRINT)) return 1;
     if (! _BRWalletInputsSigned(wallet, tx)) return 0;
-    tx->walletSigCheck = fp;
+    tx->walletSigCheck = (tx->walletSigCheck & WALLET_SIG_ALWAYS) | fp;
     return 1;
 }
 
@@ -2286,6 +2304,7 @@ static int _BRWalletUnconfirmedSpendsSigned(BRWallet *wallet, BRTransaction *tx)
 // tx and nothing else checks it, so without this a tx with a junk scriptSig would mark the wallet's coin
 // spent and stand in for it as unconfirmed change. A refused tx -- this, or out of the money range -- is
 // not kept at all: the caller still owns it.
+// checkInputs: 0 trusted (never checked), 1 checked while unconfirmed, 2 checked at any height.
 static int _BRWalletRegisterTx(BRWallet *wallet, BRTransaction *tx, int checkInputs)
 {
     int wasAdded = 0, r = 1;
@@ -2297,12 +2316,12 @@ static int _BRWalletRegisterTx(BRWallet *wallet, BRTransaction *tx, int checkInp
         pthread_mutex_lock(&wallet->lock);
 
         if (! BRSetContains(wallet->allTx, tx)) {
-            if (! _BRWalletTxMoneyRangeOK(tx) ||
-                (checkInputs && tx->blockHeight == TX_UNCONFIRMED && ! _BRWalletUnconfirmedSpendsSigned(wallet, tx))) {
+            tx->walletSigCheck = (checkInputs == 0) ? WALLET_SIG_TRUSTED : (checkInputs == 2) ? WALLET_SIG_ALWAYS : 0;
+
+            if (! _BRWalletTxMoneyRangeOK(tx) || (checkInputs && ! _BRWalletSpendsSigned(wallet, tx))) {
                 r = 0;   // refused and not kept, at any height
             }
             else {
-                if (! checkInputs) tx->walletSigCheck = WALLET_SIG_TRUSTED;   // never rechecked (balance rebuild)
 
                 if (_BRWalletContainsTx(wallet, tx)) {
                     // TODO: handle tx replacement with input sequence numbers
@@ -2367,6 +2386,31 @@ int BRWalletRegisterTransaction(BRWallet *wallet, BRTransaction *tx)
 int BRWalletRegisterTransactionTrusted(BRWallet *wallet, BRTransaction *tx)
 {
     return _BRWalletRegisterTx(wallet, tx, 0);
+}
+
+int BRWalletRegisterTransactionUnproven(BRWallet *wallet, BRTransaction *tx)
+{
+    return _BRWalletRegisterTx(wallet, tx, 2);
+}
+
+// BRWalletUpdateTransactions for heights the wallet has not proven itself (a server reported them): each
+// record not registered through the trusted path keeps being checked at its new height
+// (WALLET_SIG_ALWAYS), so a server-reported confirmation cannot make an unsigned spend count.
+void BRWalletUpdateTransactionsUnproven(BRWallet *wallet, const UInt256 txHashes[], size_t txCount,
+                                        uint32_t blockHeight, uint32_t timestamp)
+{
+    assert(wallet != NULL);
+    assert(txHashes != NULL || txCount == 0);
+    pthread_mutex_lock(&wallet->lock);
+
+    for (size_t i = 0; i < txCount; i++) {
+        BRTransaction *tx = BRSetGet(wallet->allTx, &txHashes[i]);
+
+        if (tx && tx->walletSigCheck != WALLET_SIG_TRUSTED) tx->walletSigCheck |= WALLET_SIG_ALWAYS;
+    }
+
+    pthread_mutex_unlock(&wallet->lock);
+    BRWalletUpdateTransactions(wallet, txHashes, txCount, blockHeight, timestamp);
 }
 
 // removes a tx from the wallet and calls BRTransactionFree() on it, along with any tx that depend on its outputs
@@ -2453,13 +2497,30 @@ BRTransaction *BRWalletTransactionForHash(BRWallet *wallet, UInt256 txHash)
 }
 
 // true if no previous wallet transaction spends any of the given transaction's inputs, and no inputs are invalid
+#define TX_VALID_BUDGET 10000   // transactions one validity question may visit, ancestors included
+#define TX_VALID_DEPTH  100     // unconfirmed generations it may descend (relay policy stops at 25)
+
+static int _BRWalletTxIsValid(BRWallet *wallet, const BRTransaction *tx, int depth, int *budget);
+
 int BRWalletTransactionIsValid(BRWallet *wallet, const BRTransaction *tx)
+{
+    int budget = TX_VALID_BUDGET;
+
+    return _BRWalletTxIsValid(wallet, tx, TX_VALID_DEPTH, &budget);
+}
+
+// The validity walk visits unconfirmed ancestors, which a peer can chain without limit: it is bounded
+// in depth (the stack) and in total visits (`budget`, shared by the whole question, so shared ancestors
+// cannot multiply the work), and a question that runs out of either is answered "not valid" -- no valid
+// unconfirmed tx has an ancestry near those bounds.
+static int _BRWalletTxIsValid(BRWallet *wallet, const BRTransaction *tx, int depth, int *budget)
 {
     BRTransaction *t;
     int r = 1;
 
     assert(wallet != NULL);
     assert(tx != NULL);
+    if (depth <= 0 || --*budget < 0) return 0;
     if (!BRTransactionIsSigned(tx)) {
         return 0;
     }
@@ -2476,6 +2537,8 @@ int BRWalletTransactionIsValid(BRWallet *wallet, const BRTransaction *tx)
                 if (BRSetContains(wallet->spentOutputs, &tx->inputs[i]))
                     r = 0;
             }
+            // an unconfirmed tx that spends a wallet coin without validly signing it is no valid tx
+            if (r && ! _BRWalletInputsSigned(wallet, tx)) r = 0;
         }
         else if (BRSetContains(wallet->invalidTx, tx))
             r = 0;
@@ -2484,7 +2547,7 @@ int BRWalletTransactionIsValid(BRWallet *wallet, const BRTransaction *tx)
 
         for (size_t i = 0; r && i < tx->inCount; i++) {
             t = BRWalletTransactionForHash(wallet, tx->inputs[i].txHash);
-            if (t && ! BRWalletTransactionIsValid(wallet, t))
+            if (t && ! _BRWalletTxIsValid(wallet, t, depth - 1, budget))
                 r = 0;
         }
     }

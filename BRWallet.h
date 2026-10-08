@@ -324,6 +324,15 @@ int BRWalletRegisterTransaction(BRWallet *wallet, BRTransaction *tx);
 // hashes to its header. Every other caller uses BRWalletRegisterTransaction.
 int BRWalletRegisterTransactionTrusted(BRWallet *wallet, BRTransaction *tx);
 
+// The same as BRWalletRegisterTransaction for a tx whose height the wallet has not proven itself (a
+// server reported it): its signatures on wallet coins are checked at any height, at registration and at
+// every balance rebuild, as an unconfirmed tx's are.
+int BRWalletRegisterTransactionUnproven(BRWallet *wallet, BRTransaction *tx);
+
+// BRWalletUpdateTransactions for heights a server reported: the records stay checked as above.
+void BRWalletUpdateTransactionsUnproven(BRWallet *wallet, const UInt256 txHashes[], size_t txCount,
+                                        uint32_t blockHeight, uint32_t timestamp);
+
 // removes a tx from the wallet and calls BRTransactionFree() on it, along with any tx that depend on its outputs
 void BRWalletRemoveTransaction(BRWallet *wallet, UInt256 txHash);
 

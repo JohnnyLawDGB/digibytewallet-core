@@ -151,6 +151,11 @@ int BRTransactionIsSigned(const BRTransaction *tx);
 // returns true if tx is signed
 int BRTransactionSign(BRTransaction *tx, int forkId, BRKey keys[], size_t keysCount);
 
+// Verifies input index's signature against the prevout scriptPubKey/amount the caller has attached to the
+// inputs (as for signing; P2TR needs every input's). P2PKH, P2SH-P2WPKH, P2WPKH (SIGHASH_ALL) and the P2TR
+// key path (SIGHASH_DEFAULT/ALL). 1 when valid; 0 when invalid, missing data, or not a handled type.
+int BRTransactionVerifyInput(const BRTransaction *tx, size_t index);
+
 // true if tx meets IsStandard() rules: https://bitcoin.org/en/developer-guide#standard-transactions
 int BRTransactionIsStandard(const BRTransaction *tx);
 

@@ -597,6 +597,19 @@ int BRKeyTaprootOutputKey(BRKey *key, uint8_t out32[32])
     return r;
 }
 
+// BIP-340: 1 when sig64 is a valid Schnorr signature of md under the 32-byte x-only public key xonly32
+// (for a taproot key-path spend, the output key X(Q) the scriptPubKey carries), else 0.
+int BRKeySchnorrVerify(const uint8_t xonly32[32], UInt256 md, const uint8_t sig64[64])
+{
+    secp256k1_xonly_pubkey xo;
+
+    assert(xonly32 != NULL);
+    assert(sig64 != NULL);
+    pthread_once(&_ctx_once, _ctx_init);
+    return (secp256k1_xonly_pubkey_parse(_ctx, &xo, xonly32) &&
+            secp256k1_schnorrsig_verify(_ctx, sig64, md.u8, 32, &xo) == 1) ? 1 : 0;
+}
+
 // writes the BIP-86 key-path-only P2TR (Taproot) address for key to addr:
 // {OP_1, 0x20, X(Q)} bech32m-encoded (BIP-350) with the DigiByte witness hrp.
 // returns the number of bytes written, or 0 on failure

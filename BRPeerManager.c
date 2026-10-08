@@ -2411,7 +2411,10 @@ static void _peerRelayedTx(void *info, BRTransaction *tx)
     }
 
     if (manager->syncStartHeight == 0 || BRWalletContainsTransaction(manager->wallet, tx)) {
-        isWalletTx = BRWalletRegisterTransaction(manager->wallet, tx);
+        // A tx the peer is handing over from a block it delivered (its tx list hashed to the header
+        // this wallet requested) is the block's and needs no signature check; a relayed one does.
+        isWalletTx = BRPeerIsDeliveringBlockTxs(peer) ? BRWalletRegisterTransactionTrusted(manager->wallet, tx)
+                                                      : BRWalletRegisterTransaction(manager->wallet, tx);
 #ifdef PUBLISH_RELAY_OBJECT_UNFIXED
         // Comparison arm only: the shape that left the parsed object unreleased whenever the
         // wallet already held a record of its hash.
@@ -2510,7 +2513,8 @@ static void _peerHasTx(void *info, UInt256 txHash)
     }
 
     if (tx) {
-        isWalletTx = BRWalletRegisterTransaction(manager->wallet, tx);
+        // tx is the wallet's own record or a tx this wallet published (signed itself)
+        isWalletTx = BRWalletRegisterTransactionTrusted(manager->wallet, tx);
         if (isWalletTx) tx = BRWalletTransactionForHash(manager->wallet, tx->txHash);
         // If the wallet took a listed object here, the entry follows it to the wallet's ownership.
 #ifndef PUBLISH_OWNED_FOLLOWS_UNFIXED
@@ -4349,7 +4353,7 @@ static BRTransaction *_peerRequestedTx(void *info, UInt256 txHash)
         // The stem peer taking a stem is not the network relaying it back: counting it would tell
         // the wallet's embargo the stem propagated when the stem peer may yet drop it.
         if (! _BRPeerManagerIsStemming(manager, txHash)) _BRTxPeerListAddPeer(&manager->txRelays, txHash, peer);
-        BRWalletRegisterTransaction(manager->wallet, tx);
+        BRWalletRegisterTransactionTrusted(manager->wallet, tx);   // a tx this wallet published (signed itself)
         // If the wallet took the listed object here, the entry follows it to the wallet's ownership.
 #ifndef PUBLISH_OWNED_FOLLOWS_UNFIXED
         _BRPeerManagerOwnershipFollowsObject(manager, txHash);

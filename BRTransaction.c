@@ -1180,6 +1180,130 @@ int BRTransactionSign(BRTransaction *tx, int forkId, BRKey keys[], size_t keysCo
     else return 0;
 }
 
+// Splits a stored witness (each item as varint length + bytes) into at most `max` items. Returns the
+// item count, or SIZE_MAX when the witness is malformed or holds more than `max` items.
+static size_t _BRWitnessItems(const uint8_t *w, size_t wLen, const uint8_t *items[], size_t lens[], size_t max)
+{
+    size_t off = 0, count = 0, len = 0;
+
+    while (off < wLen) {
+        size_t l = (size_t)BRVarInt(&w[off], wLen - off, &len);
+
+        if (len == 0 || len > wLen - off || l > wLen - off - len || count >= max) return SIZE_MAX;
+        items[count] = &w[off + len];
+        lens[count++] = l;
+        off += len + l;
+    }
+
+    return count;
+}
+
+// ECDSA check of a P2PKH / P2WPKH-style signature: `sig` is DER + one SIGHASH_ALL byte, `pubKey` hashes to
+// `pkh`, and the signature is valid for md.
+static int _BRVerifyEcdsa(const uint8_t *sig, size_t sigLen, const uint8_t *pubKey, size_t pkLen,
+                          const uint8_t *pkh, UInt256 md)
+{
+    BRKey key;
+    UInt160 h;
+
+    if (sigLen < 2 || sig[sigLen - 1] != SIGHASH_ALL || (pkLen != 33 && pkLen != 65)) return 0;
+    BRHash160(&h, pubKey, pkLen);
+    if (memcmp(h.u8, pkh, 20) != 0) return 0;
+    if (! BRKeySetPubKey(&key, pubKey, pkLen)) return 0;
+    return BRKeyVerify(&key, md, sig, sigLen - 1);
+}
+
+// Verifies input `index`'s signature against the prevout each input carries in script/amount, attached
+// by the caller as for BRTransactionSign (a P2TR input needs every input's attached, as BIP-341 commits
+// them all). Handles exactly what this wallet signs: P2PKH, P2SH-wrapped P2WPKH (BIP49) and P2WPKH with
+// SIGHASH_ALL, and the P2TR key path with SIGHASH_DEFAULT or SIGHASH_ALL. Returns 1 for a valid
+// signature; 0 for an invalid one, a missing prevout, or anything else it does not handle.
+int BRTransactionVerifyInput(const BRTransaction *tx, size_t index)
+{
+    const BRTxInput *in;
+    const uint8_t *s, *items[2];
+    size_t n, lens[2];
+    UInt256 md = UINT256_ZERO;
+
+    assert(tx != NULL);
+    if (! tx || index >= tx->inCount) return 0;
+    in = &tx->inputs[index];
+    s = in->script;
+    n = in->scriptLen;
+    if (! s) return 0;
+
+    if (n == 25 && s[0] == OP_DUP && s[1] == OP_HASH160 && s[2] == 20 && s[23] == OP_EQUALVERIFY &&
+        s[24] == OP_CHECKSIG) { // P2PKH: scriptSig = <sig> <pubkey>
+        const uint8_t *elems[BRScriptElements(NULL, 0, in->signature, in->sigLen)];
+        size_t count = BRScriptElements(elems, sizeof(elems)/sizeof(*elems), in->signature, in->sigLen);
+        size_t sigLen = 0, pkLen = 0;
+        const uint8_t *sig, *pk;
+
+        if (in->sigLen == 0 || count != 2) return 0;
+        sig = BRScriptData(elems[0], &sigLen);
+        pk = BRScriptData(elems[1], &pkLen);
+        if (! sig || ! pk) return 0;
+
+        uint8_t data[_BRTransactionData(tx, NULL, 0, index, SIGHASH_ALL)];
+        size_t dataLen = _BRTransactionData(tx, data, sizeof(data), index, SIGHASH_ALL);
+
+        if (dataLen == 0) return 0;
+        BRSHA256_2(&md, data, dataLen);
+        return _BRVerifyEcdsa(sig, sigLen, pk, pkLen, &s[3], md);
+    }
+
+    if ((n == 22 && s[0] == OP_0 && s[1] == 20) ||                              // P2WPKH
+        (n == 23 && s[0] == OP_HASH160 && s[1] == 20 && s[22] == OP_EQUAL)) {    // P2SH-P2WPKH
+        BRTxInput ins[tx->inCount];
+        BRTransaction t = *tx;
+        uint8_t redeem[22] = { OP_0, 20 };
+        const uint8_t *pkh = &s[2];
+
+        if (_BRWitnessItems(in->witness, in->witLen, items, lens, 2) != 2) return 0;
+        memcpy(ins, tx->inputs, sizeof(ins));
+        t.inputs = ins;
+
+        if (n == 23) { // the scriptSig is one push of the redeemScript 0014<h>, and it must hash to s
+            const uint8_t *elems[BRScriptElements(NULL, 0, in->signature, in->sigLen)];
+            size_t count = BRScriptElements(elems, sizeof(elems)/sizeof(*elems), in->signature, in->sigLen);
+            size_t rLen = 0;
+            const uint8_t *r = (count == 1) ? BRScriptData(elems[0], &rLen) : NULL;
+            UInt160 rh;
+
+            if (! r || rLen != 22 || r[0] != OP_0 || r[1] != 20) return 0;
+            BRHash160(&rh, r, rLen);
+            if (memcmp(rh.u8, &s[2], 20) != 0) return 0;
+            memcpy(&redeem[2], &r[2], 20);
+            ins[index].script = redeem;          // BIP143 scriptCode comes from the redeemScript
+            ins[index].scriptLen = sizeof(redeem);
+            pkh = &r[2];
+        }
+        else if (in->sigLen != 0) return 0;      // native segwit: empty scriptSig
+
+        uint8_t data[_BRTransactionWitnessData(&t, NULL, 0, index, SIGHASH_ALL)];
+        size_t dataLen = _BRTransactionWitnessData(&t, data, sizeof(data), index, SIGHASH_ALL);
+
+        if (dataLen == 0) return 0;
+        BRSHA256_2(&md, data, dataLen);
+        return _BRVerifyEcdsa(items[0], lens[0], items[1], lens[1], pkh, md);
+    }
+
+    if (n == 34 && s[0] == OP_1 && s[1] == 32) { // P2TR key path: witness = one 64- or 65-byte signature
+        uint8_t hashType = SIGHASH_DEFAULT;
+
+        if (in->sigLen != 0 || _BRWitnessItems(in->witness, in->witLen, items, lens, 2) != 1) return 0;
+        if (lens[0] == 65) {
+            hashType = items[0][64];
+            if (hashType != SIGHASH_ALL) return 0;   // 0x00 is never explicit; other types unhandled
+        }
+        else if (lens[0] != 64) return 0;
+        if (_BRTransactionTaprootSighash(tx, NULL, 0, index, hashType, &md) == 0) return 0;
+        return BRKeySchnorrVerify(&s[2], md, items[0]);
+    }
+
+    return 0;
+}
+
 // true if tx meets IsStandard() rules: https://bitcoin.org/en/developer-guide#standard-transactions
 int BRTransactionIsStandard(const BRTransaction *tx)
 {

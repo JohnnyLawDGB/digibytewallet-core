@@ -309,6 +309,7 @@ typedef struct {
     // block on the very mutex under investigation).
     volatile double acceptStart;
     volatile char acceptType[16];
+    int deliveringBlockTxs;   // set on the peer thread while it hands a verified block's txs to relayedTx
     int sentVerack, gotVerack, sentGetaddr, sentFilter, sentGetdata, sentMempool, sentGetblocks;
     int compactFiltersOnly; // BR_SYNC_MODE_COMPACT_FILTERS_ONLY: pull headers to tip, never getblocks
     // Paced-convoy fetch gate (spec Part A). Nonzero == the block-header frontier
@@ -1672,10 +1673,16 @@ static int _BRPeerAcceptBlockMessage(BRPeer *peer, const uint8_t *msg, size_t ms
     }
 #endif
 
-    // Second walk: hand each tx on.
+    // Second walk: hand each tx on. While it runs, BRPeerIsDeliveringBlockTxs tells the relayedTx
+    // callback (on this same thread) that the tx it is handed is in this block, whose tx list hashed to
+    // the header the wallet requested -- so it is the block's, not a relayed unconfirmed claim.
     size_t delivered = 0;
+    int walked;
 
-    if (! _BRPeerWalkBlockTxs(peer, msg, msgLen, off, txCount, NULL, 1, &delivered)) {
+    ctx->deliveringBlockTxs = 1;
+    walked = _BRPeerWalkBlockTxs(peer, msg, msgLen, off, txCount, NULL, 1, &delivered);
+    ctx->deliveringBlockTxs = 0;
+    if (! walked) {
         free(txHashes);
         return 0;
     }
@@ -3165,6 +3172,11 @@ void BRPeerFree(BRPeer *peer)
     if (ctx->pongCallback) array_free(ctx->pongCallback);
     pthread_mutex_destroy(&ctx->pongLock);
     free(ctx);
+}
+
+int BRPeerIsDeliveringBlockTxs(BRPeer *peer)
+{
+    return ((BRPeerContext *)peer)->deliveringBlockTxs;
 }
 
 void BRPeerAcceptMessageTest(BRPeer *peer, const uint8_t *msg, size_t msgLen, const char *type)

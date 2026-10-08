@@ -268,6 +268,11 @@ uint64_t BRWalletTotalReceived(BRWallet *wallet);
 // writes unspent outputs to utxos and returns the number of outputs written, or number available if utxos is NULL
 size_t BRWalletUTXOs(BRWallet *wallet, BRUTXO utxos[], size_t utxosCount);
 
+// The UTXOs coin selection draws from, in its order: confirmed coins first, then the wallet's own
+// unconfirmed change; never an asset-held or unsignable output or an unconfirmed coin from someone
+// else. Returns the number written, or the total when utxos is NULL.
+size_t BRWalletSelectableUTXOs(BRWallet *wallet, BRUTXO utxos[], size_t utxosCount);
+
 // wallet's unspent DigiDollar token UTXOs (SEND coin-selection input)
 size_t BRWalletDigiDollarUTXOs(BRWallet *wallet, BRUTXO utxos[], size_t utxosCount);
 
@@ -285,6 +290,11 @@ void BRWalletSetFeePerKb(BRWallet *wallet, uint64_t feePerKb);
 // returns an unsigned transaction that sends the specified amount from the wallet to the given address
 // result must be freed using BRTransactionFree()
 BRTransaction *BRWalletCreateTransaction(BRWallet *wallet, uint64_t amount, const char *addr);
+
+// The same, at feePerKb for this one build (0: the wallet's rate). Neither reads nor changes the
+// wallet's rate (BRWalletSetFeePerKb), so concurrent builds and feefilter updates cannot mix in.
+BRTransaction *BRWalletCreateTransactionAtFeePerKb(BRWallet *wallet, uint64_t amount, const char *addr,
+                                                   uint64_t feePerKb);
 
 // returns an unsigned transaction that satisifes the given transaction outputs
 // result must be freed using BRTransactionFree()
@@ -308,6 +318,11 @@ int BRWalletContainsTransaction(BRWallet *wallet, const BRTransaction *tx);
 
 // adds a transaction to the wallet, or returns false if it isn't associated with the wallet
 int BRWalletRegisterTransaction(BRWallet *wallet, BRTransaction *tx);
+
+// The same, without checking an unconfirmed tx's signatures on the wallet's outputs. Only for a tx that
+// needs no check: one this wallet signed itself, or one delivered inside a block whose transaction list
+// hashes to its header. Every other caller uses BRWalletRegisterTransaction.
+int BRWalletRegisterTransactionTrusted(BRWallet *wallet, BRTransaction *tx);
 
 // removes a tx from the wallet and calls BRTransactionFree() on it, along with any tx that depend on its outputs
 void BRWalletRemoveTransaction(BRWallet *wallet, UInt256 txHash);

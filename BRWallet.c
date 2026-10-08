@@ -118,25 +118,73 @@ inline static size_t _txChainIndex(const BRTransaction *tx, const BRAddress *add
     return SIZE_MAX;
 }
 
-inline static int _BRWalletTxIsAscending(BRWallet *wallet, const BRTransaction *tx1, const BRTransaction *tx2)
+// The number of input-chain links a single comparison will walk before it stops and
+// lets the chain-position tie-break decide. It is far above the ancestor depth of any
+// honest unconfirmed chain, so the order the wallet presents is unchanged for real
+// transactions; it exists only so that a peer-relayed chain of unconfirmed
+// transactions cannot make the walk scale with the chain length -- and so the
+// insertion sort that drives it cannot become cubic -- and so that a crafted cycle in
+// the input graph cannot recurse without end.
+#ifndef WALLET_ASCENDING_DEPTH_UNFIXED
+#define WALLET_MAX_ASCENDING_STEPS 256
+#endif
+
+#ifdef KAT_ASCENDING_COUNTER
+// Test-only instrumentation (never defined in an app build): counts the input-chain
+// links walked by the current comparison and records the largest any one comparison
+// walked, so a host KAT can prove the walk is bounded per comparison rather than
+// scaling with the chain length. Inert unless the KAT build defines the macro.
+size_t _kat_asc_steps = 0, _kat_asc_max = 0;
+#endif
+
+inline static int _BRWalletTxIsAscendingBudget(BRWallet *wallet, const BRTransaction *tx1,
+                                               const BRTransaction *tx2, unsigned *budget)
 {
     if (! tx1 || ! tx2) return 0;
+#ifdef KAT_ASCENDING_COUNTER
+    _kat_asc_steps++;
+#endif
     if (tx1->blockHeight > tx2->blockHeight) return 1;
     if (tx1->blockHeight < tx2->blockHeight) return 0;
-    
+
     for (size_t i = 0; i < tx1->inCount; i++) {
         if (UInt256Eq(tx1->inputs[i].txHash, tx2->txHash)) return 1;
     }
-    
+
     for (size_t i = 0; i < tx2->inCount; i++) {
         if (UInt256Eq(tx2->inputs[i].txHash, tx1->txHash)) return 0;
     }
 
     for (size_t i = 0; i < tx1->inCount; i++) {
-        if (_BRWalletTxIsAscending(wallet, BRSetGet(wallet->allTx, &(tx1->inputs[i].txHash)), tx2)) return 1;
+#ifndef WALLET_ASCENDING_DEPTH_UNFIXED
+        // bound the total number of links walked per comparison, across depth and
+        // breadth alike; when the budget is spent the walk stops and the result falls
+        // through to the chain-position ordering, exactly as an exhausted honest walk
+        // would.
+        if (*budget == 0) return 0;
+        (*budget)--;
+#endif
+        if (_BRWalletTxIsAscendingBudget(wallet, BRSetGet(wallet->allTx, &(tx1->inputs[i].txHash)), tx2, budget)) return 1;
     }
 
     return 0;
+}
+
+inline static int _BRWalletTxIsAscending(BRWallet *wallet, const BRTransaction *tx1, const BRTransaction *tx2)
+{
+#ifndef WALLET_ASCENDING_DEPTH_UNFIXED
+    unsigned budget = WALLET_MAX_ASCENDING_STEPS;
+#else
+    unsigned budget = 0; // the comparison arm does not bound the walk
+#endif
+#ifdef KAT_ASCENDING_COUNTER
+    _kat_asc_steps = 0;
+    int r = _BRWalletTxIsAscendingBudget(wallet, tx1, tx2, &budget);
+    if (_kat_asc_steps > _kat_asc_max) _kat_asc_max = _kat_asc_steps;
+    return r;
+#else
+    return _BRWalletTxIsAscendingBudget(wallet, tx1, tx2, &budget);
+#endif
 }
 
 inline static int _BRWalletTxCompare(BRWallet *wallet, const BRTransaction *tx1, const BRTransaction *tx2)

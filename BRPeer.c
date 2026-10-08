@@ -513,6 +513,13 @@ static int _BRPeerKnowsTxHash(BRPeerContext *ctx, const UInt256 *hash)
     return known;
 }
 
+// The most tx hashes a peer keeps in its knownTxHashes dedup cache. Far more than any
+// honest inv/mempool working set, so recent-hash deduplication is unaffected, but a
+// hard ceiling so a peer streaming novel inv hashes cannot drive unbounded memory growth.
+#ifndef PEER_KNOWN_TX_CAP_UNFIXED
+#define PEER_KNOWN_TX_HASHES_MAX 10000
+#endif
+
 // Add the hashes this peer does not already know.
 //
 // If `added` is non-NULL it receives the hashes ACTUALLY added (the caller must size it for at
@@ -552,6 +559,22 @@ static void _BRPeerAddKnownTxHashesInternal(const BRPeer *peer, const UInt256 tx
             }
         }
         else BRSetAdd(ctx->knownTxHashSet, &ctx->knownTxHashes[array_count(ctx->knownTxHashes) - 1]);
+
+#ifndef PEER_KNOWN_TX_CAP_UNFIXED
+        // knownTxHashes is fed from inv and the mempool and is only a dedup cache, so it
+        // is capped: a peer streaming novel hashes cannot grow it without bound. On
+        // overflow the oldest third is evicted and knownTxHashSet rebuilt -- its entries
+        // are interior pointers into the array, so a shift invalidates all of them, the
+        // same rebuild the realloc branch above performs. This mirrors the knownBlockHashes
+        // trim, and keeps the most recent hashes so recent dedup is unaffected.
+        if (array_count(ctx->knownTxHashes) > PEER_KNOWN_TX_HASHES_MAX) {
+            array_rm_range(ctx->knownTxHashes, 0, array_count(ctx->knownTxHashes)/3);
+            BRSetClear(ctx->knownTxHashSet);
+            for (j = array_count(ctx->knownTxHashes); j > 0; j--) {
+                BRSetAdd(ctx->knownTxHashSet, &ctx->knownTxHashes[j - 1]);
+            }
+        }
+#endif
 
         if (added) added[n] = txHashes[i];
         n++;

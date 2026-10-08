@@ -461,6 +461,11 @@ inline static int BRPeerEq(const void *peer, const void *otherPeer)
 }
 
 // frees memory allocated for peer
+// 1 while this peer's thread is handing the transactions of a delivered block to relayedTx: the block
+// was requested from this peer and its tx list hashes to its header's merkle root. Meaningful only when
+// called from that relayedTx callback (it runs on the same thread).
+int BRPeerIsDeliveringBlockTxs(BRPeer *peer);
+
 void BRPeerFree(BRPeer *peer);
 
 // SOCKS5 proxy support — set ONCE before peer connections are established.

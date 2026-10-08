@@ -1520,7 +1520,9 @@ BRTransaction *BRWalletCreateTransaction(BRWallet *wallet, uint64_t amount, cons
     assert(addr != NULL && BRAddressIsValid(addr));
     o.amount = amount;
     BRTxOutputSetAddress(&o, addr);
-    return BRWalletCreateTxForOutputs(wallet, &o, 1);
+    BRTransaction *tx = BRWalletCreateTxForOutputs(wallet, &o, 1);
+    if (o.script) array_free(o.script);   // the builder copied it into its own output
+    return tx;
 }
 
 // True when the output's script is one of the exact templates BRTransactionSign spends for a wallet
@@ -1541,11 +1543,20 @@ static int _BRWalletOutputSignable(const BRTxOutput *out)
 }
 
 // True when an unconfirmed tx is the wallet's own: every input spends an output paying a wallet address
-// that is itself confirmed or, in turn, the wallet's own unconfirmed tx. That is a send or its change.
-// Anything else unconfirmed came from someone else and is not a coin until a block confirms it -- a peer
-// can relay any unconfirmed tx, and the wallet does not verify signatures. `budget` bounds the walk
-// (a shared ancestor would otherwise be visited once per path); running out answers "not own".
+// that is itself confirmed or, in turn, the wallet's own unconfirmed tx, and it pays out no more than it
+// spends. That is a send or its change. It cannot be counterfeited: an unconfirmed tx that spends a
+// wallet output is registered only with a valid signature for that output (_BRWalletInputsSigned), or
+// through BRWalletRegisterTransactionTrusted (a tx this wallet signed, or one a block delivered), so
+// such a tx was signed with the wallet's keys. Anything else unconfirmed came from someone else and is
+// not a coin until a block confirms it. `budget` is shared by every check in one selection (a shared
+// ancestor would otherwise be visited once per path, per coin); running out answers "not own".
 // Caller holds wallet->lock.
+#ifdef WALLET_KAT_COUNT_WALK
+// Host-KAT-only: counts input visits of the own-unconfirmed walk, so a gate can bound the work of one
+// selection without timing it. Never defined in production.
+unsigned long _walletKatWalkVisits = 0;
+#endif
+
 static int _BRWalletTxIsOwnUnconfirmed(BRWallet *wallet, const BRTransaction *tx, int depth, int *budget)
 {
     uint64_t in = 0, out = 0;
@@ -1557,6 +1568,9 @@ static int _BRWalletTxIsOwnUnconfirmed(BRWallet *wallet, const BRTransaction *tx
         uint32_t n = tx->inputs[i].index;
 
         if (--*budget < 0) return 0;
+#ifdef WALLET_KAT_COUNT_WALK
+        _walletKatWalkVisits++;
+#endif
         if (! p || n >= p->outCount || ! BRSetContains(wallet->allAddrs, p->outputs[n].address)) return 0;
         if (p->blockHeight == TX_UNCONFIRMED && ! _BRWalletTxIsOwnUnconfirmed(wallet, p, depth - 1, budget)) return 0;
         in = _BRMoneyAdd(in, p->outputs[n].amount);
@@ -1566,20 +1580,93 @@ static int _BRWalletTxIsOwnUnconfirmed(BRWallet *wallet, const BRTransaction *tx
     return out <= in;   // a send never pays out more than it spends
 }
 
-// Coin selection takes confirmed coins on its first pass and the wallet's own unconfirmed change on
-// its second; an unconfirmed coin received from someone else is never selected. Caller holds wallet->lock.
-static int _BRWalletUtxoSelectable(BRWallet *wallet, const BRTransaction *tx, int pass)
-{
-    int budget = 1000;
+#define SELECT_WALK_BUDGET 10000   // input visits per selection, for every own-unconfirmed check together
 
+// Coin selection takes confirmed coins on its first pass and the wallet's own unconfirmed change on
+// its second; an unconfirmed coin received from someone else is never selected. `budget` is the one
+// SELECT_WALK_BUDGET of the calling selection. Caller holds wallet->lock.
+static int _BRWalletUtxoSelectable(BRWallet *wallet, const BRTransaction *tx, int pass, int *budget)
+{
     if (tx->blockHeight != TX_UNCONFIRMED) return pass == 0;
-    return pass == 1 && _BRWalletTxIsOwnUnconfirmed(wallet, tx, 25, &budget);
+    return pass == 1 && _BRWalletTxIsOwnUnconfirmed(wallet, tx, 25, budget);
+}
+
+// Either pass: confirmed, or the wallet's own unconfirmed. Caller holds wallet->lock.
+static int _BRWalletUtxoSelectableAny(BRWallet *wallet, const BRTransaction *tx, int *budget)
+{
+    return _BRWalletUtxoSelectable(wallet, tx, 0, budget) || _BRWalletUtxoSelectable(wallet, tx, 1, budget);
+}
+
+// The UTXOs coin selection would draw from, in its order: confirmed coins, then the wallet's own
+// unconfirmed change -- never an asset-held or unsignable output, nor an unconfirmed coin someone else
+// sent. For builders outside this file (the DigiAsset send's DGB fee inputs) so they spend by the same
+// rule. Returns the number written, or the total when utxos is NULL.
+size_t BRWalletSelectableUTXOs(BRWallet *wallet, BRUTXO *utxos, size_t utxosCount)
+{
+    size_t n, k, w = 0;
+    int budget = SELECT_WALK_BUDGET;
+
+    assert(wallet != NULL);
+    pthread_mutex_lock(&wallet->lock);
+    n = array_count(wallet->utxos);
+
+    for (k = 0; k < 2*n && (! utxos || w < utxosCount); k++) {
+        BRUTXO *o = &wallet->utxos[k % n];
+        BRTransaction *tx = BRSetGet(wallet->allTx, o);
+
+        if (! tx || o->n >= tx->outCount) continue;
+        if (BRWalletUtxoIsAsset(wallet, o)) continue;
+        if (! _BRWalletOutputSignable(&tx->outputs[o->n])) continue;
+        if (! _BRWalletUtxoSelectable(wallet, tx, k >= n, &budget)) continue;
+        if (utxos) utxos[w] = *o;
+        w++;
+    }
+
+    pthread_mutex_unlock(&wallet->lock);
+    return w;
+}
+
+// BRWalletMinOutputAmount at a given rate.
+static uint64_t _BRMinOutputAmountAt(uint64_t feePerKb)
+{
+    uint64_t amount = (TX_MIN_OUTPUT_AMOUNT*feePerKb + MIN_FEE_PER_KB - 1)/MIN_FEE_PER_KB;
+
+    return (amount > TX_MIN_OUTPUT_AMOUNT) ? amount : TX_MIN_OUTPUT_AMOUNT;
+}
+
+static BRTransaction *_BRWalletCreateTxForOutputsAt(BRWallet *wallet, const BRTxOutput outputs[], size_t outCount,
+                                                    int force, uint64_t feePerKb);
+
+// The same as BRWalletCreateTransaction, at `feePerKb` for this one build (0: the wallet's rate). The
+// wallet's own rate is neither read for the fee nor changed, so a custom rate cannot outlive its send
+// and no concurrent build or feefilter update can mix into it.
+BRTransaction *BRWalletCreateTransactionAtFeePerKb(BRWallet *wallet, uint64_t amount, const char *addr,
+                                                   uint64_t feePerKb)
+{
+    BRTxOutput o = BR_TX_OUTPUT_NONE;
+    BRTransaction *tx;
+
+    assert(wallet != NULL);
+    assert(amount > 0);
+    assert(addr != NULL && BRAddressIsValid(addr));
+    o.amount = amount;
+    BRTxOutputSetAddress(&o, addr);
+    tx = _BRWalletCreateTxForOutputsAt(wallet, &o, 1, 0, feePerKb ? feePerKb : BRWalletFeePerKb(wallet));
+    if (o.script) array_free(o.script);
+    return tx;
 }
 
 BRTransaction *BRWalletCreateTxForOutputsEx(BRWallet *wallet, const BRTxOutput outputs[], size_t outCount, int force) {
+    return _BRWalletCreateTxForOutputsAt(wallet, outputs, outCount, force, BRWalletFeePerKb(wallet));
+}
+
+static BRTransaction *_BRWalletCreateTxForOutputsAt(BRWallet *wallet, const BRTxOutput outputs[], size_t outCount,
+                                                    int force, uint64_t feePerKb)
+{
     BRTransaction *tx, *transaction = BRTransactionNew();
     uint64_t feeAmount, amount = 0, balance = 0, minAmount;
     size_t i, j, k, nUtxos, cpfpSize = 0;
+    int budget = SELECT_WALK_BUDGET;
     BRUTXO *o;
     BRAddress addr = BR_ADDRESS_NONE;
     
@@ -1593,9 +1680,9 @@ BRTransaction *BRWalletCreateTxForOutputsEx(BRWallet *wallet, const BRTxOutput o
         amount += outputs[i].amount;
     }
     
-    minAmount = BRWalletMinOutputAmount(wallet);
+    minAmount = _BRMinOutputAmountAt(feePerKb);
     pthread_mutex_lock(&wallet->lock);
-    feeAmount = _txFee(wallet->feePerKb, BRTransactionVSize(transaction) + TX_OUTPUT_SIZE);
+    feeAmount = _txFee(feePerKb, BRTransactionVSize(transaction) + TX_OUTPUT_SIZE);
     
     // TODO: use up all UTXOs for all used addresses to avoid leaving funds in addresses whose public key is revealed
     // TODO: avoid combining addresses in a single transaction when possible to reduce information leakage
@@ -1611,7 +1698,7 @@ BRTransaction *BRWalletCreateTxForOutputsEx(BRWallet *wallet, const BRTxOutput o
         if (! tx || o->n >= tx->outCount) continue;
         if (BRWalletUtxoIsAsset(wallet, o)) continue;
         if (! _BRWalletOutputSignable(&tx->outputs[o->n])) continue;   // never select what cannot be signed
-        if (! _BRWalletUtxoSelectable(wallet, tx, k >= nUtxos)) continue;
+        if (! _BRWalletUtxoSelectable(wallet, tx, k >= nUtxos, &budget)) continue;
 
         BRTransactionAddInput(transaction, tx->txHash, o->n, tx->outputs[o->n].amount,
                               tx->outputs[o->n].script, tx->outputs[o->n].scriptLen, NULL, 0, NULL, 0, TXIN_SEQUENCE);
@@ -1621,7 +1708,7 @@ BRTransaction *BRWalletCreateTxForOutputsEx(BRWallet *wallet, const BRTxOutput o
             transaction = NULL;
             
             // check for sufficient total funds before building a smaller transaction
-            if (wallet->balance < amount + _txFee(wallet->feePerKb, 10 + array_count(wallet->utxos)*TX_INPUT_SIZE +
+            if (wallet->balance < amount + _txFee(feePerKb, 10 + array_count(wallet->utxos)*TX_INPUT_SIZE +
                                                   (outCount + 1)*TX_OUTPUT_SIZE + cpfpSize)) break;
             pthread_mutex_unlock(&wallet->lock);
             
@@ -1633,9 +1720,9 @@ BRTransaction *BRWalletCreateTxForOutputsEx(BRWallet *wallet, const BRTxOutput o
                 }
                 
                 newOutputs[outCount - 1].amount -= amount + feeAmount - balance; // reduce last output amount
-                transaction = BRWalletCreateTxForOutputs(wallet, newOutputs, outCount);
+                transaction = _BRWalletCreateTxForOutputsAt(wallet, newOutputs, outCount, 0, feePerKb);
             }
-            else transaction = BRWalletCreateTxForOutputs(wallet, outputs, outCount - 1); // remove last output
+            else transaction = _BRWalletCreateTxForOutputsAt(wallet, outputs, outCount - 1, 0, feePerKb); // remove last output
             
             balance = amount = feeAmount = 0;
             pthread_mutex_lock(&wallet->lock);
@@ -1650,7 +1737,7 @@ BRTransaction *BRWalletCreateTxForOutputsEx(BRWallet *wallet, const BRTxOutput o
         //            ! _BRWalletTxIsSend(wallet, tx)) cpfpSize += BRTransactionSize(tx);
         
         // fee amount after adding a change output
-        feeAmount = _txFee(wallet->feePerKb, BRTransactionVSize(transaction) + TX_OUTPUT_SIZE + cpfpSize);
+        feeAmount = _txFee(feePerKb, BRTransactionVSize(transaction) + TX_OUTPUT_SIZE + cpfpSize);
         
         // increase fee to round off remaining wallet balance to nearest 100 satoshi
         if (wallet->balance > amount + feeAmount) feeAmount += (wallet->balance - (amount + feeAmount)) % 100;
@@ -1864,12 +1951,13 @@ BRTransaction *BRWalletCreateDigiDollarTransfer(BRWallet *wallet, const uint8_t 
     struct _feeSel *feesel = _ddAllocWork(feeN, sizeof(*feesel));
     if (! feesel) { free(ddsel); pthread_mutex_unlock(&wallet->lock); return NULL; }    // allocation refused
     size_t fm = 0; uint64_t dgbIn = 0, fee = DD_MIN_FEE, feePerKb = DEFAULT_FEE_PER_KB;
+    int budget = SELECT_WALK_BUDGET;
     for (size_t i = 0; i < feeN; i++) {
         BRUTXO *o = &wallet->utxos[i];
         BRTransaction *ut = BRSetGet(wallet->allTx, o);
         if (! ut || o->n >= ut->outCount || ut->outputs[o->n].scriptLen > sizeof(feesel[fm].script)) continue;
         if (! _BRWalletOutputSignable(&ut->outputs[o->n])) continue;   // never select what cannot be signed
-        if (! _BRWalletUtxoSelectable(wallet, ut, 0) && ! _BRWalletUtxoSelectable(wallet, ut, 1)) continue;
+        if (! _BRWalletUtxoSelectableAny(wallet, ut, &budget)) continue;
         feesel[fm].hash = ut->txHash; feesel[fm].n = o->n; feesel[fm].amt = ut->outputs[o->n].amount;
         feesel[fm].scriptLen = ut->outputs[o->n].scriptLen;
         memcpy(feesel[fm].script, ut->outputs[o->n].script, feesel[fm].scriptLen);
@@ -2117,7 +2205,49 @@ int BRWalletContainsTransaction(BRWallet *wallet, const BRTransaction *tx)
 }
 
 // adds a transaction to the wallet, or returns false if it isn't associated with the wallet
-int BRWalletRegisterTransaction(BRWallet *wallet, BRTransaction *tx)
+// True when every input of tx that spends an output paying a wallet address carries a valid signature
+// for that output (BRTransactionVerifyInput, against the prevout the wallet holds). An input it cannot
+// verify -- a type or hash type it does not handle, or a P2TR spend beside an input whose prevout the
+// wallet does not hold -- counts as unsigned. Inputs spending anything else are not the wallet's to
+// judge. Caller holds wallet->lock.
+static int _BRWalletInputsSigned(BRWallet *wallet, const BRTransaction *tx)
+{
+    BRTransaction *t = NULL;
+    int r = 1;
+
+    for (size_t i = 0; r && i < tx->inCount; i++) {
+        BRTransaction *p = BRSetGet(wallet->allTx, &tx->inputs[i].txHash);
+        uint32_t n = tx->inputs[i].index;
+
+        if (! p || n >= p->outCount || ! BRSetContains(wallet->allAddrs, p->outputs[n].address)) continue;
+
+        if (! t) { // a copy carrying each prevout the wallet holds, as the signer sees them
+            t = BRTransactionCopy(tx);
+            if (! t) return 0;
+
+            for (size_t k = 0; k < t->inCount; k++) {
+                BRTransaction *pk = BRSetGet(wallet->allTx, &t->inputs[k].txHash);
+                uint32_t nk = t->inputs[k].index;
+
+                if (! pk || nk >= pk->outCount || ! pk->outputs[nk].script) continue;
+                BRTxInputSetScript(&t->inputs[k], pk->outputs[nk].script, pk->outputs[nk].scriptLen);
+                t->inputs[k].amount = pk->outputs[nk].amount;
+            }
+        }
+
+        r = BRTransactionVerifyInput(t, i);
+    }
+
+    if (t) BRTransactionFree(t);
+    return r;
+}
+
+// Registers tx. checkInputs: an UNCONFIRMED tx that spends a wallet output must sign it validly
+// (_BRWalletInputsSigned), or it is refused until a block delivers it. A peer can relay any unconfirmed
+// tx and nothing else checks it, so without this a tx with a junk scriptSig would mark the wallet's coin
+// spent and stand in for it as unconfirmed change. A refused tx -- this, or out of the money range -- is
+// not kept at all: the caller still owns it.
+static int _BRWalletRegisterTx(BRWallet *wallet, BRTransaction *tx, int checkInputs)
 {
     int wasAdded = 0, r = 1;
     
@@ -2128,10 +2258,11 @@ int BRWalletRegisterTransaction(BRWallet *wallet, BRTransaction *tx)
         pthread_mutex_lock(&wallet->lock);
 
         if (! BRSetContains(wallet->allTx, tx)) {
-            // An out-of-range transaction is refused like one that is not the wallet's: it never
-            // reaches the balance, so its values cannot wrap the wallet's sums. (Ownership is as for
-            // any non-wallet tx, which callers already handle: kept in allTx only while unconfirmed.)
-            if (_BRWalletTxMoneyRangeOK(tx) && _BRWalletContainsTx(wallet, tx)) {
+            if (! _BRWalletTxMoneyRangeOK(tx) ||
+                (checkInputs && tx->blockHeight == TX_UNCONFIRMED && ! _BRWalletInputsSigned(wallet, tx))) {
+                r = 0;   // refused and not kept, at any height
+            }
+            else if (_BRWalletContainsTx(wallet, tx)) {
                 // TODO: verify signatures when possible
                 // TODO: handle tx replacement with input sequence numbers
                 //       (for now, replacements appear invalid until confirmation)
@@ -2184,6 +2315,16 @@ int BRWalletRegisterTransaction(BRWallet *wallet, BRTransaction *tx)
     }
 
     return r;
+}
+
+int BRWalletRegisterTransaction(BRWallet *wallet, BRTransaction *tx)
+{
+    return _BRWalletRegisterTx(wallet, tx, 1);
+}
+
+int BRWalletRegisterTransactionTrusted(BRWallet *wallet, BRTransaction *tx)
+{
+    return _BRWalletRegisterTx(wallet, tx, 0);
 }
 
 // removes a tx from the wallet and calls BRTransactionFree() on it, along with any tx that depend on its outputs
@@ -2494,7 +2635,7 @@ uint64_t BRWalletAmountReceivedFromTx(BRWallet *wallet, const BRTransaction *tx)
     
     // TODO: don't include outputs below TX_MIN_OUTPUT_AMOUNT
     for (size_t i = 0; tx && i < tx->outCount; i++) {
-        if (BRSetContains(wallet->allAddrs, tx->outputs[i].address)) amount += tx->outputs[i].amount;
+        if (BRSetContains(wallet->allAddrs, tx->outputs[i].address)) amount = _BRMoneyAdd(amount, tx->outputs[i].amount);
     }
     
     pthread_mutex_unlock(&wallet->lock);
@@ -2515,7 +2656,7 @@ uint64_t BRWalletAmountSentByTx(BRWallet *wallet, const BRTransaction *tx)
         uint32_t n = tx->inputs[i].index;
         
         if (t && n < t->outCount && BRSetContains(wallet->allAddrs, t->outputs[n].address)) {
-            amount += t->outputs[n].amount;
+            amount = _BRMoneyAdd(amount, t->outputs[n].amount);
         }
     }
     
@@ -2537,15 +2678,17 @@ uint64_t BRWalletFeeForTx(BRWallet *wallet, const BRTransaction *tx)
         uint32_t n = tx->inputs[i].index;
         
         if (t && n < t->outCount) {
-            amount += t->outputs[n].amount;
+            amount = _BRMoneyAdd(amount, t->outputs[n].amount);
+            if (amount == UINT64_MAX) amount = UINT64_MAX - 1;   // a saturated sum is not "unknown"
         }
         else amount = UINT64_MAX;
     }
     
     pthread_mutex_unlock(&wallet->lock);
     
+    // outputs above the inputs: no fee a valid tx can pay, so the fee is reported as unknown
     for (size_t i = 0; tx && i < tx->outCount && amount != UINT64_MAX; i++) {
-        amount -= tx->outputs[i].amount;
+        amount = (tx->outputs[i].amount > amount) ? UINT64_MAX : amount - tx->outputs[i].amount;
     }
     
     return amount;
@@ -2650,6 +2793,7 @@ uint64_t BRWalletMaxOutputAmount(BRWallet *wallet)
     BRUTXO *o;
     uint64_t fee, amount = 0;
     size_t i, txSize, cpfpSize = 0, inCount = 0;
+    int budget = SELECT_WALK_BUDGET;
 
     assert(wallet != NULL);
     pthread_mutex_lock(&wallet->lock);
@@ -2659,7 +2803,7 @@ uint64_t BRWalletMaxOutputAmount(BRWallet *wallet)
         tx = BRSetGet(wallet->allTx, &o->hash);
         if (! tx || o->n >= tx->outCount) continue;
         if (! _BRWalletOutputSignable(&tx->outputs[o->n])) continue;   // what selection would skip
-        if (! _BRWalletUtxoSelectable(wallet, tx, 0) && ! _BRWalletUtxoSelectable(wallet, tx, 1)) continue;
+        if (! _BRWalletUtxoSelectableAny(wallet, tx, &budget)) continue;
         inCount++;
         amount = _BRMoneyAdd(amount, tx->outputs[o->n].amount);
         

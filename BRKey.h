@@ -144,6 +144,9 @@ size_t BRKeyTaprootSchnorrSign(BRKey *key, uint8_t *sig64, UInt256 md);
 // out32. Returns 1 on success, 0 on failure.
 int BRKeyTaprootOutputKey(BRKey *key, uint8_t out32[32]);
 
+// BIP-340: 1 when sig64 is a valid Schnorr signature of md under the x-only public key xonly32, else 0.
+int BRKeySchnorrVerify(const uint8_t xonly32[32], UInt256 md, const uint8_t sig64[64]);
+
 // writes the BIP-86 key-path-only P2TR (Taproot) address for key to addr:
 // {OP_1, 0x20, X(Q)} bech32m-encoded (BIP-350) with the DigiByte witness hrp.
 // returns the number of bytes written, or 0 on failure

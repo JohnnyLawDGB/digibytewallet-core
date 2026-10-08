@@ -1449,6 +1449,23 @@ BRTransaction *BRWalletCreateTransaction(BRWallet *wallet, uint64_t amount, cons
     return BRWalletCreateTxForOutputs(wallet, &o, 1);
 }
 
+// True when the output's script is one of the exact templates BRTransactionSign spends for a wallet
+// key: P2PKH, P2SH (BIP49 P2SH-P2WPKH), P2WPKH or P2TR. Coin selection skips any other output, so an
+// output credited by mistake is left unspent instead of failing every send it is picked for.
+static int _BRWalletOutputSignable(const BRTxOutput *out)
+{
+    const uint8_t *s = out->script;
+    size_t n = out->scriptLen;
+
+    if (! s) return 0;
+    if (n == 25) return s[0] == OP_DUP && s[1] == OP_HASH160 && s[2] == 20 && s[23] == OP_EQUALVERIFY &&
+                        s[24] == OP_CHECKSIG;                                       // P2PKH
+    if (n == 23) return s[0] == OP_HASH160 && s[1] == 20 && s[22] == OP_EQUAL;      // P2SH
+    if (n == 22) return s[0] == OP_0 && s[1] == 20;                                 // P2WPKH
+    if (n == 34) return s[0] == OP_1 && s[1] == 32;                                 // P2TR
+    return 0;
+}
+
 BRTransaction *BRWalletCreateTxForOutputsEx(BRWallet *wallet, const BRTxOutput outputs[], size_t outCount, int force) {
     BRTransaction *tx, *transaction = BRTransactionNew();
     uint64_t feeAmount, amount = 0, balance = 0, minAmount;
@@ -1480,6 +1497,7 @@ BRTransaction *BRWalletCreateTxForOutputsEx(BRWallet *wallet, const BRTxOutput o
         
         if (! tx || o->n >= tx->outCount) continue;
         if (BRWalletUtxoIsAsset(wallet, o)) continue;
+        if (! _BRWalletOutputSignable(&tx->outputs[o->n])) continue;   // never select what cannot be signed
 
         BRTransactionAddInput(transaction, tx->txHash, o->n, tx->outputs[o->n].amount,
                               tx->outputs[o->n].script, tx->outputs[o->n].scriptLen, NULL, 0, NULL, 0, TXIN_SEQUENCE);
@@ -1736,6 +1754,7 @@ BRTransaction *BRWalletCreateDigiDollarTransfer(BRWallet *wallet, const uint8_t 
         BRUTXO *o = &wallet->utxos[i];
         BRTransaction *ut = BRSetGet(wallet->allTx, o);
         if (! ut || o->n >= ut->outCount || ut->outputs[o->n].scriptLen > sizeof(feesel[fm].script)) continue;
+        if (! _BRWalletOutputSignable(&ut->outputs[o->n])) continue;   // never select what cannot be signed
         feesel[fm].hash = ut->txHash; feesel[fm].n = o->n; feesel[fm].amt = ut->outputs[o->n].amount;
         feesel[fm].scriptLen = ut->outputs[o->n].scriptLen;
         memcpy(feesel[fm].script, ut->outputs[o->n].script, feesel[fm].scriptLen);

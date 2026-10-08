@@ -414,6 +414,9 @@ static void _BRWalletUpdateBalance(BRWallet *wallet)
                         balance += 0; // DD tokens are zero-value; never touch the DGB balance
                     } else if (BRTxOutputIsAsset(tx, &tx->outputs[j]) ||
                                _BRWalletIsAssetOverride(wallet, tx->txHash, (uint32_t)j)) {
+                        // Held: an output an asset instruction names, one the asset layer
+                        // registered, or any output of a transaction whose DigiAsset carrier
+                        // cannot be classified (BRTxOutputIsAsset fails closed on those).
                         array_add(wallet->assetUtxos, ((BRUTXO) { tx->txHash, (uint32_t)j }));
                         balance += 0;
                     } else {

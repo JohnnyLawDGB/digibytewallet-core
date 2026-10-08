@@ -1665,7 +1665,9 @@ static int _ddSelectAcceptable(struct _ddSel *sel, size_t m, uint64_t cents, siz
 // `cents` and DGB UTXOs for the fee, emits recipient DD + DD change + DGB change + OP_RETURN, version
 // 0x02000770. Returns the unsigned tx (caller signs with BRWalletSignTransaction), or NULL on failure.
 // All wallet reads happen under a SINGLE lock hold (inputs snapshotted by value incl. scriptPubKey bytes);
-// the tx is then built unlocked -- BRWalletUnusedAddrs/BRWalletMinOutputAmount take wallet->lock internally.
+// the tx is then built unlocked -- BRWalletUnusedAddrs takes wallet->lock internally.
+// The fee does not depend on BRWalletSetFeePerKb: it is DD_MIN_FEE (or the size at DEFAULT_FEE_PER_KB,
+// if larger) plus any DGB change below TX_MIN_OUTPUT_AMOUNT.
 BRTransaction *BRWalletCreateDigiDollarTransfer(BRWallet *wallet, const uint8_t recipientKey32[32],
                                                 uint64_t cents)
 {
@@ -1723,10 +1725,13 @@ BRTransaction *BRWalletCreateDigiDollarTransfer(BRWallet *wallet, const uint8_t 
     }
 
     // --- snapshot DGB fee UTXOs on the HEAP; DD_MIN_FEE floor dominates the size-based estimate ---
+    // The rate is DEFAULT_FEE_PER_KB, never wallet->feePerKb: that one is whatever the last DGB send
+    // or a peer's feefilter left there, and a DigiDollar send is confirmed showing the DD_MIN_FEE
+    // floor. At the default rate the floor is what is paid, plus at most a sub-dust DGB change below.
     size_t feeN = array_count(wallet->utxos);
     struct _feeSel *feesel = _ddAllocWork(feeN, sizeof(*feesel));
     if (! feesel) { free(ddsel); pthread_mutex_unlock(&wallet->lock); return NULL; }    // allocation refused
-    size_t fm = 0; uint64_t dgbIn = 0, fee = DD_MIN_FEE, feePerKb = wallet->feePerKb;
+    size_t fm = 0; uint64_t dgbIn = 0, fee = DD_MIN_FEE, feePerKb = DEFAULT_FEE_PER_KB;
     for (size_t i = 0; i < feeN; i++) {
         BRUTXO *o = &wallet->utxos[i];
         BRTransaction *ut = BRSetGet(wallet->allTx, o);
@@ -1745,7 +1750,9 @@ BRTransaction *BRWalletCreateDigiDollarTransfer(BRWallet *wallet, const uint8_t 
     pthread_mutex_unlock(&wallet->lock);
 
     // --- build the tx UNLOCKED (these helpers take wallet->lock internally) ---
-    uint64_t dust = BRWalletMinOutputAmount(wallet);
+    // DGB change below this goes to the fee. It is the dust amount at the same DEFAULT_FEE_PER_KB
+    // (BRWalletMinOutputAmount at that rate, = TX_MIN_OUTPUT_AMOUNT), not one scaled by a stale rate.
+    uint64_t dust = TX_MIN_OUTPUT_AMOUNT;
     BRAddress ddCa = BR_ADDRESS_NONE, dgbCa = BR_ADDRESS_NONE;
     if (ddChange > 0) {
         BRWalletUnusedAddrs(wallet, &ddCa, 1, 1, 2);                 // internal taproot change (we own it)

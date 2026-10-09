@@ -466,6 +466,12 @@ inline static int BRPeerEq(const void *peer, const void *otherPeer)
 // called from that relayedTx callback (it runs on the same thread).
 int BRPeerIsDeliveringBlockTxs(BRPeer *peer);
 
+// the hash of the block whose transactions this peer's thread is handing to relayedTx, or zero when it is not
+// handing any over. Same thread rule as BRPeerIsDeliveringBlockTxs. The peer layer has checked only that this
+// peer was asked for the block and that its tx list hashes to the block's own header; whether the block is one
+// the manager holds, on its main chain, is the manager's to check.
+UInt256 BRPeerDeliveringBlockHash(BRPeer *peer);
+
 void BRPeerFree(BRPeer *peer);
 
 // SOCKS5 proxy support — set ONCE before peer connections are established.

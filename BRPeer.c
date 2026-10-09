@@ -310,6 +310,7 @@ typedef struct {
     volatile double acceptStart;
     volatile char acceptType[16];
     int deliveringBlockTxs;   // set on the peer thread while it hands a verified block's txs to relayedTx
+    UInt256 deliveringBlockHash; // the hash of that block while deliveringBlockTxs is set, else zero
     int sentVerack, gotVerack, sentGetaddr, sentFilter, sentGetdata, sentMempool, sentGetblocks;
     int compactFiltersOnly; // BR_SYNC_MODE_COMPACT_FILTERS_ONLY: pull headers to tip, never getblocks
     // Paced-convoy fetch gate (spec Part A). Nonzero == the block-header frontier
@@ -1679,9 +1680,11 @@ static int _BRPeerAcceptBlockMessage(BRPeer *peer, const uint8_t *msg, size_t ms
     size_t delivered = 0;
     int walked;
 
+    ctx->deliveringBlockHash = blockHash;
     ctx->deliveringBlockTxs = 1;
     walked = _BRPeerWalkBlockTxs(peer, msg, msgLen, off, txCount, NULL, 1, &delivered);
     ctx->deliveringBlockTxs = 0;
+    ctx->deliveringBlockHash = UINT256_ZERO;
     if (! walked) {
         free(txHashes);
         return 0;
@@ -3177,6 +3180,13 @@ void BRPeerFree(BRPeer *peer)
 int BRPeerIsDeliveringBlockTxs(BRPeer *peer)
 {
     return ((BRPeerContext *)peer)->deliveringBlockTxs;
+}
+
+UInt256 BRPeerDeliveringBlockHash(BRPeer *peer)
+{
+    BRPeerContext *ctx = (BRPeerContext *)peer;
+
+    return ctx->deliveringBlockTxs ? ctx->deliveringBlockHash : UINT256_ZERO;
 }
 
 void BRPeerAcceptMessageTest(BRPeer *peer, const uint8_t *msg, size_t msgLen, const char *type)

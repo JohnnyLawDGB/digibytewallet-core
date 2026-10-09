@@ -298,6 +298,11 @@ typedef struct {
 #define DIFF_V4_CONTEXTS_MAX 4
 #endif
 
+// the sparse main-chain index (_BRPeerManagerMainHashAtHeightLocked): one entry every MAIN_INDEX_STRIDE heights, at
+// most MAIN_INDEX_MAX entries (262,144 heights below the top one; a deeper query walks on from the lowest entry)
+#define MAIN_INDEX_STRIDE 256u
+#define MAIN_INDEX_MAX    1024u
+
 struct BRPeerManagerStruct {
     const BRChainParams *params;
     BRWallet *wallet;
@@ -372,6 +377,13 @@ struct BRPeerManagerStruct {
     // See BRCFSolicitedBlock above. calloc'd with the manager -> starts empty.
     BRCFSolicitedBlock cfSolicitedBlocks[CF_SOLICITED_BLOCKS_MAX];
     uint64_t cfSolicitedSeq;
+    // Sparse index of the main chain (see _BRPeerManagerMainHashAtHeightLocked). calloc'd with the manager ->
+    // starts empty (mainIndexCount 0).
+    UInt256 mainIndexTip;              // the lastBlock the entries descend from
+    uint32_t mainIndexTipHeight;
+    uint32_t mainIndexTop;             // height of mainIndex[0], a multiple of MAIN_INDEX_STRIDE
+    size_t mainIndexCount;             // mainIndex[k] is the main-chain hash at mainIndexTop - k*MAIN_INDEX_STRIDE
+    UInt256 mainIndex[MAIN_INDEX_MAX];
     // Cached BIP 158 wallet element set, reused across arriving cfilters. Rebuilding it
     // per filter was 98.8% of the per-filter cost (see _BRPeerManagerFilterElementsLocked).
     // cfElemsAddrCount is the address count the cache was built from and is the ONLY
@@ -2394,6 +2406,32 @@ static void _peerRelayedPeers(void *info, const BRPeer peers[], size_t peersCoun
         manager->savePeers) manager->savePeers(manager->info, 1, save, peersCount);
 }
 
+static int _BRPeerManagerFindSolicitedBlockLocked(BRPeerManager *manager, UInt256 blockHash, uint32_t height);
+static UInt256 _BRPeerManagerMainHashAtHeightLocked(BRPeerManager *manager, uint32_t height);
+
+// INT-2026-10-09-D. A transaction counts as trusted (registered without a signature check) only when the block
+// that delivered it is the manager's own main-chain block it asked for. Three things must hold, all against the
+// manager's own state, not the peer's:
+//   - the block is resident here;
+//   - it is on the main chain: the block the chain ending at lastBlock holds at its height (the answer of the walk
+//     down from lastBlock that _peerRelayedBlockTxns uses, read through the index; a walk that runs off the
+//     resident set proves nothing, so it counts as not on the main chain);
+//   - the manager asked for it: it is in the solicitation table at that height.
+// The peer layer has already checked that this peer was asked for the block and that its tx list hashes to the
+// block's own header. That proves the list belongs to that header, not that the header is on the main chain.
+// Anything that fails here goes through the checked path, which still registers a tx that pays the wallet or
+// validly signs its coins. Caller holds manager->lock.
+static int _BRPeerManagerDeliveryIsTrustedLocked(BRPeerManager *manager, UInt256 blockHash)
+{
+    if (UInt256IsZero(blockHash)) return 0;
+
+    BRMerkleBlock *b = BRSetGet(manager->blocks, &blockHash);
+
+    if (! b || b->height == BLOCK_UNKNOWN_HEIGHT) return 0;                              // not resident
+    if (_BRPeerManagerFindSolicitedBlockLocked(manager, blockHash, b->height) < 0) return 0; // not asked for
+    return UInt256Eq(_BRPeerManagerMainHashAtHeightLocked(manager, b->height), blockHash);  // on the main chain
+}
+
 static void _peerRelayedTx(void *info, BRTransaction *tx)
 {
     BRPeer *peer = ((BRPeerCallbackInfo *)info)->peer;
@@ -2423,10 +2461,20 @@ static void _peerRelayedTx(void *info, BRTransaction *tx)
     }
 
     if (manager->syncStartHeight == 0 || BRWalletContainsTransaction(manager->wallet, tx)) {
-        // A tx the peer is handing over from a block it delivered (its tx list hashed to the header
-        // this wallet requested) is the block's and needs no signature check; a relayed one does.
-        isWalletTx = BRPeerIsDeliveringBlockTxs(peer) ? BRWalletRegisterTransactionTrusted(manager->wallet, tx)
-                                                      : BRWalletRegisterTransaction(manager->wallet, tx);
+#ifdef INT_2026_10_09_D_UNFIXED
+        // Comparison arm only (int_2026_10_09_d_kat); never defined in a production build. The earlier shape:
+        // any tx a peer hands over from a block it delivered is trusted, whatever block that is.
+        int trusted = BRPeerIsDeliveringBlockTxs(peer);
+#else
+        // A tx the peer is handing over from a block it delivered is the block's and needs no signature check
+        // only when that block is the manager's own main-chain block it asked for (see
+        // _BRPeerManagerDeliveryIsTrustedLocked). Any other tx, relayed or delivered, takes the checked path.
+        // The trust question matters only for a tx the wallet would hold, so the walk runs only for those.
+        int trusted = BRPeerIsDeliveringBlockTxs(peer) && BRWalletContainsTransaction(manager->wallet, tx) &&
+                      _BRPeerManagerDeliveryIsTrustedLocked(manager, BRPeerDeliveringBlockHash(peer));
+#endif
+        isWalletTx = trusted ? BRWalletRegisterTransactionTrusted(manager->wallet, tx)
+                             : BRWalletRegisterTransaction(manager->wallet, tx);
 #ifdef PUBLISH_RELAY_OBJECT_UNFIXED
         // Comparison arm only: the shape that left the parsed object unreleased whenever the
         // wallet already held a record of its hash.
@@ -4829,6 +4877,105 @@ static UInt256 _BRPeerManagerBlockHashAtHeight(BRPeerManager *manager, uint32_t 
     return UINT256_ZERO;
 }
 
+// ---- MAIN-CHAIN HASH AT HEIGHT, INDEXED -------------------------------------
+// The same answer as _BRPeerManagerBlockHashAtHeight, without its cost per call. That walk takes (tip - height)
+// lookups, and the INT-2026-10-09-D checks ask it for every filter match and every delivered wallet tx, at heights
+// that sit deep below the tip during a long scan. This keeps the main-chain hash at every height that is a multiple
+// of MAIN_INDEX_STRIDE, from the tip down, so a query walks at most one stride from an entry.
+//   - Every entry is an ancestor of the tip it was recorded under: a block's ancestors are fixed by its header.
+//   - Before use, that tip must still be lastBlock, or an ancestor of it (checked by walking down from lastBlock to
+//     its height; the entries that walk passes are added on top). Anything else (a reorg, a rewind) drops the index.
+//   - An entry whose block is no longer resident is answered by the full walk.
+// Entries are added as walks pass them, so the index costs nothing until it is asked, and each header the tip
+// advances by is walked at most twice. Caller holds manager->lock.
+static void _BRPeerManagerMainIndexNoteLocked(BRPeerManager *manager, const BRMerkleBlock *b)
+{
+    size_t n = manager->mainIndexCount;
+
+    // the next entry down is at mainIndexTop - n*MAIN_INDEX_STRIDE
+    if (n < MAIN_INDEX_MAX && manager->mainIndexTop >= n*MAIN_INDEX_STRIDE &&
+        b->height == manager->mainIndexTop - n*MAIN_INDEX_STRIDE) {
+        manager->mainIndex[n] = b->blockHash;
+        manager->mainIndexCount = n + 1;
+    }
+}
+
+static UInt256 _BRPeerManagerMainHashAtHeightLocked(BRPeerManager *manager, uint32_t height)
+{
+    BRMerkleBlock *tip = manager->lastBlock, *b;
+
+    if (! tip || height > tip->height) return UINT256_ZERO;
+
+    if (manager->mainIndexCount > 0 && ! UInt256Eq(manager->mainIndexTip, tip->blockHash)) {
+        int kept = 0;
+
+        if (tip->height >= manager->mainIndexTipHeight &&
+            tip->height - manager->mainIndexTipHeight <= MAIN_INDEX_MAX*MAIN_INDEX_STRIDE) {
+            size_t m = 0;   // entry heights above mainIndexTop, up to the new tip
+
+            for (b = tip; b && b->height > manager->mainIndexTipHeight; b = BRSetGet(manager->blocks, &b->prevBlock)) {
+                if (b->height % MAIN_INDEX_STRIDE == 0 && b->height > manager->mainIndexTop) m++;
+            }
+
+            if (b && UInt256Eq(b->blockHash, manager->mainIndexTip)) {   // lastBlock extends the indexed tip
+                kept = 1;
+
+                if (m > 0) {   // shift the old entries down by m and write the new ones above them, highest first
+                    size_t keep = (manager->mainIndexCount + m <= MAIN_INDEX_MAX) ? manager->mainIndexCount :
+                                  (MAIN_INDEX_MAX > m ? MAIN_INDEX_MAX - m : 0);
+                    size_t k = 0;
+
+                    memmove(&manager->mainIndex[m], &manager->mainIndex[0], keep*sizeof(manager->mainIndex[0]));
+                    for (b = tip; b && k < m; b = BRSetGet(manager->blocks, &b->prevBlock)) {
+                        if (b->height % MAIN_INDEX_STRIDE == 0 && b->height > manager->mainIndexTop) {
+                            manager->mainIndex[k++] = b->blockHash;
+                        }
+                    }
+
+                    if (k == m) {
+                        manager->mainIndexTop += (uint32_t)m*MAIN_INDEX_STRIDE;
+                        manager->mainIndexCount = m + keep;
+                    }
+                    else kept = 0;   // the second walk did not see what the first did: start over
+                }
+
+                manager->mainIndexTip = tip->blockHash;
+                manager->mainIndexTipHeight = tip->height;
+            }
+        }
+
+        if (! kept) manager->mainIndexCount = 0;
+    }
+
+    if (manager->mainIndexCount == 0) {   // start an index under this tip; the walk below adds its entries
+        manager->mainIndexTip = tip->blockHash;
+        manager->mainIndexTipHeight = tip->height;
+        manager->mainIndexTop = tip->height - tip->height % MAIN_INDEX_STRIDE;
+    }
+
+    // start from the lowest entry at or above the height (the tip when there is none)
+    b = tip;
+    if (manager->mainIndexCount > 0 && height <= manager->mainIndexTop) {
+        size_t k = (manager->mainIndexTop - height)/MAIN_INDEX_STRIDE;   // entry k is at or above the height
+
+        if (k >= manager->mainIndexCount) k = manager->mainIndexCount - 1;
+        b = BRSetGet(manager->blocks, &manager->mainIndex[k]);
+        if (! b) return _BRPeerManagerBlockHashAtHeight(manager, height);   // no longer resident: the full walk
+    }
+
+    while (b && b->height > height) {
+        _BRPeerManagerMainIndexNoteLocked(manager, b);
+        b = BRSetGet(manager->blocks, &b->prevBlock);
+    }
+
+    if (b && b->height == height) {
+        _BRPeerManagerMainIndexNoteLocked(manager, b);
+        return b->blockHash;
+    }
+
+    return UINT256_ZERO;
+}
+
 #if CF_LEDGER_DRIVE_REREQUEST
 // Resolve N heights to block hashes in ONE descent from lastBlock. Equivalent to
 // calling _BRPeerManagerBlockHashAtHeight for each height, but O(chainLen) once
@@ -6134,6 +6281,19 @@ static void _peerRelayedCFilter(void *info, uint8_t filterType, UInt256 blockHas
     manager->cfEvalNanos += (_cfNowNanos() - _tEval0);
 #endif
 
+#ifndef INT_2026_10_09_D_UNFIXED
+    // INT-2026-10-09-D. A full block is requested only for the block our main chain holds at this height. The
+    // filter bytes are checked against the filter header at the height, not against this block hash, so a match
+    // keyed by another block at the same height says nothing about ours. No request, nothing recorded, and the
+    // height stays outstanding for the ordinary re-request, which asks by our own block hash.
+    if (hit && ! UInt256Eq(_BRPeerManagerMainHashAtHeightLocked(manager, b->height), blockHash)) {
+        peer_log(peer, "cfilter: match on block %s @ %u, which our main chain does not hold there — no block "
+                 "request, left outstanding", log_u256_hex_encode(blockHash), b->height);
+        MGR_UNLOCK(manager);
+        return;
+    }
+#endif
+
     if (hit) {
         peer_log(peer, "cfilter: MATCH on block %s @ height %u, requesting full block",
                  log_u256_hex_encode(blockHash), b->height);
@@ -6857,6 +7017,15 @@ static int _cfBufEval(void *vctx, uint32_t height, UInt256 blockHash, const uint
             if (_BRPeerManagerPeerCanServeFilters(m->connectedPeers[i - 1])) { p = m->connectedPeers[i - 1]; break; }
         }
         if (! p) return 0;                                                 // hit but no peer -> KEEP buffered, stay outstanding, retry
+#ifndef INT_2026_10_09_D_UNFIXED
+        // INT-2026-10-09-D: a full block is requested only for the block our main chain holds at this height (see
+        // _peerRelayedCFilter). Otherwise drop the bytes and leave the height outstanding for the re-request.
+        if (! UInt256Eq(_BRPeerManagerMainHashAtHeightLocked(m, height), blockHash)) {
+            peer_log(p, "cf-ledger: buffered match on block %s @ %u, which our main chain does not hold there — no "
+                     "block request, left outstanding", log_u256_hex_encode(blockHash), height);
+            return 1;
+        }
+#endif
         _BRPeerManagerRecordSolicitedBlockLocked(m, blockHash, height);    // C1: record BEFORE the send (see _peerRelayedBlockTxns)
         BRPeerSendGetdataBlocks(p, &blockHash, 1);                         // credit: fetch the block -> tx registered on arrival
 #ifdef CF_MATCH_MARK_ON_REQUEST_UNFIXED

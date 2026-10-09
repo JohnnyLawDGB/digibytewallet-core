@@ -129,7 +129,11 @@ static inline size_t BRSavedBlocksDeserialize(const uint8_t *b, size_t len,
         uint32_t height   = UInt32GetLE(&b[pos]); pos += 4;
         BRMerkleBlock *block;
 
-        if (pos + blockLen > len) break;
+#ifdef BB_2026_10_09_HARLEY_UNFIXED
+        if (pos + blockLen > len) break;   // comparison shape: wraps on a 32-bit size_t
+#else
+        if (blockLen > len - pos) break;   // pos <= len holds here (loop condition)
+#endif
         block = BRMerkleBlockParse(&b[pos], blockLen);
         pos += blockLen;
 

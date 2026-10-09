@@ -108,7 +108,15 @@ static inline size_t BRPeerPenaltyDeserialize(const uint8_t *buf, size_t bufLen,
 
     if (! buf || bufLen < BR_PEER_PENALTY_HEADER_BYTES) return 0;
     claimed = (size_t)UInt32GetLE(buf);
+#ifdef BB_2026_10_09_HARLEY_UNFIXED
+    // Comparison shape for the host KAT only: claimed * 26 wraps when size_t is 32 bits
+    // (claimed = 0x80000000 gives 0), so the guard passes and the walk leaves the blob.
     if (bufLen < BR_PEER_PENALTY_HEADER_BYTES + claimed * BR_PEER_PENALTY_ENTRY_BYTES) return 0;
+#else
+    // Divide the bytes present rather than multiply the count read off disk: the product
+    // can wrap on a 32-bit size_t, the quotient cannot. Same verdict on every honest blob.
+    if (claimed > (bufLen - BR_PEER_PENALTY_HEADER_BYTES) / BR_PEER_PENALTY_ENTRY_BYTES) return 0;
+#endif
 
     for (size_t i = 0; i < claimed && out < maxCount; i++) {
         UInt128 a;

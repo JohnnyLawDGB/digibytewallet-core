@@ -6107,6 +6107,23 @@ static void _peerRelayedCFilter(void *info, uint8_t filterType, UInt256 blockHas
     // (positive CF-served signal), independent of whether it hits our wallet.
     _recordCFServed(manager, peer);
 
+#ifndef INT_2026_10_09_D_UNFIXED
+    // INT-2026-10-09-D. A filter is evaluated only for the block our main chain holds at this height. The bytes are
+    // checked against the filter header at the height, not against this block hash, and the block hash is the key
+    // the filter is read with. Keyed by another block at the same height (a stale one, or any other), neither a match
+    // nor a miss says anything about ours. So nothing is requested, the height is not marked scanned, and it stays
+    // outstanding for the ordinary re-request, which asks by our own block hash.
+    if (! UInt256Eq(_BRPeerManagerMainHashAtHeightLocked(manager, b->height), blockHash)) {
+        peer_log(peer, "cfilter: filter for block %s @ %u, which our main chain does not hold there — not evaluated, "
+                 "left outstanding", log_u256_hex_encode(blockHash), b->height);
+#ifdef CF_RECV_DIAG
+        manager->cfExitVerifyFail++;
+#endif
+        MGR_UNLOCK(manager);
+        return;
+    }
+#endif
+
     BRGCSFilter *gcs = BRGCSFilterBasicParse(encoded, encodedLen, blockHash);
     if (!gcs) {
 #ifdef CF_PIN_DIAG
@@ -6164,19 +6181,6 @@ static void _peerRelayedCFilter(void *info, uint8_t filterType, UInt256 blockHas
     BRGCSFilterFree(gcs);
 #ifdef CF_RECV_DIAG
     manager->cfEvalNanos += (_cfNowNanos() - _tEval0);
-#endif
-
-#ifndef INT_2026_10_09_D_UNFIXED
-    // INT-2026-10-09-D. A full block is requested only for the block our main chain holds at this height. The
-    // filter bytes are checked against the filter header at the height, not against this block hash, so a match
-    // keyed by another block at the same height says nothing about ours. No request, nothing recorded, and the
-    // height stays outstanding for the ordinary re-request, which asks by our own block hash.
-    if (hit && ! UInt256Eq(_BRPeerManagerMainHashAtHeightLocked(manager, b->height), blockHash)) {
-        peer_log(peer, "cfilter: match on block %s @ %u, which our main chain does not hold there — no block "
-                 "request, left outstanding", log_u256_hex_encode(blockHash), b->height);
-        MGR_UNLOCK(manager);
-        return;
-    }
 #endif
 
     if (hit) {
@@ -6888,6 +6892,15 @@ static int _cfBufEval(void *vctx, uint32_t height, UInt256 blockHash, const uint
     BRPeerManager *m = c->m;
 
     if (! BRCompactFilterChainVerifyFilter(m->compactFilterChain, height, bytes, len)) return 1; // bad bytes: drop, leave outstanding (re-request)
+#ifndef INT_2026_10_09_D_UNFIXED
+    // INT-2026-10-09-D: a filter is evaluated only for the block our main chain holds at this height (see
+    // _peerRelayedCFilter). Otherwise drop the bytes; the height is not marked scanned and stays outstanding.
+    if (! UInt256Eq(_BRPeerManagerMainHashAtHeightLocked(m, height), blockHash)) {
+        _peer_log("cf-ledger: buffered filter for block %s @ %u, which our main chain does not hold there — not "
+                  "evaluated, left outstanding\n", log_u256_hex_encode(blockHash), height);
+        return 1;
+    }
+#endif
     BRGCSFilter *gcs = BRGCSFilterBasicParse(bytes, len, blockHash);        // blockHash is the SipHash key (3-arg)
     if (! gcs) return 1;                                                   // unparseable: drop, leave outstanding
 
@@ -6902,15 +6915,6 @@ static int _cfBufEval(void *vctx, uint32_t height, UInt256 blockHash, const uint
             if (_BRPeerManagerPeerCanServeFilters(m->connectedPeers[i - 1])) { p = m->connectedPeers[i - 1]; break; }
         }
         if (! p) return 0;                                                 // hit but no peer -> KEEP buffered, stay outstanding, retry
-#ifndef INT_2026_10_09_D_UNFIXED
-        // INT-2026-10-09-D: a full block is requested only for the block our main chain holds at this height (see
-        // _peerRelayedCFilter). Otherwise drop the bytes and leave the height outstanding for the re-request.
-        if (! UInt256Eq(_BRPeerManagerMainHashAtHeightLocked(m, height), blockHash)) {
-            peer_log(p, "cf-ledger: buffered match on block %s @ %u, which our main chain does not hold there — no "
-                     "block request, left outstanding", log_u256_hex_encode(blockHash), height);
-            return 1;
-        }
-#endif
         _BRPeerManagerRecordSolicitedBlockLocked(m, blockHash, height);    // C1: record BEFORE the send (see _peerRelayedBlockTxns)
         BRPeerSendGetdataBlocks(p, &blockHash, 1);                         // credit: fetch the block -> tx registered on arrival
 #ifdef CF_MATCH_MARK_ON_REQUEST_UNFIXED

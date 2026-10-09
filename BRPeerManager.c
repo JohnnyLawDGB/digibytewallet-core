@@ -3240,6 +3240,32 @@ static int _BRPeerManagerDiffV4ExpectedLocked(BRPeerManager *manager, const BRMe
     *expected = BRDifficultyV4Target(p, lastTimes, firstTimes, prevAlgo->target, prevAlgoDistance);
     return 1;
 }
+
+#if DGB_HEADER_DIFF_CHECK >= 2
+// INT-2026-10-09-E. 1 if the history under `prev` that _BRPeerManagerDiffV4ExpectedLocked reads stops, within that
+// walk's reach, at a parent that is not resident: the resident floor, below which this wallet dropped the headers it
+// once held. 0 if it reaches a checkpoint (its stub), or runs past the reach (a header of an algorithm absent that long
+// cannot be judged for another reason). This line has no checkpoint difficulty contexts, so a missing parent is always
+// the floor. A checkpoint's real header takes the place of its stub only on top of its resident parent (a header
+// whose parent is not held is never made resident) or from the saved chain, whose lowest block is its run's floor.
+static int _BRPeerManagerDiffV4HistoryStopsAtFloorLocked(BRPeerManager *manager, const BRMerkleBlock *prev)
+{
+    const uint32_t reach = BR_DIFF_V4_NUM_ALGOS*manager->params->diffV4.averagingInterval + BR_DIFF_V4_MEDIAN_SPAN +
+                           DIFF_V4_ALGO_WALK_MAX + 1;
+    const BRMerkleBlock *b = prev;
+
+    for (uint32_t i = 0; b && i < reach; i++) {
+        if (UInt256IsZero(b->prevBlock)) return 0;   // a checkpoint stub: the chain starts at a checkpoint
+
+        const BRMerkleBlock *parent = BRSetGet(manager->blocks, &b->prevBlock);
+
+        if (! parent) return 1;   // the resident floor
+        b = parent;
+    }
+
+    return 0;
+}
+#endif
 #endif
 
 static int _BRPeerManagerVerifyBlock(BRPeerManager *manager, BRMerkleBlock *block, BRMerkleBlock *prev, BRPeer *peer)
@@ -3287,6 +3313,24 @@ static int _BRPeerManagerVerifyBlock(BRPeerManager *manager, BRMerkleBlock *bloc
             BRMerkleBlockDiffCountAdd(BR_DIFF_SKIP);
             peer_log(peer, "diff-skip h=%" PRIu32 " algo=%s blockHash: %s (ancestors not resident)", block->height,
                      BRMerkleBlockAlgoName(BRMerkleBlockAlgo(block)), u256hex(block->blockHash));
+#if DGB_HEADER_DIFF_CHECK >= 2 && !defined(INT_2026_10_09_E_UNFIXED)
+            // INT-2026-10-09-E. At level 2 a header off the main chain that cannot be judged because its history
+            // stops at the resident floor is refused, and the peer treated as misbehaving, as for an off-target
+            // header. The rest keep the skip:
+            //   - a header that extends lastBlock: a chain that starts at a checkpoint (none carries a difficulty
+            //     context on this line) has no history for its first headers, and they are the only way forward;
+            //   - a header off the main chain whose history reaches a checkpoint: the chain the wallet took first
+            //     there may not be the real one, so the real one must still be able to grow beside it and win;
+            //   - a header we already hold: it adds nothing and goes on to the existing-block path.
+            // A reorg near the tip is judged (its ancestors are resident), so it never reaches this branch.
+            if (! UInt256Eq(block->prevBlock, b->blockHash) && ! BRSetContains(manager->blocks, block) &&
+                _BRPeerManagerDiffV4HistoryStopsAtFloorLocked(manager, prev)) {
+                peer_log(peer, "diff-unjudged-fork h=%" PRIu32 " algo=%s blockHash: %s (does not extend the tip at "
+                         "%" PRIu32 ", history stops at the resident floor; refused)", block->height,
+                         BRMerkleBlockAlgoName(BRMerkleBlockAlgo(block)), u256hex(block->blockHash), b->height);
+                r = 0;
+            }
+#endif
         }
         else if (block->target != expected) {
             BRMerkleBlockDiffCountAdd(BR_DIFF_MISMATCH);

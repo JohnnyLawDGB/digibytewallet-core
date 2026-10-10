@@ -54,21 +54,24 @@ extern "C" {
 
 // The longest input parsed, in bytes. A QR code holds at most 2,953 bytes.
 #define BR_PAYMENT_URI_MAX 4096
+// The buffer the caller lends BRPaymentUriParse for the text fields: four fields, each up to
+// BR_PAYMENT_URI_MAX bytes plus a NUL. (Text is not embedded in the struct: Swift's C importer
+// drops fixed arrays this large, and a JNI caller copies out of one buffer anyway.)
+#define BR_PAYMENT_URI_BUF_SIZE (4 * (BR_PAYMENT_URI_MAX + 1))
 
+// Every text field points into the caller's buffer, is NUL-terminated, and is valid (empty when
+// absent) for as long as that buffer is. Decoded fields may contain NUL bytes: use the length.
 typedef struct {
-    char address[BR_PAYMENT_URI_MAX + 1];   // NUL-terminated, as written
+    const char *address; size_t addressLen;   // as written, never decoded
     int hasAmount;
-    int64_t amount;                         // satoshis
+    int64_t amount;                           // satoshis
     int hasLabel;
-    char label[BR_PAYMENT_URI_MAX + 1];     // decoded; may contain NUL (use labelLen)
-    size_t labelLen;
+    const char *label; size_t labelLen;       // decoded
     int hasMessage;
-    char message[BR_PAYMENT_URI_MAX + 1];   // decoded; may contain NUL (use messageLen)
-    size_t messageLen;
+    const char *message; size_t messageLen;   // decoded
     int hasAsset;
-    char assetId[BR_PAYMENT_URI_MAX + 1];   // decoded; may contain NUL (use assetIdLen)
-    size_t assetIdLen;
-    int64_t assetAmount;                    // the asset's raw units, > 0
+    const char *assetId; size_t assetIdLen;   // decoded
+    int64_t assetAmount;                      // the asset's raw units, > 0
 } BRPaymentUri;
 
 static inline int _BRUriIsSpace(char c)
@@ -127,8 +130,9 @@ static inline int _BRUriParseInt64(const char *s, size_t len, int64_t *out)
     return 1;
 }
 
-// Parses text[0..len) into *uri. Returns 1 for a request, 0 when the input is rejected.
-static inline int BRPaymentUriParse(const char *text, size_t len, BRPaymentUri *uri)
+// Parses text[0..len) into *uri, with the text fields in buf (bufLen >= BR_PAYMENT_URI_BUF_SIZE).
+// Returns 1 for a request, 0 when the input is rejected or buf is too small.
+static inline int BRPaymentUriParse(const char *text, size_t len, BRPaymentUri *uri, char *buf, size_t bufLen)
 {
     static const char scheme[] = "digibyte:";
     const size_t schemeLen = sizeof(scheme) - 1;
@@ -136,9 +140,17 @@ static inline int BRPaymentUriParse(const char *text, size_t len, BRPaymentUri *
     int seenAmount = 0, seenLabel = 0, seenMessage = 0, seenAssetId = 0, seenAssetAmount = 0;
     char key[BR_PAYMENT_URI_MAX + 1], amountText[BR_PAYMENT_URI_MAX + 1], assetAmountText[BR_PAYMENT_URI_MAX + 1];
     size_t keyLen, amountLen = 0, assetAmountLen = 0;
+    char *fAddress, *fLabel, *fMessage, *fAssetId;   // writable views of the caller's buffer
 
     if (! uri) return 0;
     memset(uri, 0, sizeof(*uri));
+    if (! buf || bufLen < BR_PAYMENT_URI_BUF_SIZE) return 0;
+    fAddress = buf;
+    fLabel = fAddress + (BR_PAYMENT_URI_MAX + 1);
+    fMessage = fLabel + (BR_PAYMENT_URI_MAX + 1);
+    fAssetId = fMessage + (BR_PAYMENT_URI_MAX + 1);
+    fAddress[0] = fLabel[0] = fMessage[0] = fAssetId[0] = '\0';
+    uri->address = fAddress; uri->label = fLabel; uri->message = fMessage; uri->assetId = fAssetId;
     if (! text || len > BR_PAYMENT_URI_MAX || memchr(text, '\0', len)) return 0;
 
     while (start < end && _BRUriIsSpace(text[start])) start++;
@@ -151,8 +163,9 @@ static inline int BRPaymentUriParse(const char *text, size_t len, BRPaymentUri *
         if (text[i] == ':' && text[i + 1] == '/' && text[i + 2] == '/') return 0;   // a foreign scheme
     }
     if (! hasScheme) {                                     // a bare address
-        memcpy(uri->address, text, len);
-        uri->address[len] = '\0';
+        memcpy(fAddress, text, len);
+        fAddress[len] = '\0';
+        uri->addressLen = len;
         return 1;
     }
 
@@ -162,8 +175,9 @@ static inline int BRPaymentUriParse(const char *text, size_t len, BRPaymentUri *
     while (a0 < a1 && _BRUriIsSpace(text[a0])) a0++;
     while (a1 > a0 && _BRUriIsSpace(text[a1 - 1])) a1--;
     if (a0 == a1) return 0;
-    memcpy(uri->address, text + a0, a1 - a0);
-    uri->address[a1 - a0] = '\0';
+    memcpy(fAddress, text + a0, a1 - a0);
+    fAddress[a1 - a0] = '\0';
+    uri->addressLen = a1 - a0;
 
     for (i = q + 1; i <= len && q < len; ) {
         size_t p = i, eq, pairEnd;
@@ -186,13 +200,13 @@ static inline int BRPaymentUriParse(const char *text, size_t len, BRPaymentUri *
                     seenAmount = 1; amountLen = _BRUriDecode(val, valLen, amountText);
                 }
                 else if (keyLen == 5 && memcmp(key, "label", 5) == 0 && _BR_URI_TAKE(seenLabel)) {
-                    seenLabel = 1; uri->hasLabel = 1; uri->labelLen = _BRUriDecode(val, valLen, uri->label);
+                    seenLabel = 1; uri->hasLabel = 1; uri->labelLen = _BRUriDecode(val, valLen, fLabel);
                 }
                 else if (keyLen == 7 && memcmp(key, "message", 7) == 0 && _BR_URI_TAKE(seenMessage)) {
-                    seenMessage = 1; uri->hasMessage = 1; uri->messageLen = _BRUriDecode(val, valLen, uri->message);
+                    seenMessage = 1; uri->hasMessage = 1; uri->messageLen = _BRUriDecode(val, valLen, fMessage);
                 }
                 else if (keyLen == 7 && memcmp(key, "assetId", 7) == 0 && _BR_URI_TAKE(seenAssetId)) {
-                    seenAssetId = 1; uri->assetIdLen = _BRUriDecode(val, valLen, uri->assetId);
+                    seenAssetId = 1; uri->assetIdLen = _BRUriDecode(val, valLen, fAssetId);
                 }
                 else if (keyLen == 11 && memcmp(key, "assetAmount", 11) == 0 && _BR_URI_TAKE(seenAssetAmount)) {
                     seenAssetAmount = 1; assetAmountLen = _BRUriDecode(val, valLen, assetAmountText);
@@ -218,13 +232,13 @@ static inline int BRPaymentUriParse(const char *text, size_t len, BRPaymentUri *
         }
 #ifdef PAYMENT_URI_UNFIXED
         // RED ARM SEAM: fail open. A half or malformed asset request degrades to a plain one.
-        if (! (haveId && haveQty && qty > 0)) { haveId = haveQty = 0; uri->assetIdLen = 0; uri->assetId[0] = '\0'; }
+        if (! (haveId && haveQty && qty > 0)) { haveId = haveQty = 0; uri->assetIdLen = 0; fAssetId[0] = '\0'; }
 #else
         if (haveId != haveQty) return 0;
         if (haveQty && qty <= 0) return 0;
 #endif
         if (haveId) { uri->hasAsset = 1; uri->assetAmount = qty; }
-        else { uri->assetIdLen = 0; uri->assetId[0] = '\0'; }
+        else { uri->assetIdLen = 0; fAssetId[0] = '\0'; }
     }
 
     if (seenAmount && memchr(amountText, '\0', amountLen) == NULL)

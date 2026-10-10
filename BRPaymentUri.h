@@ -57,7 +57,8 @@ extern "C" {
 // The buffer the caller lends BRPaymentUriParse for the text fields: four fields, each up to
 // BR_PAYMENT_URI_MAX bytes plus a NUL. (Text is not embedded in the struct: Swift's C importer
 // drops fixed arrays this large, and a JNI caller copies out of one buffer anyway.)
-#define BR_PAYMENT_URI_BUF_SIZE (4 * (BR_PAYMENT_URI_MAX + 1))
+#define BR_PAYMENT_URI_BUF_SIZE 16388   // 4 * (BR_PAYMENT_URI_MAX + 1): a literal, so Swift sees it
+typedef char _BRPaymentUriBufSizeIsFourFields[(BR_PAYMENT_URI_BUF_SIZE == 4 * (BR_PAYMENT_URI_MAX + 1)) ? 1 : -1];
 
 // Every text field points into the caller's buffer, is NUL-terminated, and is valid (empty when
 // absent) for as long as that buffer is. Decoded fields may contain NUL bytes: use the length.

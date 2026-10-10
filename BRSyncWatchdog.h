@@ -7,7 +7,10 @@
 //  re-init the scan, so a platform that decides differently either wipes a healthy descent or
 //  leaves a wedged wallet wedged. Until 2026-10 the rules lived in Kotlin
 //  (Bip158WatchdogPolicy.kt, and the tier ordering inline in SyncService.startTipStallWatchdog);
-//  Bip158WatchdogPolicyTest.kt is carried over case for case in the host KAT.
+//  Bip158WatchdogPolicyTest.kt is carried over case for case in the host KAT. The two loops that
+//  drive these decisions (startBip158Watchdog, startTipStallWatchdog) are here as state machines
+//  too (BRBip158WatchdogStep, BRTipStallDecide), so a platform performs actions and decides
+//  nothing.
 //
 //  The liveness signal is the CF SCAN frontier (BRPeerManagerLowestNeededHeight), not the block
 //  tip: the paced convoy freezes the block-header frontier at scanFrontier + CF_CONVOY_WINDOW by
@@ -30,6 +33,7 @@
 #ifndef BRSyncWatchdog_h
 #define BRSyncWatchdog_h
 
+#include "BRCFRecoveryPolicy.h"
 #include <stdint.h>
 
 #ifdef __cplusplus
@@ -51,6 +55,9 @@ extern "C" {
 #define BR_WD_CF_CONVOY_WINDOW_FALLBACK    10000LL     // CF_CONVOY_WINDOW, for callers without the header
 #define BR_WD_CF_CONVOY_REARM_MAX_FALLBACK 2           // CF_CONVOY_REARM_MAX, likewise
 #define BR_WD_SUPPRESSION_MAX_MS_FALLBACK  1800000LL   // BRWatchdogSuppressionMaxMs(2): 30 min
+#define BR_WD_BIP158_POLL_MS               15000LL     // the BIP158 watchdog's poll
+#define BR_WD_BIP158_FALLBACK_TIMEOUT_MS   120000LL    // before the post-timeout branch may act
+#define BR_WD_BLOCK_CATCHUP_GRACE          50LL        // blocks within the estimated height = caught up
 
 static inline int64_t _brWdSub(int64_t a, int64_t b) { return (int64_t)((uint64_t)a - (uint64_t)b); }
 static inline int64_t _brWdTwice(int64_t a) { return (int64_t)((uint64_t)a * 2u); }
@@ -274,6 +281,129 @@ static inline BRTipStallAction BRTipStallDecide(BRTipStallState *state, int peer
         return BRTipStallFastRecover;
     }
     return BRTipStallNone;
+}
+
+// ---- the BIP158 watchdog loop (SyncService.startBip158Watchdog's step) --------------------
+
+typedef struct {
+    int64_t startedAtMs;
+    int64_t cfTipAtStart, lastCfTip, cfNetMax, cfNetProgressMs;
+    int64_t lastBlockTip, lastBlockProgressMs;
+    int64_t scanNetMax, scanProgressMs;
+    int reanchoredThisSession;
+    int64_t reanchorAtMs;
+    int cfFrozenRecovered;
+    int corruptHeals;
+    int64_t lastCorruptHealMs;
+    int corruptHealRotation;
+} BRBip158WatchdogState;
+
+typedef enum {
+    BRBip158Wait = 0,           // keep polling (progressing, catching up, awaiting a rebuild, or stuck)
+    BRBip158Healthy,            // filters keep pace: the watchdog is done for this session
+    BRBip158RecoverFrozenCf,    // drop what BRCFRecoveryDecide(...FilterChainWedged) says, recreate the
+                                // manager resuming near the tip
+    BRBip158HealCorruptChain,   // drop what BRCFRecoveryDecide(...FilterChainCorrupt) says (all filter
+                                // state), re-anchor at the floor, recreate the manager, then pin the
+                                // validated canon filter peer at index *pinRotation (if any)
+    BRBip158Reanchor            // BRPeerManagerReanchorCompactFilterChainAtFloor, then report the result
+                                // with BRBip158WatchdogReanchored
+} BRBip158Action;
+
+// Call right after sync starts (the manager must exist), with its first readings.
+static inline BRBip158WatchdogState BRBip158WatchdogInit(int64_t cfTip, int64_t blockTip, int64_t scanFrontier, int64_t nowMs)
+{
+    BRBip158WatchdogState s;
+    s.startedAtMs = nowMs;
+    s.cfTipAtStart = s.lastCfTip = s.cfNetMax = cfTip;
+    s.cfNetProgressMs = nowMs;
+    s.lastBlockTip = blockTip;
+    s.lastBlockProgressMs = nowMs;
+    s.scanNetMax = scanFrontier;
+    s.scanProgressMs = nowMs;
+    s.reanchoredThisSession = 0;
+    s.reanchorAtMs = 0;
+    s.cfFrozenRecovered = 0;
+    s.corruptHeals = 0;
+    s.lastCorruptHealMs = 0;
+    s.corruptHealRotation = 0;
+    return s;
+}
+
+// One poll (every BR_WD_BIP158_POLL_MS). Inputs are this poll's readings: the filter tip
+// (BRPeerManagerCFChainTipHeight), the block tip, the peers' estimated height, the scan frontier
+// (BRPeerManagerLowestNeededHeight), the peer count, BRPeerManagerHasPendingAbandonment, and
+// whether this wallet has ever reached sync. For BRBip158HealCorruptChain, *pinRotation receives
+// the index of the canon filter peer to pin (rotating through the validated pool).
+static inline BRBip158Action BRBip158WatchdogStep(BRBip158WatchdogState *s, int64_t cfTipNow, int64_t blockTip,
+    int64_t estimatedHeight, int64_t scanNow, int peerCount, int abandonmentPendingCycles, int hasReachedSynced,
+    int64_t suppressionMaxMs, int64_t nowMs, int *pinRotation)
+{
+    int64_t gap = _brWdSub(blockTip, cfTipNow), elapsed = _brWdSub(nowMs, s->startedAtMs), scanStalled;
+    int cfAdvancedSinceStart = cfTipNow > s->cfTipAtStart;
+    int blocksCaughtUp = estimatedHeight > 0 && blockTip >= estimatedHeight - BR_WD_BLOCK_CATCHUP_GRACE;
+    int advanced, blockClimbing;
+    BRWatchdogFrontierProgress scanStep;
+
+    if (BRWatchdogIsFilterSyncHealthy(gap, cfAdvancedSinceStart, blocksCaughtUp)) return BRBip158Healthy;
+
+    advanced = cfTipNow > s->lastCfTip;
+    s->lastCfTip = cfTipNow;
+    blockClimbing = blockTip > s->lastBlockTip;
+    if (blockClimbing) s->lastBlockProgressMs = nowMs;
+    s->lastBlockTip = blockTip;
+    // Running max, so a re-anchor's transient 0 cannot reset the frozen clock.
+    if (cfTipNow > s->cfNetMax) { s->cfNetMax = cfTipNow; s->cfNetProgressMs = nowMs; }
+    scanStep = BRWatchdogStepScanFrontier(s->scanNetMax, s->scanProgressMs, scanNow, nowMs);
+    s->scanNetMax = scanStep.frontier;
+    s->scanProgressMs = scanStep.lastChangeMs;
+    scanStalled = _brWdSub(nowMs, s->scanProgressMs);
+
+    if (BRWatchdogShouldRecoverFrozenCf(blockClimbing, _brWdSub(nowMs, s->cfNetProgressMs), s->cfNetMax,
+                                        s->cfFrozenRecovered, scanStalled, abandonmentPendingCycles,
+                                        BR_WD_CF_FROZEN_RECOVERY_MS, suppressionMaxMs)) {
+        s->cfFrozenRecovered = 1;
+        if (BRCFRecoveryDecide(BRCFRecoveryReasonFilterChainWedged).dropScanLedger) s->scanNetMax = 0;
+        s->scanProgressMs = nowMs;
+        return BRBip158RecoverFrozenCf;
+    }
+    if (advanced) return BRBip158Wait;            // progressing
+    if (! blocksCaughtUp) return BRBip158Wait;    // headers still catching up
+
+    if (BRWatchdogShouldHealCorruptChain(blocksCaughtUp, peerCount, _brWdSub(nowMs, s->cfNetProgressMs),
+                                         s->reanchoredThisSession, _brWdSub(nowMs, s->reanchorAtMs), s->corruptHeals,
+                                         scanStalled, abandonmentPendingCycles, BR_WD_CF_CORRUPT_HEAL_MS,
+                                         BR_WD_MAX_CF_CORRUPT_HEALS, suppressionMaxMs) &&
+        _brWdSub(nowMs, s->lastCorruptHealMs) >= BR_WD_CF_CORRUPT_HEAL_COOLDOWN_MS) {
+        s->corruptHeals++;
+        s->lastCorruptHealMs = nowMs;
+        if (pinRotation) *pinRotation = s->corruptHealRotation;
+        s->corruptHealRotation++;
+        s->cfNetMax = 0;
+        s->cfNetProgressMs = nowMs;
+        s->lastCfTip = 0;
+        s->scanNetMax = 0;
+        s->scanProgressMs = nowMs;
+        return BRBip158HealCorruptChain;
+    }
+
+    if (elapsed >= BR_WD_BIP158_FALLBACK_TIMEOUT_MS &&
+        BRWatchdogDecidePostTimeout(hasReachedSynced, s->reanchoredThisSession, _brWdSub(nowMs, s->reanchorAtMs),
+                                    scanStalled, abandonmentPendingCycles, BR_WD_CF_FROZEN_RECOVERY_MS,
+                                    suppressionMaxMs) == BRWatchdogReanchor) return BRBip158Reanchor;
+    return BRBip158Wait;    // awaiting a rebuild, or stuck on filters (never a bloom fallback)
+}
+
+// The result of the re-anchor BRBip158WatchdogStep asked for. A declined re-anchor changes nothing
+// (the wallet stays on filters); an issued one starts its grace window, and the caller drops what
+// BRCFRecoveryDecide(BRCFRecoveryReasonReanchored) says.
+static inline void BRBip158WatchdogReanchored(BRBip158WatchdogState *s, int issued, int64_t nowMs)
+{
+    if (! issued) return;
+    s->reanchoredThisSession = 1;
+    s->reanchorAtMs = nowMs;
+    if (BRCFRecoveryDecide(BRCFRecoveryReasonReanchored).dropScanLedger) s->scanNetMax = 0;
+    s->scanProgressMs = nowMs;
 }
 
 #ifdef __cplusplus

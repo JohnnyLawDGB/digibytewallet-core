@@ -125,6 +125,19 @@ static inline BRStrandedAction BRStrandedSendDecide(int listed, uint32_t height,
 #endif
 }
 
+// A send the wallet holds but can never confirm: another transaction spent one of its inputs
+// (BRWalletTransactionIsValid is 0; it is 1 for a hash the wallet does not hold). When the
+// decision above is BRStrandedRepublish and the send is conflicted, it is REMOVED instead of
+// re-published, through the manager when there is one (BRPeerManagerRemoveTransaction, so the
+// publish list and the wallet agree), and its record is dropped: re-flooding it forever is the
+// only alternative, since it cannot confirm. Only this authoritative signal removes a send, never
+// a missing relay, so a valid but slow send is never dropped. (Android's SyncService sweep; on
+// Android the asset rows such a send leaves behind are cleaned too.)
+static inline int BRStrandedSendIsConflicted(int listed, int valid)
+{
+    return listed && ! valid;
+}
+
 #ifdef __cplusplus
 }
 #endif

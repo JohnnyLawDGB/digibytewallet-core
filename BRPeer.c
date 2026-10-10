@@ -29,6 +29,7 @@
 #include "BRArray.h"
 #include "BRCrypto.h"
 #include "BRGCSFilter.h"
+#include "BRPeerDialAddress.h"
 #ifdef __ANDROID__
 #include <android/log.h>
 #endif
@@ -1957,6 +1958,19 @@ static int _BRPeerOpenSocket(BRPeer *peer, int domain, double timeout, int *erro
      * 127.0.0.1 (IPv4). Force PF_INET so IPv6 peers don't create an IPv6
      * socket that can't connect to the IPv4 proxy (EINVAL). */
     int sockDomain = BRPeerHasSocksProxy() ? PF_INET : domain;
+
+    /* Direct to an IPv4 peer: dial what this network can route (BRPeerDialAddress.h). The same
+     * IPv4 address on a network with IPv4; a NAT64-synthesized IPv6 address on an IPv6-only
+     * network, where the IPv4-mapped address the core used to dial routes nowhere. */
+    struct sockaddr_storage dialAddr;
+    socklen_t dialLen = 0;
+    int dialFamily = 0;
+
+    if (! BRPeerHasSocksProxy() && domain == PF_INET6 && _BRPeerIsIPv4(peer)) {
+        dialFamily = BRPeerDialAddress(peer->address, peer->port, &dialAddr, &dialLen);
+        sockDomain = (dialFamily == AF_INET6) ? PF_INET6 : PF_INET;
+    }
+
     ctx->socket = socket(sockDomain, SOCK_STREAM, 0);
 
     if (ctx->socket < 0) {
@@ -2044,8 +2058,12 @@ static int _BRPeerOpenSocket(BRPeer *peer, int domain, double timeout, int *erro
                 }
             }
         } else {
-            /* Direct connection — original code path */
-            if (domain == PF_INET6) {
+            /* Direct connection */
+            if (dialLen > 0) {
+                memcpy(&addr, &dialAddr, dialLen);
+                addrLen = dialLen;
+            }
+            else if (domain == PF_INET6) {
                 ((struct sockaddr_in6 *)&addr)->sin6_family = AF_INET6;
                 ((struct sockaddr_in6 *)&addr)->sin6_addr = *(struct in6_addr *)&peer->address;
                 ((struct sockaddr_in6 *)&addr)->sin6_port = htons(peer->port);
@@ -2071,8 +2089,17 @@ static int _BRPeerOpenSocket(BRPeer *peer, int domain, double timeout, int *erro
                     r = 0;
                 }
             }
-            else if (err && domain == PF_INET6 && _BRPeerIsIPv4(peer)) {
-                return _BRPeerOpenSocket(peer, PF_INET, timeout, error); // fallback to IPv4
+            else if (err && dialFamily == AF_INET6) {
+                /* The synthesized IPv6 dial failed at once: try the IPv4 address itself. Close
+                 * this socket first (the retry opens its own; before 2026-10 the retry
+                 * overwrote ctx->socket and leaked it), unless a disconnect already took it. */
+                int s = ctx->socket;
+                if (s < 0) r = 0;
+                else {
+                    ctx->socket = -1;
+                    close(s);
+                    return _BRPeerOpenSocket(peer, PF_INET, timeout, error);
+                }
             }
             else if (err) r = 0;
         }

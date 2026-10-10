@@ -58,6 +58,7 @@ extern "C" {
 #define BR_WD_BIP158_POLL_MS               15000LL     // the BIP158 watchdog's poll
 #define BR_WD_BIP158_FALLBACK_TIMEOUT_MS   120000LL    // before the post-timeout branch may act
 #define BR_WD_BLOCK_CATCHUP_GRACE          50LL        // blocks within the estimated height = caught up
+#define BR_WD_ZERO_PEER_RECREATE_THRESHOLD 3           // keepalive ticks at 0 peers before a forced recreate
 
 static inline int64_t _brWdSub(int64_t a, int64_t b) { return (int64_t)((uint64_t)a - (uint64_t)b); }
 static inline int64_t _brWdTwice(int64_t a) { return (int64_t)((uint64_t)a * 2u); }
@@ -404,6 +405,35 @@ static inline void BRBip158WatchdogReanchored(BRBip158WatchdogState *s, int issu
     s->reanchorAtMs = nowMs;
     if (BRCFRecoveryDecide(BRCFRecoveryReasonReanchored).dropScanLedger) s->scanNetMax = 0;
     s->scanProgressMs = nowMs;
+}
+
+// ---- the zero-peer escalation (SyncService's keepalive tick) ------------------------------
+
+typedef enum {
+    BRZeroPeerNone = 0,
+    BRZeroPeerReconnect,              // add the filter peers and connect (BRPeerManagerConnect)
+    BRZeroPeerRecreateThenReconnect,  // recreate the manager resuming near the tip, then reconnect
+    BRZeroPeerDeferForTor,            // 0 peers, but Tor is still coming up: never dial direct first
+    BRZeroPeerKickSync                // peers, never synced, not done: connect again to keep it moving
+} BRZeroPeerAction;
+
+// One keepalive tick (Android: every 10 s). *zeroPeerStreak is the caller's counter, starting at 0.
+// At 0 peers every tick reconnects, and every BR_WD_ZERO_PEER_RECREATE_THRESHOLD-th consecutive one
+// recreates the manager first (a light reconnect that is not recovering). Any peer resets the
+// streak; while the wallet has never reached sync and is not done, each tick kicks sync again.
+static inline BRZeroPeerAction BRZeroPeerStep(int *zeroPeerStreak, int peerCount, int torComingUp,
+                                              int hasReachedSynced, double syncProgress)
+{
+    if (peerCount > 0) {
+        *zeroPeerStreak = 0;
+        return (! hasReachedSynced && syncProgress < 1.0) ? BRZeroPeerKickSync : BRZeroPeerNone;
+    }
+    if (torComingUp) return BRZeroPeerDeferForTor;
+    if (++*zeroPeerStreak >= BR_WD_ZERO_PEER_RECREATE_THRESHOLD) {
+        *zeroPeerStreak = 0;
+        return BRZeroPeerRecreateThenReconnect;
+    }
+    return BRZeroPeerReconnect;
 }
 
 #ifdef __cplusplus

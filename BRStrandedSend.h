@@ -61,8 +61,9 @@ extern "C" {
 // Re-publishes of one send before the sweep holds it (or, for a send the wallet does not hold,
 // gives it up).
 #define BR_STRANDED_MAX_ATTEMPTS  3u
-// How long a held send waits, after its last attempt, before the sweep tries it once more.
-#define BR_STRANDED_HOLD_MS       (60LL * 60LL * 1000LL)
+// How long a held send waits, after its last attempt, before the sweep tries it once more:
+// one hour. A plain literal, so Swift's C importer sees it (it skips expression macros).
+#define BR_STRANDED_HOLD_MS       3600000LL
 
 typedef enum {
     BRStrandedRepublish = 0,     // re-publish now; the caller counts the attempt

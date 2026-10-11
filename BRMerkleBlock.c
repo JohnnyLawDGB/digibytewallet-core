@@ -140,6 +140,13 @@ BRMerkleBlock *BRMerkleBlockParse(const uint8_t *buf, size_t bufLen)
             off += len;
             block->flagsLen = (size_t)BRVarInt(&buf[off], (off <= bufLen ? bufLen - off : 0), &len);
             off += len;
+#ifndef WIRE_COUNT_BOUNDS_UNFIXED
+            // invariant: the flags length is bounded by the bytes that remain, as
+            // the hash count is, so the comparison below cannot wrap and a non-zero
+            // length always has its bytes behind it.
+            if (block->flagsLen > (off <= bufLen ? bufLen - off : 0))
+                block->flagsLen = 0;
+#endif
             len = block->flagsLen;
             block->flags = (off + len <= bufLen) ? malloc(len) : NULL;
             if (block->flags) memcpy(block->flags, &buf[off], len);

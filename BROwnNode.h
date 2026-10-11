@@ -31,6 +31,9 @@
 //  anything else is dark: 2 (connected but serving no filters, a node without
 //  peerblockfilters=1) is exactly the misconfiguration this status exists to show.
 //
+//  BROwnNodeWatchdogMayPin: while an own node is pinned, the sync watchdogs leave the pin slot
+//  alone (see the function).
+//
 //  Where this refuses what Kotlin accepts (iOS shows the address as invalid; Android saves it and
 //  then cannot use it): a port written in non-ASCII digits, a host longer than the caller's
 //  buffer, and letters outside ASCII in a dgbnode:// host (Android's lookup cannot resolve them
@@ -341,6 +344,17 @@ static inline BROwnNodeHealth BROwnNodeHealthFor(int compactFilterPeerStatus)
 {
     return compactFilterPeerStatus == 3 ? BROwnNodeHealthServing
          : compactFilterPeerStatus == 1 ? BROwnNodeHealthConnecting : BROwnNodeHealthDark;
+}
+
+// The sync watchdogs' canon-peer pin (BRSyncWatchdog.h: the fast tip-stall tier and the corrupt-
+// chain heal) shares the peer manager's single pin slot with the own node. While an own node is
+// pinned, the watchdogs neither pin a canon peer nor clear the slot when the scan recovers: the
+// own node stays the pin, and an exclusive own node stays exclusive. (Android's watchdog pinned
+// and cleared regardless, which dropped an exclusive own node to public peers for the rest of
+// the session.)
+static inline int BROwnNodeWatchdogMayPin(int ownNodePinned)
+{
+    return ownNodePinned ? 0 : 1;
 }
 
 #ifdef __cplusplus

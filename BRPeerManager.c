@@ -1213,8 +1213,20 @@ static void _requestUnrelayedTxGetdataDone(void *info, int success)
                     // or received coins in them. Removing them here is what
                     // caused users to see their sends flash into history on
                     // app launch and then vanish the moment the sync hit tip.
-                    if (BRWalletAmountSentByTx(manager->wallet, tx) == 0 &&
-                        BRWalletAmountReceivedFromTx(manager->wallet, tx) == 0) {
+                    //
+                    // A token output the wallet owns is a stake as well. A
+                    // DigiDollar output is zero-value by protocol (its amount is
+                    // in the "DD" OP_RETURN) and a DigiAsset carrier can be, so
+                    // the DGB sums alone score such a receive zero. The record is
+                    // also what the app's confirmation reconcile promotes to
+                    // release the credit held back while it is pending.
+                    int stake = BRWalletAmountSentByTx(manager->wallet, tx) != 0 ||
+                                BRWalletAmountReceivedFromTx(manager->wallet, tx) != 0;
+                    // (the comparison arm, -DTIPSWEEP_TOKEN_STAKE_UNFIXED, counts the DGB sums alone)
+#ifndef TIPSWEEP_TOKEN_STAKE_UNFIXED
+                    if (! stake) stake = BRWalletTxHasOwnedTokenOutput(manager->wallet, tx);
+#endif
+                    if (! stake) {
                         // The wallet releases a record: no entry may go on naming it.
                         size_t listed = array_count(manager->publishedTx);
                         int held[listed > 0 ? listed : 1];

@@ -2803,6 +2803,29 @@ uint64_t BRWalletAmountSentByTx(BRWallet *wallet, const BRTransaction *tx)
     return amount;
 }
 
+// Whether tx pays this wallet a token output: the tests _BRWalletUpdateBalance uses to hold an owned output
+// in ddUtxos or assetUtxos rather than among the plain coins, without the DigiDollar activation floor (a
+// height test; the record asked about here may not have a height yet). An unclassifiable DigiAsset carrier
+// answers yes for every output, as it does there.
+int BRWalletTxHasOwnedTokenOutput(BRWallet *wallet, const BRTransaction *tx)
+{
+    int r = 0;
+
+    assert(wallet != NULL);
+    assert(tx != NULL);
+    pthread_mutex_lock(&wallet->lock);
+
+    for (size_t i = 0; tx && ! r && i < tx->outCount; i++) {
+        if (tx->outputs[i].address[0] == '\0' || ! BRSetContains(wallet->allAddrs, tx->outputs[i].address)) continue;
+        r = (BRDigiDollarOutputAmount(tx, i) >= 0 ||
+             BRTxOutputIsAsset(tx, &tx->outputs[i]) ||
+             _BRWalletIsAssetOverride(wallet, tx->txHash, (uint32_t)i)) ? 1 : 0;
+    }
+
+    pthread_mutex_unlock(&wallet->lock);
+    return r;
+}
+
 // returns the fee for the given transaction if all its inputs are from wallet transactions, UINT64_MAX otherwise
 uint64_t BRWalletFeeForTx(BRWallet *wallet, const BRTransaction *tx)
 {

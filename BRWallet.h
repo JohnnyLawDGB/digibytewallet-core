@@ -374,6 +374,13 @@ uint64_t BRWalletAmountReceivedFromTx(BRWallet *wallet, const BRTransaction *tx)
 // returns the amount sent from the wallet by the trasaction (total wallet outputs consumed, change and fee included)
 uint64_t BRWalletAmountSentByTx(BRWallet *wallet, const BRTransaction *tx);
 
+// returns 1 if the transaction pays an output this wallet owns that carries a token -- a DigiDollar output
+// bound to an amount slot, or an output holding DigiAsset units (an asset instruction names it, its carrier
+// cannot be classified, or the asset layer registered it) -- else 0. A DigiDollar output is zero-value by
+// protocol, so the two DGB sums above do not see it. Height-agnostic: an unconfirmed transaction is classified
+// as it will be once confirmed.
+int BRWalletTxHasOwnedTokenOutput(BRWallet *wallet, const BRTransaction *tx);
+
 // returns the fee for the given transaction if all its inputs are from wallet transactions, UINT64_MAX otherwise
 uint64_t BRWalletFeeForTx(BRWallet *wallet, const BRTransaction *tx);
 

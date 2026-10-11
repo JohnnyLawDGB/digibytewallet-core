@@ -77,9 +77,20 @@ size_t BRBase58Decode(uint8_t *data, size_t dataLen, const char *str)
     size_t i = 0, j, len, zcount = 0;
     
     assert(str != NULL);
+#ifndef BASE58_INPUT_BOUND_UNFIXED
+    // invariant: a string longer than any value the wallet decodes is answered 0 without being decoded, and no more
+    // than its first BR_BASE58_MAX_STR_LEN + 1 characters are read. any other string decodes in a buffer of fixed
+    // size, so neither the time nor the stack a decode takes grows with the string it is given
+    for (len = 0; str && len <= BR_BASE58_MAX_STR_LEN && str[len]; len++);
+    if (len > BR_BASE58_MAX_STR_LEN) return 0;
+#endif
     while (str && *str == '1') str++, zcount++; // count leading zeroes
     
+#ifndef BASE58_INPUT_BOUND_UNFIXED
+    uint8_t buf[BR_BASE58_MAX_STR_LEN*733/1000 + 1]; // log(58)/log(256), rounded up, for the longest string decoded
+#else
     uint8_t buf[(str) ? strlen(str)*733/1000 + 1 : 0]; // log(58)/log(256), rounded up
+#endif
     
     memset(buf, 0, sizeof(buf));
     
@@ -164,8 +175,15 @@ size_t BRBase58CheckEncode(char *str, size_t strLen, const uint8_t *data, size_t
 // returns the number of bytes written to data, or total dataLen needed if data is NULL
 size_t BRBase58CheckDecode(uint8_t *data, size_t dataLen, const char *str)
 {
+#ifndef BASE58_INPUT_BOUND_UNFIXED
+    // BRBase58Decode() answers 0 for a string longer than BR_BASE58_MAX_STR_LEN, and never decodes more bytes than the
+    // string has characters, so a buffer of that many bytes holds any answer
+    size_t len, bufLen = BR_BASE58_MAX_STR_LEN;
+    uint8_t md[256/8], _buf[BR_BASE58_MAX_STR_LEN], *buf = _buf;
+#else
     size_t len, bufLen = (str) ? strlen(str) : 0;
     uint8_t md[256/8], _buf[(bufLen <= 0x1000) ? bufLen : 0], *buf = (bufLen <= 0x1000) ? _buf : malloc(bufLen);
+#endif
 
     assert(str != NULL);
     assert(buf != NULL);

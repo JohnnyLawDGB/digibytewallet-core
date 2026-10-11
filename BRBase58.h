@@ -44,14 +44,14 @@ extern "C" {
 size_t BRBase58Encode(char *str, size_t strLen, const uint8_t *data, size_t dataLen);
 
 // returns the number of bytes written to data, or total dataLen needed if data is NULL
-// returns 0 if str is longer than BR_BASE58_MAX_STR_LEN
+// returns 0 if str is longer than BR_BASE58_MAX_STR_LEN or holds any character outside the base58 alphabet
 size_t BRBase58Decode(uint8_t *data, size_t dataLen, const char *str);
 
 // returns the number of characters written to str including NULL terminator, or total strLen needed if str is NULL
 size_t BRBase58CheckEncode(char *str, size_t strLen, const uint8_t *data, size_t dataLen);
 
 // returns the number of bytes written to data, or total dataLen needed if data is NULL
-// returns 0 if str is longer than BR_BASE58_MAX_STR_LEN
+// returns 0 if str is longer than BR_BASE58_MAX_STR_LEN or holds any character outside the base58 alphabet
 size_t BRBase58CheckDecode(uint8_t *data, size_t dataLen, const char *str);
 
 #ifdef __cplusplus

@@ -129,6 +129,11 @@ size_t BRBase58Decode(uint8_t *data, size_t dataLen, const char *str)
                 carry = UINT32_MAX;
         }
         
+#ifndef BASE58_STRICT_ALPHABET_UNFIXED
+        // invariant: a string is decoded only if every character in it is in the alphabet. any other string is
+        // answered 0, so what is decoded is the value of the whole string, never of a part of it
+        if (carry >= 58) { mem_clean(buf, sizeof(buf)); return 0; }
+#endif
         if (carry >= 58) break; // invalid base58 digit
         
         for (j = sizeof(buf); j > 0; j--) {

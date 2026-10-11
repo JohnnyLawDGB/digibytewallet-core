@@ -35,16 +35,23 @@ extern "C" {
 
 // base58 and base58check encoding: https://en.bitcoin.it/wiki/Base58Check_encoding
 
+// the longest base58 string the wallet has any use for is a serialized BIP32 extended key: 82 bytes, at most 112
+// characters (a BIP38 key is 58, a WIF key 51 or 52, a DigiDollar address 52, a DigiByte address 34). the decoders
+// answer 0 for a longer string without decoding it
+#define BR_BASE58_MAX_STR_LEN 128
+
 // returns the number of characters written to str including NULL terminator, or total strLen needed if str is NULL
 size_t BRBase58Encode(char *str, size_t strLen, const uint8_t *data, size_t dataLen);
 
 // returns the number of bytes written to data, or total dataLen needed if data is NULL
+// returns 0 if str is longer than BR_BASE58_MAX_STR_LEN
 size_t BRBase58Decode(uint8_t *data, size_t dataLen, const char *str);
 
 // returns the number of characters written to str including NULL terminator, or total strLen needed if str is NULL
 size_t BRBase58CheckEncode(char *str, size_t strLen, const uint8_t *data, size_t dataLen);
 
 // returns the number of bytes written to data, or total dataLen needed if data is NULL
+// returns 0 if str is longer than BR_BASE58_MAX_STR_LEN
 size_t BRBase58CheckDecode(uint8_t *data, size_t dataLen, const char *str);
 
 #ifdef __cplusplus

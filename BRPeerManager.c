@@ -209,7 +209,8 @@ static size_t _BRTxPeerListAddPeer(BRTxPeerList **list, UInt256 txHash, const BR
     return 1;
 }
 
-// removes peer from the list of peers associated with txHash, returns true if peer was found
+// removes peer from the list of peers associated with txHash, returns true if peer was found. The
+// record for txHash stays, even with no peer left in it: see _BRTxPeerListHasRecord.
 static int _BRTxPeerListRemovePeer(BRTxPeerList *list, UInt256 txHash, const BRPeer *peer)
 {
     for (size_t i = array_count(list); i > 0; i--) {
@@ -224,6 +225,19 @@ static int _BRTxPeerListRemovePeer(BRTxPeerList *list, UInt256 txHash, const BRP
         break;
     }
     
+    return 0;
+}
+
+// true while the list holds a record for txHash, with or without peers in it. For txRelays this is
+// the evidence that a peer had the transaction: a peer that relayed, announced or asked for it leaves
+// the record when it disconnects, answers notfound or rejects it, but the record stays until the
+// transaction confirms or the wallet removes it.
+static int _BRTxPeerListHasRecord(const BRTxPeerList *list, UInt256 txHash)
+{
+    for (size_t i = array_count(list); i > 0; i--) {
+        if (UInt256Eq(list[i - 1].txHash, txHash)) return 1;
+    }
+
     return 0;
 }
 
@@ -2337,6 +2351,7 @@ static void _peerDisconnected(void *info, int error)
     // a 10-minute "not synced" ban.
     _penalizeFor(manager, peer->address, peer->port, time(NULL), PEER_REDIAL_COOLDOWN_SECONDS);
 
+    // The peer leaves every relay record; the records stay (see _BRTxPeerListHasRecord).
     for (size_t i = array_count(manager->txRelays); i > 0; i--) {
         peerList = &manager->txRelays[i - 1];
 
@@ -8654,6 +8669,9 @@ void BRPeerManagerRemoveTransaction(BRPeerManager *manager, UInt256 txHash)
     BRWalletRemoveTransaction(manager->wallet, txHash);
     _BRPeerManagerPurgeReleasedRecords(manager, held);
     _BRTxPeerListDrop(manager->txRejects, txHash);
+#ifndef RELAY_EVIDENCE_UNFIXED
+    _BRTxPeerListDrop(manager->txRelays, txHash);   // the relay record lasts as long as the transaction
+#endif
 
     MGR_UNLOCK(manager);
     _BRPeerManagerFlushAnswers(manager);
@@ -8700,8 +8718,10 @@ static size_t _BRTxRejectGroupCount(BRPeerManager *manager, UInt256 txHash)
 // See BRPeerManager.h. A reject message is one peer's word: a peer can reject a valid transaction
 // that honest peers already relayed, and a wallet that took that as final would give the coins back
 // for a second payment while the first still confirms. So one peer's rejection -- however often it
-// repeats -- refuses nothing; rejections from two network groups do, and only while no peer has
-// relayed or announced the transaction.
+// repeats -- refuses nothing; rejections from two network groups do, and only if no peer has relayed,
+// announced or asked for the transaction in this manager's life. That evidence does not lapse with the
+// peer: a relay record stays after its peers disconnect, answer notfound or reject, until the
+// transaction confirms or is removed, so ordinary churn cannot turn an accepted send into a refused one.
 int BRPeerManagerTxRefusedByNetwork(BRPeerManager *manager, UInt256 txHash)
 {
     int refused;
@@ -8711,8 +8731,11 @@ int BRPeerManagerTxRefusedByNetwork(BRPeerManager *manager, UInt256 txHash)
 #ifdef REJECT_QUORUM_UNFIXED
     // Comparison arm: one peer's rejection taken as the network's -- the rule this replaces.
     refused = _BRTxPeerListCount(manager->txRejects, txHash) > 0;
-#else
+#elif defined(RELAY_EVIDENCE_UNFIXED)
+    // Comparison arm: only the peers relaying it right now count -- evidence that lapses with each peer.
     refused = _BRTxPeerListCount(manager->txRelays, txHash) == 0 && _BRTxRejectGroupCount(manager, txHash) >= 2;
+#else
+    refused = ! _BRTxPeerListHasRecord(manager->txRelays, txHash) && _BRTxRejectGroupCount(manager, txHash) >= 2;
 #endif
     MGR_UNLOCK(manager);
     return refused;

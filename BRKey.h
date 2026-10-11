@@ -75,6 +75,7 @@ int BRKeySetSecret(BRKey *key, const UInt256 *secret, int compressed);
 int BRKeySetPrivKey(BRKey *key, const char *privKey);
 
 // assigns DER encoded pubKey to key and returns true on success
+// pkLen must be 33 (compressed) or 65 (uncompressed); any other length is refused: the key is cleared and 0 returned
 int BRKeySetPubKey(BRKey *key, const uint8_t *pubKey, size_t pkLen);
 
 // writes the WIF private key to privKey and returns the number of bytes writen, or pkLen needed if privKey is NULL

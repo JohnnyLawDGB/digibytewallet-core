@@ -227,6 +227,21 @@ static int _BRTxPeerListRemovePeer(BRTxPeerList *list, UInt256 txHash, const BRP
     return 0;
 }
 
+// forgets every peer associated with txHash
+static void _BRTxPeerListDrop(BRTxPeerList *list, UInt256 txHash)
+{
+    for (size_t i = array_count(list); i > 0; i--) {
+        if (! UInt256Eq(list[i - 1].txHash, txHash)) continue;
+        array_free(list[i - 1].peers);
+        array_rm(list, i - 1);
+        break;
+    }
+}
+
+// Rejecting peers recorded per transaction. Two in distinct network groups are the evidence
+// BRPeerManagerTxRefusedByNetwork needs; a few more cover peers sharing a group.
+#define TX_REJECTS_PER_TX_MAX 8
+
 // comparator for sorting peers by timestamp, most recent first
 inline static int _peerTimestampCompare(const void *peer, const void *otherPeer)
 {
@@ -346,6 +361,9 @@ struct BRPeerManagerStruct {
     int      orphanChainAsked;
     uint64_t orphanReanchorRequests;
     BRTxPeerList *txRelays, *txRequests;
+    // Peers that rejected a transaction this wallet holds or publishes as invalid, non-standard or
+    // dust: the evidence BRPeerManagerTxRefusedByNetwork weighs. Guarded by manager->lock.
+    BRTxPeerList *txRejects;
     BRPublishedTx *publishedTx;
     UInt256 *publishedTxHashes;
     // Verdicts taken from publish entries under the lock, delivered by the next
@@ -1142,6 +1160,8 @@ static void _BRPeerManagerUpdateTx(BRPeerManager *manager, const UInt256 txHashe
                 array_free(manager->txRelays[j - 1].peers);
                 array_rm(manager->txRelays, j - 1);
             }
+
+            _BRTxPeerListDrop(manager->txRejects, txHashes[i]);   // a confirmed transaction was not refused
         }
     }
     
@@ -1245,6 +1265,16 @@ static void _requestUnrelayedTxGetdataDone(void *info, int success)
 
     MGR_UNLOCK(manager);
     _BRPeerManagerFlushAnswers(manager);
+}
+
+// caller must hold manager->lock. True while txHash is in the publish list. Decided by the cached
+// hash, never by reading a listed object.
+static int _BRPeerManagerPublishListed(BRPeerManager *manager, UInt256 txHash)
+{
+    for (size_t i = array_count(manager->publishedTxHashes); i > 0; i--) {
+        if (UInt256Eq(manager->publishedTxHashes[i - 1], txHash)) return 1;
+    }
+    return 0;
 }
 
 // caller must hold manager->lock. True while txHash is in its stem phase.
@@ -2639,6 +2669,15 @@ static void _peerRejectedTx(void *info, UInt256 txHash, uint8_t code)
         _BRPeerManagerAnswerEntry(manager, txHash, EINVAL);
     }
 #endif
+
+    // Who rejected it, for BRPeerManagerTxRefusedByNetwork. Only for a transaction this wallet holds
+    // or publishes, and at most TX_REJECTS_PER_TX_MAX peers each, so a peer naming arbitrary hashes
+    // cannot grow the record.
+    if ((code == REJECT_INVALID || code == REJECT_NONSTANDARD || code == REJECT_DUST) &&
+        (tx || _BRPeerManagerPublishListed(manager, txHash)) &&
+        _BRTxPeerListCount(manager->txRejects, txHash) < TX_REJECTS_PER_TX_MAX) {
+        _BRTxPeerListAddPeer(&manager->txRejects, txHash, peer);
+    }
 
     if (tx) {
         if (wasRelaying && tx->blockHeight == TX_UNCONFIRMED) {
@@ -4899,6 +4938,7 @@ BRPeerManager *BRPeerManagerNewEx(const BRChainParams *params, BRWallet *wallet,
     
     array_new(manager->txRelays, 10);
     array_new(manager->txRequests, 10);
+    array_new(manager->txRejects, 10);
     array_new(manager->publishedTx, 10);
     array_new(manager->publishedTxHashes, 10);
     array_new(manager->pendingAnswers, 4);
@@ -8613,9 +8653,69 @@ void BRPeerManagerRemoveTransaction(BRPeerManager *manager, UInt256 txHash)
     _BRPeerManagerSnapshotHeld(manager, held);
     BRWalletRemoveTransaction(manager->wallet, txHash);
     _BRPeerManagerPurgeReleasedRecords(manager, held);
+    _BRTxPeerListDrop(manager->txRejects, txHash);
 
     MGR_UNLOCK(manager);
     _BRPeerManagerFlushAnswers(manager);
+}
+
+// A peer's network group: an IPv4 address's /16, any other address's /32 -- the grouping DigiByte
+// Core uses to keep its connections diverse, so that addresses one operator holds count once.
+static uint64_t _BRPeerNetGroup(const BRPeer *peer)
+{
+    const UInt128 *a = &peer->address;
+
+    if (a->u64[0] == 0 && a->u16[4] == 0 && a->u16[5] == 0xffff) {   // IPv4-mapped
+        return (4ULL << 32) | ((uint64_t)a->u8[12] << 8) | a->u8[13];
+    }
+
+    return (6ULL << 32) | ((uint64_t)a->u8[0] << 24) | ((uint64_t)a->u8[1] << 16) |
+           ((uint64_t)a->u8[2] << 8) | a->u8[3];
+}
+
+// caller must hold manager->lock. The number of distinct network groups among the peers that
+// rejected txHash as invalid, non-standard or dust.
+static size_t _BRTxRejectGroupCount(BRPeerManager *manager, UInt256 txHash)
+{
+    for (size_t i = array_count(manager->txRejects); i > 0; i--) {
+        if (! UInt256Eq(manager->txRejects[i - 1].txHash, txHash)) continue;
+
+        const BRPeer *peers = manager->txRejects[i - 1].peers;
+        size_t count = array_count(manager->txRejects[i - 1].peers), groups = 0;
+
+        for (size_t j = 0; j < count; j++) {
+            uint64_t group = _BRPeerNetGroup(&peers[j]);
+            int seen = 0;
+
+            for (size_t k = 0; k < j && ! seen; k++) seen = (_BRPeerNetGroup(&peers[k]) == group);
+            if (! seen) groups++;
+        }
+
+        return groups;
+    }
+
+    return 0;
+}
+
+// See BRPeerManager.h. A reject message is one peer's word: a peer can reject a valid transaction
+// that honest peers already relayed, and a wallet that took that as final would give the coins back
+// for a second payment while the first still confirms. So one peer's rejection -- however often it
+// repeats -- refuses nothing; rejections from two network groups do, and only while no peer has
+// relayed or announced the transaction.
+int BRPeerManagerTxRefusedByNetwork(BRPeerManager *manager, UInt256 txHash)
+{
+    int refused;
+
+    assert(manager != NULL);
+    MGR_LOCK(manager);
+#ifdef REJECT_QUORUM_UNFIXED
+    // Comparison arm: one peer's rejection taken as the network's -- the rule this replaces.
+    refused = _BRTxPeerListCount(manager->txRejects, txHash) > 0;
+#else
+    refused = _BRTxPeerListCount(manager->txRelays, txHash) == 0 && _BRTxRejectGroupCount(manager, txHash) >= 2;
+#endif
+    MGR_UNLOCK(manager);
+    return refused;
 }
 
 // number of connected peers that have relayed the given unconfirmed transaction
@@ -8711,6 +8811,8 @@ static void _BRPeerManagerFreeNow(BRPeerManager *manager)
     array_free(manager->txRelays);
     for (size_t i = array_count(manager->txRequests); i > 0; i--) array_free(manager->txRequests[i - 1].peers);
     array_free(manager->txRequests);
+    for (size_t i = array_count(manager->txRejects); i > 0; i--) array_free(manager->txRejects[i - 1].peers);
+    array_free(manager->txRejects);
     array_free(manager->publishedTx);
     array_free(manager->publishedTxHashes);
     array_free(manager->dandelionPeers);

@@ -731,6 +731,13 @@ void BRPeerManagerRemoveTransaction(BRPeerManager *manager, UInt256 txHash);
 // number of connected peers that have relayed the given unconfirmed transaction
 size_t BRPeerManagerRelayCount(BRPeerManager *manager, UInt256 txHash);
 
+// 1 when the network has refused the transaction on evidence no single peer can supply: peers in at
+// least two network groups (an IPv4 address's /16, any other address's /32) rejected it as invalid,
+// non-standard or dust, and no peer has relayed or announced it. 0 otherwise -- after one peer's
+// rejection, however often repeated, and whenever a peer has the transaction. A reject message is one
+// peer's word: the peer's own rejection is recorded, never a verdict on the transaction's behalf.
+int BRPeerManagerTxRefusedByNetwork(BRPeerManager *manager, UInt256 txHash);
+
 // Enable/disable Dandelion stem submission (default on). Thread-safe.
 void BRPeerManagerSetDandelionEnabled(BRPeerManager *manager, int enabled);
 

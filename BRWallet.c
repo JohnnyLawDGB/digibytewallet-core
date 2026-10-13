@@ -88,6 +88,11 @@ struct BRWalletStruct {
     // &watchedAddrs[i], to avoid the realloc-dangling use-after-free class.
     BRAddress *watchedAddrs;
     BRSet *allTx, *invalidTx, *pendingTx, *spentOutputs, *usedAddrs, *allAddrs;
+    // The non-wallet records allTx keeps (an unconfirmed tx a peer relayed that is not the wallet's,
+    // held for the validity and pending checks of the wallet's own unconfirmed txs), and their
+    // serialized size in bytes. The wallet owns them: they are not in `transactions`.
+    BRSet *foreignTx;
+    size_t foreignBytes;
     void *callbackInfo;
     void (*balanceChanged)(void *info, uint64_t balance);
     void (*txAdded)(void *info, BRTransaction *tx);
@@ -95,6 +100,13 @@ struct BRWalletStruct {
     void (*txDeleted)(void *info, UInt256 txHash, int notifyUser, int recommendRescan);
     pthread_mutex_t lock;
 };
+
+// The non-wallet unconfirmed records the wallet keeps are bounded by count and by serialized bytes.
+// Past either bound a further one is not kept (the caller still owns it, as for any refused tx); the
+// wallet's own transactions are never affected. Honest traffic stays far below both: peers announce
+// no mempool to this wallet, so such records are only the few unconfirmed txs it is shown.
+#define WALLET_FOREIGN_TX_MAX_COUNT 1000
+#define WALLET_FOREIGN_TX_MAX_BYTES (2*1000*1000)
 
 inline static uint64_t _txFee(uint64_t feePerKb, size_t size)
 {
@@ -589,6 +601,8 @@ BRWallet *BRWalletNew(BRTransaction *transactions[], size_t txCount, BRMasterPub
     wallet->hasTaprootKey = 0;
     array_new(wallet->balanceHist, txCount + 100);
     wallet->allTx = BRSetNew(BRTransactionHash, BRTransactionEq, txCount + 100);
+    wallet->foreignTx = BRSetNew(BRTransactionHash, BRTransactionEq, 16);
+    wallet->foreignBytes = 0;
     wallet->invalidTx = BRSetNew(BRTransactionHash, BRTransactionEq, 10);
     wallet->pendingTx = BRSetNew(BRTransactionHash, BRTransactionEq, 10);
     wallet->spentOutputs = BRSetNew(BRUTXOHash, BRUTXOEq, txCount + 100);
@@ -1716,7 +1730,14 @@ static BRTransaction *_BRWalletCreateTxForOutputsAt(BRWallet *wallet, const BRTx
         if (BRTransactionVSize(transaction) + TX_OUTPUT_SIZE > TX_MAX_SIZE) { // transaction size-in-bytes too large
             BRTransactionFree(transaction);
             transaction = NULL;
-            
+#ifndef SEND_SIZE_CAP_UNFIXED
+            // The coins that fit TX_MAX_SIZE do not cover the outputs: refuse the build. Selection never
+            // changes or drops an output the caller asked for, so a send either pays exactly what was
+            // approved or is not built at all (the wallet must consolidate its coins first).
+            break;
+#else
+            // Comparison arm only (send_size_cap_kat); never defined in a production build. The earlier
+            // shape rebuilt the send with its last output lowered, or removed.
             // check for sufficient total funds before building a smaller transaction
             if (wallet->balance < amount + _txFee(feePerKb, 10 + array_count(wallet->utxos)*TX_INPUT_SIZE +
                                                   (outCount + 1)*TX_OUTPUT_SIZE + cpfpSize)) break;
@@ -1737,6 +1758,7 @@ static BRTransaction *_BRWalletCreateTxForOutputsAt(BRWallet *wallet, const BRTx
             balance = amount = feeAmount = 0;
             pthread_mutex_lock(&wallet->lock);
             break;
+#endif
         }
         
         balance = _BRMoneyAdd(balance, tx->outputs[o->n].amount);
@@ -2329,6 +2351,30 @@ static int _BRWalletSpendsSigned(BRWallet *wallet, BRTransaction *tx, int always
     return 1;
 }
 
+// Keeps a non-wallet unconfirmed tx in allTx when the kept set stays within its bounds; returns 1 when
+// kept (the wallet then owns tx), 0 when not (the caller still owns it). Caller holds wallet->lock.
+static int _BRWalletKeepForeignTx(BRWallet *wallet, BRTransaction *tx)
+{
+    size_t size = BRTransactionSize(tx);
+
+    if (BRSetCount(wallet->foreignTx) >= WALLET_FOREIGN_TX_MAX_COUNT ||
+        size > WALLET_FOREIGN_TX_MAX_BYTES - wallet->foreignBytes) return 0;
+    BRSetAdd(wallet->allTx, tx);
+    BRSetAdd(wallet->foreignTx, tx);
+    wallet->foreignBytes += size;
+    return 1;
+}
+
+// Drops tx from the kept non-wallet set, if it is there. Caller holds wallet->lock, and removes tx
+// from allTx itself.
+static void _BRWalletForgetForeignTx(BRWallet *wallet, const BRTransaction *tx)
+{
+    if (BRSetRemove(wallet->foreignTx, tx)) {
+        size_t size = BRTransactionSize(tx);
+        wallet->foreignBytes = (size < wallet->foreignBytes) ? wallet->foreignBytes - size : 0;
+    }
+}
+
 // Registers tx. checkInputs: an UNCONFIRMED tx that spends a wallet output must sign it validly
 // (_BRWalletInputsSigned), or it is refused until a block delivers it. A peer can relay any unconfirmed
 // tx and nothing else checks it, so without this a tx with a junk scriptSig would mark the wallet's coin
@@ -2364,10 +2410,16 @@ static int _BRWalletRegisterTx(BRWallet *wallet, BRTransaction *tx, int checkInp
                     wasAdded = 1;
                 }
                 else { // keep track of unconfirmed non-wallet tx for invalid tx checks and child-pays-for-parent fees
-                       // BUG: limit total non-wallet unconfirmed tx to avoid memory exhaustion attack
+#ifndef WALLET_FOREIGN_TX_BOUND_UNFIXED
+                    // Kept only within the count and byte bounds; past them it is not kept, and the
+                    // caller, which still owns it, releases it.
+                    if (tx->blockHeight == TX_UNCONFIRMED) _BRWalletKeepForeignTx(wallet, tx);
+#else
+                    // Comparison arm only (wallet_foreign_tx_bound_kat); never defined in a production
+                    // build. The earlier shape kept every one, without bound or release.
                     if (tx->blockHeight == TX_UNCONFIRMED) BRSetAdd(wallet->allTx, tx);
+#endif
                     r = 0;
-                    // BUG: XXX memory leak if tx is not added to wallet->allTx, and we can't just free it
                 }
             }
         }
@@ -2483,6 +2535,7 @@ void BRWalletRemoveTransaction(BRWallet *wallet, UInt256 txHash)
         }
         else {
             BRSetRemove(wallet->allTx, tx);
+            _BRWalletForgetForeignTx(wallet, tx);
             
             for (size_t i = array_count(wallet->transactions); i > 0; i--) {
                 if (! BRTransactionEq(wallet->transactions[i - 1], tx)) continue;
@@ -2699,6 +2752,7 @@ void BRWalletUpdateTransactions(BRWallet *wallet, const UInt256 txHashes[], size
             // amount calculation. Removing a parent tx causes
             // BRWalletAmountSentByTx to return 0, making sends disappear.
             BRSetRemove(wallet->allTx, tx);
+            _BRWalletForgetForeignTx(wallet, tx);
             BRTransactionFree(tx);
         }
     }
@@ -2982,6 +3036,12 @@ uint64_t BRWalletMaxOutputAmount(BRWallet *wallet)
     return (amount > fee) ? amount - fee : 0;
 }
 
+static void _BRWalletFreeForeignTx(void *info, void *tx)
+{
+    (void)info;
+    BRTransactionFree(tx);
+}
+
 // frees memory allocated for wallet, and calls BRTransactionFree() for all registered transactions
 void BRWalletFree(BRWallet *wallet)
 {
@@ -2989,6 +3049,11 @@ void BRWalletFree(BRWallet *wallet)
     pthread_mutex_lock(&wallet->lock);
     BRSetFree(wallet->allAddrs);
     BRSetFree(wallet->usedAddrs);
+#ifndef WALLET_FOREIGN_TX_BOUND_UNFIXED
+    // The kept non-wallet records are the wallet's: release them with it.
+    BRSetApply(wallet->foreignTx, NULL, _BRWalletFreeForeignTx);
+#endif
+    BRSetFree(wallet->foreignTx);
     BRSetFree(wallet->allTx);
     BRSetFree(wallet->invalidTx);
     BRSetFree(wallet->pendingTx);

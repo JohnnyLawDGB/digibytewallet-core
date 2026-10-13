@@ -1095,6 +1095,61 @@ size_t BRWalletTransactions(BRWallet *wallet, BRTransaction *transactions[], siz
     return txCount;
 }
 
+// Readers outside the wallet take what they need while the wallet holds its lock. The pointers
+// BRWalletTransactions and BRWalletTransactionForHash return are the wallet's own objects, handed out
+// after the lock is released; BRWalletRemoveTransaction frees such an object once it has left the
+// wallet's set, from any thread. The three accessors below copy under the lock instead, so nothing a
+// caller holds can be freed by the wallet. BRTransactionCopy is a pure read of the tx (no wallet
+// re-entry, no callback, no other lock), so holding wallet->lock across it adds no lock ordering.
+
+// writes deep copies of the transactions registered in the wallet, sorted by date, oldest first, all
+// taken in one lock hold; same count rules as BRWalletTransactions. The caller frees each copy written
+// with BRTransactionFree().
+size_t BRWalletCopyTransactions(BRWallet *wallet, BRTransaction *transactions[], size_t txCount)
+{
+    assert(wallet != NULL);
+    pthread_mutex_lock(&wallet->lock);
+    if (! transactions || array_count(wallet->transactions) < txCount) txCount = array_count(wallet->transactions);
+
+    for (size_t i = 0; transactions && i < txCount; i++) {
+        transactions[i] = BRTransactionCopy(wallet->transactions[i]);
+    }
+
+    pthread_mutex_unlock(&wallet->lock);
+    return txCount;
+}
+
+// writes the hashes of the transactions registered in the wallet, in BRWalletTransactions order, taken in
+// one lock hold; same count rules as BRWalletTransactions
+size_t BRWalletTransactionHashes(BRWallet *wallet, UInt256 hashes[], size_t count)
+{
+    assert(wallet != NULL);
+    pthread_mutex_lock(&wallet->lock);
+    if (! hashes || array_count(wallet->transactions) < count) count = array_count(wallet->transactions);
+
+    for (size_t i = 0; hashes && i < count; i++) {
+        hashes[i] = wallet->transactions[i]->txHash;
+    }
+
+    pthread_mutex_unlock(&wallet->lock);
+    return count;
+}
+
+// returns a deep copy, taken under the wallet lock, of the transaction with the given hash, or NULL if the
+// wallet does not hold it; the caller frees it with BRTransactionFree()
+BRTransaction *BRWalletCopyTransactionForHash(BRWallet *wallet, UInt256 txHash)
+{
+    BRTransaction *tx, *cpy = NULL;
+
+    assert(wallet != NULL);
+    if (UInt256IsZero(txHash)) return NULL;
+    pthread_mutex_lock(&wallet->lock);
+    tx = BRSetGet(wallet->allTx, &txHash);
+    if (tx) cpy = BRTransactionCopy(tx);
+    pthread_mutex_unlock(&wallet->lock);
+    return cpy;
+}
+
 // Serializes ALL registered transactions into `buf` as a single persistence blob,
 // oldest-first, holding wallet->lock across BOTH the sizing pass and the write pass.
 //

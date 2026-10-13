@@ -85,6 +85,8 @@
 // disconnect (same day) made it worse by pumping evictions with short-lived entries.
 // 256 entries x (16 + 2 + 8) B ~= 6.6 KB -- irrelevant next to the churn it prevents.
 #define PEER_PENALTY_MAX     256
+// A serialized set is sized from BRPeerPenalty.h's BR_PEER_PENALTY_MAX: the two must agree.
+CF_STATIC_ASSERT(PEER_PENALTY_MAX == BR_PEER_PENALTY_MAX, "BR_PEER_PENALTY_MAX must equal PEER_PENALTY_MAX");
 #define PEER_PENALTY_SECONDS (10*60) // 10 min; a genuinely-behind node is skipped this long
 // Short cooldown applied after ANY disconnect, INCLUDING a clean one (error == 0).
 // _peerDisconnected only removes a peer from the pool when error != 0, so a clean
@@ -6737,6 +6739,21 @@ int BRPeerManagerCompactFilterPeerStatus(BRPeerManager *manager, UInt128 addr, u
 
 // Begin an async connect to a copy of `tmpl`, wiring all manager callbacks and
 // adding it to connectedPeers. Caller must hold manager->lock. Mirrors the inline
+// A dial whose peer thread could not be started (BRPeerConnect returned 0). No thread will run the
+// disconnect path or the thread cleanup for this peer, so they run here, exactly once: the peer's
+// disconnect, the thread count taken for it, and its callback info. Only BRPeerConnect's answer says
+// a thread did not start; the peer's status cannot, since a started thread that failed fast has
+// already marked it disconnected and is about to run the same path itself. Caller holds
+// manager->lock; it is released around the disconnect path, as a peer thread would hold it.
+static void _BRPeerManagerDialNotStarted(BRPeerManager *manager, BRPeerCallbackInfo *info)
+{
+    MGR_UNLOCK(manager);
+    _peerDisconnected(info, ENOTCONN);
+    MGR_LOCK(manager);
+    manager->peerThreadCount--;
+    free(info);
+}
+
 // connect block in BRPeerManagerConnect so the BIP158 filter-first pre-pass and the
 // regular bloom selection share identical setup.
 static void _BRPeerManagerBeginConnect(BRPeerManager *manager, const BRPeer *tmpl)
@@ -6754,6 +6771,11 @@ static void _BRPeerManagerBeginConnect(BRPeerManager *manager, const BRPeer *tmp
                        _peerNetworkIsReachable, _peerThreadCleanup);
     BRPeerSetEarliestKeyTime(info->peer, manager->earliestKeyTime);
     BRPeerSetCompactFiltersOnly(info->peer, manager->syncMode == BR_SYNC_MODE_COMPACT_FILTERS_ONLY);
+#ifndef PEER_DIAL_DISCONNECT_ONCE_UNFIXED
+    if (! BRPeerConnect(info->peer)) _BRPeerManagerDialNotStarted(manager, info);
+#else
+    // Comparison arm only (peer_dial_disconnect_once_kat); never defined in a production build. The
+    // earlier shape read "no thread started" from the peer's status.
     BRPeerConnect(info->peer);
 
     if (BRPeerConnectStatus(info->peer) == BRPeerStatusDisconnected) {
@@ -6762,6 +6784,7 @@ static void _BRPeerManagerBeginConnect(BRPeerManager *manager, const BRPeer *tmp
         MGR_LOCK(manager);
         manager->peerThreadCount--;
     }
+#endif
 }
 
 // Count peers in the candidate pool (manager->peers) that are compact-filter capable, NOT already
@@ -7020,6 +7043,10 @@ void BRPeerManagerConnect(BRPeerManager *manager)
                                    _peerRequestedTx, _peerNetworkIsReachable, _peerThreadCleanup);
                 BRPeerSetEarliestKeyTime(info->peer, manager->earliestKeyTime);
                 BRPeerSetCompactFiltersOnly(info->peer, manager->syncMode == BR_SYNC_MODE_COMPACT_FILTERS_ONLY);
+#ifndef PEER_DIAL_DISCONNECT_ONCE_UNFIXED
+                if (! BRPeerConnect(info->peer)) _BRPeerManagerDialNotStarted(manager, info);
+#else
+                // Comparison arm only (peer_dial_disconnect_once_kat): the earlier shape.
                 BRPeerConnect(info->peer);
                 
                 if (BRPeerConnectStatus(info->peer) == BRPeerStatusDisconnected) {
@@ -7028,6 +7055,7 @@ void BRPeerManagerConnect(BRPeerManager *manager)
                     MGR_LOCK(manager);
                     manager->peerThreadCount--;
                 }
+#endif
             }
         }
 

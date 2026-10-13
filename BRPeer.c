@@ -2509,7 +2509,7 @@ double BRPeerCurrentMessageSecs(BRPeer *peer)
 }
 
 // open connection to peer and perform handshake
-void BRPeerConnect(BRPeer *peer)
+int BRPeerConnect(BRPeer *peer)
 {
     BRPeerContext *ctx = (BRPeerContext *)peer;
     struct timeval tv;
@@ -2543,8 +2543,13 @@ void BRPeerConnect(BRPeer *peer)
                 ctx->status = BRPeerStatusDisconnected;
                 //if (ctx->disconnected) ctx->disconnected(ctx->info, error);
             }
+            else pthread_attr_destroy(&attr);
         }
     }
+
+    // A started thread may already have ended and marked the peer disconnected, so the status is no
+    // answer to "did a thread start"; only error is.
+    return (error == 0);
 }
 
 // close connection to peer

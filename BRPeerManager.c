@@ -3075,6 +3075,18 @@ static void _BRPeerManagerClearMemory(BRPeerManager* manager) {
         }
     }
 
+#if !defined(JUDGED_CONFIRMATION_HOLD_UNFIXED)
+    // A block holding a confirmation that waits for its checkpoint stays resident: the release checks it is still on
+    // the chain the checkpoint pins (_BRPeerManagerReleaseHeldLocked). The wait is bounded by the distance to the next
+    // checkpoint, well inside the span clamp below.
+    for (size_t i = 0; i < manager->confirmHeldCount; i++) {
+        uint32_t h = manager->confirmHeld[i].height;
+        uint32_t heldFloor = (h > CLEAR_MEM_CF_RETENTION_MARGIN) ? h - CLEAR_MEM_CF_RETENTION_MARGIN : 1;
+
+        if (cfFloor == 0 || heldFloor < cfFloor) cfFloor = heldFloor;
+    }
+#endif
+
 #ifndef CF_RETENTION_NO_SPAN_CLAMP
     // Make the retained span UNCONDITIONALLY bounded. The floor above is anchored to the
     // SCAN (min(cfNext, lowestNeeded) - margin), which is correct, but its bound is
@@ -3609,11 +3621,14 @@ static int _BRPeerManagerHoldConfirmLocked(BRPeerManager *manager, const UInt256
 // Confirms each held transaction whose block the chain now pins, at that block's height, if the block is still on the
 // main chain; forgets one whose height the chain pins with another block. The rest keep waiting. Caller holds
 // manager->lock.
+static void _BRPeerManagerPersistCFLedgerLocked(BRPeerManager *manager);
+
 static void _BRPeerManagerReleaseHeldLocked(BRPeerManager *manager)
 {
     if (manager->confirmHeldCount == 0 || ! manager->lastBlock) return;
 
     uint32_t tip = manager->lastBlock->height;
+    size_t count0 = manager->confirmHeldCount;
 
     for (size_t i = manager->confirmHeldCount; i > 0; i--) {
         BRConfirmHeld e = manager->confirmHeld[i - 1];
@@ -3623,6 +3638,12 @@ static void _BRPeerManagerReleaseHeldLocked(BRPeerManager *manager)
         int pinned = e.height <= tip && _BRPeerManagerConfirmableLocked(manager, &(BRMerkleBlock) {
                          .height = e.height, .unjudged = 1 }, tip);
 
+#if !defined(JUDGED_CONFIRMATION_HOLD_UNFIXED)
+        // A block no longer resident cannot be placed on or off the chain (memory clearing keeps held blocks; see
+        // _BRPeerManagerClearMemory): it keeps waiting rather than be dropped, and the stored ledger still has its
+        // height to scan, so a restart settles it.
+        if (! b) continue;
+#endif
         if (onMain ? ! _BRPeerManagerConfirmableLocked(manager, b, tip) : ! pinned) continue;   // still waiting
 
         manager->confirmHeld[i - 1] = manager->confirmHeld[--manager->confirmHeldCount];
@@ -3634,6 +3655,9 @@ static void _BRPeerManagerReleaseHeldLocked(BRPeerManager *manager)
             _peer_log("confirm-dropped h=%" PRIu32 " (its block is not the one the chain holds there)\n", e.height);
         }
     }
+
+    // the stored ledger had the settled heights still to scan; store it as it now is
+    if (manager->confirmHeldCount != count0) _BRPeerManagerPersistCFLedgerLocked(manager);
 }
 
 // Serialize a set of saved blocks into the flat persistence buffer WHILE THE
@@ -3675,14 +3699,38 @@ static uint8_t *_serializeSavedBlocks(BRMerkleBlock *blocks[], size_t count, siz
     return buf;
 }
 
+// The scan ledger as it may be stored. A height whose block holds a confirmation still waiting for its checkpoint
+// (CONFIRM_HELD_MAX) is complete only in memory: the wait list is not stored, so the stored ledger is rewound to the
+// lowest such height and a restart (or a recreate) scans from there again, where the block is fetched and held, or
+// confirmed, afresh. Writes like BRCFScanLedgerSerialize. Caller holds manager->lock.
+static size_t _BRPeerManagerSerializeLedgerLocked(BRPeerManager *manager, uint8_t *buf, size_t bufLen)
+{
+#if !defined(JUDGED_CONFIRMATION_HOLD_UNFIXED)
+    if (manager->confirmHeldCount > 0) {
+        uint32_t lowest = manager->confirmHeld[0].height;
+        BRCFScanLedger *copy = malloc(sizeof(*copy));
+
+        for (size_t i = 1; i < manager->confirmHeldCount; i++)
+            if (manager->confirmHeld[i].height < lowest) lowest = manager->confirmHeld[i].height;
+        if (! copy) return 0;
+        memcpy(copy, &manager->cfLedger, sizeof(*copy));
+        BRCFScanLedgerRewindTo(copy, lowest);   // only scalars and the hole arrays change; nothing it points to
+        size_t n = BRCFScanLedgerSerialize(copy, buf, bufLen);
+        free(copy);
+        return n;
+    }
+#endif
+    return BRCFScanLedgerSerialize(&manager->cfLedger, buf, bufLen);
+}
+
 // Caller holds manager->lock. The callback copies the bytes before returning.
 static void _BRPeerManagerPersistCFLedgerLocked(BRPeerManager *manager)
 {
     if (!manager->saveCFLedger) return;
-    size_t ledgerLen = BRCFScanLedgerSerialize(&manager->cfLedger, NULL, 0);
+    size_t ledgerLen = _BRPeerManagerSerializeLedgerLocked(manager, NULL, 0);
     uint8_t *ledgerBuf = (ledgerLen > 0) ? malloc(ledgerLen) : NULL;
     if (!ledgerBuf) return;
-    size_t wrote = BRCFScanLedgerSerialize(&manager->cfLedger, ledgerBuf, ledgerLen);
+    size_t wrote = _BRPeerManagerSerializeLedgerLocked(manager, ledgerBuf, ledgerLen);
     if (wrote == ledgerLen) {
         manager->saveCFLedger(manager->saveCFLedgerInfo, ledgerBuf, ledgerLen);
     }
@@ -9487,7 +9535,7 @@ size_t BRPeerManagerCFLedgerSerialize(BRPeerManager *manager, uint8_t *buf, size
 {
     assert(manager != NULL);
     MGR_LOCK(manager);
-    size_t n = BRCFScanLedgerSerialize(&manager->cfLedger, buf, buflen);
+    size_t n = _BRPeerManagerSerializeLedgerLocked(manager, buf, buflen);
     MGR_UNLOCK(manager);
     return n;
 }

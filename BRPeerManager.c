@@ -85,6 +85,8 @@
 // disconnect (same day) made it worse by pumping evictions with short-lived entries.
 // 256 entries x (16 + 2 + 8) B ~= 6.6 KB -- irrelevant next to the churn it prevents.
 #define PEER_PENALTY_MAX     256
+// A serialized set is sized from BRPeerPenalty.h's BR_PEER_PENALTY_MAX: the two must agree.
+CF_STATIC_ASSERT(PEER_PENALTY_MAX == BR_PEER_PENALTY_MAX, "BR_PEER_PENALTY_MAX must equal PEER_PENALTY_MAX");
 #define PEER_PENALTY_SECONDS (10*60) // 10 min; a genuinely-behind node is skipped this long
 // Short cooldown applied after ANY disconnect, INCLUDING a clean one (error == 0).
 // _peerDisconnected only removes a peer from the pool when error != 0, so a clean
@@ -209,7 +211,8 @@ static size_t _BRTxPeerListAddPeer(BRTxPeerList **list, UInt256 txHash, const BR
     return 1;
 }
 
-// removes peer from the list of peers associated with txHash, returns true if peer was found
+// removes peer from the list of peers associated with txHash, returns true if peer was found. The
+// record for txHash stays, even with no peer left in it: see _BRTxPeerListHasRecord.
 static int _BRTxPeerListRemovePeer(BRTxPeerList *list, UInt256 txHash, const BRPeer *peer)
 {
     for (size_t i = array_count(list); i > 0; i--) {
@@ -226,6 +229,34 @@ static int _BRTxPeerListRemovePeer(BRTxPeerList *list, UInt256 txHash, const BRP
     
     return 0;
 }
+
+// true while the list holds a record for txHash, with or without peers in it. For txRelays this is
+// the evidence that a peer had the transaction: a peer that relayed, announced or asked for it leaves
+// the record when it disconnects, answers notfound or rejects it, but the record stays until the
+// transaction confirms or the wallet removes it.
+static int _BRTxPeerListHasRecord(const BRTxPeerList *list, UInt256 txHash)
+{
+    for (size_t i = array_count(list); i > 0; i--) {
+        if (UInt256Eq(list[i - 1].txHash, txHash)) return 1;
+    }
+
+    return 0;
+}
+
+// forgets every peer associated with txHash
+static void _BRTxPeerListDrop(BRTxPeerList *list, UInt256 txHash)
+{
+    for (size_t i = array_count(list); i > 0; i--) {
+        if (! UInt256Eq(list[i - 1].txHash, txHash)) continue;
+        array_free(list[i - 1].peers);
+        array_rm(list, i - 1);
+        break;
+    }
+}
+
+// Rejecting peers recorded per transaction. Two in distinct network groups are the evidence
+// BRPeerManagerTxRefusedByNetwork needs; a few more cover peers sharing a group.
+#define TX_REJECTS_PER_TX_MAX 8
 
 // comparator for sorting peers by timestamp, most recent first
 inline static int _peerTimestampCompare(const void *peer, const void *otherPeer)
@@ -298,6 +329,17 @@ typedef struct {
 #define DIFF_V4_CONTEXTS_MAX 4
 #endif
 
+// Wallet transactions found in a block that is not yet confirmable (_BRPeerManagerConfirmableLocked): each waits here,
+// unconfirmed, until the chain reaches the checkpoint that pins its block, and is then confirmed at that block's
+// height if the block is still on the main chain. Manager-inline and bounded; a delivery that would not fit is left
+// for the scan to fetch again (its height stays outstanding), so nothing is dropped silently.
+#define CONFIRM_HELD_MAX 1024
+
+typedef struct {
+    UInt256 txHash, blockHash;
+    uint32_t height, timestamp;
+} BRConfirmHeld;
+
 // the sparse main-chain index (_BRPeerManagerMainHashAtHeightLocked): one entry every MAIN_INDEX_STRIDE heights, at
 // most MAIN_INDEX_MAX entries (262,144 heights below the top one; a deeper query walks on from the lowest entry)
 #define MAIN_INDEX_STRIDE 256u
@@ -332,6 +374,8 @@ struct BRPeerManagerStruct {
     UInt256 diffContextHashes[DIFF_V4_CONTEXTS_MAX];
     size_t diffContextCount;
 #endif
+    BRConfirmHeld confirmHeld[CONFIRM_HELD_MAX];   // see CONFIRM_HELD_MAX
+    size_t confirmHeldCount;
     // Bound on the parentless-header ("orphan") set -- see ORPHAN_SET_* in BRPeerManager.h.
     // orphanBytes is the resident byte total across manager->orphans. Every path that adds a
     // header to the set or takes one out adjusts it (_BRPeerManagerStoreOrphanLocked and
@@ -346,6 +390,9 @@ struct BRPeerManagerStruct {
     int      orphanChainAsked;
     uint64_t orphanReanchorRequests;
     BRTxPeerList *txRelays, *txRequests;
+    // Peers that rejected a transaction this wallet holds or publishes as invalid, non-standard or
+    // dust: the evidence BRPeerManagerTxRefusedByNetwork weighs. Guarded by manager->lock.
+    BRTxPeerList *txRejects;
     BRPublishedTx *publishedTx;
     UInt256 *publishedTxHashes;
     // Verdicts taken from publish entries under the lock, delivered by the next
@@ -1142,6 +1189,8 @@ static void _BRPeerManagerUpdateTx(BRPeerManager *manager, const UInt256 txHashe
                 array_free(manager->txRelays[j - 1].peers);
                 array_rm(manager->txRelays, j - 1);
             }
+
+            _BRTxPeerListDrop(manager->txRejects, txHashes[i]);   // a confirmed transaction was not refused
         }
     }
     
@@ -1213,8 +1262,20 @@ static void _requestUnrelayedTxGetdataDone(void *info, int success)
                     // or received coins in them. Removing them here is what
                     // caused users to see their sends flash into history on
                     // app launch and then vanish the moment the sync hit tip.
-                    if (BRWalletAmountSentByTx(manager->wallet, tx) == 0 &&
-                        BRWalletAmountReceivedFromTx(manager->wallet, tx) == 0) {
+                    //
+                    // A token output the wallet owns is a stake as well. A
+                    // DigiDollar output is zero-value by protocol (its amount is
+                    // in the "DD" OP_RETURN) and a DigiAsset carrier can be, so
+                    // the DGB sums alone score such a receive zero. The record is
+                    // also what the app's confirmation reconcile promotes to
+                    // release the credit held back while it is pending.
+                    int stake = BRWalletAmountSentByTx(manager->wallet, tx) != 0 ||
+                                BRWalletAmountReceivedFromTx(manager->wallet, tx) != 0;
+                    // (the comparison arm, -DTIPSWEEP_TOKEN_STAKE_UNFIXED, counts the DGB sums alone)
+#ifndef TIPSWEEP_TOKEN_STAKE_UNFIXED
+                    if (! stake) stake = BRWalletTxHasOwnedTokenOutput(manager->wallet, tx);
+#endif
+                    if (! stake) {
                         // The wallet releases a record: no entry may go on naming it.
                         size_t listed = array_count(manager->publishedTx);
                         int held[listed > 0 ? listed : 1];
@@ -1233,6 +1294,16 @@ static void _requestUnrelayedTxGetdataDone(void *info, int success)
 
     MGR_UNLOCK(manager);
     _BRPeerManagerFlushAnswers(manager);
+}
+
+// caller must hold manager->lock. True while txHash is in the publish list. Decided by the cached
+// hash, never by reading a listed object.
+static int _BRPeerManagerPublishListed(BRPeerManager *manager, UInt256 txHash)
+{
+    for (size_t i = array_count(manager->publishedTxHashes); i > 0; i--) {
+        if (UInt256Eq(manager->publishedTxHashes[i - 1], txHash)) return 1;
+    }
+    return 0;
 }
 
 // caller must hold manager->lock. True while txHash is in its stem phase.
@@ -2295,6 +2366,7 @@ static void _peerDisconnected(void *info, int error)
     // a 10-minute "not synced" ban.
     _penalizeFor(manager, peer->address, peer->port, time(NULL), PEER_REDIAL_COOLDOWN_SECONDS);
 
+    // The peer leaves every relay record; the records stay (see _BRTxPeerListHasRecord).
     for (size_t i = array_count(manager->txRelays); i > 0; i--) {
         peerList = &manager->txRelays[i - 1];
 
@@ -2408,6 +2480,7 @@ static void _peerRelayedPeers(void *info, const BRPeer peers[], size_t peersCoun
 
 static int _BRPeerManagerFindSolicitedBlockLocked(BRPeerManager *manager, UInt256 blockHash, uint32_t height);
 static UInt256 _BRPeerManagerMainHashAtHeightLocked(BRPeerManager *manager, uint32_t height);
+static int _BRPeerManagerConfirmableLocked(BRPeerManager *manager, const BRMerkleBlock *b, uint32_t tipHeight);
 
 // INT-2026-10-09-D. A transaction counts as trusted (registered without a signature check) only when the block
 // that delivered it is the manager's own main-chain block it asked for. Three things must hold, all against the
@@ -2416,7 +2489,9 @@ static UInt256 _BRPeerManagerMainHashAtHeightLocked(BRPeerManager *manager, uint
 //   - it is on the main chain: the block the chain ending at lastBlock holds at its height (the answer of the walk
 //     down from lastBlock that _peerRelayedBlockTxns uses, read through the index; a walk that runs off the
 //     resident set proves nothing, so it counts as not on the main chain);
-//   - the manager asked for it: it is in the solicitation table at that height.
+//   - the manager asked for it: it is in the solicitation table at that height;
+//   - its header is one the wallet can vouch for (_BRPeerManagerConfirmableLocked): a block that cannot yet confirm
+//     a transaction cannot vouch for one either.
 // The peer layer has already checked that this peer was asked for the block and that its tx list hashes to the
 // block's own header. That proves the list belongs to that header, not that the header is on the main chain.
 // Anything that fails here goes through the checked path, which still registers a tx that pays the wallet or
@@ -2429,6 +2504,7 @@ static int _BRPeerManagerDeliveryIsTrustedLocked(BRPeerManager *manager, UInt256
 
     if (! b || b->height == BLOCK_UNKNOWN_HEIGHT) return 0;                              // not resident
     if (_BRPeerManagerFindSolicitedBlockLocked(manager, blockHash, b->height) < 0) return 0; // not asked for
+    if (! manager->lastBlock || ! _BRPeerManagerConfirmableLocked(manager, b, manager->lastBlock->height)) return 0;
     return UInt256Eq(_BRPeerManagerMainHashAtHeightLocked(manager, b->height), blockHash);  // on the main chain
 }
 
@@ -2627,6 +2703,15 @@ static void _peerRejectedTx(void *info, UInt256 txHash, uint8_t code)
         _BRPeerManagerAnswerEntry(manager, txHash, EINVAL);
     }
 #endif
+
+    // Who rejected it, for BRPeerManagerTxRefusedByNetwork. Only for a transaction this wallet holds
+    // or publishes, and at most TX_REJECTS_PER_TX_MAX peers each, so a peer naming arbitrary hashes
+    // cannot grow the record.
+    if ((code == REJECT_INVALID || code == REJECT_NONSTANDARD || code == REJECT_DUST) &&
+        (tx || _BRPeerManagerPublishListed(manager, txHash)) &&
+        _BRTxPeerListCount(manager->txRejects, txHash) < TX_REJECTS_PER_TX_MAX) {
+        _BRTxPeerListAddPeer(&manager->txRejects, txHash, peer);
+    }
 
     if (tx) {
         if (wasRelaying && tx->blockHeight == TX_UNCONFIRMED) {
@@ -2992,6 +3077,18 @@ static void _BRPeerManagerClearMemory(BRPeerManager* manager) {
         }
     }
 
+#if !defined(JUDGED_CONFIRMATION_HOLD_UNFIXED)
+    // A block holding a confirmation that waits for its checkpoint stays resident: the release checks it is still on
+    // the chain the checkpoint pins (_BRPeerManagerReleaseHeldLocked). The wait is bounded by the distance to the next
+    // checkpoint, well inside the span clamp below.
+    for (size_t i = 0; i < manager->confirmHeldCount; i++) {
+        uint32_t h = manager->confirmHeld[i].height;
+        uint32_t heldFloor = (h > CLEAR_MEM_CF_RETENTION_MARGIN) ? h - CLEAR_MEM_CF_RETENTION_MARGIN : 1;
+
+        if (cfFloor == 0 || heldFloor < cfFloor) cfFloor = heldFloor;
+    }
+#endif
+
 #ifndef CF_RETENTION_NO_SPAN_CLAMP
     // Make the retained span UNCONDITIONALLY bounded. The floor above is anchored to the
     // SCAN (min(cfNext, lowestNeeded) - margin), which is correct, but its bound is
@@ -3350,7 +3447,7 @@ static int _BRPeerManagerDiffV4HistoryStopsAtFloorLocked(BRPeerManager *manager,
 static int _BRPeerManagerVerifyBlock(BRPeerManager *manager, BRMerkleBlock *block, BRMerkleBlock *prev, BRPeer *peer)
 {
     uint32_t transitionTime = 0;
-    int r = 1;
+    int r = 1, diffMatch = 0;
     
     // check if we hit a difficulty transition, and find previous transition time
     BRMerkleBlock *b = manager->lastBlock;
@@ -3420,7 +3517,10 @@ static int _BRPeerManagerVerifyBlock(BRPeerManager *manager, BRMerkleBlock *bloc
             r = 0;
 #endif
         }
-        else BRMerkleBlockDiffCountAdd(BR_DIFF_MATCH);
+        else {
+            BRMerkleBlockDiffCountAdd(BR_DIFF_MATCH);
+            diffMatch = 1;
+        }
     }
 #endif
 
@@ -3440,9 +3540,126 @@ static int _BRPeerManagerVerifyBlock(BRPeerManager *manager, BRMerkleBlock *bloc
                      "expected: %s", block->height, u256hex(block->blockHash), u256hex(checkpoint->blockHash));
             r = 0;
         }
+
+#if DGB_HEADER_DIFF_CHECK >= 1 && !defined(JUDGED_CONFIRMATION_UNFIXED)
+        // Whether the wallet can vouch for this header's difficulty (BRMerkleBlock.unjudged): a header at a checkpoint
+        // is the checkpoint; any other is vouched for only if its target was judged and matched, against a history
+        // that was itself vouched for -- its parent is (a checkpoint, a judged header, or one the chain started from).
+        // A verdict read off unjudged headers proves nothing: they set the history it was computed from.
+        block->unjudged = (checkpoint || (diffMatch && prev && ! prev->unjudged)) ? 0 : 1;
+#endif
     }
+    (void)diffMatch;
 
     return r;
+}
+
+#if DGB_HEADER_DIFF_CHECK >= 1 && !defined(JUDGED_CONFIRMATION_UNFIXED)
+// the height of the highest checkpoint at or below `height`, or 0
+static uint32_t _BRPeerManagerCheckpointAtOrBelow(BRPeerManager *manager, uint32_t height)
+{
+    uint32_t h = 0;
+
+    for (size_t i = 0; i < manager->params->checkpointsCount; i++) {
+        if (manager->params->checkpoints[i].height <= height && manager->params->checkpoints[i].height > h)
+            h = manager->params->checkpoints[i].height;
+    }
+
+    return h;
+}
+#endif
+
+// 1 if a wallet transaction may be confirmed into `b`, a block on the chain ending at a tip of height `tipHeight`:
+// its header was judged against history the wallet vouches for, or a checkpoint at or below the tip pins it (the
+// chain reached that checkpoint, so every block under it is the real one). A block above a checkpoint without a
+// difficulty context is neither until the chain reaches the next checkpoint: a confirmation there would rest on
+// headers nobody judged. A network that ships no checkpoint context (testnet26) has nothing to judge its first
+// headers by and keeps confirming as before. Caller holds manager->lock.
+static int _BRPeerManagerConfirmableLocked(BRPeerManager *manager, const BRMerkleBlock *b, uint32_t tipHeight)
+{
+#if DGB_HEADER_DIFF_CHECK >= 1 && !defined(JUDGED_CONFIRMATION_UNFIXED)
+    if (manager->params->checkpointContextsCount == 0 || ! b->unjudged) return 1;
+    return b->height <= _BRPeerManagerCheckpointAtOrBelow(manager, tipHeight);
+#else
+    (void)manager; (void)b; (void)tipHeight;
+    return 1;
+#endif
+}
+
+// Holds the wallet transactions `txHashes` found in `b`, a main-chain block not yet confirmable, until the chain pins
+// it (CONFIRM_HELD_MAX). Returns 0, holding none of them, if they do not all fit. Caller holds manager->lock.
+static int _BRPeerManagerHoldConfirmLocked(BRPeerManager *manager, const UInt256 txHashes[], size_t txCount,
+                                           const BRMerkleBlock *b)
+{
+    size_t fresh = 0;
+
+    for (size_t i = 0; i < txCount; i++) {
+        int known = 0;
+
+        for (size_t j = 0; ! known && j < manager->confirmHeldCount; j++) {
+            known = UInt256Eq(manager->confirmHeld[j].txHash, txHashes[i]) &&
+                    UInt256Eq(manager->confirmHeld[j].blockHash, b->blockHash);
+        }
+        if (! known) fresh++;
+    }
+
+    if (fresh > CONFIRM_HELD_MAX - manager->confirmHeldCount) return 0;
+
+    for (size_t i = 0; i < txCount; i++) {
+        int known = 0;
+
+        for (size_t j = 0; ! known && j < manager->confirmHeldCount; j++) {
+            known = UInt256Eq(manager->confirmHeld[j].txHash, txHashes[i]) &&
+                    UInt256Eq(manager->confirmHeld[j].blockHash, b->blockHash);
+        }
+        if (known) continue;
+        manager->confirmHeld[manager->confirmHeldCount++] =
+            (BRConfirmHeld) { txHashes[i], b->blockHash, b->height, b->timestamp };
+    }
+
+    return 1;
+}
+
+// Confirms each held transaction whose block the chain now pins, at that block's height, if the block is still on the
+// main chain; forgets one whose height the chain pins with another block. The rest keep waiting. Caller holds
+// manager->lock.
+static void _BRPeerManagerPersistCFLedgerLocked(BRPeerManager *manager);
+
+static void _BRPeerManagerReleaseHeldLocked(BRPeerManager *manager)
+{
+    if (manager->confirmHeldCount == 0 || ! manager->lastBlock) return;
+
+    uint32_t tip = manager->lastBlock->height;
+    size_t count0 = manager->confirmHeldCount;
+
+    for (size_t i = manager->confirmHeldCount; i > 0; i--) {
+        BRConfirmHeld e = manager->confirmHeld[i - 1];
+        BRMerkleBlock *b = BRSetGet(manager->blocks, &e.blockHash);
+        int onMain = b && e.height <= tip &&
+                     UInt256Eq(_BRPeerManagerMainHashAtHeightLocked(manager, e.height), e.blockHash);
+        int pinned = e.height <= tip && _BRPeerManagerConfirmableLocked(manager, &(BRMerkleBlock) {
+                         .height = e.height, .unjudged = 1 }, tip);
+
+#if !defined(JUDGED_CONFIRMATION_HOLD_UNFIXED)
+        // A block no longer resident cannot be placed on or off the chain (memory clearing keeps held blocks; see
+        // _BRPeerManagerClearMemory): it keeps waiting rather than be dropped, and the stored ledger still has its
+        // height to scan, so a restart settles it.
+        if (! b) continue;
+#endif
+        if (onMain ? ! _BRPeerManagerConfirmableLocked(manager, b, tip) : ! pinned) continue;   // still waiting
+
+        manager->confirmHeld[i - 1] = manager->confirmHeld[--manager->confirmHeldCount];
+        if (onMain) {
+            _peer_log("confirm-released h=%" PRIu32 " (the chain reached the checkpoint that pins its block)\n", e.height);
+            _BRPeerManagerUpdateTx(manager, &e.txHash, 1, e.height, e.timestamp);
+        }
+        else {
+            _peer_log("confirm-dropped h=%" PRIu32 " (its block is not the one the chain holds there)\n", e.height);
+        }
+    }
+
+    // the stored ledger had the settled heights still to scan; store it as it now is
+    if (manager->confirmHeldCount != count0) _BRPeerManagerPersistCFLedgerLocked(manager);
 }
 
 // Serialize a set of saved blocks into the flat persistence buffer WHILE THE
@@ -3484,14 +3701,38 @@ static uint8_t *_serializeSavedBlocks(BRMerkleBlock *blocks[], size_t count, siz
     return buf;
 }
 
+// The scan ledger as it may be stored. A height whose block holds a confirmation still waiting for its checkpoint
+// (CONFIRM_HELD_MAX) is complete only in memory: the wait list is not stored, so the stored ledger is rewound to the
+// lowest such height and a restart (or a recreate) scans from there again, where the block is fetched and held, or
+// confirmed, afresh. Writes like BRCFScanLedgerSerialize. Caller holds manager->lock.
+static size_t _BRPeerManagerSerializeLedgerLocked(BRPeerManager *manager, uint8_t *buf, size_t bufLen)
+{
+#if !defined(JUDGED_CONFIRMATION_HOLD_UNFIXED)
+    if (manager->confirmHeldCount > 0) {
+        uint32_t lowest = manager->confirmHeld[0].height;
+        BRCFScanLedger *copy = malloc(sizeof(*copy));
+
+        for (size_t i = 1; i < manager->confirmHeldCount; i++)
+            if (manager->confirmHeld[i].height < lowest) lowest = manager->confirmHeld[i].height;
+        if (! copy) return 0;
+        memcpy(copy, &manager->cfLedger, sizeof(*copy));
+        BRCFScanLedgerRewindTo(copy, lowest);   // only scalars and the hole arrays change; nothing it points to
+        size_t n = BRCFScanLedgerSerialize(copy, buf, bufLen);
+        free(copy);
+        return n;
+    }
+#endif
+    return BRCFScanLedgerSerialize(&manager->cfLedger, buf, bufLen);
+}
+
 // Caller holds manager->lock. The callback copies the bytes before returning.
 static void _BRPeerManagerPersistCFLedgerLocked(BRPeerManager *manager)
 {
     if (!manager->saveCFLedger) return;
-    size_t ledgerLen = BRCFScanLedgerSerialize(&manager->cfLedger, NULL, 0);
+    size_t ledgerLen = _BRPeerManagerSerializeLedgerLocked(manager, NULL, 0);
     uint8_t *ledgerBuf = (ledgerLen > 0) ? malloc(ledgerLen) : NULL;
     if (!ledgerBuf) return;
-    size_t wrote = BRCFScanLedgerSerialize(&manager->cfLedger, ledgerBuf, ledgerLen);
+    size_t wrote = _BRPeerManagerSerializeLedgerLocked(manager, ledgerBuf, ledgerLen);
     if (wrote == ledgerLen) {
         manager->saveCFLedger(manager->saveCFLedgerInfo, ledgerBuf, ledgerLen);
     }
@@ -3841,6 +4082,7 @@ static BRMerkleBlock *_peerRelayedBlockOnce(void *info, BRMerkleBlock *block)
         _BRPeerManagerInstallSavedBlock(manager, block);
         manager->lastBlock = block;
         BRWalletSetBlockHeight(manager->wallet, block->height);   // the verified tip, never the estimate
+        if (BRSetGet(manager->checkpoints, block)) _BRPeerManagerReleaseHeldLocked(manager);   // the chain is pinned here
 
         // Paced-convoy: lastBlock just advanced, so the header window changed —
         // recompute it once and re-push the verdict to every connected peer
@@ -3863,7 +4105,8 @@ static BRMerkleBlock *_peerRelayedBlockOnce(void *info, BRMerkleBlock *block)
         // clear some memory
         _BRPeerManagerClearMemory(manager);
         
-        if (txCount > 0) _BRPeerManagerUpdateTx(manager, txHashes, txCount, block->height, txTime);
+        if (txCount > 0 && _BRPeerManagerConfirmableLocked(manager, block, block->height))
+            _BRPeerManagerUpdateTx(manager, txHashes, txCount, block->height, txTime);
         if (manager->downloadPeer) BRPeerSetCurrentBlockHeight(manager->downloadPeer, block->height);
             
         if (block->height < manager->estimatedHeight && peer == manager->downloadPeer) {
@@ -3927,7 +4170,8 @@ static BRMerkleBlock *_peerRelayedBlockOnce(void *info, BRMerkleBlock *block)
         // same guard in _peerRelayedBlockTxns): we cannot prove `block` is on the main
         // chain, so skip the height stamping rather than deref NULL in BRMerkleBlockEq.
         if (b && BRMerkleBlockEq(b, block)) { // if it's not on a fork, set block heights for its transactions
-            if (txCount > 0) _BRPeerManagerUpdateTx(manager, txHashes, txCount, block->height, txTime);
+            if (txCount > 0 && _BRPeerManagerConfirmableLocked(manager, b, manager->lastBlock->height))
+                _BRPeerManagerUpdateTx(manager, txHashes, txCount, block->height, txTime);
             if (block->height == manager->lastBlock->height) manager->lastBlock = block;
         }
         
@@ -3935,6 +4179,8 @@ static BRMerkleBlock *_peerRelayedBlockOnce(void *info, BRMerkleBlock *block)
 
         // check if another block with equal hash existed
         if (b != block) {
+            block->unjudged = block->unjudged && b->unjudged;   // the same header: a verdict once given stands
+
             int freeable = 1;
 #ifdef CHECKPOINT_STUB_FREE_UNGUARDED_UNFIXED
             // RED ARM ONLY (checkpoint_stub_free_guard_kat) — never defined in a production
@@ -4084,13 +4330,15 @@ static BRMerkleBlock *_peerRelayedBlockOnce(void *info, BRMerkleBlock *block)
                 }
                 
                 count = BRMerkleBlockTxHashes(b, txHashes, count);
+                int confirmable = _BRPeerManagerConfirmableLocked(manager, b, block->height);
                 b = BRSetGet(manager->blocks, &b->prevBlock);
                 if (b) timestamp = timestamp/2 + b->timestamp/2;
-                if (count > 0) BRWalletUpdateTransactions(manager->wallet, txHashes, count, height, timestamp);
+                if (count > 0 && confirmable) BRWalletUpdateTransactions(manager->wallet, txHashes, count, height, timestamp);
             }
         
             if (block)
             manager->lastBlock = block;
+            _BRPeerManagerReleaseHeldLocked(manager);   // the new chain may reach a checkpoint the old one did not
 
 #ifndef CF_REORG_REWIND_UNFIXED
             // The filter-header chain and the scan ledger follow the new best chain:
@@ -4122,6 +4370,15 @@ static BRMerkleBlock *_peerRelayedBlockOnce(void *info, BRMerkleBlock *block)
 #endif
     }
     
+    // A header run the wallet cannot vouch for is not persisted: a restart would read it back as the wallet's own
+    // chain. The tip is confirmable only if everything under it is (_BRPeerManagerConfirmableLocked), so the save
+    // waits until the chain reaches a header it can vouch for.
+    if (saveCount && block && ! _BRPeerManagerConfirmableLocked(manager, block, block->height)) {
+        peer_log(peer, "not saving blocks: the tip at %" PRIu32 " has no difficulty verdict the wallet can vouch for",
+                 block->height);
+        saveCount = 0;
+    }
+
     BRMerkleBlock **saveBlocks = saveCount ? calloc(saveCount, sizeof(*saveBlocks)) : NULL;
     if (! saveBlocks) saveCount = 0;
     
@@ -4346,13 +4603,34 @@ static void _peerRelayedBlockTxns(void *info, UInt256 blockHash, UInt256 merkleR
             // commits to. (BRPeer.c already refuses to hand on anything else; this holds on its own.)
             // Confirmed BEFORE the height is marked evaluated, so a stop in between leaves the height
             // to be scanned again rather than evaluated with its receive unconfirmed.
+            //
+            // A block the wallet cannot vouch for yet (_BRPeerManagerConfirmableLocked) does not confirm them: they
+            // wait, unconfirmed, until the chain reaches the checkpoint that pins it. The height is still complete
+            // (the wallet holds its transactions); if the wait list is full it stays outstanding instead.
+            int complete = 1;
+
             if (walletCount > 0) {
-                _BRPeerManagerUpdateTx(manager, walletHashes, walletCount, b->height, b->timestamp);
-                confirmed = 1;
+                if (_BRPeerManagerConfirmableLocked(manager, b, manager->lastBlock->height)) {
+                    _BRPeerManagerUpdateTx(manager, walletHashes, walletCount, b->height, b->timestamp);
+                    confirmed = 1;
+                }
+                else if (_BRPeerManagerHoldConfirmLocked(manager, walletHashes, walletCount, b)) {
+                    _peer_log("confirm-held h=%u tx=%zu (its header has no difficulty verdict the wallet can vouch "
+                              "for; confirmed once the chain reaches the next checkpoint)\n", b->height, walletCount);
+                }
+                else {
+                    _peer_log("confirm-held h=%u tx=%zu: the wait list is full -- the height stays outstanding\n",
+                              b->height, walletCount);
+                    complete = 0;
+                }
             }
+#else
+            int complete = 1;
 #endif
-            BRCFScanLedgerMarkEvaluated(&manager->cfLedger, b->height);
-            _BRPeerManagerPersistCFLedgerLocked(manager);
+            if (complete) {
+                BRCFScanLedgerMarkEvaluated(&manager->cfLedger, b->height);
+                _BRPeerManagerPersistCFLedgerLocked(manager);
+            }
         }
     }
     else {
@@ -4887,6 +5165,7 @@ BRPeerManager *BRPeerManagerNewEx(const BRChainParams *params, BRWallet *wallet,
     
     array_new(manager->txRelays, 10);
     array_new(manager->txRequests, 10);
+    array_new(manager->txRejects, 10);
     array_new(manager->publishedTx, 10);
     array_new(manager->publishedTxHashes, 10);
     array_new(manager->pendingAnswers, 4);
@@ -6670,6 +6949,21 @@ int BRPeerManagerCompactFilterPeerStatus(BRPeerManager *manager, UInt128 addr, u
 
 // Begin an async connect to a copy of `tmpl`, wiring all manager callbacks and
 // adding it to connectedPeers. Caller must hold manager->lock. Mirrors the inline
+// A dial whose peer thread could not be started (BRPeerConnect returned 0). No thread will run the
+// disconnect path or the thread cleanup for this peer, so they run here, exactly once: the peer's
+// disconnect, the thread count taken for it, and its callback info. Only BRPeerConnect's answer says
+// a thread did not start; the peer's status cannot, since a started thread that failed fast has
+// already marked it disconnected and is about to run the same path itself. Caller holds
+// manager->lock; it is released around the disconnect path, as a peer thread would hold it.
+static void _BRPeerManagerDialNotStarted(BRPeerManager *manager, BRPeerCallbackInfo *info)
+{
+    MGR_UNLOCK(manager);
+    _peerDisconnected(info, ENOTCONN);
+    MGR_LOCK(manager);
+    manager->peerThreadCount--;
+    free(info);
+}
+
 // connect block in BRPeerManagerConnect so the BIP158 filter-first pre-pass and the
 // regular bloom selection share identical setup.
 static void _BRPeerManagerBeginConnect(BRPeerManager *manager, const BRPeer *tmpl)
@@ -6687,6 +6981,11 @@ static void _BRPeerManagerBeginConnect(BRPeerManager *manager, const BRPeer *tmp
                        _peerNetworkIsReachable, _peerThreadCleanup);
     BRPeerSetEarliestKeyTime(info->peer, manager->earliestKeyTime);
     BRPeerSetCompactFiltersOnly(info->peer, manager->syncMode == BR_SYNC_MODE_COMPACT_FILTERS_ONLY);
+#ifndef PEER_DIAL_DISCONNECT_ONCE_UNFIXED
+    if (! BRPeerConnect(info->peer)) _BRPeerManagerDialNotStarted(manager, info);
+#else
+    // Comparison arm only (peer_dial_disconnect_once_kat); never defined in a production build. The
+    // earlier shape read "no thread started" from the peer's status.
     BRPeerConnect(info->peer);
 
     if (BRPeerConnectStatus(info->peer) == BRPeerStatusDisconnected) {
@@ -6695,6 +6994,7 @@ static void _BRPeerManagerBeginConnect(BRPeerManager *manager, const BRPeer *tmp
         MGR_LOCK(manager);
         manager->peerThreadCount--;
     }
+#endif
 }
 
 // Count peers in the candidate pool (manager->peers) that are compact-filter capable, NOT already
@@ -6953,6 +7253,10 @@ void BRPeerManagerConnect(BRPeerManager *manager)
                                    _peerRequestedTx, _peerNetworkIsReachable, _peerThreadCleanup);
                 BRPeerSetEarliestKeyTime(info->peer, manager->earliestKeyTime);
                 BRPeerSetCompactFiltersOnly(info->peer, manager->syncMode == BR_SYNC_MODE_COMPACT_FILTERS_ONLY);
+#ifndef PEER_DIAL_DISCONNECT_ONCE_UNFIXED
+                if (! BRPeerConnect(info->peer)) _BRPeerManagerDialNotStarted(manager, info);
+#else
+                // Comparison arm only (peer_dial_disconnect_once_kat): the earlier shape.
                 BRPeerConnect(info->peer);
                 
                 if (BRPeerConnectStatus(info->peer) == BRPeerStatusDisconnected) {
@@ -6961,6 +7265,7 @@ void BRPeerManagerConnect(BRPeerManager *manager)
                     MGR_LOCK(manager);
                     manager->peerThreadCount--;
                 }
+#endif
             }
         }
 
@@ -8601,9 +8906,77 @@ void BRPeerManagerRemoveTransaction(BRPeerManager *manager, UInt256 txHash)
     _BRPeerManagerSnapshotHeld(manager, held);
     BRWalletRemoveTransaction(manager->wallet, txHash);
     _BRPeerManagerPurgeReleasedRecords(manager, held);
+    _BRTxPeerListDrop(manager->txRejects, txHash);
+#ifndef RELAY_EVIDENCE_UNFIXED
+    _BRTxPeerListDrop(manager->txRelays, txHash);   // the relay record lasts as long as the transaction
+#endif
 
     MGR_UNLOCK(manager);
     _BRPeerManagerFlushAnswers(manager);
+}
+
+// A peer's network group: an IPv4 address's /16, any other address's /32 -- the grouping DigiByte
+// Core uses to keep its connections diverse, so that addresses one operator holds count once.
+static uint64_t _BRPeerNetGroup(const BRPeer *peer)
+{
+    const UInt128 *a = &peer->address;
+
+    if (a->u64[0] == 0 && a->u16[4] == 0 && a->u16[5] == 0xffff) {   // IPv4-mapped
+        return (4ULL << 32) | ((uint64_t)a->u8[12] << 8) | a->u8[13];
+    }
+
+    return (6ULL << 32) | ((uint64_t)a->u8[0] << 24) | ((uint64_t)a->u8[1] << 16) |
+           ((uint64_t)a->u8[2] << 8) | a->u8[3];
+}
+
+// caller must hold manager->lock. The number of distinct network groups among the peers that
+// rejected txHash as invalid, non-standard or dust.
+static size_t _BRTxRejectGroupCount(BRPeerManager *manager, UInt256 txHash)
+{
+    for (size_t i = array_count(manager->txRejects); i > 0; i--) {
+        if (! UInt256Eq(manager->txRejects[i - 1].txHash, txHash)) continue;
+
+        const BRPeer *peers = manager->txRejects[i - 1].peers;
+        size_t count = array_count(manager->txRejects[i - 1].peers), groups = 0;
+
+        for (size_t j = 0; j < count; j++) {
+            uint64_t group = _BRPeerNetGroup(&peers[j]);
+            int seen = 0;
+
+            for (size_t k = 0; k < j && ! seen; k++) seen = (_BRPeerNetGroup(&peers[k]) == group);
+            if (! seen) groups++;
+        }
+
+        return groups;
+    }
+
+    return 0;
+}
+
+// See BRPeerManager.h. A reject message is one peer's word: a peer can reject a valid transaction
+// that honest peers already relayed, and a wallet that took that as final would give the coins back
+// for a second payment while the first still confirms. So one peer's rejection -- however often it
+// repeats -- refuses nothing; rejections from two network groups do, and only if no peer has relayed,
+// announced or asked for the transaction in this manager's life. That evidence does not lapse with the
+// peer: a relay record stays after its peers disconnect, answer notfound or reject, until the
+// transaction confirms or is removed, so ordinary churn cannot turn an accepted send into a refused one.
+int BRPeerManagerTxRefusedByNetwork(BRPeerManager *manager, UInt256 txHash)
+{
+    int refused;
+
+    assert(manager != NULL);
+    MGR_LOCK(manager);
+#ifdef REJECT_QUORUM_UNFIXED
+    // Comparison arm: one peer's rejection taken as the network's -- the rule this replaces.
+    refused = _BRTxPeerListCount(manager->txRejects, txHash) > 0;
+#elif defined(RELAY_EVIDENCE_UNFIXED)
+    // Comparison arm: only the peers relaying it right now count -- evidence that lapses with each peer.
+    refused = _BRTxPeerListCount(manager->txRelays, txHash) == 0 && _BRTxRejectGroupCount(manager, txHash) >= 2;
+#else
+    refused = ! _BRTxPeerListHasRecord(manager->txRelays, txHash) && _BRTxRejectGroupCount(manager, txHash) >= 2;
+#endif
+    MGR_UNLOCK(manager);
+    return refused;
 }
 
 // number of connected peers that have relayed the given unconfirmed transaction
@@ -8699,6 +9072,8 @@ static void _BRPeerManagerFreeNow(BRPeerManager *manager)
     array_free(manager->txRelays);
     for (size_t i = array_count(manager->txRequests); i > 0; i--) array_free(manager->txRequests[i - 1].peers);
     array_free(manager->txRequests);
+    for (size_t i = array_count(manager->txRejects); i > 0; i--) array_free(manager->txRejects[i - 1].peers);
+    array_free(manager->txRejects);
     array_free(manager->publishedTx);
     array_free(manager->publishedTxHashes);
     array_free(manager->dandelionPeers);
@@ -9188,7 +9563,7 @@ size_t BRPeerManagerCFLedgerSerialize(BRPeerManager *manager, uint8_t *buf, size
 {
     assert(manager != NULL);
     MGR_LOCK(manager);
-    size_t n = BRCFScanLedgerSerialize(&manager->cfLedger, buf, buflen);
+    size_t n = _BRPeerManagerSerializeLedgerLocked(manager, buf, buflen);
     MGR_UNLOCK(manager);
     return n;
 }

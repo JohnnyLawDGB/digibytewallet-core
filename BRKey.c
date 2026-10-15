@@ -230,13 +230,24 @@ int BRKeySetPrivKey(BRKey *key, const char *privKey)
 }
 
 // assigns DER encoded pubKey to key and returns true on success
+// pkLen must be 33 (compressed) or 65 (uncompressed); any other length is refused: the key is cleared and 0 returned
 int BRKeySetPubKey(BRKey *key, const uint8_t *pubKey, size_t pkLen)
 {
     secp256k1_pubkey pk;
     
     assert(key != NULL);
     assert(pubKey != NULL);
+#ifdef PUBKEY_LENGTH_RUNTIME_UNFIXED
+    // Comparison arm only (pubkey_length_runtime_kat): the earlier shape, whose only length check was an assert.
     assert(pkLen == 33 || pkLen == 65);
+#else
+    // key->pubKey holds 65 bytes. The length is checked at runtime, not by assert(): assert() compiles to nothing
+    // under NDEBUG, which every Release build defines, and pkLen can come from data the wallet did not produce.
+    if (! key || ! pubKey || (pkLen != 33 && pkLen != 65)) {
+        if (key) BRKeyClean(key);
+        return 0;
+    }
+#endif
     
     pthread_once(&_ctx_once, _ctx_init);
     BRKeyClean(key);

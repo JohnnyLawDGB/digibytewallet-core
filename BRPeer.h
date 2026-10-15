@@ -320,7 +320,11 @@ uint32_t BRPeerMsgsOut(BRPeer *peer);
 int      BRPeerCompletedHandshake(BRPeer *peer); // got verack — separates "never usable" from "went bad"
 
 // open connection to peer and perform handshake
-void BRPeerConnect(BRPeer *peer);
+// Returns 1 when the peer is in a peer thread's hands (a thread was started, one is already running,
+// or the connect waits for the network): that thread runs the disconnected callback when it ends.
+// Returns 0 when no thread could be started: the peer is left disconnected, the disconnected callback
+// will not run, and the caller runs its disconnect path itself.
+int BRPeerConnect(BRPeer *peer);
 
 // close connection to peer
 void BRPeerDisconnect(BRPeer *peer);

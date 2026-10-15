@@ -37,6 +37,20 @@
 #define MAX_PROOF_OF_WORK 0x1e0fffff    // highest value for difficulty target (higher values are less difficult)
 #define TARGET_TIMESPAN (0.10*24*60*60) // the targeted timespan between difficulty target adjustments
 
+#ifndef MERKLE_TREE_DEPTH_UNFIXED
+// The depth of a merkle tree over x leaves, for any 32-bit count. The count is the block's totalTx, a
+// u32 read from the wire or from saved blocks; taken unsigned, every value gives a depth of at most 32
+// and the shift loop always ends.
+inline static int _ceil_log2(uint32_t x)
+{
+    int r = (x & (x - 1)) ? 1 : 0;
+    
+    while ((x >>= 1) != 0) r++;
+    return r;
+}
+#else
+// Comparison arm only (merkle_tree_depth_kat); never defined in a production build. The earlier shape
+// took the count as a signed int.
 inline static int _ceil_log2(int x)
 {
     int r = (x & (x - 1)) ? 1 : 0;
@@ -44,6 +58,7 @@ inline static int _ceil_log2(int x)
     while ((x >>= 1) != 0) r++;
     return r;
 }
+#endif
 
 // from https://en.bitcoin.it/wiki/Protocol_specification#Merkle_Trees
 // Merkle trees are binary trees of hashes. Merkle trees in bitcoin use a double SHA-256, the SHA-256 hash of the
@@ -140,6 +155,13 @@ BRMerkleBlock *BRMerkleBlockParse(const uint8_t *buf, size_t bufLen)
             off += len;
             block->flagsLen = (size_t)BRVarInt(&buf[off], (off <= bufLen ? bufLen - off : 0), &len);
             off += len;
+#ifndef WIRE_COUNT_BOUNDS_UNFIXED
+            // invariant: the flags length is bounded by the bytes that remain, as
+            // the hash count is, so the comparison below cannot wrap and a non-zero
+            // length always has its bytes behind it.
+            if (block->flagsLen > (off <= bufLen ? bufLen - off : 0))
+                block->flagsLen = 0;
+#endif
             len = block->flagsLen;
             block->flags = (off + len <= bufLen) ? malloc(len) : NULL;
             if (block->flags) memcpy(block->flags, &buf[off], len);

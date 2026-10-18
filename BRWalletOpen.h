@@ -74,9 +74,12 @@ static inline BRWalletMasterKeys BRWalletMasterKeysFromSeed(const void *seed, si
 // Opens a wallet watching every tree in BR_WALLET_OPEN_TREES. Use this for a new
 // wallet, a restored wallet and every later unlock alike.
 //
-// transactions/txCount: saved transactions, exactly as for BRWalletNew -- the
-// wallet takes ownership of each BRTransaction, the array stays the caller's.
-// Pass NULL, 0 for a wallet with no history.
+// transactions/txCount: saved transactions, exactly as for BRWalletNew. The wallet
+// takes ownership of each record it KEEPS; it skips a repeated hash, an unsigned
+// record and one outside the money range WITHOUT freeing it, so after the call the
+// caller frees every record the wallet does not hold as itself
+// (BRWalletTransactionForHash(wallet, tx->txHash) != tx), and all of them when NULL
+// is returned. The array stays the caller's. Pass NULL, 0 for a wallet with no history.
 //
 // Returns NULL if the wallet could not be created. Free with BRWalletFree().
 static inline BRWallet *BRWalletOpenWithKeys(BRTransaction *transactions[], size_t txCount,

@@ -184,6 +184,17 @@ static inline int BRPublishOutcomeUserVisiblySent(int error)
     return BRPublishOutcomeOf(error).kind == BRPublishKindAccepted;
 }
 
+// How long a send screen waits for the verdict on a send it just published, before it may say
+// anything (Android 4.1.0's PublishOutcome.await): read the publish result ring
+// (BRWalletSend.h) every BR_PUBLISH_AWAIT_POLL_MS, for at most BR_PUBLISH_AWAIT_TIMEOUT_MS.
+// The first verdict is the verdict (the core answers each publish once), and only
+// BRPublishOutcomeUserVisiblySent() may be shown as "sent". No verdict within the wait is never
+// "sent": the screen says it went out and was not yet relayed. The core answers ETIMEDOUT once
+// no peer has taken the transaction for its 20 s PROTOCOL_TIMEOUT (BRPeerManager.c, which
+// checks the relation at compile time), so the wait outlasts that.
+#define BR_PUBLISH_AWAIT_POLL_MS    500
+#define BR_PUBLISH_AWAIT_TIMEOUT_MS 25000
+
 // The platform's own errno values, exposed so a consumer that must carry its own
 // copy of this table (the Kotlin mirror) can assert its constants against the
 // platform rather than against a comment. Returns 0 for an index out of range.

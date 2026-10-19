@@ -41,7 +41,9 @@
 //
 //  Host KAT: digibytewallet-android native/src/test/host/cf_restore_preflight_kat/
 //  (CfRestorePreflightTest case for case, and a line-for-line model of the Kotlin compared
-//  against this header). Header-only, static inline.
+//  against this header). Vectors: vectors/cf-restore-preflight/, this header's answers on a fixed
+//  corpus, which Android's host-JVM CfRestorePreflightVectorsTest holds its Kotlin to; a change to
+//  the rule regenerates them (the KAT fails until it does). Header-only, static inline.
 //
 
 #ifndef BRCFRestorePreflight_h

@@ -24,6 +24,7 @@
 //  THE SOFTWARE.
 
 #include "BRCFScanLedger.h"
+#include "BRCFRestorePreflight.h"
 
 #include <stdint.h>
 #include <stddef.h>
@@ -1173,6 +1174,20 @@ size_t BRCFScanLedgerTakePending(BRCFScanLedger *l, UInt256 blockHash, UInt256 *
 #define CF_LEDGER_OUT_ENTRY_V2  (4 + 1)      // height u32, headerRace u8
 #define CF_LEDGER_GU_ENTRY_V3   (4 + 2)      // height u32, rearmCycles u8, offersLive u8
 #define CF_LEDGER_GU_ENTRY_V2   (4)          // height u32
+
+// The cold-start check (BRCFRestorePreflight.h) reads this format without this parser, so a
+// format change must change it too. Each check stands aside only in the host-KAT shape that
+// simulates such a change on purpose.
+_Static_assert(CF_LEDGER_MAGIC == BR_CF_RESTORE_LEDGER_MAGIC, "BRCFRestorePreflight.h: ledger magic");
+#ifndef CF_LEDGER_STRIDE_GATE_UNFIXED
+_Static_assert(CF_LEDGER_VERSION == BR_CF_RESTORE_LEDGER_VERSION_MAX, "BRCFRestorePreflight.h: ledger version");
+#endif
+_Static_assert(CF_LEDGER_OUT_ENTRY_V2 == 5 && CF_LEDGER_OUT_ENTRY_V3 == 6 &&
+               CF_LEDGER_GU_ENTRY_V2 == 4 && CF_LEDGER_GU_ENTRY_V3 == 6, "BRCFRestorePreflight.h: entry sizes");
+_Static_assert(CF_OUTSTANDING_MAX == BR_CF_RESTORE_LEDGER_ENTRIES_MAX, "BRCFRestorePreflight.h: outstanding cap");
+#ifndef CF_GAVEUP_CEILING_UNFIXED
+_Static_assert(CF_GAVEUP_MAX == BR_CF_RESTORE_LEDGER_ENTRIES_MAX, "BRCFRestorePreflight.h: parked cap");
+#endif
 
 static void _putU32(uint8_t *p, uint32_t v)
 {

@@ -1600,6 +1600,9 @@ static BRPeer *_BRPeerManagerAnyFilterCapablePeer(BRPeerManager *manager);
 // definition below.
 static void _BRPeerManagerRequestNextCFHeaders(BRPeerManager *manager, BRPeer *peer, int isConvoyAdvance);
 static void _BRPeerManagerCFFollowReorgLocked(BRPeerManager *manager, uint32_t forkNext, BRPeer *peer);
+#ifndef CF_GAP_RESCAN_UNFIXED
+static void _BRPeerManagerCFRescanAfterGrowthLocked(BRPeerManager *manager, uint32_t height, BRPeer *peer);
+#endif
 static size_t _BRPeerManagerTrimCFChainLocked(BRPeerManager *manager);
 static int _BRPeerManagerReanchorAtFloorLocked(BRPeerManager *manager, int force);
 // Defined near BRPeerManagerRequestCompactFilters; forward-declared so the Phase 2
@@ -2544,6 +2547,13 @@ static void _peerRelayedTx(void *info, BRTransaction *tx)
     
     MGR_LOCK(manager);
     peer_log(peer, "relayed tx: %.12s", u256hex(tx->txHash));
+#ifndef CF_GAP_RESCAN_UNFIXED
+    // The address-set size before this tx is registered: a registration that extends a chain
+    // while a requested block is being handed over invalidates the filters already judged at
+    // and above that block (see _BRPeerManagerCFRescanAfterGrowthLocked).
+    size_t addrCountBefore = 0;
+    if (manager->wallet) BRWalletAddrSetKey(manager->wallet, NULL, &addrCountBefore);
+#endif
     
     for (size_t i = array_count(manager->publishedTx); i > 0; i--) { // see if tx is in list of published tx
         if (UInt256Eq(manager->publishedTxHashes[i - 1], tx->txHash)) {
@@ -2630,6 +2640,19 @@ static void _peerRelayedTx(void *info, BRTransaction *tx)
             BRWalletUnusedAddrs(manager->wallet, NULL, SEQUENCE_GAP_LIMIT_EXTERNAL, 0, 2);
             BRWalletUnusedAddrs(manager->wallet, NULL, SEQUENCE_GAP_LIMIT_INTERNAL, 1, 2);
         }
+
+#ifndef CF_GAP_RESCAN_UNFIXED
+        if (manager->wallet && BRPeerIsDeliveringBlockTxs(peer)) {
+            size_t addrCountAfter = 0;
+            BRWalletAddrSetKey(manager->wallet, NULL, &addrCountAfter);
+            if (addrCountAfter > addrCountBefore) {
+                UInt256 deliveringHash = BRPeerDeliveringBlockHash(peer);
+                BRMerkleBlock *db = UInt256IsZero(deliveringHash) ? NULL : BRSetGet(manager->blocks, &deliveringHash);
+                if (db && db->height != BLOCK_UNKNOWN_HEIGHT)
+                    _BRPeerManagerCFRescanAfterGrowthLocked(manager, db->height, peer);
+            }
+        }
+#endif
     }
     
     // set timestamp when tx is verified
@@ -9534,6 +9557,64 @@ static void _BRPeerManagerCFFollowReorgLocked(BRPeerManager *manager, uint32_t f
     }
     _BRPeerManagerPersistCFLedgerLocked(manager);
 }
+
+#ifndef CF_GAP_RESCAN_UNFIXED
+// The wallet's watched address set grew while a block the scan asked for was handing its
+// transactions over: a transaction in the block at `height` used an address near the end of
+// a chain, so the chain was extended (BRWalletRegisterTransaction's gap extension). Every
+// filter at or above `height` that was already evaluated was matched against the set as it
+// was BEFORE the extension, so a payment at one of those heights to a newly added address
+// was a clean miss and its height is marked scanned. Nothing would ever look at it again.
+//
+// Filters arrive well ahead of the full blocks they ask for (the forward fetch keeps up to
+// CF_OUTSTANDING_LOWWATER heights in flight), so this is the normal shape of a wallet that
+// uses addresses faster than its look-ahead: the block that reveals address N arrives after
+// the filter for the block that pays address N+11 was already judged a miss.
+//
+// So the scan goes back to `height` and every filter from there up is fetched and matched
+// again, now against the grown set. The rewind is the same one a reorg makes
+// (BRCFScanLedgerRewindTo plus the forward-fetch cursor), so the ordinary forward drive does
+// the re-fetch; a re-matched block that was already delivered is delivered again and its
+// transactions are registered idempotently. `height` itself is included: a transaction
+// earlier in the same block that paid a newly added address was handed over before the
+// extension, and only a re-delivery lets the wallet see it.
+//
+// Before rewinding, the look-ahead is restored to the full gap + 100 that wallet load and a
+// filter-capable connect give (_BRPeerManagerPregenAddrWindow). Without that the extension is
+// only the bare gap limit, every further use past it repeats this rewind, and the effective
+// look-ahead for the rest of the session is 10 receive / 5 change addresses.
+//
+// A wallet that never uses an address within the gap limit of the end of its window never
+// extends a chain here, so it never reaches this function: its scan, its address set and its
+// wallet state are exactly what they were. The cost is paid only on growth: at most the
+// heights requested above `height` (bounded by the convoy, CF_CONVOY_WINDOW above the scan
+// frontier, which `height` pins because its block was still outstanding) are fetched again,
+// plus the full blocks among them that match. The set grows a bounded number of times (once
+// per ~100 addresses used past the window, after the top-up), so the rewinds terminate.
+//
+// Caller holds manager->lock and must NOT hold wallet->lock.
+static void _BRPeerManagerCFRescanAfterGrowthLocked(BRPeerManager *manager, uint32_t height, BRPeer *peer)
+{
+    if (! _cfConvoyScanArmed(manager)) return;
+    if (height == 0 || height == BLOCK_UNKNOWN_HEIGHT) return;
+
+    _BRPeerManagerPregenAddrWindow(manager);   // restore the full look-ahead before re-matching
+
+    uint32_t from = height;
+    uint32_t start = BRCFScanLedgerStartHeight(&manager->cfLedger);
+    uint32_t abandoned = BRCFScanLedgerAbandonedBelow(&manager->cfLedger);
+    if (from < start) from = start;            // RewindTo would otherwise move the ledger's start down
+    if (from < abandoned) from = abandoned;    // heights below the hard floor are never re-requested
+    if (from == 0 || from > manager->cfLedger.requestedThrough) return;   // nothing evaluated at or above it
+
+    uint32_t requestedThrough = manager->cfLedger.requestedThrough;
+    BRCFScanLedgerRewindTo(&manager->cfLedger, from);
+    if (manager->autoFetchCFiltersThrough >= from) manager->autoFetchCFiltersThrough = from - 1;
+    peer_log(peer, "cf-gap: the wallet's address set grew at block %u — filters [%u..%u] are scanned again "
+             "against the grown set", height, from, requestedThrough);
+    _BRPeerManagerPersistCFLedgerLocked(manager);
+}
+#endif
 
 // The filter-header chain reached BR_COMPACT_FILTER_CHAIN_MAX. Drop the headers the scan
 // no longer needs: everything below its lowest needed height, less

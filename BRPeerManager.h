@@ -677,6 +677,22 @@ uint32_t BRPeerManagerEstimatedBlockHeight(BRPeerManager *manager);
 // current proof-of-work verified best block height
 uint32_t BRPeerManagerLastBlockHeight(BRPeerManager *manager);
 
+// 1 if a confirmation a server reports at `height` may be taken: the height is on the wallet's chain at or below its
+// tip and that block is confirmable (its header judged, or pinned by a checkpoint at or below the tip). 0 otherwise:
+// the transaction stays unconfirmed. Never takes the server's word for a height the wallet cannot vouch for.
+int BRPeerManagerHeightConfirmable(BRPeerManager *manager, uint32_t height);
+
+typedef enum {
+    BR_SERVER_HEIGHT_REFUSED = 0,     // the wallet's chain does not vouch for the height: nothing changes
+    BR_SERVER_HEIGHT_RECHECKING = 1,  // the block is re-checked over P2P (or will be, next call); the tx stays pending
+    BR_SERVER_HEIGHT_TAKEN = 2,       // below everything the wallet holds, checkpoint-pinned: confirmed there, unproven
+} BRServerHeightResult;
+
+// Apply a confirmation height a server reported for the wallet's pending tx `txHash`. A server's height is never the
+// proof where the wallet can check: see BRServerHeightResult.
+BRServerHeightResult BRPeerManagerApplyServerHeight(BRPeerManager *manager, UInt256 txHash, uint32_t height,
+                                                    uint32_t timestamp);
+
 // current proof-of-work verified best block timestamp (time interval since unix epoch)
 uint32_t BRPeerManagerLastBlockTimestamp(BRPeerManager *manager);
 

@@ -342,6 +342,8 @@ static uint64_t _BRMoneyAdd(uint64_t a, uint64_t b) { return (b > UINT64_MAX - a
 static uint64_t _BRMoneySub(uint64_t a, uint64_t b) { return (b > a) ? 0 : a - b; }
 
 static int _BRWalletSpendsSigned(BRWallet *wallet, BRTransaction *tx, int always);
+static BRTransaction *_BRWalletTxForRead(BRWallet *wallet, UInt256 txHash);   // a copy to read outside the lock
+static void _BRWalletTxReadDone(BRTransaction *t);
 static void _BRWalletSigCheckForget(BRTransaction *tx);
 
 static void _BRWalletUpdateBalance(BRWallet *wallet)
@@ -499,6 +501,14 @@ static void _BRWalletUpdateBalance(BRWallet *wallet)
                     int64_t ddCents = (tx->blockHeight != TX_UNCONFIRMED && tx->blockHeight >= ddFloor) ?
                                       BRDigiDollarOutputAmount(tx, (uint32_t)j) : -1;
 #endif
+#ifndef DD_COINBASE_UNFIXED
+                    if (ddCents >= 0 && _BRTxIsCoinbase(tx)) {
+                        // A coinbase is never DigiDollar (consensus T5-02; 4.1.2 row 18, dhikariski11
+                        // 1a14c645): its DD-marked outputs were credited once mature -- a confirmed dollar
+                        // balance no transaction backs, for the cost of one block. Not DigiDollar, and not a
+                        // plain coin either (a zero-value output is no coin): nothing is credited.
+                    } else
+#endif
                     if (ddCents >= 0) {
                         array_add(wallet->ddUtxos, ((BRUTXO) { tx->txHash, (uint32_t)j }));
                         ddBalance += (uint64_t)ddCents;
@@ -538,6 +548,20 @@ static void _BRWalletUpdateBalance(BRWallet *wallet)
 
     //No longer applicable, balance is not for all transactions considering assets
     assert(array_count(wallet->balanceHist) == array_count(wallet->transactions));
+
+#ifndef PENDING_PRUNE_UNFIXED
+    // The in-loop prune runs only at the end of a non-pending transaction, and a pending one `continue`s
+    // past it: a coin a pending send spends stayed in utxos and the balance -- selectable for a second,
+    // conflicting send -- unless a later non-pending transaction happened to prune it (4.1.2 row 21,
+    // kahalihan6 1a14cdaa). spentOutputs is complete here, so prune once more, as the DD prune below does.
+    for (j = array_count(wallet->utxos); j > 0; j--) {
+        if (BRSetContains(wallet->spentOutputs, &wallet->utxos[j - 1])) {
+            t = BRSetGet(wallet->allTx, &wallet->utxos[j - 1].hash);
+            if (t) balance = _BRMoneySub(balance, t->outputs[wallet->utxos[j - 1].n].amount);
+            array_rm(wallet->utxos, j - 1);
+        }
+    }
+#endif
 
     // prune spent DD UTXOs so ddBalance is spendable, not cumulative (spentOutputs is
     // fully populated after the tx loop). Mirrors the DGB utxo prune at :269-276.
@@ -2243,7 +2267,7 @@ int BRWalletSignTransaction(BRWallet *wallet, BRTransaction *tx, int forkId, con
 
     size_t totalKeys = bip84InternalCount + bip84ExternalCount + legacyInternalCount + legacyExternalCount +
                        taprootInternalCount + taprootExternalCount;
-    BRKey keys[totalKeys];
+    BRKey keys[BR_VLA_LEN(totalKeys)];
 
     if (seed) {
         size_t keyOff = 0;
@@ -2532,24 +2556,17 @@ int BRWalletRegisterTransactionUnproven(BRWallet *wallet, BRTransaction *tx)
     return _BRWalletRegisterTx(wallet, tx, 2);
 }
 
+static void _BRWalletUpdateTransactions(BRWallet *wallet, const UInt256 txHashes[], size_t txCount,
+                                        uint32_t blockHeight, uint32_t timestamp, int unproven);
+
 // BRWalletUpdateTransactions for heights the wallet has not proven itself (a server reported them): each
 // record keeps being checked at its new height (WALLET_SIG_ALWAYS), so a server-reported confirmation
-// cannot make an unsigned spend count.
+// cannot make an unsigned spend count; and only a tx still pending is updated, so a height the wallet
+// proved (or one a peer delivered meanwhile) is never replaced by a server's.
 void BRWalletUpdateTransactionsUnproven(BRWallet *wallet, const UInt256 txHashes[], size_t txCount,
                                         uint32_t blockHeight, uint32_t timestamp)
 {
-    assert(wallet != NULL);
-    assert(txHashes != NULL || txCount == 0);
-    pthread_mutex_lock(&wallet->lock);
-
-    for (size_t i = 0; i < txCount; i++) {
-        BRTransaction *tx = BRSetGet(wallet->allTx, &txHashes[i]);
-
-        if (tx) tx->walletSigCheck |= WALLET_SIG_ALWAYS;
-    }
-
-    pthread_mutex_unlock(&wallet->lock);
-    BRWalletUpdateTransactions(wallet, txHashes, txCount, blockHeight, timestamp);
+    _BRWalletUpdateTransactions(wallet, txHashes, txCount, blockHeight, timestamp, 1);
 }
 
 // removes a tx from the wallet and calls BRTransactionFree() on it, along with any tx that depend on its outputs
@@ -2606,8 +2623,10 @@ void BRWalletRemoveTransaction(BRWallet *wallet, UInt256 txHash)
                 recommendRescan = notifyUser = 1;
                 
                 for (size_t i = 0; i < tx->inCount; i++) { // only recommend a rescan if all inputs are confirmed
-                    t = BRWalletTransactionForHash(wallet, tx->inputs[i].txHash);
-                    if (t && t->blockHeight != TX_UNCONFIRMED) continue;
+                    t = _BRWalletTxForRead(wallet, tx->inputs[i].txHash);
+                    int confirmed = t && t->blockHeight != TX_UNCONFIRMED;
+                    _BRWalletTxReadDone(t);
+                    if (confirmed) continue;
                     recommendRescan = 0;
                     break;
                 }
@@ -2634,6 +2653,37 @@ BRTransaction *BRWalletTransactionForHash(BRWallet *wallet, UInt256 txHash)
     tx = BRSetGet(wallet->allTx, &txHash);
     pthread_mutex_unlock(&wallet->lock);
     return tx;
+}
+
+// A wallet transaction to READ outside the lock (4.1.2 row 5, K2): a deep copy taken under it, freed with
+// _BRWalletTxReadDone. BRWalletTransactionForHash hands out the wallet's own object and releases the lock
+// before it returns; BRWalletRemoveTransaction (the at-tip cleanup on a peer thread, a JNI remove) can free
+// that object at any moment after, so reading a parent through it while walking a child was a
+// use-after-free. WALLET_TX_WALK_UNFIXED keeps the old raw pointer for wallet_tx_walk_kat's red arm, and
+// WALLET_TX_READ_HOOK lets that KAT act at the point the lookup has returned.
+#ifdef WALLET_TX_READ_HOOK
+void wallet_tx_read_hook(BRWallet *wallet, UInt256 txHash);
+#endif
+static BRTransaction *_BRWalletTxForRead(BRWallet *wallet, UInt256 txHash)
+{
+#ifdef WALLET_TX_WALK_UNFIXED
+    BRTransaction *t = BRWalletTransactionForHash(wallet, txHash);
+#else
+    BRTransaction *t = BRWalletCopyTransactionForHash(wallet, txHash);
+#endif
+#ifdef WALLET_TX_READ_HOOK
+    wallet_tx_read_hook(wallet, txHash);
+#endif
+    return t;
+}
+
+static void _BRWalletTxReadDone(BRTransaction *t)
+{
+#ifndef WALLET_TX_WALK_UNFIXED
+    if (t) BRTransactionFree(t);
+#else
+    (void)t;
+#endif
 }
 
 // true if no previous wallet transaction spends any of the given transaction's inputs, and no inputs are invalid
@@ -2686,9 +2736,10 @@ static int _BRWalletTxIsValid(BRWallet *wallet, const BRTransaction *tx, int dep
         pthread_mutex_unlock(&wallet->lock);
 
         for (size_t i = 0; r && i < tx->inCount; i++) {
-            t = BRWalletTransactionForHash(wallet, tx->inputs[i].txHash);
+            t = _BRWalletTxForRead(wallet, tx->inputs[i].txHash);
             if (t && ! _BRWalletTxIsValid(wallet, t, depth - 1, budget))
                 r = 0;
+            _BRWalletTxReadDone(t);
         }
     }
     
@@ -2724,8 +2775,9 @@ int BRWalletTransactionIsPending(BRWallet *wallet, const BRTransaction *tx)
         }
         
         for (size_t i = 0; ! r && i < tx->inCount; i++) { // check if any inputs are known to be pending
-            t = BRWalletTransactionForHash(wallet, tx->inputs[i].txHash);
+            t = _BRWalletTxForRead(wallet, tx->inputs[i].txHash);
             if (t && BRWalletTransactionIsPending(wallet, t)) r = 1;
+            _BRWalletTxReadDone(t);
         }
     }
     
@@ -2746,8 +2798,9 @@ int BRWalletTransactionIsVerified(BRWallet *wallet, const BRTransaction *tx)
             BRWalletTransactionIsPending(wallet, tx)) r = 0;
             
         for (size_t i = 0; r && i < tx->inCount; i++) { // check if any inputs are known to be unverified
-            t = BRWalletTransactionForHash(wallet, tx->inputs[i].txHash);
+            t = _BRWalletTxForRead(wallet, tx->inputs[i].txHash);
             if (t && ! BRWalletTransactionIsVerified(wallet, t)) r = 0;
+            _BRWalletTxReadDone(t);
         }
     }
     
@@ -2756,11 +2809,14 @@ int BRWalletTransactionIsVerified(BRWallet *wallet, const BRTransaction *tx)
 
 // set the block heights and timestamps for the given transactions
 // use height TX_UNCONFIRMED and timestamp 0 to indicate a tx should remain marked as unverified (not 0-conf safe)
-void BRWalletUpdateTransactions(BRWallet *wallet, const UInt256 txHashes[], size_t txCount, uint32_t blockHeight,
-                                uint32_t timestamp)
+// BRWalletUpdateTransactions, and its unproven form (`unproven` != 0, a height a server reported): each record is
+// marked WALLET_SIG_ALWAYS and only a still-pending record is updated -- both decided inside this one critical section,
+// so a height the wallet proved, or one a peer delivers concurrently, is never replaced by a server's.
+static void _BRWalletUpdateTransactions(BRWallet *wallet, const UInt256 txHashes[], size_t txCount,
+                                        uint32_t blockHeight, uint32_t timestamp, int unproven)
 {
     BRTransaction *tx;
-    UInt256 hashes[txCount];
+    UInt256 hashes[BR_VLA_LEN(txCount)];
     int needsUpdate = 0;
     uint32_t oldHeight;
     size_t i, j, k;
@@ -2771,7 +2827,7 @@ void BRWalletUpdateTransactions(BRWallet *wallet, const UInt256 txHashes[], size
 
     // TX_UNCONFIRMED (INT32_MAX) is a stamp, not a height: the peer manager uses it to set or clear
     // an unconfirmed tx's timestamp, and it must never become the wallet's notion of the tip.
-    if (blockHeight != TX_UNCONFIRMED && blockHeight > wallet->blockHeight) {
+    if (! unproven && blockHeight != TX_UNCONFIRMED && blockHeight > wallet->blockHeight) {
         wallet->blockHeight = blockHeight;
         // a held coin-generation output may have reached maturity at this height
         if (wallet->coinbaseOutputs > 0 && blockHeight >= wallet->nextMaturityHeight) needsUpdate = 1;
@@ -2780,6 +2836,12 @@ void BRWalletUpdateTransactions(BRWallet *wallet, const UInt256 txHashes[], size
     for (i = 0, j = 0; txHashes && i < txCount; i++) {
         tx = BRSetGet(wallet->allTx, &txHashes[i]);
         if (! tx || (tx->blockHeight == blockHeight && tx->timestamp == timestamp)) continue;
+        if (unproven) {
+#ifndef SERVER_HEIGHT_OVERWRITE_UNFIXED
+            if (tx->blockHeight != TX_UNCONFIRMED) continue;   // never replaces a height the wallet proved
+#endif
+            tx->walletSigCheck |= WALLET_SIG_ALWAYS;
+        }
         oldHeight = tx->blockHeight;
         tx->timestamp = timestamp;
         tx->blockHeight = blockHeight;
@@ -2817,6 +2879,12 @@ void BRWalletUpdateTransactions(BRWallet *wallet, const UInt256 txHashes[], size
     if (j > 0 && wallet->txUpdated) wallet->txUpdated(wallet->callbackInfo, hashes, j, blockHeight, timestamp);
 }
 
+void BRWalletUpdateTransactions(BRWallet *wallet, const UInt256 txHashes[], size_t txCount, uint32_t blockHeight,
+                                uint32_t timestamp)
+{
+    _BRWalletUpdateTransactions(wallet, txHashes, txCount, blockHeight, timestamp, 0);
+}
+
 // marks all transactions confirmed after blockHeight as unconfirmed (useful for chain re-orgs)
 void BRWalletSetTxUnconfirmedAfter(BRWallet *wallet, uint32_t blockHeight)
 {
@@ -2829,7 +2897,7 @@ void BRWalletSetTxUnconfirmedAfter(BRWallet *wallet, uint32_t blockHeight)
     while (i > 0 && wallet->transactions[i - 1]->blockHeight > blockHeight) i--;
     count -= i;
 
-    UInt256 hashes[count];
+    UInt256 hashes[BR_VLA_LEN(count)];
 
     for (j = 0; j < count; j++) {
         wallet->transactions[i + j]->blockHeight = TX_UNCONFIRMED;
@@ -3223,10 +3291,11 @@ int BRWalletOutpointAssetState(BRWallet *wallet, UInt256 txHash, uint32_t n)
     assert(wallet != NULL);
     if (BRWalletOutpointSpent(wallet, txHash, n)) return 0;
 
-    tx = BRWalletTransactionForHash(wallet, txHash);
+    tx = _BRWalletTxForRead(wallet, txHash);
     if (! tx) return -1;
-    if (! BRWalletTransactionIsValid(wallet, tx)) return -2;
-    return 1;
+    int valid = BRWalletTransactionIsValid(wallet, tx);
+    _BRWalletTxReadDone(tx);
+    return valid ? 1 : -2;
 }
 
 int BRWalletRegisterAssetOutpoint(BRWallet *wallet, UInt256 txHash, uint32_t n)

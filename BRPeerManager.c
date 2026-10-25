@@ -1221,8 +1221,8 @@ static void _requestUnrelayedTxGetdataDone(void *info, int success)
     // relaying their mempools
     if (count >= manager->maxConnectCount) {
         size_t txCount = BRWalletTxUnconfirmedBefore(manager->wallet, NULL, 0, TX_UNCONFIRMED);
-        BRTransaction *txs[(txCount < 10000) ? txCount : 10000];
-        UInt256 hashes[(txCount < 10000) ? txCount : 10000];
+        BRTransaction *txs[BR_VLA_LEN((txCount < 10000) ? txCount : 10000)];
+        UInt256 hashes[BR_VLA_LEN((txCount < 10000) ? txCount : 10000)];
         
         txCount = BRWalletTxUnconfirmedBefore(manager->wallet, txs, sizeof(txs)/sizeof(*txs), TX_UNCONFIRMED);
         // Walk a snapshot of HASHES, not of pointers: a removal below also releases the record's
@@ -1269,11 +1269,36 @@ static void _requestUnrelayedTxGetdataDone(void *info, int success)
                     // the DGB sums alone score such a receive zero. The record is
                     // also what the app's confirmation reconcile promotes to
                     // release the credit held back while it is pending.
+#if defined(UNCONF_CREDIT_UNFIXED) || defined(TIPSWEEP_TOKEN_STAKE_UNFIXED)   /* both comparison arms predate row 32 */
                     int stake = BRWalletAmountSentByTx(manager->wallet, tx) != 0 ||
                                 BRWalletAmountReceivedFromTx(manager->wallet, tx) != 0;
+#else
+                    // A plain receive is no stake on its own (4.1.2 row 32, dhikariski11 1a14c897): saved
+                    // records keep their heights now (saved_transactions_deserialize.h), so what reaches
+                    // this point really is unconfirmed, and a foreign unconfirmed receive no peer relays
+                    // or requests -- with every connected peer's mempool heard -- was credited at 0-conf
+                    // and kept forever, a payment that never happened. It goes; an honest one that
+                    // confirms comes back with its block (the compact-filter match). A send keeps its
+                    // stake (the wallet spent its own coins), and so does an owned token output (below).
+                    int stake = BRWalletAmountSentByTx(manager->wallet, tx) != 0;
+#endif
                     // (the comparison arm, -DTIPSWEEP_TOKEN_STAKE_UNFIXED, counts the DGB sums alone)
 #ifndef TIPSWEEP_TOKEN_STAKE_UNFIXED
                     if (! stake) stake = BRWalletTxHasOwnedTokenOutput(manager->wallet, tx);
+#endif
+#ifndef UNCONF_DEPENDANT_UNFIXED
+                    // A receive the wallet's own held send spends is that send's stake too (review R5): removing
+                    // it releases the send as its dependant, and the send's other coins became selectable while
+                    // it may still sit in the network's mempools. Its dependants are unconfirmed, so in this list.
+                    for (size_t k = 0; ! stake && k < txCount; k++) {
+                        BRTransaction *d = BRWalletTransactionForHash(manager->wallet, hashes[k]);
+
+                        if (! d || UInt256Eq(d->txHash, tx->txHash) || BRWalletAmountSentByTx(manager->wallet, d) == 0)
+                            continue;
+                        for (size_t j = 0; j < d->inCount; j++) {
+                            if (UInt256Eq(d->inputs[j].txHash, tx->txHash)) { stake = 1; break; }
+                        }
+                    }
 #endif
                     if (! stake) {
                         // The wallet releases a record: no entry may go on naming it.
@@ -1331,8 +1356,8 @@ static void _BRPeerManagerRequestUnrelayedTx(BRPeerManager *manager, BRPeer *pee
 {
     BRPeerCallbackInfo *info;
     size_t hashCount = 0, txCount = BRWalletTxUnconfirmedBefore(manager->wallet, NULL, 0, TX_UNCONFIRMED);
-    BRTransaction *tx[txCount];
-    UInt256 txHashes[txCount];
+    BRTransaction *tx[BR_VLA_LEN(txCount)];
+    UInt256 txHashes[BR_VLA_LEN(txCount)];
     
     txCount = BRWalletTxUnconfirmedBefore(manager->wallet, tx, txCount, TX_UNCONFIRMED);
     
@@ -2468,7 +2493,7 @@ static void _peerRelayedPeers(void *info, const BRPeer peers[], size_t peersCoun
     while (peersCount > 1000 && manager->peers[peersCount - 1].timestamp + 3*60*60 < now) peersCount--;
     array_set_count(manager->peers, peersCount);
     
-    BRPeer save[peersCount];
+    BRPeer save[BR_VLA_LEN(peersCount)];
 
     for (size_t i = 0; i < peersCount; i++) save[i] = manager->peers[i];
     MGR_UNLOCK(manager);
@@ -2518,7 +2543,7 @@ static void _peerRelayedTx(void *info, BRTransaction *tx)
     size_t relayCount = 0;
     
     MGR_LOCK(manager);
-    peer_log(peer, "relayed tx: %s", u256hex(tx->txHash));
+    peer_log(peer, "relayed tx: %.12s", u256hex(tx->txHash));
     
     for (size_t i = array_count(manager->publishedTx); i > 0; i--) { // see if tx is in list of published tx
         if (UInt256Eq(manager->publishedTxHashes[i - 1], tx->txHash)) {
@@ -2629,7 +2654,7 @@ static void _peerHasTx(void *info, UInt256 txHash)
     
     MGR_LOCK(manager);
     tx = BRWalletTransactionForHash(manager->wallet, txHash);
-    peer_log(peer, "has tx: %s", u256hex(txHash));
+    peer_log(peer, "has tx: %.12s", u256hex(txHash));
 
     for (size_t i = array_count(manager->publishedTx); i > 0; i--) { // see if tx is in list of published tx
         if (UInt256Eq(manager->publishedTxHashes[i - 1], txHash)) {
@@ -2687,8 +2712,15 @@ static void _peerRejectedTx(void *info, UInt256 txHash, uint8_t code)
     int wasRelaying;
 
     MGR_LOCK(manager);
-    peer_log(peer, "rejected tx: %s", u256hex(txHash));
+    peer_log(peer, "rejected tx: %.12s", u256hex(txHash));
+    // Copies (4.1.2 row 5, K2): the manager lock does not hold the wallet's records -- a JNI remove frees
+    // them under the wallet lock alone -- so this and the parent below are read from copies taken under it.
+#ifdef WALLET_TX_WALK_UNFIXED
     tx = BRWalletTransactionForHash(manager->wallet, txHash);
+#else
+    tx = BRWalletCopyTransactionForHash(manager->wallet, txHash);
+#endif
+    BRTransaction *const held = tx;
     _BRTxPeerListRemovePeer(manager->txRequests, txHash, peer);
     wasRelaying = _BRTxPeerListRemovePeer(manager->txRelays, txHash, peer);   // a rejecting peer is not relaying it
 
@@ -2722,8 +2754,15 @@ static void _peerRejectedTx(void *info, UInt256 txHash, uint8_t code)
         // if we get rejected for any reason other than double-spend, the peer is likely misconfigured
         if (code != REJECT_SPENT && BRWalletAmountSentByTx(manager->wallet, tx) > 0) {
             for (size_t i = 0; i < tx->inCount; i++) { // check that all inputs are confirmed before dropping peer
+#ifdef WALLET_TX_WALK_UNFIXED
                 t = BRWalletTransactionForHash(manager->wallet, tx->inputs[i].txHash);
-                if (! t || t->blockHeight != TX_UNCONFIRMED) continue;
+                int unconfirmed = t && t->blockHeight == TX_UNCONFIRMED;
+#else
+                t = BRWalletCopyTransactionForHash(manager->wallet, tx->inputs[i].txHash);
+                int unconfirmed = t && t->blockHeight == TX_UNCONFIRMED;
+                if (t) BRTransactionFree(t);
+#endif
+                if (! unconfirmed) continue;
                 tx = NULL;
                 break;
             }
@@ -2731,6 +2770,11 @@ static void _peerRejectedTx(void *info, UInt256 txHash, uint8_t code)
             if (tx) _BRPeerManagerPeerMisbehavin(manager, peer);
         }
     }
+#ifndef WALLET_TX_WALK_UNFIXED
+    if (held) BRTransactionFree(held);
+#else
+    (void)held;
+#endif
 
     MGR_UNLOCK(manager);
     _BRPeerManagerFlushAnswers(manager);
@@ -3584,6 +3628,41 @@ static int _BRPeerManagerConfirmableLocked(BRPeerManager *manager, const BRMerkl
     (void)manager; (void)b; (void)tipHeight;
     return 1;
 #endif
+}
+
+// 1 if a confirmation at `height` may be taken from outside the peer-to-peer path (a server reported it): the height is
+// on the wallet's chain, at or below its tip, and that block is confirmable by the rule above -- its header was judged,
+// or a checkpoint at or below the tip pins it. A height above the tip, a block the wallet holds unjudged, and a height
+// below the headers it holds that no checkpoint pins all answer 0, and the transaction stays unconfirmed (N1/K4).
+int BRPeerManagerHeightConfirmable(BRPeerManager *manager, uint32_t height)
+{
+    int r = 0;
+
+    assert(manager != NULL);
+    if (height == 0 || height >= TX_UNCONFIRMED) return 0;
+#ifdef SERVER_HEIGHT_UNFIXED
+    return 1;   // the comparison arm: any height a server names counts (4.1.1 behaviour)
+#endif
+    MGR_LOCK(manager);
+
+    const BRMerkleBlock *tip = manager->lastBlock, *b = tip;
+
+    if (tip && height <= tip->height) {
+        // walk the chain down from the tip; it ends at a checkpoint stub (zero prevBlock) or the oldest header held
+        while (b && b->height > height) {
+            b = UInt256IsZero(b->prevBlock) ? NULL : BRSetGet(manager->blocks, &b->prevBlock);
+        }
+
+#if DGB_HEADER_DIFF_CHECK >= 1 && !defined(JUDGED_CONFIRMATION_UNFIXED)
+        if (b && b->height == height) r = _BRPeerManagerConfirmableLocked(manager, b, tip->height);
+        else r = (height <= _BRPeerManagerCheckpointAtOrBelow(manager, tip->height));   // below the headers held
+#else
+        r = 1;
+#endif
+    }
+
+    MGR_UNLOCK(manager);
+    return r;
 }
 
 // Holds the wallet transactions `txHashes` found in `b`, a main-chain block not yet confirmable, until the chain pins
@@ -4961,6 +5040,17 @@ BRPeerManager *BRPeerManagerNewEx(const BRChainParams *params, BRWallet *wallet,
     array_new(manager->peers, peersCount);
     if (peers)
         array_add_array(manager->peers, peers, peersCount);
+#ifndef ADDR_TIMESTAMP_UNFIXED
+    // A saved list may carry entries an older build wrapped from a peer's addr timestamp (4.1.2 row 22,
+    // GHSA-cqxw): a time in the future sorted above every honest peer, every launch. Clamped as the addr
+    // handler clamps an unknown time.
+    {
+        time_t nowLoad = time(NULL);
+        for (size_t i = 0; i < array_count(manager->peers); i++) {
+            if (manager->peers[i].timestamp > (uint64_t)nowLoad + 10*60) manager->peers[i].timestamp = nowLoad - 5*24*60*60;
+        }
+    }
+#endif
     qsort(manager->peers, array_count(manager->peers), sizeof(*manager->peers), _peerTimestampCompare);
     array_new(manager->connectedPeers, PEER_MAX_CONNECTIONS);
     
@@ -5733,6 +5823,21 @@ static void _peerRelayedCFHeaders(void *info, uint8_t filterType, UInt256 stopHa
     BRPeerManager *manager = ((BRPeerCallbackInfo *)info)->manager;
 
     MGR_LOCK(manager);
+
+#ifndef CF_EMPTY_BATCH_UNFIXED
+    // An empty batch is not progress (4.1.2 row 26, bobverga 1a163a2c). It returned OK before continuity,
+    // so the handler reset cfTriedCount, credited the peer as serving filters and asked the same peer
+    // again: one peer answering empty stalled CF sync for the session (and, with no chain yet, anchored a
+    // fresh one on its word). Every getcfheaders this wallet sends covers a non-empty range, so an empty
+    // answer is not a valid one: no credit, no anchor, and the peer goes, as for a batch that contradicts.
+    if (count == 0) {
+        peer_log(peer, "cfheaders: empty batch -- not progress, dropping peer");
+        manager->cfHeadersRequestedThrough = 0;   // the range is asked again, of another peer
+        _BRPeerManagerPeerMisbehavin(manager, peer);
+        MGR_UNLOCK(manager);
+        return;
+    }
+#endif
 
     // Height-alignment guard. Compute the block height this batch claims to cover
     // (stop height − count + 1) and compare it to where our chain expects the next
@@ -8751,7 +8856,7 @@ int BRPeerManagerStemPublishTx(BRPeerManager *manager, BRTransaction *tx, void *
     _BRPeerManagerPublishPendingTx(manager, stem);      // inv(inv_tx) to the stem peer only
     BRPeerSendPing(stem, peerInfo, _publishTxInvDone);  // ping→pong confirms the inv was sent
 
-    peer_log(stem, "dandelion: stem-submitted tx %s to single peer", u256hex(txHash));
+    peer_log(stem, "dandelion: stem-submitted tx %.12s to single peer", u256hex(txHash));
     MGR_UNLOCK(manager);
     _BRPeerManagerFlushAnswers(manager);
     return 1;
@@ -8789,7 +8894,7 @@ void BRPeerManagerFluffTx(BRPeerManager *manager, UInt256 txHash)
     // the bare BR_PEER_NONE sentinel to peer_log casts it to BRPeerContext* and writes
     // inet_ntop's host string past the end of the ~40-byte stack temporary — a stack
     // buffer overflow (-fstack-protector abort). Use the peer-less _peer_log.
-    _peer_log("dandelion: embargo fluff — flooded tx %s to all peers\n", u256hex(txHash));
+    _peer_log("dandelion: embargo fluff — flooded tx %.12s to all peers\n", u256hex(txHash));
     MGR_UNLOCK(manager);
 }
 
@@ -9860,6 +9965,69 @@ size_t BRPeerManagerRequestCompactFilters(BRPeerManager *manager,
     size_t n = _BRPeerManagerRequestCFiltersLocked(manager, startHeight, stopHeight, NULL);
     MGR_UNLOCK(manager);
     return n;
+}
+
+// A confirmation height a server reported for the wallet's pending transaction `txHash` (N1/K4). The server is never
+// the proof: a height the wallet's chain does not vouch for changes nothing; a block whose header and filter header
+// the wallet holds is re-checked over the peer-to-peer path instead -- a filter peer is asked for that block's filter,
+// and a match fetches the block, which confirms the transaction through the same solicited, merkle-checked delivery as
+// any other (the transaction stays pending until then, and a call with no filter peer connected is simply repeated by
+// the next reconcile). Only a height below everything the wallet holds, pinned by a checkpoint at or below its tip, is
+// taken as reported, and the record stays signature-checked at that height (BRWalletUpdateTransactionsUnproven).
+BRServerHeightResult BRPeerManagerApplyServerHeight(BRPeerManager *manager, UInt256 txHash, uint32_t height,
+                                                    uint32_t timestamp)
+{
+    assert(manager != NULL);
+
+    // only a transaction the wallet holds and that is still pending: a height the peer-to-peer path already proved is
+    // never replaced by a server's (BRWalletUpdateTransactionsUnproven checks again under the wallet lock)
+    BRTransaction *held = BRWalletCopyTransactionForHash(manager->wallet, txHash);
+    int pending = held && held->blockHeight == TX_UNCONFIRMED;
+
+    if (held) BRTransactionFree(held);
+#ifndef SERVER_HEIGHT_OVERWRITE_UNFIXED
+    if (! pending) return BR_SERVER_HEIGHT_REFUSED;
+#else
+    (void)pending;
+#endif
+    if (! BRPeerManagerHeightConfirmable(manager, height)) return BR_SERVER_HEIGHT_REFUSED;
+
+    // a server's timestamp only orders and labels the record; it may not post-date it
+    uint32_t now = (uint32_t)time(NULL);
+    if (timestamp > now) timestamp = now;
+
+#ifndef SERVER_HEIGHT_HINT_UNFIXED
+    int checkable = 0, headerHeld = 0, coverable = 0;
+
+    MGR_LOCK(manager);
+    UInt256 blockHash = _BRPeerManagerBlockHashAtHeight(manager, height);
+
+    headerHeld = ! UInt256IsZero(blockHash);
+    if (headerHeld && manager->compactFilterChain && manager->syncMode != BR_SYNC_MODE_BLOOM_ONLY &&
+        height >= BRCompactFilterChainStartHeight(manager->compactFilterChain) &&
+        height < BRCompactFilterChainNextHeight(manager->compactFilterChain)) {
+        checkable = 1;
+        if (_BRPeerManagerRequestCFiltersWithStopHashLocked(manager, height, height, blockHash, NULL) > 0)
+            debug_log("server-height: re-checking block %" PRIu32 " over P2P for a pending tx\n", height);
+    }
+    // a held header the filter chain has not reached yet (it trails the header tip during sync and for a moment
+    // after every block) or that comes before the chain exists: the scan reaches the block and decides (review R2)
+    coverable = headerHeld && (! manager->compactFilterChain ||
+                         height >= BRCompactFilterChainStartHeight(manager->compactFilterChain));
+    MGR_UNLOCK(manager);
+    if (checkable) return BR_SERVER_HEIGHT_RECHECKING;
+#ifndef SERVER_HEIGHT_HELD_UNFIXED
+    // a held header the scan can still reach is never the server's word. Below the filter chain's start no filter can
+    // ever check it -- a restore whose birth height came too late -- so that height, like one below everything held,
+    // is taken as reported, signature-checked (the residual; refusing it left a real receive pending for good)
+    if (headerHeld && coverable) return BR_SERVER_HEIGHT_RECHECKING;
+#else
+    (void)coverable;
+#endif
+#endif
+
+    BRWalletUpdateTransactionsUnproven(manager->wallet, &txHash, 1, height, timestamp);
+    return BR_SERVER_HEIGHT_TAKEN;
 }
 
 void BRPeerManagerEnableAutoCompactFilterFetch(BRPeerManager *manager, uint32_t startHeight)

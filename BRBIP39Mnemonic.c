@@ -84,7 +84,13 @@ size_t BRBIP39Decode(uint8_t *data, size_t dataLen, const char *wordList[], cons
         if (word) word++;
     }
 
+#ifndef ZERO_VLA_UNFIXED
+    // An empty phrase has no words: no zero-length buffer, and no checksum byte read before it was set
+    // (4.1.2 row 12, N9).
+    if (count > 0 && (count % 3) == 0 && (! word || *word == '\0')) { // check that phrase has correct number of words
+#else
     if ((count % 3) == 0 && (! word || *word == '\0')) { // check that phrase has correct number of words
+#endif
         uint8_t buf[(count*11 + 7)/8];
 
         for (i = 0; i < (count*11 + 7)/8; i++) {

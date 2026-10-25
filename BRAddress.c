@@ -242,6 +242,11 @@ const uint8_t *BRScriptPKH(const uint8_t *script, size_t scriptLen)
 {
     assert(script != NULL || scriptLen == 0);
     if (! script || scriptLen == 0 || scriptLen > MAX_SCRIPT_LENGTH) return NULL;
+#ifndef ZERO_VLA_UNFIXED
+    // A script that parses to no elements (a push with no data, e.g. {0x02}) is nothing to read, and
+    // must not declare a zero-length array (undefined behaviour; 4.1.2 row 12, N9).
+    if (BRScriptElements(NULL, 0, script, scriptLen) == 0) return NULL;
+#endif
 
     const uint8_t *elems[BRScriptElements(NULL, 0, script, scriptLen)], *r = NULL;
     size_t l, count = BRScriptElements(elems, sizeof(elems)/sizeof(*elems), script, scriptLen);
@@ -278,6 +283,11 @@ size_t BRAddressFromScriptPubKey(char *addr, size_t addrLen, const uint8_t *scri
 {
     assert(script != NULL || scriptLen == 0);
     if (! script || scriptLen == 0 || scriptLen > MAX_SCRIPT_LENGTH) return 0;
+#ifndef ZERO_VLA_UNFIXED
+    // A script that parses to no elements (a push with no data, e.g. {0x02}) is nothing to read, and
+    // must not declare a zero-length array (undefined behaviour; 4.1.2 row 12, N9).
+    if (BRScriptElements(NULL, 0, script, scriptLen) == 0) return 0;
+#endif
 
     uint8_t data[21];
     const uint8_t *elems[BRScriptElements(NULL, 0, script, scriptLen)];
@@ -318,7 +328,12 @@ size_t BRAddressFromScriptSig(char *addr, size_t addrLen, const uint8_t *script,
 {
     assert(script != NULL || scriptLen == 0);
     if (! script || scriptLen == 0 || scriptLen > MAX_SCRIPT_LENGTH) return 0;
-    
+#ifndef ZERO_VLA_UNFIXED
+    // A script that parses to no elements (a push with no data, e.g. {0x02}) is nothing to read, and
+    // must not declare a zero-length array (undefined behaviour; 4.1.2 row 12, N9).
+    if (BRScriptElements(NULL, 0, script, scriptLen) == 0) return 0;
+#endif
+
     uint8_t data[21];
     const uint8_t *d = NULL, *elems[BRScriptElements(NULL, 0, script, scriptLen)];
     size_t l = 0, count = BRScriptElements(elems, sizeof(elems)/sizeof(*elems), script, scriptLen);

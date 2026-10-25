@@ -483,6 +483,10 @@ void BRPeerFree(BRPeer *peer);
 void BRPeerSetSocksProxy(const char *host, int port);
 void BRPeerClearSocksProxy(void);
 int  BRPeerHasSocksProxy(void);
+// Tor required: while set, peers are reached only through the SOCKS proxy -- no direct dial, and nothing is sent on a
+// connection that was not opened through the proxy. Set from the app's Tor rule (setting on, no fallback announced).
+void BRPeerSetTorRequired(int required);
+int  BRPeerTorRequired(void);
 
 #ifdef __cplusplus
 }

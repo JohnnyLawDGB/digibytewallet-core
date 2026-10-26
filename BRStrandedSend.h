@@ -41,14 +41,20 @@
 //  Until 2026-10 this rule lived in Kotlin (StrandedSendSelector.kt), out of reach of the iOS
 //  build. Its unit tests are carried over case for case in the host KAT.
 //
-//  Host KAT: digibytewallet-android native/src/test/host/stranded_send_kat/.
-//  Header-only, static inline, no state.
+//  The refusal hold (below BRStrandedSendIsConflicted) decides when the sweep removes a send the
+//  network refused, which unlocks its coins (Android 4.1.0, PublishOutcome.actionFor and
+//  RefusalHold.kt; the conflicted verdict holds the same way since 4.1.2).
+//
+//  Host KATs: digibytewallet-android native/src/test/host/stranded_send_kat/ and
+//  native/src/test/host/refusal_hold_kat/.
+//  Header-only, static inline, no state of its own (the refusal hold's is the caller's).
 //
 
 #ifndef BRStrandedSend_h
 #define BRStrandedSend_h
 
 #include "BRTransaction.h"   // TX_UNCONFIRMED
+#include "BRPublishOutcome.h" // BRPublishOutcomeOf: the terminal verdict
 #include <stddef.h>
 #include <stdint.h>
 
@@ -133,9 +139,144 @@ static inline BRStrandedAction BRStrandedSendDecide(int listed, uint32_t height,
 // only alternative, since it cannot confirm. Only this authoritative signal removes a send, never
 // a missing relay, so a valid but slow send is never dropped. (Android's SyncService sweep; on
 // Android the asset rows such a send leaves behind are cleaned too.)
+//
+// Since Android 4.1.2 the conflicted verdict must also HOLD before the send is removed: the core
+// marks invalid an unconfirmed send that lost an ordering race to another unconfirmed wallet
+// transaction, and that send can still be the one that confirms. So the caller passes the
+// verdict through a BRStrandedRefusalHold of its own (refused = conflicted; one slot per send,
+// never the slot of the same send's peer refusal, below) and removes the send only once
+// BRStrandedRefusalHoldObserve answers 1 (Android: InvalidSendRemoval.kt).
 static inline int BRStrandedSendIsConflicted(int listed, int valid)
 {
     return listed && ! valid;
+}
+
+// ---- A send the network refused: removed, and its coins unlocked, only on all of this ----
+//
+// From Android 4.1.0 (PublishOutcome.actionFor, RefusalHold.kt; the sweep in SyncService). The
+// sweep removes a recorded send, which gives its coins back to the wallet, and forgets its
+// record, only when all three hold:
+//
+//   1. its last publish ended in a TERMINAL verdict (BRPublishOutcomeOf(error).isTerminal: EINVAL);
+//   2. it is a PLAIN DGB send (BRStrandedSendIsPlainDgb): an asset or DigiDollar send keeps its
+//      own handling, since the asset layer reads an abandoned attempt from the wallet;
+//   3. the core calls it refused BY THE NETWORK (BRPeerManagerTxRefusedByNetwork: peers in at
+//      least two network groups rejected it and no peer relayed, announced or asked for it),
+//      and that answer has HELD (BRStrandedRefusalHoldObserve): refused at two observations at
+//      least BR_STRANDED_REFUSAL_HOLD_MS apart, on one peer manager, and at every observation
+//      in between.
+//
+// No single peer's message removes a send. A terminal verdict can be one peer's rejection, and a
+// peer can reject a valid transaction honest peers already relayed: removing it would give its
+// coins back, the user would pay again with other coins, and both payments could confirm. The
+// network's answer can also come moments after a peer manager starts, before every connected
+// peer has answered, and a rebuilt manager starts with no relay evidence; hence the hold, on one
+// manager. Anything else keeps the send: its coins stay locked and the sweep carries on.
+
+// The refusal hold: ten minutes, about seven sweeps at Android's 90-second cadence. A plain
+// literal, so Swift's C importer sees it.
+#define BR_STRANDED_REFUSAL_HOLD_MS  600000LL
+
+typedef enum {
+    BRStrandedRefusalKeep = 0,            // carry on as before: validity check, bounded republish
+    BRStrandedRefusalRemoveAndUnlock = 1  // remove the send from the wallet (unlocks its coins), forget its record
+} BRStrandedRefusalAction;
+
+// Whether a recorded send moves only DGB, from the wallet's own copy of it. Every input fails
+// closed: anything that is not exactly "held, no asset, no DigiDollar" is not plain.
+//   held            the wallet holds the send (its copy could be read)
+//   containsAsset   BRTXContainsAsset of that copy: 0 for none; nonzero for an asset transfer,
+//                   or when it could not be read
+//   digiDollarType  BRDigiDollarTxType of that copy: 0 for none, 1-3 for a DigiDollar
+//                   transaction, negative when it could not be read
+// (Android: SyncService.isPlainDgbSend, which reads both through NativeBridge.)
+static inline int BRStrandedSendIsPlainDgb(int held, int containsAsset, int digiDollarType)
+{
+    return held && containsAsset == 0 && digiDollarType == 0;
+}
+
+// The sweep's action on a recorded send.
+//   publishError    the errno of its last publish (BRPublishOutcomeOf); a send with no verdict
+//                   yet passes -1 (Android's PENDING), which is not terminal
+//   plainDgb        BRStrandedSendIsPlainDgb
+//   refusedByPeers  BRStrandedRefusalHoldObserve's answer for the send's network refusal
+static inline BRStrandedRefusalAction BRStrandedRefusalActionFor(int publishError, int plainDgb,
+                                                                 int refusedByPeers)
+{
+    int terminal = BRPublishOutcomeOf(publishError).isTerminal;
+
+#if defined(STRANDED_REFUSAL_RED_NO_PLAIN_GATE)
+    // RED ARM SEAM (refusal_hold_kat): no plain-DGB gate; an asset or DigiDollar send is removed too.
+    (void)plainDgb;
+    return (terminal && refusedByPeers) ? BRStrandedRefusalRemoveAndUnlock : BRStrandedRefusalKeep;
+#elif defined(STRANDED_REFUSAL_RED_ONE_PEER)
+    // RED ARM SEAM (refusal_hold_kat): one peer's terminal rejection removes the send.
+    (void)refusedByPeers;
+    return (terminal && plainDgb) ? BRStrandedRefusalRemoveAndUnlock : BRStrandedRefusalKeep;
+#else
+    return (terminal && plainDgb && refusedByPeers) ? BRStrandedRefusalRemoveAndUnlock
+                                                    : BRStrandedRefusalKeep;
+#endif
+}
+
+// One send's first sighting of a refusal, kept by the caller, one per send (and one more per
+// send for the conflicted verdict, above). All zeroes (= {0}) is "no sighting": a new session
+// starts with none, and nothing here is ever persisted.
+typedef struct {
+    int sighted;          // 0: no sighting; the other fields mean nothing
+    int64_t firstSeenMs;  // the clock when the refusal was first seen
+    int64_t manager;      // the peer manager it was seen on
+} BRStrandedRefusalHold;
+
+// Drops the send's first sighting: the send has left the sweep.
+static inline void BRStrandedRefusalHoldForget(BRStrandedRefusalHold *hold)
+{
+    if (hold) { hold->sighted = 0; hold->firstSeenMs = 0; hold->manager = 0; }
+}
+
+// Records one observation of the core's answer for a send, and returns 1 only once the refusal
+// has held for holdMs (BR_STRANDED_REFUSAL_HOLD_MS) on one peer manager.
+//   refused         the core's answer, read BETWEEN the two readings of the manager
+//   beforeKnown, managerBefore / afterKnown, managerAfter
+//                   the peer manager (Android: the bridge's generation, which every build bumps)
+//                   read before and after the answer; known = 0 when it could not be read
+//   nowMs           a clock that never steps back and does not run while the device sleeps
+//                   (Android: SystemClock.uptimeMillis)
+// An answer that is not a refusal, during which the manager changed, or whose manager is unknown
+// is no sighting, and drops the first sighting: the refusal must hold again from the start. A
+// first sighting made on another manager starts again on this one, so a hold started on one
+// manager never completes on another. A clock reading earlier than the first sighting never
+// counts as time held (differences wrap as Kotlin's Long does). holdMs <= 0 never acts (Kotlin
+// refuses to build such a hold). A NULL hold answers 0.
+static inline int BRStrandedRefusalHoldObserve(BRStrandedRefusalHold *hold, int refused,
+                                               int beforeKnown, int64_t managerBefore,
+                                               int afterKnown, int64_t managerAfter,
+                                               int64_t nowMs, int64_t holdMs)
+{
+    if (! hold) return 0;
+    if (holdMs <= 0) { BRStrandedRefusalHoldForget(hold); return 0; }
+
+#ifdef STRANDED_REFUSAL_RED_NO_HOLD
+    // RED ARM SEAM (refusal_hold_kat): the first sighting is acted on at once.
+    (void)beforeKnown; (void)managerBefore; (void)afterKnown; (void)managerAfter; (void)nowMs;
+    return refused ? 1 : 0;
+#else
+#ifdef STRANDED_REFUSAL_RED_ANY_MANAGER
+    // RED ARM SEAM (refusal_hold_kat): the manager is not read; a hold spans a rebuild.
+    beforeKnown = afterKnown = 1; managerBefore = managerAfter = 0;
+#endif
+    if (! refused || ! beforeKnown || ! afterKnown || managerBefore != managerAfter) {
+        BRStrandedRefusalHoldForget(hold);
+        return 0;
+    }
+    if (! hold->sighted || hold->manager != managerBefore) {
+        hold->sighted = 1;
+        hold->firstSeenMs = nowMs;
+        hold->manager = managerBefore;
+        return 0;
+    }
+    return (int64_t)((uint64_t)nowMs - (uint64_t)hold->firstSeenMs) >= holdMs;
+#endif
 }
 
 #ifdef __cplusplus

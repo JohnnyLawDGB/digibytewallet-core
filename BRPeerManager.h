@@ -677,6 +677,22 @@ uint32_t BRPeerManagerEstimatedBlockHeight(BRPeerManager *manager);
 // current proof-of-work verified best block height
 uint32_t BRPeerManagerLastBlockHeight(BRPeerManager *manager);
 
+// 1 if a confirmation a server reports at `height` may be taken: the height is on the wallet's chain at or below its
+// tip and that block is confirmable (its header judged, or pinned by a checkpoint at or below the tip). 0 otherwise:
+// the transaction stays unconfirmed. Never takes the server's word for a height the wallet cannot vouch for.
+int BRPeerManagerHeightConfirmable(BRPeerManager *manager, uint32_t height);
+
+typedef enum {
+    BR_SERVER_HEIGHT_REFUSED = 0,     // the wallet's chain does not vouch for the height: nothing changes
+    BR_SERVER_HEIGHT_RECHECKING = 1,  // the block is re-checked over P2P (or will be, next call); the tx stays pending
+    BR_SERVER_HEIGHT_TAKEN = 2,       // below everything the wallet holds, checkpoint-pinned: confirmed there, unproven
+} BRServerHeightResult;
+
+// Apply a confirmation height a server reported for the wallet's pending tx `txHash`. A server's height is never the
+// proof where the wallet can check: see BRServerHeightResult.
+BRServerHeightResult BRPeerManagerApplyServerHeight(BRPeerManager *manager, UInt256 txHash, uint32_t height,
+                                                    uint32_t timestamp);
+
 // current proof-of-work verified best block timestamp (time interval since unix epoch)
 uint32_t BRPeerManagerLastBlockTimestamp(BRPeerManager *manager);
 
@@ -730,6 +746,15 @@ void BRPeerManagerRemoveTransaction(BRPeerManager *manager, UInt256 txHash);
 
 // number of connected peers that have relayed the given unconfirmed transaction
 size_t BRPeerManagerRelayCount(BRPeerManager *manager, UInt256 txHash);
+
+// 1 when the network has refused the transaction on evidence no single peer can supply: peers in at
+// least two network groups (an IPv4 address's /16, any other address's /32) rejected it as invalid,
+// non-standard or dust, and no peer has relayed, announced or asked for it in this manager's life.
+// 0 otherwise -- after one peer's rejection, however often repeated, and whenever a peer has had the
+// transaction, even if that peer has since disconnected, answered notfound or rejected it: the relay
+// evidence is kept until the transaction confirms or is removed. A reject message is one peer's word:
+// the peer's own rejection is recorded, never a verdict on the transaction's behalf.
+int BRPeerManagerTxRefusedByNetwork(BRPeerManager *manager, UInt256 txHash);
 
 // Enable/disable Dandelion stem submission (default on). Thread-safe.
 void BRPeerManagerSetDandelionEnabled(BRPeerManager *manager, int enabled);

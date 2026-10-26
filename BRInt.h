@@ -382,4 +382,12 @@ inline static UInt256 UInt256Get(const void *b32)
 }
 #endif
 
+// The length of a variable-length array sized by a count that can be 0: a zero-length VLA is undefined behaviour
+// (4.1.2 row 12, N9; review R9). The extra slot is never read -- every such array is filled and walked by its count.
+#ifndef ZERO_VLA_UNFIXED
+#define BR_VLA_LEN(n) ((n) > 0 ? (n) : 1)
+#else
+#define BR_VLA_LEN(n) (n)
+#endif
+
 #endif // BRInt_h

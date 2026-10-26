@@ -116,6 +116,10 @@ BRTransaction *BRTransactionCopy(const BRTransaction *tx);
 // retruns a transaction that must be freed by calling BRTransactionFree()
 BRTransaction *BRTransactionParse(const uint8_t *buf, size_t bufLen);
 
+// parses a transaction in the network's signed format only -- never reading an input as the wallet's
+// internal unsigned form; use for every transaction that came from outside this wallet's own builder
+BRTransaction *BRTransactionParseSigned(const uint8_t *buf, size_t bufLen);
+
 // returns number of bytes written to buf, or total bufLen needed if buf is NULL
 // (tx->blockHeight and tx->timestamp are not serialized)
 size_t BRTransactionSerialize(const BRTransaction *tx, uint8_t *buf, size_t bufLen);

@@ -234,6 +234,21 @@ int BRWalletAddressIsUsed(BRWallet *wallet, const char *addr);
 // returns the number of transactions written, or total number available if transactions is NULL
 size_t BRWalletTransactions(BRWallet *wallet, BRTransaction *transactions[], size_t txCount);
 
+// BRWalletTransactions and BRWalletTransactionForHash hand out the wallet's own objects after the wallet
+// lock is released, and BRWalletRemoveTransaction may free them at any time from another thread. A reader
+// outside the wallet uses these instead, which copy while the lock is held:
+
+// deep copies of the registered transactions, oldest first, taken in one lock hold; same count rules as
+// BRWalletTransactions. The caller frees each copy written with BRTransactionFree().
+size_t BRWalletCopyTransactions(BRWallet *wallet, BRTransaction *transactions[], size_t txCount);
+
+// the registered transactions' hashes, in BRWalletTransactions order, taken in one lock hold
+size_t BRWalletTransactionHashes(BRWallet *wallet, UInt256 hashes[], size_t count);
+
+// a deep copy of the registered transaction with the given hash, taken under the lock, or NULL;
+// the caller frees it with BRTransactionFree()
+BRTransaction *BRWalletCopyTransactionForHash(BRWallet *wallet, UInt256 txHash);
+
 // serializes ALL registered transactions (oldest first) into `buf` as one persistence blob,
 // holding wallet->lock across the ENTIRE size+write pass so no BRTransaction can be freed
 // mid-serialize (the lock-safe replacement for the BRWalletTransactions-copy-then-serialize
@@ -338,7 +353,9 @@ void BRWalletUpdateTransactionsUnproven(BRWallet *wallet, const UInt256 txHashes
 // removes a tx from the wallet and calls BRTransactionFree() on it, along with any tx that depend on its outputs
 void BRWalletRemoveTransaction(BRWallet *wallet, UInt256 txHash);
 
-// returns the transaction with the given hash if it's been registered in the wallet
+// returns the transaction with the given hash if it's been registered in the wallet. The object is the
+// wallet's own and may be freed by BRWalletRemoveTransaction once the call returns: outside the wallet, use
+// the answer only as "held or not" (or as an identity comparison), and BRWalletCopyTransactionForHash to read it.
 BRTransaction *BRWalletTransactionForHash(BRWallet *wallet, UInt256 txHash);
 
 // true if no previous wallet transaction spends any of the given transaction's inputs, and no inputs are invalid
@@ -373,6 +390,13 @@ uint64_t BRWalletAmountReceivedFromTx(BRWallet *wallet, const BRTransaction *tx)
 
 // returns the amount sent from the wallet by the trasaction (total wallet outputs consumed, change and fee included)
 uint64_t BRWalletAmountSentByTx(BRWallet *wallet, const BRTransaction *tx);
+
+// returns 1 if the transaction pays an output this wallet owns that carries a token -- a DigiDollar output
+// bound to an amount slot, or an output holding DigiAsset units (an asset instruction names it, its carrier
+// cannot be classified, or the asset layer registered it) -- else 0. A DigiDollar output is zero-value by
+// protocol, so the two DGB sums above do not see it. Height-agnostic: an unconfirmed transaction is classified
+// as it will be once confirmed.
+int BRWalletTxHasOwnedTokenOutput(BRWallet *wallet, const BRTransaction *tx);
 
 // returns the fee for the given transaction if all its inputs are from wallet transactions, UINT64_MAX otherwise
 uint64_t BRWalletFeeForTx(BRWallet *wallet, const BRTransaction *tx);

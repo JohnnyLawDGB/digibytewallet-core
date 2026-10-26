@@ -136,6 +136,12 @@ typedef struct {
     uint8_t *flags;
     size_t flagsLen;
     uint32_t height;
+    // 1 while the header has no difficulty verdict the wallet can vouch for: it was not judged (no history under it,
+    // or below MultiShield V4), or it was judged only against headers that were themselves unjudged. Set by the peer
+    // manager when it accepts a relayed header; 0 for a checkpoint, a header matching one, a persisted header and
+    // anything not relayed. A wallet transaction is confirmed into such a block only once a checkpoint the chain has
+    // reached pins it (BRPeerManager.c, _BRPeerManagerConfirmableLocked).
+    uint32_t unjudged;
 } BRMerkleBlock;
     
 // Taken from https://github.com/digibyte/digibyte/blob/ce4e150f6d77abdd533a3b289ffd9f19fe8af277/src/primitives/block.h

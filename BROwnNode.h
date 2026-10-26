@@ -9,17 +9,24 @@
 //
 //  BROwnNodeParseHostPort (CustomNode.parse, the typed field): "host" or "host:port". Trimmed as
 //  Kotlin's trim() trims (ASCII 9-13 and 28-31, and Unicode Zs, Zl, Zp). The port is after the
-//  LAST ':', trimmed, Kotlin's toIntOrNull (an optional sign, then decimal digits; overflow is no
-//  number) and 1..65535; without one, the default. The host is trimmed again and must be
-//  non-empty with no "//" (a URL) and no ':' (IPv6). Any other bytes are accepted, as Kotlin
-//  accepts them.
+//  LAST ':', trimmed, read as Kotlin's toIntOrNull reads it (an optional sign, then decimal digits;
+//  overflow is no number) but in ASCII digits only (see below), and 1..65535; without one, the
+//  default. The host is trimmed again and must be non-empty with no "//" (a URL) and no ':'
+//  (IPv6). Any other bytes are accepted, as Kotlin accepts them.
 //  BROwnNodeUriParse (OwnNodeUri.parse, a scanned or pasted reference): `dgbnode://host[:port]
 //  [?net=&label=]`, or a raw host[:port]. The host:port must be letters, digits, '.', '-' and
 //  ':' only, and a `.onion` host is refused (not yet supported). Query values are decoded as
-//  java.net.URLDecoder decodes them; where URLDecoder would throw, the raw value is used, as
-//  Kotlin's catch does. net is the last "mainnet" or "testnet" given; the label is the last
-//  label= value, decoded but NOT filtered: the platform filters it for display (letters, digits,
-//  whitespace, "-_.", trimmed, at most 32 UTF-16 units), since a label decides nothing.
+//  java.net.URLDecoder decodes them ON AN ANDROID DEVICE; where it would throw, the raw value is
+//  used, as Kotlin's catch does. Android's libcore URLDecoder ("Android-changed: App compat.
+//  Forbid non-hex chars after '%'", present from Android 7 through AOSP main) throws when either
+//  character after a '%' is not an ASCII hex digit, before Integer.parseInt sees it. Desktop
+//  Java does not: it hands the pair to Integer.parseInt, which reads "%+F" as 15, "%-0" as 0 and
+//  accepts non-ASCII digits. This follows the device: "My%20Node%+5" is the raw value
+//  "My%20Node%+5", not "My Node" and a byte 5. The Kotlin unit tests (OwnNodeUriTest) run on a
+//  desktop JVM, so they show desktop Java's answer, not the device's; the host KAT is the
+//  device's. net is the last "mainnet" or "testnet" given; the label is the last label= value,
+//  decoded but NOT filtered: the platform filters it for display (letters, digits, whitespace,
+//  "-_.", trimmed, at most 32 UTF-16 units), since a label decides nothing.
 //  BROwnNodeIPv4Literal (OwnNodeAddress.ipv4Literal): four dot-separated groups of one to three
 //  ASCII digits, each at most 255, canonicalised ("010.1.2.3" is 10.1.2.3).
 //  BROwnNodeResolvePlan (OwnNodeAddress.resolve): an IPv4 address is used as given; with Tor on,
@@ -31,10 +38,14 @@
 //  anything else is dark: 2 (connected but serving no filters, a node without
 //  peerblockfilters=1) is exactly the misconfiguration this status exists to show.
 //
-//  Where this refuses what Kotlin accepts (iOS shows the address as invalid; Android saves it and
-//  then cannot use it): a port written in non-ASCII digits, a host longer than the caller's
-//  buffer, and letters outside ASCII in a dgbnode:// host (Android's lookup cannot resolve them
-//  either). A percent escape written in non-ASCII hex digits reads as malformed (the raw value).
+//  Where this refuses what Kotlin accepts (iOS shows the address as invalid):
+//  - A port written in non-ASCII digits. A deliberate difference: Kotlin's toIntOrNull reads any
+//    Unicode decimal digit (Character.digit), so Android accepts "host:" followed by 12024 in
+//    Arabic-Indic digits (U+0661 U+0662 U+0660 U+0662 U+0664) and dials port 12024. The C refuses
+//    it: a port should be the digits it shows in ASCII, and refusing is the safer side. Android's
+//    CustomNode.parse is to follow (ASCII digits only).
+//  - A host longer than the caller's buffer (BR_OWN_NODE_HOST_MAX holds any DNS name, 253).
+//  - Letters outside ASCII in a dgbnode:// host (Android's lookup does not resolve them either).
 //
 //  Host KAT: digibytewallet-android native/src/test/host/own_node_kat/ (CustomNodeTest,
 //  OwnNodeUriTest and OwnNodeAddressTest, case for case, plus the edges above).
@@ -170,10 +181,11 @@ static inline int _BROwnNodeHex(unsigned char c)
     return -1;
 }
 
-// java.net.URLDecoder.decode(s, "UTF-8") over s[0..len) into out (capacity >= len): '+' is a
-// space; each run of %XX is bytes, where XX is Integer.parseInt(XX, 16) (so "+F" is 15 and "-0"
-// is 0, a negative value throws); a '%' that cannot start a full escape throws. Returns the
-// decoded length, or -1 where URLDecoder throws (the caller then uses the raw value).
+// Android's java.net.URLDecoder.decode(s, "UTF-8") over s[0..len) into out (capacity >= len):
+// '+' is a space; each run of %XX is bytes, and XX must be two ASCII hex digits (libcore's
+// isValidHexChar: 0-9, a-f, A-F; so "%+F", "%-0" and a non-ASCII digit all throw, unlike desktop
+// Java); a '%' that cannot start a full escape throws. Returns the decoded length, or -1 where
+// URLDecoder throws (the caller then uses the raw value).
 static inline long _BROwnNodeUrlDecode(const char *s, size_t len, char *out)
 {
     size_t i = 0, n = 0;
@@ -184,17 +196,10 @@ static inline long _BROwnNodeUrlDecode(const char *s, size_t len, char *out)
         if (c == '+') { out[n++] = ' '; i++; continue; }
         if (c != '%') { out[n++] = c; i++; continue; }
         while (i + 2 < len && c == '%') {
-            const unsigned char a = (unsigned char)s[i + 1], b = (unsigned char)s[i + 2];
-            int v;
+            const int a = _BROwnNodeHex((unsigned char)s[i + 1]), b = _BROwnNodeHex((unsigned char)s[i + 2]);
 
-            if (a == '+' || a == '-') {
-                if (_BROwnNodeHex(b) < 0) return -1;
-                v = (a == '-') ? -_BROwnNodeHex(b) : _BROwnNodeHex(b);
-            }
-            else if (_BROwnNodeHex(a) < 0 || _BROwnNodeHex(b) < 0) return -1;
-            else v = _BROwnNodeHex(a) << 4 | _BROwnNodeHex(b);
-            if (v < 0) return -1;
-            out[n++] = (char)v;
+            if (a < 0 || b < 0) return -1;
+            out[n++] = (char)(a << 4 | b);
             i += 3;
             if (i < len) c = s[i];
         }

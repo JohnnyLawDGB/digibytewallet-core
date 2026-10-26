@@ -165,7 +165,9 @@ static inline int64_t BRSavedBlocksTopHeight(const uint8_t *b, size_t len)
 // advances (DigiByte reorgs are far shallower than the gaps seen), so a lower window is stale: one
 // replacing a higher window across launches (23 176 000 -> 23 060 000, observed) forced a
 // ~480 000-block re-sync. An unreadable top (-1) is written anyway, so a real save is never
-// silently lost. persistedTop is 0 when nothing is persisted.
+// silently lost. persistedTop is 0 when nothing is persisted. A caller that deliberately drops
+// its saved blocks (a rescan or reset) must reset its persisted top with them, as Android clears
+// saved_blocks_tip; otherwise this guard refuses every lower window that follows.
 static inline int BRSavedBlocksShouldPersist(int64_t newTop, int64_t persistedTop)
 {
 #ifdef SAVED_BLOCKS_GUARD_RED

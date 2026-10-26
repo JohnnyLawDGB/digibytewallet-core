@@ -1,0 +1,145 @@
+name: CI
+
+# The core has no test suite of its own: its known-answer tests live in the Android wallet
+# (JohnnyLawDGB/digibytewallet-android, native/src/test/host/*_kat), which carries this repo as
+# the submodule native/src/main/jni/digibytewallet-core. This workflow checks out the Android
+# repo, drops THIS core checkout in at the submodule path, and runs the same host KAT sweep the
+# Android CI runs -- on Linux, so the 32-bit, sanitizer and LeakSanitizer arms a Mac cannot run
+# are exercised (docs/development-process.md in the Android repo, "What CI must cover").
+on:
+  pull_request:
+    branches: [develop, master]
+    # `edited` so an `Android-Branch:` line added to the description takes effect without a push.
+    types: [opened, synchronize, reopened, edited]
+  push:
+    branches: [develop]
+  workflow_dispatch:
+    inputs:
+      android_ref:
+        description: 'Android branch to test this core against (default: auto, see "Pick the Android branch")'
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+
+# A new push to a PR supersedes its running sweep (1h45m). Other runs group by commit, so every
+# merge to develop gets its own run: a group keeps only one pending run, and a shared develop group
+# would drop the middle merge of three.
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  host-kats:
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    permissions:
+      contents: read
+    steps:
+      # COMPANION ANDROID BRANCH. A core change that adds or changes a KAT usually ships with an
+      # Android PR carrying that KAT, so testing against Android `develop` would miss it (or fail on
+      # a KAT develop does not have yet). The Android branch is chosen, first match wins:
+      #   1. workflow_dispatch input `android_ref`;
+      #   2. a line `Android-Branch: <name>` in the core PR's description;
+      #   3. an Android branch with the same name as the core branch (core `claude/foo` -> `claude/foo`);
+      #   4. the same name plus `-kat` (core `claude/foo` -> `claude/foo-kat`);
+      #   5. `develop`.
+      # Candidates 1-2 must exist or the job fails (an explicit request that silently fell back to
+      # develop would test the wrong thing); 3-4 are only used if they exist. Values from the event
+      # arrive through env, never interpolated into the script.
+      - name: Pick the Android branch
+        id: android
+        env:
+          ANDROID_REPO: https://github.com/JohnnyLawDGB/digibytewallet-android.git
+          INPUT_REF: ${{ inputs.android_ref }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+          CORE_BRANCH: ${{ github.head_ref || github.ref_name }}
+        run: |
+          set -euo pipefail
+          valid() { [[ "$1" =~ ^[A-Za-z0-9._/-]+$ ]] && [[ "$1" != *..* ]]; }
+          # ls-remote --exit-code: 2 = no such branch; any other failure (network) fails the job
+          # rather than quietly testing against develop.
+          exists() {
+            valid "$1" || return 1
+            rc=0
+            git ls-remote --exit-code --heads "$ANDROID_REPO" "refs/heads/$1" >/dev/null || rc=$?
+            [ "$rc" -eq 0 ] && return 0
+            [ "$rc" -eq 2 ] && return 1
+            echo "::error::git ls-remote failed (rc $rc) looking up $1"; exit 1
+          }
+          explicit="${INPUT_REF:-}"
+          if [ -z "$explicit" ]; then
+            explicit="$(printf '%s\n' "${PR_BODY:-}" | tr -d '\r' \
+              | sed -n 's/^[[:space:]]*Android-Branch:[[:space:]]*\([^[:space:]]*\).*$/\1/p' | head -1)"
+          fi
+          if [ -n "$explicit" ]; then
+            if ! exists "$explicit"; then
+              echo "::error::requested Android branch '$explicit' does not exist (or is not a valid name)"
+              exit 1
+            fi
+            ref="$explicit"
+          elif [ "$CORE_BRANCH" != develop ] && [ "$CORE_BRANCH" != master ] && exists "$CORE_BRANCH"; then
+            ref="$CORE_BRANCH"
+          elif [ "$CORE_BRANCH" != develop ] && [ "$CORE_BRANCH" != master ] && exists "$CORE_BRANCH-kat"; then
+            ref="$CORE_BRANCH-kat"
+          else
+            ref=develop
+          fi
+          echo "core branch: $CORE_BRANCH -> Android branch: $ref"
+          echo "Core tested against Android \`$ref\`." >> "$GITHUB_STEP_SUMMARY"
+          # Green here means green against that branch; the run on develop after the merge is
+          # what checks Android develop.
+          if [ "$ref" != develop ]; then
+            echo "::notice::tested against Android branch $ref, not develop"
+          fi
+          echo "ref=$ref" >> "$GITHUB_OUTPUT"
+
+      # No submodules: the core is substituted below, and the Android repo has no other submodule.
+      - name: Check out the Android wallet
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          repository: JohnnyLawDGB/digibytewallet-android
+          ref: ${{ steps.android.outputs.ref }}
+          path: android
+          submodules: false
+          persist-credentials: false
+
+      # The PR's head commit (not GitHub's merge preview), i.e. exactly what the Android submodule
+      # pin would point at. secp256k1 is vendored in this repo as plain files, not a nested
+      # submodule, so there is nothing further to initialize.
+      - name: Check out this core at the submodule path
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          path: android/native/src/main/jni/digibytewallet-core
+          # Full history: some suites check a base commit (dd_coin_selection_kat's base-drift
+          # gate) and skip when it is missing.
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Show what is under test
+        env:
+          ANDROID_REF: ${{ steps.android.outputs.ref }}
+        run: |
+          echo "android: $(git -C android rev-parse HEAD) ($ANDROID_REF)"
+          echo "core:    $(git -C android/native/src/main/jni/digibytewallet-core rev-parse HEAD)"
+
+      # Same toolchain as the Android CI's sweep: the runner image ships clang and its sanitizer
+      # runtimes (incl. LeakSanitizer and the 32-bit ASan runtime) but not the 32-bit libc headers,
+      # which the suites with a `clang -m32` arm need. A suite that cannot build an arm fails rather
+      # than skips, on purpose: install the toolchain, never relax the suite.
+      - name: 32-bit toolchain for the native sweep
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq gcc-multilib
+
+      # Exits non-zero if any KAT fails or a *_kat directory has no runner. The floor catches a
+      # sweep that ran almost nothing (an Android ref with few or no suites) and still exited 0.
+      - name: Native host KATs (full sweep)
+        working-directory: android
+        run: |
+          ./scripts/run-host-kats.sh 2>&1 | tee "$RUNNER_TEMP/kats.log"
+          passed="$(sed -n 's/^host KATs: \([0-9]*\) passed.*/\1/p' "$RUNNER_TEMP/kats.log" | tail -1)"
+          if [ "${passed:-0}" -lt 150 ]; then
+            echo "::error::only ${passed:-0} host KAT suites passed (expected at least 150)"
+            exit 1
+          fi

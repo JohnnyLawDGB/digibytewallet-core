@@ -9576,8 +9576,24 @@ static void _BRPeerManagerCFFollowReorgLocked(BRPeerManager *manager, uint32_t f
 // uses addresses faster than its look-ahead: the block that reveals address N arrives after
 // the filter for the block that pays address N+11 was already judged a miss.
 //
-// So the scan goes back to `height` and every filter from there up is fetched and matched
-// again, now against the grown set. The rewind is the same one a reorg makes
+// Blocks are not delivered in height order, so the rewind cannot start at `height`. Every
+// filter above the scan frontier (scannedThrough) was judged while some matched block below it
+// could still be in flight, i.e. against a set that may lack growth an in-order scan would
+// have given it. Concretely, with a window of 0..109: X at H1 pays index 104, B at H2 pays 112,
+// A at H3 pays 105, H1 < H2 < H3, and all three filters are judged before any block arrives
+// (B misses). A's block arrives first and grows the set; X's then grows nothing (the set
+// already covers it), so X never triggers a rewind of its own. Rewinding from H3 leaves H2
+// scanned and the payment to 112 is lost. Whichever block grows the set first may be the
+// highest one, so the rewind starts at scannedThrough + 1: the frontier only passes a matched
+// height once its full block was delivered (the block-completion gate), so every height at or
+// below it was judged after all growth from blocks beneath it, which is exactly what an
+// in-order scan would have seen. While the delivering block is outstanding its own height
+// pins the frontier below it, so scannedThrough + 1 <= height; a block delivered again after
+// its height was completed (a re-match after an earlier rewind) can sit at or below the
+// frontier, and then the rewind starts at `height` itself.
+//
+// So the scan goes back to min(scannedThrough + 1, height) and every filter from there up is
+// fetched and matched again, now against the grown set. The rewind is the same one a reorg makes
 // (BRCFScanLedgerRewindTo plus the forward-fetch cursor), so the ordinary forward drive does
 // the re-fetch; a re-matched block that was already delivered is delivered again and its
 // transactions are registered idempotently. `height` itself is included: a transaction
@@ -9592,8 +9608,8 @@ static void _BRPeerManagerCFFollowReorgLocked(BRPeerManager *manager, uint32_t f
 // A wallet that never uses an address within the gap limit of the end of its window never
 // extends a chain here, so it never reaches this function: its scan, its address set and its
 // wallet state are exactly what they were. The cost is paid only on growth: at most the
-// heights requested above `height` (bounded by the convoy, CF_CONVOY_WINDOW above the scan
-// frontier, which `height` pins because its block was still outstanding) are fetched again,
+// heights requested above the scan frontier (bounded by the convoy, CF_CONVOY_WINDOW above
+// it) are fetched again,
 // plus the full blocks among them that match. The set grows a bounded number of times (once
 // per ~100 addresses used past the window, after the top-up), so the rewinds terminate.
 //
@@ -9605,12 +9621,19 @@ static void _BRPeerManagerCFRescanAfterGrowthLocked(BRPeerManager *manager, uint
 
     _BRPeerManagerPregenAddrWindow(manager);   // restore the full look-ahead before re-matching
 
+#ifdef CF_GAP_RESCAN_FROM_HEIGHT_UNFIXED
+    // PRE-FIX shape — host-KAT red-before-green ONLY (cf_gap_rescan_kat out-of-order case).
     uint32_t from = height;
+#else
+    // Out-of-order delivery: start at the frontier, not at the delivering block (see above).
+    uint32_t from = BRCFScanLedgerScannedThrough(&manager->cfLedger) + 1;
+    if (height < from) from = height;
+#endif
     uint32_t start = BRCFScanLedgerStartHeight(&manager->cfLedger);
     uint32_t abandoned = BRCFScanLedgerAbandonedBelow(&manager->cfLedger);
     if (from < start) from = start;            // RewindTo would otherwise move the ledger's start down
     if (from < abandoned) from = abandoned;    // heights below the hard floor are never re-requested
-    if (from == 0 || from > manager->cfLedger.requestedThrough) return;   // nothing evaluated at or above it
+    if (from == 0 || from > manager->cfLedger.requestedThrough) return;   // nothing judged at or above it
 
     uint32_t requestedThrough = manager->cfLedger.requestedThrough;
     BRCFScanLedgerRewindTo(&manager->cfLedger, from);

@@ -1,10 +1,26 @@
 //
 //  BRWalletSend.h
 //
-//  The two rules a platform must follow around BRPeerManagerPublishTx, shared so iOS and
-//  Android follow them identically. Until 2026-10 both lived in the Android JNI bridge
+//  The rules a platform must follow around BRPeerManagerPublishTx, shared so iOS and Android
+//  follow them identically. Until 2026-10 they lived in the Android JNI bridge
 //  (jni_transaction.c: _registerWalletCopy and the publish-result ring), which the iOS
-//  XCFramework does not contain.
+//  XCFramework does not contain. This header carries rules 1 and 2; steps 0 and 1b below are
+//  the rest of every Android publish path (since 4.1.2) and are not in this header.
+//
+//  The order, as every Android publish path runs it (publishTransaction, publishTransactionStem,
+//  sendApprovedDigiDollar):
+//
+//     0. tx = BRTransactionParseSigned(bytes)       -- only where the send arrives as bytes
+//     1. BRWalletRegisterOwnSend(wallet, tx)        -- rule 1 below (Android: _registerWalletCopy)
+//    1b. coin_reservation_release(tx->txHash)       -- immediately after 1, never before
+//     2. BRPeerManagerPublishTx(manager, tx, ctx, cb) with cb recording into a BRPublishRing
+//
+//  0. PARSE PUBLISH BYTES AS SIGNED. A send handed to the publish as serialized bytes (Android's
+//     publishTransaction and publishTransactionStem; the DigiDollar path builds and signs its tx
+//     in-process and has no bytes to parse) is read with BRTransactionParseSigned, never
+//     BRTransactionParse: the latter may read a signed input whose scriptSig also looks like a
+//     scriptPubKey as the internal unsigned form, misparse the rest, and get the txid wrong
+//     (4.1.2 row 9). The wallet would then register, and key the ring by, a hash no peer echoes.
 //
 //  1. ONE OWNER PER OBJECT (BRWalletRegisterOwnSend). The wallet keeps its own record of a
 //     send and the peer manager is handed the ORIGINAL to broadcast; the manager takes
@@ -20,7 +36,24 @@
 //     Register BEFORE publishing, so the send is in BRWalletTransactions() the moment the
 //     publish returns, and pass a NON-NULL callback to BRPeerManagerPublishTx: a NULL-callback
 //     publish is never cancelled or freed, so a send the network refused stays "pending" with
-//     its inputs marked spent.
+//     its inputs marked spent. (Step 1b, the coin-reservation release, goes between this
+//     registration and the publish.)
+//
+//  1b. RELEASE THE COIN RESERVATION RIGHT AFTER REGISTERING. Since 4.1.2 Android's signer claims
+//     a signed transaction's inputs for its txid (bridge coin_reservation.h; seed_sign_transaction)
+//     and refuses to sign another transaction spending a claimed coin. The claim covers the window
+//     between the signature and step 1, when the wallet does not yet hold those coins as spent.
+//     Release it only AFTER step 1: releasing before the wallet's record exists reopens exactly
+//     that window (a second send checked in between is signed on the same coins -- the
+//     double-sign 4.1.2 closed). Never releasing is not safe either: the coins stay held for the
+//     reservation's TTL (COIN_RESERVATION_TTL_S, 60 s), refusing every legitimate send that needs
+//     them. Android releases unconditionally, whether or not rule 1 took a copy (a record
+//     already held marks the coins spent just the same). Android gates the order with
+//     native/src/test/host/coin_reservation_kat/run.sh (each _registerWalletCopy line must be
+//     followed directly by the release).
+//     Coin reservation lives only in Android's bridge today. A platform with more than one path
+//     that signs (a send, a DigiDollar or asset send, a sweep) needs the same claim/release; it is
+//     a push-down candidate for this core.
 //
 //  2. THE PUBLISH VERDICT IS RECORDED (BRPublishRing). The publish callback fires on a peer
 //     thread long after the caller returned, so the platform asks later. A fixed ring, not a

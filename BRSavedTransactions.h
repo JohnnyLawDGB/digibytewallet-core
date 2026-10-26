@@ -19,6 +19,15 @@
 //  restored without its height reads as unconfirmed, and the balance a user sees after a
 //  restart changes.
 //
+//  Every record is a transaction the wallet registered, and the wallet registers only signed
+//  transactions, so each one is read with BRTransactionParseSigned (BRTransaction.h).
+//  BRTransactionParse also accepts the wallet's internal unsigned form and decides per input
+//  which it is reading: a signed input whose scriptSig also reads as a scriptPubKey
+//  (OP_0 PUSH20 / PUSH32) is taken for an unsigned one, and the rest of the transaction
+//  misparses -- wrong txid and outputs, or no transaction at all. The Android bridge's
+//  reader moved to BRTransactionParseSigned in 4.1.2; this one must read the same bytes the
+//  same way, or a relaunch restores a different wallet on iOS than on Android.
+//
 //  Host KAT: digibytewallet-android native/src/test/host/saved_transactions_core_kat/.
 //  Header-only, static inline; no locking or I/O.
 //
@@ -44,7 +53,8 @@ extern "C" {
 // over when the transactions are handed to them. On a
 // corrupt count (0 or above BR_SAVED_TRANSACTIONS_MAX_COUNT), a NULL or short blob, or a
 // failed allocation, sets *outTxs = NULL and returns 0. A record running past the blob
-// ends the walk; the records before it are kept. A record that does not parse is skipped.
+// ends the walk; the records before it are kept. A record that does not parse as a signed
+// transaction is skipped.
 static inline size_t BRSavedTransactionsDeserialize(const uint8_t *buf, size_t len, BRTransaction ***outTxs)
 {
     size_t pos = 0, loaded = 0;
@@ -67,7 +77,13 @@ static inline size_t BRSavedTransactionsDeserialize(const uint8_t *buf, size_t l
         BRTransaction *tx;
 
         if (txSize > len - pos) break;   // pos <= len holds here (loop condition)
+#ifdef SAVED_TRANSACTIONS_UNSIGNED_PARSE_UNFIXED
+        // RED-gate shape only: the inferring parser, which misreads a signed input shaped
+        // like a scriptPubKey. Never defined in a production build.
         tx = BRTransactionParse(&buf[pos], txSize);
+#else
+        tx = BRTransactionParseSigned(&buf[pos], txSize);
+#endif
         pos += txSize;
         if (! tx) continue;
 #ifdef SAVED_TRANSACTIONS_METADATA_UNFIXED

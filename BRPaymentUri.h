@@ -29,8 +29,12 @@
 //    - input is bounded at BR_PAYMENT_URI_MAX bytes and must not contain a NUL byte;
 //    - trimming and "blank" are ASCII whitespace only, and integers are ASCII digits only
 //      (Kotlin also accepted Unicode spaces and digits, e.g. an Arabic-Indic asset quantity);
-//    - a percent escape is '%' and exactly two hex digits; Kotlin's toIntOrNull(16) also
-//      accepted a sign ("%-1" decoded to byte 0xFF);
+//    - a percent escape is '%' and exactly two ASCII hex digits (0-9 a-f A-F); anything else
+//      leaves the '%' as a literal character. Kotlin's toIntOrNull(16) also accepted a sign
+//      ("%-1" decoded to byte 0xFF) and, through Character.digit, any Unicode decimal digit:
+//      full-width "%<U+FF16><U+FF11>" decoded to 'a', so "digibyte:DA?%<U+FF16><U+FF11>mount=1000
+//      &amount=1" was 1000 DGB on Android and 1 DGB here. DigiByteUri.kt's decoder matches
+//      _BRUriHex as of Android branch claude/uri-ascii-hex (2026-10-26);
 //    - decoding works on bytes, so UTF-8 outside the BMP survives; Kotlin re-encoded a
 //      surrogate pair one half at a time, turning an emoji into "??".
 //  The scheme is matched case-sensitively, as before; BIP21 allows "DIGIBYTE:" and accepting it

@@ -2502,6 +2502,33 @@ static int _BRWalletRegisterTx(BRWallet *wallet, BRTransaction *tx, int checkInp
                 }
             }
         }
+#ifndef WALLET_FOREIGN_PROMOTE_UNFIXED
+        else {
+            // The wallet already holds a record of this hash. When that record is a kept NON-wallet tx (foreignTx)
+            // that pays the wallet now, the address set grew after it was kept: a block handed it over before a
+            // later transaction in the same block extended a chain to the address it pays (the compact-filter gap
+            // rescan then delivers the block again, see _BRPeerManagerCFRescanAfterGrowthLocked). Without this the
+            // record stays foreign forever: the re-delivery is a no-op, the block's confirmation stamps a height
+            // on it, and the payment is never counted. Promote it through the same checks a new tx takes.
+            BRTransaction *rec = BRSetGet(wallet->allTx, tx);
+
+            if (rec && BRSetContains(wallet->foreignTx, rec) && _BRWalletContainsTx(wallet, rec)) {
+                if (! _BRWalletTxMoneyRangeOK(rec) ||
+                    (checkInputs && ! _BRWalletSpendsSigned(wallet, rec, checkInputs == 2))) {
+                    r = 0;   // refused: the record stays as it was
+                }
+                else {
+                    if (checkInputs == 2) rec->walletSigCheck |= WALLET_SIG_ALWAYS;
+                    if (checkInputs == 0) _BRWalletSigCheckTrust(wallet, rec);
+                    _BRWalletForgetForeignTx(wallet, rec);
+                    _BRWalletInsertTx(wallet, rec);
+                    _BRWalletUpdateBalance(wallet);
+                    tx = rec;   // the callbacks below are handed the wallet's record, not the caller's copy
+                    wasAdded = 1;
+                }
+            }
+        }
+#endif
     
         pthread_mutex_unlock(&wallet->lock);
     }

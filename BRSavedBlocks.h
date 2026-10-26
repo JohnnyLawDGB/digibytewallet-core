@@ -11,6 +11,10 @@
 //  compilation unit the XCFramework does not contain, so the iOS port had no
 //  way to resume and re-synced ~126,000 blocks on every launch.
 //
+//  BRSavedBlocksTopHeight and BRSavedBlocksShouldPersist are the write side's guard (Android's
+//  BlockPersistencePolicy): a window below the persisted tip never replaces it. Host KAT:
+//  digibytewallet-android native/src/test/host/saved_blocks_guard_kat/.
+//
 //  It is pure and always was -- no JNI, no locking, no I/O -- which is why this
 //  is a move rather than a rewrite. The Android bridge header now forwards here
 //  so both platforms parse with one implementation. A second parser for a
@@ -145,6 +149,34 @@ static inline size_t BRSavedBlocksDeserialize(const uint8_t *b, size_t len,
 
     *outBlocks = blocks;
     return loaded;
+}
+
+// The top (newest) block's height in a saved-blocks buffer: the first entry's height, since the
+// core writes the window from the tip backward. -1 when the buffer is too short to hold it.
+// (Android's parseSavedBlocksTopHeight.)
+static inline int64_t BRSavedBlocksTopHeight(const uint8_t *b, size_t len)
+{
+    if (! b || len < 12) return -1;
+    return (int64_t)UInt32GetLE(&b[8]);
+}
+
+// The monotonic guard on persisting a window (Android's shouldPersistBlocks): a new window
+// replaces the persisted one only when its top is at least the persisted top. The block tip only
+// advances (DigiByte reorgs are far shallower than the gaps seen), so a lower window is stale: one
+// replacing a higher window across launches (23 176 000 -> 23 060 000, observed) forced a
+// ~480 000-block re-sync. An unreadable top (-1) is written anyway, so a real save is never
+// silently lost. persistedTop is 0 when nothing is persisted. A caller that deliberately drops
+// its saved blocks (a rescan or reset) must reset its persisted top with them, as Android clears
+// saved_blocks_tip; otherwise this guard refuses every lower window that follows.
+static inline int BRSavedBlocksShouldPersist(int64_t newTop, int64_t persistedTop)
+{
+#ifdef SAVED_BLOCKS_GUARD_RED
+    // RED ARM SEAM (saved_blocks_guard_kat): no guard, the pre-fix blind overwrite.
+    (void)newTop; (void)persistedTop;
+    return 1;
+#else
+    return (newTop < 0 || newTop >= persistedTop) ? 1 : 0;
+#endif
 }
 
 #ifdef __cplusplus

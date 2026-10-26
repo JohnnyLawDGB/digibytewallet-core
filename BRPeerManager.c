@@ -24,6 +24,7 @@
 
 #include <arpa/inet.h>   // inet_ntop for IPv6-correct peer logging
 #include "BRPeerManager.h"
+#include "BRPublishOutcome.h"
 #include "BRPeerConnectPolicy.h"
 #include "BRSet.h"
 #include "BRArray.h"
@@ -53,6 +54,10 @@
 #include <netinet/in.h>
 
 #define PROTOCOL_TIMEOUT      20.0
+// A send screen's wait for a verdict (BRPublishOutcome.h) must outlast the publish timeout, or it
+// would give up before the core could answer ETIMEDOUT.
+_Static_assert(BR_PUBLISH_AWAIT_TIMEOUT_MS > (int)PROTOCOL_TIMEOUT * 1000,
+               "BR_PUBLISH_AWAIT_TIMEOUT_MS must outlast PROTOCOL_TIMEOUT");
 #define MAX_CONNECT_FAILURES  20 // notify user of network problems after this many connect failures in a row
 #define PEER_FLAG_SYNCED      0x01
 #define PEER_FLAG_NEEDSUPDATE 0x02

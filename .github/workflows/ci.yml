@@ -9,6 +9,8 @@ name: CI
 on:
   pull_request:
     branches: [develop, master]
+    # `edited` so an `Android-Branch:` line added to the description takes effect without a push.
+    types: [opened, synchronize, reopened, edited]
   push:
     branches: [develop]
   workflow_dispatch:
@@ -21,9 +23,11 @@ on:
 permissions:
   contents: read
 
-# A new push to a PR supersedes its running sweep (1h45m); develop's runs always finish.
+# A new push to a PR supersedes its running sweep (1h45m). Other runs group by commit, so every
+# merge to develop gets its own run: a group keeps only one pending run, and a shared develop group
+# would drop the middle merge of three.
 concurrency:
-  group: ci-${{ github.event.pull_request.number || github.ref }}
+  group: ci-${{ github.event.pull_request.number || github.sha }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
@@ -83,6 +87,12 @@ jobs:
             ref=develop
           fi
           echo "core branch: $CORE_BRANCH -> Android branch: $ref"
+          echo "Core tested against Android \`$ref\`." >> "$GITHUB_STEP_SUMMARY"
+          # Green here means green against that branch; the run on develop after the merge is
+          # what checks Android develop.
+          if [ "$ref" != develop ]; then
+            echo "::notice::tested against Android branch $ref, not develop"
+          fi
           echo "ref=$ref" >> "$GITHUB_OUTPUT"
 
       # No submodules: the core is substituted below, and the Android repo has no other submodule.
@@ -103,6 +113,9 @@ jobs:
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
           path: android/native/src/main/jni/digibytewallet-core
+          # Full history: some suites check a base commit (dd_coin_selection_kat's base-drift
+          # gate) and skip when it is missing.
+          fetch-depth: 0
           persist-credentials: false
 
       - name: Show what is under test
@@ -119,7 +132,14 @@ jobs:
       - name: 32-bit toolchain for the native sweep
         run: sudo apt-get update -qq && sudo apt-get install -y -qq gcc-multilib
 
-      # Exits non-zero if any KAT fails or a *_kat directory has no runner.
+      # Exits non-zero if any KAT fails or a *_kat directory has no runner. The floor catches a
+      # sweep that ran almost nothing (an Android ref with few or no suites) and still exited 0.
       - name: Native host KATs (full sweep)
         working-directory: android
-        run: ./scripts/run-host-kats.sh
+        run: |
+          ./scripts/run-host-kats.sh 2>&1 | tee "$RUNNER_TEMP/kats.log"
+          passed="$(sed -n 's/^host KATs: \([0-9]*\) passed.*/\1/p' "$RUNNER_TEMP/kats.log" | tail -1)"
+          if [ "${passed:-0}" -lt 150 ]; then
+            echo "::error::only ${passed:-0} host KAT suites passed (expected at least 150)"
+            exit 1
+          fi

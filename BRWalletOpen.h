@@ -81,7 +81,8 @@ static inline BRWalletMasterKeys BRWalletMasterKeysFromSeed(const void *seed, si
 // (BRWalletTransactionForHash(wallet, tx->txHash) != tx), and all of them when NULL
 // is returned. The array stays the caller's. Pass NULL, 0 for a wallet with no history.
 //
-// Returns NULL if the wallet could not be created. Free with BRWalletFree().
+// Records are not checked against these keys: pass only this wallet's own. NULL
+// comes back only if allocation fails. Free with BRWalletFree().
 static inline BRWallet *BRWalletOpenWithKeys(BRTransaction *transactions[], size_t txCount,
                                              BRWalletMasterKeys keys)
 {

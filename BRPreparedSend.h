@@ -7,6 +7,13 @@
 //  Android JNI bridge (prepared_send.h, called by jni_transaction.c's quoteTransaction and
 //  signPreparedTransaction), which the iOS XCFramework does not contain.
 //
+//  Not everything the signer checks. Since Android 4.1.2 its signer also refuses a coin another
+//  signed-but-unregistered send has claimed (bridge coin_reservation.h; released as BRWalletSend.h
+//  step 1b describes) and re-checks the inputs are unspent (spend_guard.h). BRPreparedSendCheck reads
+//  BRWalletUTXOs, which already leaves out coins a pending send spends, but it cannot see two
+//  prepared sends signed before either is registered. A platform that can sign two sends at once
+//  needs the reservation too (a push-down candidate).
+//
 //  The flow. A send is built (BRWalletCreateTransactionAtFeePerKb) and quoted at review, before
 //  the credential prompt, and the SAME bytes are signed after it. The prepared state is those
 //  bytes plus their quote -- never a live BRTransaction -- so nothing native outlives the prompt.

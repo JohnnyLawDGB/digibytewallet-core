@@ -15,31 +15,33 @@
 #define ODOCRYPT_SHAPECHANGE_INTERVAL_TESTNET (1*24*60*60)
 #define ODOCRYPT_DIGEST_SIZE          (80)
 
+enum {
 // Number of rounds.
-enum { ODOCRYPT_ROUNDS = 84 };
+    ODOCRYPT_ROUNDS = 84,
 // Odo utilizes two sbox sizes - 6-bit sboxes, which are ideally suited for
 // FPGA logic elements, and 10-bit sboxes, which are ideally suited for FPGA
 // RAM elements.
-enum { ODOCRYPT_SMALL_SBOX_WIDTH = 6 };
-enum { ODOCRYPT_LARGE_SBOX_WIDTH = 10 };
+    ODOCRYPT_SMALL_SBOX_WIDTH = 6,
+    ODOCRYPT_LARGE_SBOX_WIDTH = 10,
 // The pboxes are constructed using 3 primitives, applied multiple times.
-enum { ODOCRYPT_PBOX_SUBROUNDS = 6 };
+    ODOCRYPT_PBOX_SUBROUNDS = 6,
 // This constant should be a generator for the multiplicative group of
 // integers modulo STATE_SIZE (3 or 7 for a STATE_SIZE of 10).  It controls
 // one part of the pbox step.
-enum { ODOCRYPT_PBOX_M = 3 };
+    ODOCRYPT_PBOX_M = 3,
 // The multiplicative inverse of PBOX_M modulo STATE_SIZE
-enum { ODOCRYPT_INV_PBOX_M = 7 };
+    ODOCRYPT_INV_PBOX_M = 7,
 // This constant must be even.  It controls the number of rotations used in
 // the linear mixing step.
-enum { ODOCRYPT_ROTATION_COUNT = 6 };
+    ODOCRYPT_ROTATION_COUNT = 6,
 // Odo internally operates on 64-bit words.
-enum { ODOCRYPT_WORD_BITS = 64 };
+    ODOCRYPT_WORD_BITS = 64,
 
-enum { ODOCRYPT_DIGEST_BITS = 8 * ODOCRYPT_DIGEST_SIZE };
-enum { ODOCRYPT_STATE_SIZE = ODOCRYPT_DIGEST_BITS / ODOCRYPT_WORD_BITS };
-enum { ODOCRYPT_SMALL_SBOX_COUNT = ODOCRYPT_DIGEST_BITS / (ODOCRYPT_SMALL_SBOX_WIDTH + ODOCRYPT_LARGE_SBOX_WIDTH) };
-enum { ODOCRYPT_LARGE_SBOX_COUNT = ODOCRYPT_STATE_SIZE };
+    ODOCRYPT_DIGEST_BITS = 8 * ODOCRYPT_DIGEST_SIZE,
+    ODOCRYPT_STATE_SIZE = ODOCRYPT_DIGEST_BITS / ODOCRYPT_WORD_BITS,
+    ODOCRYPT_SMALL_SBOX_COUNT = ODOCRYPT_DIGEST_BITS / (ODOCRYPT_SMALL_SBOX_WIDTH + ODOCRYPT_LARGE_SBOX_WIDTH),
+    ODOCRYPT_LARGE_SBOX_COUNT = ODOCRYPT_STATE_SIZE
+};
 
 typedef struct {
     uint64_t mask[ODOCRYPT_PBOX_SUBROUNDS][ODOCRYPT_STATE_SIZE/2];

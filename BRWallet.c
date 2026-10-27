@@ -2512,7 +2512,7 @@ static int _BRWalletRegisterTx(BRWallet *wallet, BRTransaction *tx, int checkInp
 
             if (rec && BRSetContains(wallet->foreignTx, rec) && _BRWalletContainsTx(wallet, rec)) {
 #ifndef WALLET_PROMOTE_SAME_RECORD_UNFIXED
-                if (rec == tx && checkInputs == 0) checkInputs = 1;
+                if (rec == tx && checkInputs == 0) checkInputs = 1;   // the wallet's own record passed back is registered as checked
 #endif
                 if (! _BRWalletTxMoneyRangeOK(rec) ||
                     (checkInputs && ! _BRWalletSpendsSigned(wallet, rec, checkInputs == 2))) {

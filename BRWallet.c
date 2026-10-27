@@ -2502,6 +2502,34 @@ static int _BRWalletRegisterTx(BRWallet *wallet, BRTransaction *tx, int checkInp
                 }
             }
         }
+#ifndef WALLET_FOREIGN_PROMOTE_UNFIXED
+        else {
+            // The wallet already holds a record of this hash. A held non-wallet record (foreignTx) that touches
+            // the wallet's current address set (for example when a block is delivered again after new addresses
+            // were generated) is moved into the wallet's transactions, with the same money-range and signature
+            // checks a new tx takes.
+            BRTransaction *rec = BRSetGet(wallet->allTx, tx);
+
+            if (rec && BRSetContains(wallet->foreignTx, rec) && _BRWalletContainsTx(wallet, rec)) {
+#ifndef WALLET_PROMOTE_SAME_RECORD_UNFIXED
+                if (rec == tx && checkInputs == 0) checkInputs = 1;   // the wallet's own record passed back is registered as checked
+#endif
+                if (! _BRWalletTxMoneyRangeOK(rec) ||
+                    (checkInputs && ! _BRWalletSpendsSigned(wallet, rec, checkInputs == 2))) {
+                    r = 0;   // refused: the record stays as it was, held as non-wallet
+                }
+                else {
+                    if (checkInputs == 2) rec->walletSigCheck |= WALLET_SIG_ALWAYS;
+                    if (checkInputs == 0) _BRWalletSigCheckTrust(wallet, rec);
+                    _BRWalletForgetForeignTx(wallet, rec);
+                    _BRWalletInsertTx(wallet, rec);
+                    _BRWalletUpdateBalance(wallet);
+                    tx = rec;   // the callbacks below are handed the wallet's record, not the caller's copy
+                    wasAdded = 1;
+                }
+            }
+        }
+#endif
     
         pthread_mutex_unlock(&wallet->lock);
     }

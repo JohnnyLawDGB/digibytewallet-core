@@ -1121,6 +1121,20 @@ static void _setApplyFreeBlock(void *info, void *block)
     BRMerkleBlockFree(block);
 }
 
+// BRSetApply over manager->checkpoints at teardown: release a checkpoint block that neither
+// manager->blocks nor manager->orphans holds (by pointer identity). Those two sets free their own
+// below; a block only the checkpoint set still holds has no other owner. That is a checkpoint stub
+// _BRPeerManagerClearMemory pruned from blocks (it spares the very object checkpoints holds), one a
+// same-hash header displaced while its height disagreed, or one an orphan drop spared.
+static void _setApplyFreeCheckpointOnly(void *info, void *block)
+{
+    BRPeerManager *manager = info;
+
+    if (BRSetGet(manager->blocks, block) != block && BRSetGet(manager->orphans, block) != block) {
+        BRMerkleBlockFree(block);
+    }
+}
+
 static size_t _BRPeerManagerAddPeer(BRPeerManager *manager, BRPeer *peer) {
 	size_t add = 1;
 	for (size_t i = array_count(manager->peers); i > 0; i--) {
@@ -2291,6 +2305,23 @@ static void _peerDisconnected(void *info, int error)
 
     //free(info);
     MGR_LOCK(manager);
+
+#ifndef PEER_LATE_CALLBACK_UNFIXED
+    // A callback queued on this peer after its thread's own drain. The peer thread answers its
+    // pongs and mempool request with success 0 as it exits, but a sender that saw the peer still
+    // connected under manager->lock (BRPeerManagerPublishTx, the stem and fluff paths,
+    // _peerConnected) can queue one more between that drain and this call, and BRPeerFree below
+    // would drop it unanswered: its context (a BRPeerCallbackInfo) is never freed and the work it
+    // stands for never happens. Every manager-side sender holds manager->lock, so a count of zero
+    // read under the lock stays zero through BRPeerFree. The callbacks take the lock themselves
+    // and may queue another (_publishTxInvDone -> _BRPeerManagerRequestUnrelayedTx), hence the
+    // loop. The peer is still listed while they run, as it is during the thread's drain.
+    while (BRPeerPendingCallbackCount(peer) > 0) {
+        MGR_UNLOCK(manager);
+        BRPeerCancelPendingCallbacks(peer);
+        MGR_LOCK(manager);
+    }
+#endif
 
     /* ---- DISCONNECT LEDGER: record this close before any teardown touches the peer ----
      * peer is BRPeerFree'd at the bottom of this function, so everything must be read here.
@@ -9196,6 +9227,9 @@ static void _BRPeerManagerFreeNow(BRPeerManager *manager)
     array_free(manager->peers);
     for (size_t i = array_count(manager->connectedPeers); i > 0; i--) BRPeerFree(manager->connectedPeers[i - 1]);
     array_free(manager->connectedPeers);
+#ifndef CHECKPOINT_RELEASE_UNFIXED
+    BRSetApply(manager->checkpoints, manager, _setApplyFreeCheckpointOnly);   // before blocks and orphans go
+#endif
     BRSetApply(manager->blocks, NULL, _setApplyFreeBlock);
     BRSetFree(manager->blocks);
     BRSetApply(manager->orphans, NULL, _setApplyFreeBlock);

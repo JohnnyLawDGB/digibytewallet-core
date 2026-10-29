@@ -1121,6 +1121,20 @@ static void _setApplyFreeBlock(void *info, void *block)
     BRMerkleBlockFree(block);
 }
 
+// BRSetApply over manager->checkpoints at teardown: release a checkpoint block that neither
+// manager->blocks nor manager->orphans holds (by pointer identity). Those two sets free their own
+// below; a block only the checkpoint set still holds has no other owner. That is a checkpoint stub
+// _BRPeerManagerClearMemory pruned from blocks (it spares the very object checkpoints holds), one a
+// same-hash header displaced while its height disagreed, or one an orphan drop spared.
+static void _setApplyFreeCheckpointOnly(void *info, void *block)
+{
+    BRPeerManager *manager = info;
+
+    if (BRSetGet(manager->blocks, block) != block && BRSetGet(manager->orphans, block) != block) {
+        BRMerkleBlockFree(block);
+    }
+}
+
 static size_t _BRPeerManagerAddPeer(BRPeerManager *manager, BRPeer *peer) {
 	size_t add = 1;
 	for (size_t i = array_count(manager->peers); i > 0; i--) {
@@ -9213,6 +9227,9 @@ static void _BRPeerManagerFreeNow(BRPeerManager *manager)
     array_free(manager->peers);
     for (size_t i = array_count(manager->connectedPeers); i > 0; i--) BRPeerFree(manager->connectedPeers[i - 1]);
     array_free(manager->connectedPeers);
+#ifndef CHECKPOINT_RELEASE_UNFIXED
+    BRSetApply(manager->checkpoints, manager, _setApplyFreeCheckpointOnly);   // before blocks and orphans go
+#endif
     BRSetApply(manager->blocks, NULL, _setApplyFreeBlock);
     BRSetFree(manager->blocks);
     BRSetApply(manager->orphans, NULL, _setApplyFreeBlock);

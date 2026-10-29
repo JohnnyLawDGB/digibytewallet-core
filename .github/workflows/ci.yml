@@ -6,6 +6,12 @@ name: CI
 # repo, drops THIS core checkout in at the submodule path, and runs the same host KAT sweep the
 # Android CI runs -- on Linux, so the 32-bit, sanitizer and LeakSanitizer arms a Mac cannot run
 # are exercised (docs/development-process.md in the Android repo, "What CI must cover").
+#
+# SHARDED. One job ran the sweep in 1h30-2h15. Now `plan` lists the suites and splits them
+# (.github/kat-shards/plan.py, balanced by recorded timings); each `shard` job runs its suites one
+# at a time through the Android repo's own runner; and `host-kats`, the job that used to run the
+# whole sweep and keeps its check name, passes only if every shard passed and the suites that
+# passed are exactly the planned list (.github/kat-shards/check.sh).
 on:
   pull_request:
     branches: [develop, master]
@@ -23,19 +29,30 @@ on:
 permissions:
   contents: read
 
-# A new push to a PR supersedes its running sweep (1h45m). Other runs group by commit, so every
-# merge to develop gets its own run: a group keeps only one pending run, and a shared develop group
-# would drop the middle merge of three.
+# A new push to a PR supersedes its running sweep. Other runs group by commit, so every merge to
+# develop gets its own run: a group keeps only one pending run, and a shared develop group would
+# drop the middle merge of three.
 concurrency:
   group: ci-${{ github.event.pull_request.number || github.sha }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
+env:
+  # Shards run in parallel. The longest suite (cf_scan_ledger_drive_kat, ~19 min) bounds a
+  # shard from below; at 8 the others plan at about the same length.
+  KAT_SHARDS: 8
+  # The fewest suites that must pass in all (catches an Android ref with few or no suites).
+  KAT_FLOOR: 150
+
 jobs:
-  host-kats:
+  plan:
     runs-on: ubuntu-latest
-    timeout-minutes: 150
+    timeout-minutes: 10
     permissions:
       contents: read
+    outputs:
+      android_ref: ${{ steps.android.outputs.ref }}
+      android_sha: ${{ steps.plan.outputs.android_sha }}
+      shards: ${{ steps.plan.outputs.shards }}
     steps:
       # COMPANION ANDROID BRANCH. A core change that adds or changes a KAT usually ships with an
       # Android PR carrying that KAT, so testing against Android `develop` would miss it (or fail on
@@ -95,12 +112,60 @@ jobs:
           fi
           echo "ref=$ref" >> "$GITHUB_OUTPUT"
 
-      # No submodules: the core is substituted below, and the Android repo has no other submodule.
+
+      # Only the suite list is needed here; the shards check out the same commit (android_sha), so
+      # a push to the Android branch mid-run cannot give two shards different suites.
       - name: Check out the Android wallet
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           repository: JohnnyLawDGB/digibytewallet-android
           ref: ${{ steps.android.outputs.ref }}
+          path: android
+          submodules: false
+          persist-credentials: false
+
+      - name: Check out this core
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          path: core
+          persist-credentials: false
+
+      - name: Plan the shards
+        id: plan
+        run: |
+          set -euo pipefail
+          python3 core/.github/kat-shards/plan.py android/native/src/test/host \
+            core/.github/kat-shards/timings.txt "$KAT_SHARDS" plan
+          echo "android_sha=$(git -C android rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "shards=$(python3 -c 'import json,sys; print(json.dumps(list(range(int(sys.argv[1])))))' "$KAT_SHARDS")" >> "$GITHUB_OUTPUT"
+
+      - name: Upload the plan
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: kat-plan
+          path: plan/
+          if-no-files-found: error
+
+  shard:
+    name: shard ${{ matrix.shard }}
+    needs: plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    strategy:
+      # Every shard runs to the end, so one failure does not hide another.
+      fail-fast: false
+      matrix:
+        shard: ${{ fromJSON(needs.plan.outputs.shards) }}
+    steps:
+      # No submodules: the core is substituted below, and the Android repo has no other submodule.
+      - name: Check out the Android wallet
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          repository: JohnnyLawDGB/digibytewallet-android
+          ref: ${{ needs.plan.outputs.android_sha }}
           path: android
           submodules: false
           persist-credentials: false
@@ -120,10 +185,16 @@ jobs:
 
       - name: Show what is under test
         env:
-          ANDROID_REF: ${{ steps.android.outputs.ref }}
+          ANDROID_REF: ${{ needs.plan.outputs.android_ref }}
         run: |
           echo "android: $(git -C android rev-parse HEAD) ($ANDROID_REF)"
           echo "core:    $(git -C android/native/src/main/jni/digibytewallet-core rev-parse HEAD)"
+
+      - name: Download the plan
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: kat-plan
+          path: plan
 
       # Same toolchain as the Android CI's sweep: the runner image ships clang and its sanitizer
       # runtimes (incl. LeakSanitizer and the 32-bit ASan runtime) but not the 32-bit libc headers,
@@ -132,14 +203,90 @@ jobs:
       - name: 32-bit toolchain for the native sweep
         run: sudo apt-get update -qq && sudo apt-get install -y -qq gcc-multilib
 
-      # Exits non-zero if any KAT fails or a *_kat directory has no runner. The floor catches a
-      # sweep that ran almost nothing (an Android ref with few or no suites) and still exited 0.
-      - name: Native host KATs (full sweep)
-        working-directory: android
+      - name: Native host KATs (shard ${{ matrix.shard }})
+        env:
+          SHARD: ${{ matrix.shard }}
         run: |
-          ./scripts/run-host-kats.sh 2>&1 | tee "$RUNNER_TEMP/kats.log"
-          passed="$(sed -n 's/^host KATs: \([0-9]*\) passed.*/\1/p' "$RUNNER_TEMP/kats.log" | tail -1)"
-          if [ "${passed:-0}" -lt 150 ]; then
-            echo "::error::only ${passed:-0} host KAT suites passed (expected at least 150)"
+          mkdir -p results
+          bash android/native/src/main/jni/digibytewallet-core/.github/kat-shards/run-shard.sh \
+            android "plan/shard-$SHARD.txt" "results/results-$SHARD.txt"
+
+      - name: Upload the shard's results
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: kat-results-${{ matrix.shard }}
+          path: results/
+          if-no-files-found: ignore
+
+  # The check that used to be the whole sweep. Runs even when a shard failed or was cancelled, and
+  # fails unless the plan and every shard succeeded and the passed suites are exactly the plan.
+  host-kats:
+    needs: [plan, shard]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Every job succeeded
+        env:
+          PLAN: ${{ needs.plan.result }}
+          SHARDS: ${{ needs.shard.result }}
+        run: |
+          echo "plan: $PLAN, shards: $SHARDS"
+          if [ "$PLAN" != success ] || [ "$SHARDS" != success ]; then
+            echo "::error::plan $PLAN, shards $SHARDS"
             exit 1
           fi
+
+      - name: Check out this core
+        if: always()
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          path: core
+          persist-credentials: false
+
+      - name: Download the plan
+        if: always()
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: kat-plan
+          path: plan
+
+      - name: Download the shards' results
+        if: always()
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: kat-results-*
+          path: results
+          merge-multiple: true
+
+      # Runs after a failed shard too, to name every suite that did not pass.
+      - name: Coverage (every planned suite passed, in its shard)
+        if: always()
+        run: |
+          set -euo pipefail
+          mkdir -p results
+          bash core/.github/kat-shards/check.sh plan results "$KAT_SHARDS" "$KAT_FLOOR" 2>&1 \
+            | tee "$RUNNER_TEMP/coverage.txt"
+          {
+            echo '```'
+            cat "$RUNNER_TEMP/coverage.txt"
+            echo '```'
+            echo '<details><summary>Slowest suites</summary>'
+            echo
+            echo '```'
+            grep -v '^#' results/timings.txt | sort -rn | head -25
+            echo '```'
+            echo '</details>'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload the timings
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: kat-timings
+          path: results/timings.txt
+          if-no-files-found: ignore

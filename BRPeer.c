@@ -3290,6 +3290,37 @@ void BRPeerRerequestBlocks(BRPeer *peer, UInt256 fromBlock)
     }
 }
 
+size_t BRPeerPendingCallbackCount(BRPeer *peer)
+{
+    BRPeerContext *ctx = (BRPeerContext *)peer;
+
+    return _BRPeerPongPending(ctx) + (ctx->mempoolCallback ? 1 : 0);
+}
+
+// Same answers as the peer thread's own disconnect drain in _peerThreadRoutine: pop under the
+// pong lock, call with no lock held.
+void BRPeerCancelPendingCallbacks(BRPeer *peer)
+{
+    BRPeerContext *ctx = (BRPeerContext *)peer;
+    void (*pongCallback)(void *, int) = NULL;
+    void *pongInfo = NULL;
+
+    while (_BRPeerPongPop(ctx, &pongCallback, &pongInfo)) {
+        if (pongCallback) pongCallback(pongInfo, 0);
+        pongCallback = NULL;
+        pongInfo = NULL;
+    }
+
+    if (ctx->mempoolCallback) {
+        void (*mempoolCallback)(void *, int) = ctx->mempoolCallback;
+        void *mempoolInfo = ctx->mempoolInfo;
+
+        ctx->mempoolCallback = NULL;
+        ctx->mempoolInfo = NULL;
+        mempoolCallback(mempoolInfo, 0);
+    }
+}
+
 void BRPeerFree(BRPeer *peer)
 {
     BRPeerContext *ctx = (BRPeerContext *)peer;

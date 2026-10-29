@@ -2292,6 +2292,23 @@ static void _peerDisconnected(void *info, int error)
     //free(info);
     MGR_LOCK(manager);
 
+#ifndef PEER_LATE_CALLBACK_UNFIXED
+    // A callback queued on this peer after its thread's own drain. The peer thread answers its
+    // pongs and mempool request with success 0 as it exits, but a sender that saw the peer still
+    // connected under manager->lock (BRPeerManagerPublishTx, the stem and fluff paths,
+    // _peerConnected) can queue one more between that drain and this call, and BRPeerFree below
+    // would drop it unanswered: its context (a BRPeerCallbackInfo) is never freed and the work it
+    // stands for never happens. Every manager-side sender holds manager->lock, so a count of zero
+    // read under the lock stays zero through BRPeerFree. The callbacks take the lock themselves
+    // and may queue another (_publishTxInvDone -> _BRPeerManagerRequestUnrelayedTx), hence the
+    // loop. The peer is still listed while they run, as it is during the thread's drain.
+    while (BRPeerPendingCallbackCount(peer) > 0) {
+        MGR_UNLOCK(manager);
+        BRPeerCancelPendingCallbacks(peer);
+        MGR_LOCK(manager);
+    }
+#endif
+
     /* ---- DISCONNECT LEDGER: record this close before any teardown touches the peer ----
      * peer is BRPeerFree'd at the bottom of this function, so everything must be read here.
      * The download-peer flag matters most: a close on the download peer stalls the sync,

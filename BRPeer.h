@@ -476,6 +476,16 @@ int BRPeerIsDeliveringBlockTxs(BRPeer *peer);
 // the manager holds, on its main chain, is the manager's to check.
 UInt256 BRPeerDeliveringBlockHash(BRPeer *peer);
 
+// Callbacks still waiting on a peer whose thread has ended: the pongs queued by BRPeerSendPing and
+// BRPeerSendPingProbe, and a mempool request's completion. The peer thread answers every one with
+// success 0 as it exits, but a caller that saw the peer connected just before that can queue one
+// more after it. BRPeerPendingCallbackCount says how many are queued now; BRPeerCancelPendingCallbacks
+// answers each with success 0, oldest first, and holds no lock while it calls one (the callbacks
+// take manager->lock, so the caller must not hold it). Both are for the peer's disconnect handler,
+// before it frees the peer.
+size_t BRPeerPendingCallbackCount(BRPeer *peer);
+void BRPeerCancelPendingCallbacks(BRPeer *peer);
+
 void BRPeerFree(BRPeer *peer);
 
 // SOCKS5 proxy support — set ONCE before peer connections are established.

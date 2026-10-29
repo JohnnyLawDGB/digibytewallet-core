@@ -961,7 +961,8 @@ static void _blockmix_salsa8(uint64_t *dest, const uint64_t *src, uint64_t *b, u
 void BRScrypt(void *dk, size_t dkLen, const void *pw, size_t pwLen, const void *salt, size_t saltLen,
               unsigned n, unsigned r, unsigned p)
 {
-    uint64_t x[16*r], y[16*r], z[8], *v = malloc(128*r*n), m;
+    size_t vLen = (size_t)128*r*n; // one size_t product: the allocation and the clean below use the same length
+    uint64_t x[16*r], y[16*r], z[8], *v = malloc(vLen), m;
     uint32_t b[32*r*p];
     
     assert(v != NULL);
@@ -1001,7 +1002,7 @@ void BRScrypt(void *dk, size_t dkLen, const void *pw, size_t pwLen, const void *
     mem_clean(x, sizeof(x));
     mem_clean(y, sizeof(y));
     mem_clean(z, sizeof(z));
-    mem_clean(v, 128*r*n);
+    mem_clean(v, vLen);
     free(v);
 }
 

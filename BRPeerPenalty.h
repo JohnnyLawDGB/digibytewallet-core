@@ -72,6 +72,18 @@ static inline int BRPeerPenaltyContains(const UInt128 *addrs, const uint16_t *po
 #define BR_PEER_PENALTY_ENTRY_BYTES 26u
 #define BR_PEER_PENALTY_HEADER_BYTES 4u
 
+// The most entries the peer manager keeps (its PEER_PENALTY_MAX), and so the most a serialized
+// set can hold. A buffer of BR_PEER_PENALTY_BLOB_MAX bytes holds every live set the manager can
+// serialize: persistence never comes back empty because the set outgrew the caller's buffer.
+#define BR_PEER_PENALTY_MAX 256u
+#ifndef PEER_PENALTY_BLOB_UNFIXED
+#define BR_PEER_PENALTY_BLOB_MAX (BR_PEER_PENALTY_HEADER_BYTES + BR_PEER_PENALTY_MAX * BR_PEER_PENALTY_ENTRY_BYTES)
+#else
+// Comparison arm only (peer_penalty_blob_kat); never defined in a production build. The earlier
+// caller buffer, sized for 32 entries.
+#define BR_PEER_PENALTY_BLOB_MAX (4u + 32u * 26u)
+#endif
+
 // Serialize the live (unexpired) entries into [buf]. Returns bytes written, or 0 if the
 // buffer is too small — never a truncated blob, which would deserialize into garbage
 // penalties on the next launch.

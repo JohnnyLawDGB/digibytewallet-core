@@ -29,6 +29,7 @@
 #include "BRArray.h"
 #include "BRCrypto.h"
 #include "BRGCSFilter.h"
+#include "BRPeerDialAddress.h"
 #ifdef __ANDROID__
 #include <android/log.h>
 #endif
@@ -81,6 +82,26 @@ int BRPeerHasSocksProxy(void) {
     has = (g_socksHost[0] != '\0' && g_socksPort > 0);
     pthread_mutex_unlock(&g_socksMutex);
     return has;
+}
+
+/* "Tor required" (4.1.2 row 2, N3): while set, a peer is reached through the SOCKS proxy or not at all -- no direct
+ * dial, and nothing sent on a connection that was not opened through the proxy (one made before Tor was switched
+ * on). The app sets it from the same rule as its other traffic: the user's Tor setting is on and no clearnet
+ * fallback has been announced. Guarded by g_socksMutex. */
+static int g_torRequired = 0;
+
+void BRPeerSetTorRequired(int required) {
+    pthread_mutex_lock(&g_socksMutex);
+    g_torRequired = required ? 1 : 0;
+    pthread_mutex_unlock(&g_socksMutex);
+}
+
+int BRPeerTorRequired(void) {
+    int r;
+    pthread_mutex_lock(&g_socksMutex);
+    r = g_torRequired;
+    pthread_mutex_unlock(&g_socksMutex);
+    return r;
 }
 
 /* Perform SOCKS5 handshake on an already-connected (to proxy) blocking socket.
@@ -145,6 +166,7 @@ static int _BRPeerSocks5Handshake(int sock, const UInt128 *peer_addr, uint16_t p
 
 #define HEADER_LENGTH      24
 #define MAX_MSG_LENGTH     0x02000000u
+#define PAYLOAD_KEEP       0x00100000u   // a peer's receive buffer is shrunk back to this after a larger message
 #define MAX_GETDATA_HASHES 50000
 // Outgoing-message payloads up to this size are built on the stack; larger ones
 // are heap-allocated. Prevents a stack-VLA overflow (SIGSEGV) when a message
@@ -404,6 +426,7 @@ typedef struct {
     pthread_mutex_t pongLock;
     void *volatile mempoolInfo;
     void (*volatile mempoolCallback)(void *info, int success);
+    volatile uint8_t viaSocks;   // this connection was opened through the SOCKS proxy (Tor)
     pthread_t thread;
 } BRPeerContext;
 
@@ -849,7 +872,7 @@ static int _BRPeerAcceptAddrMessage(BRPeer *peer, const uint8_t *msg, size_t msg
         peer_log(peer, "dropping addr message, %zu is too many addresses, max is 1000", count);
     }
     else if (ctx->sentGetaddr) { // simple anti-tarpitting tactic, don't accept unsolicited addresses
-        BRPeer peers[count], p;
+        BRPeer peers[BR_VLA_LEN(count)], p;
         size_t peersCount = 0;
         time_t now = time(NULL);
         
@@ -869,7 +892,13 @@ static int _BRPeerAcceptAddrMessage(BRPeer *peer, const uint8_t *msg, size_t msg
             if (! _BRPeerIsIPv4(&p)) continue; // ignore IPv6 for now
         
             // if address time is more than 10 min in the future or unknown, set to 5 days old
+#ifdef ADDR_TIMESTAMP_UNFIXED
             if (p.timestamp > now + 10*60 || p.timestamp == 0) p.timestamp = now - 5*24*60*60;
+#else
+            // ... and so for a time too small to take two hours from (4.1.2 row 22, GHSA-cqxw): ts = 1
+            // wrapped to 2^64 - 7199, sorted above every honest peer, filled the dial loop and was saved.
+            if (p.timestamp > now + 10*60 || p.timestamp < 2*60*60) p.timestamp = now - 5*24*60*60;
+#endif
             p.timestamp -= 2*60*60; // subtract two hours
             peers[peersCount++] = p; // add it to the list
         }
@@ -1036,12 +1065,27 @@ static int _BRPeerAcceptInvMessage(BRPeer *peer, const uint8_t *msg, size_t msgL
     return r;
 }
 
+// The largest tx / dandeliontx message taken (4.1.2 row 4, K3). A standard transaction's serialized size
+// cannot exceed its weight, and the standard weight limit is 400,000; this wallet asks peers only for
+// mempool transactions this way (blocks arrive whole, as block messages). Bigger is refused before it
+// is parsed: a 32 MiB message of minimal outputs made the parser allocate ~500 MB.
+#define MAX_TX_MESSAGE_LENGTH 400000u
+
 static int _BRPeerAcceptTxMessage(BRPeer *peer, const uint8_t *msg, size_t msgLen, int is_dandelion)
 {
     BRPeerContext *ctx = (BRPeerContext *)peer;
-    BRTransaction *tx = BRTransactionParse(msg, msgLen);
+    BRTransaction *tx;
     UInt256 txHash;
     int r = 1;
+
+#ifndef TX_SIZE_GATE_UNFIXED
+    if (msgLen > MAX_TX_MESSAGE_LENGTH) {   // refused unparsed; 0 disconnects the peer as misbehaving
+        peer_log(peer, "%s message of %zu bytes is over %u: refused unparsed", is_dandelion ? "dandeliontx" : "tx",
+                 msgLen, MAX_TX_MESSAGE_LENGTH);
+        return 0;
+    }
+#endif
+    tx = BRTransactionParseSigned(msg, msgLen);
 
     if (! tx) {
         peer_log(peer, "malformed tx message with length: %zu", msgLen);
@@ -1063,14 +1107,14 @@ static int _BRPeerAcceptTxMessage(BRPeer *peer, const uint8_t *msg, size_t msgLe
     // connection.
     else if (! _BRPeerTakeRequested(ctx, &ctx->requestedTxHashes, tx->txHash) &&
              ! _BRPeerCurrentBlockHasTx(ctx, tx->txHash)) {
-        peer_log(peer, "%s %s was not requested from this peer, ignoring", is_dandelion ? "dandeliontx" : "tx",
+        peer_log(peer, "%s %.12s was not requested from this peer, ignoring", is_dandelion ? "dandeliontx" : "tx",
                  log_u256_hex_encode(tx->txHash));
         BRTransactionFree(tx);
     }
 #endif
     else {
         txHash = tx->txHash;
-        peer_log(peer, "got tx: %s", log_u256_hex_encode(txHash));
+        peer_log(peer, "got tx: %.12s", log_u256_hex_encode(txHash));
 
         if (ctx->relayedTx) {
             ctx->relayedTx(ctx->info, tx);
@@ -1396,9 +1440,22 @@ static int _BRPeerAcceptPingMessage(BRPeer *peer, const uint8_t *msg, size_t msg
         peer_log(peer, "malformed ping message, length is %zu, should be %zu", msgLen, sizeof(uint64_t));
         r = 0;
     }
+#ifndef PING_ECHO_UNFIXED
+    // A ping is its 8-byte nonce (BIP 31), and the pong is that nonce. The whole message used to be echoed,
+    // so a peer could make the wallet hold and send back up to 32 MiB per ping (4.1.2 row 31). A longer
+    // ping is not one: the peer is dropped.
+    else if (msgLen > sizeof(uint64_t)) {
+        peer_log(peer, "ping message of %zu bytes is not an 8-byte nonce: refused", msgLen);
+        r = 0;
+    }
+#endif
     else {
         peer_log(peer, "got ping");
+#ifndef PING_ECHO_UNFIXED
+        BRPeerSendMessage(peer, msg, sizeof(uint64_t), MSG_PONG);
+#else
         BRPeerSendMessage(peer, msg, msgLen, MSG_PONG);
+#endif
     }
 
     return r;
@@ -1503,7 +1560,7 @@ static int _BRPeerAcceptRejectMessage(BRPeer *peer, const uint8_t *msg, size_t m
             off += hashLen;
 
             if (! UInt256IsZero(txHash)) {
-                peer_log(peer, "rejected %s code: 0x%x reason: \"%s\" txid: %s", type, code, reason,
+                peer_log(peer, "rejected %s code: 0x%x reason: \"%s\" txid: %.12s", type, code, reason,
                          log_u256_hex_encode(txHash));
                 if (ctx->rejectedTx) ctx->rejectedTx(ctx->info, txHash, code);
             }
@@ -1548,7 +1605,7 @@ static int _BRPeerWalkBlockTxs(BRPeer *peer, const uint8_t *msg, size_t msgLen, 
             peer_log(peer, "malformed block: ran off end at tx %zu of %zu", i, txCount);
             return 0;
         }
-        BRTransaction *tx = BRTransactionParse(&msg[off], msgLen - off);
+        BRTransaction *tx = BRTransactionParseSigned(&msg[off], msgLen - off);
         if (!tx) {
             peer_log(peer, "malformed block: tx %zu failed to parse", i);
             return 0;
@@ -1989,7 +2046,31 @@ static int _BRPeerOpenSocket(BRPeer *peer, int domain, double timeout, int *erro
     /* When routing through SOCKS5, the TCP connection goes to the proxy at
      * 127.0.0.1 (IPv4). Force PF_INET so IPv6 peers don't create an IPv6
      * socket that can't connect to the IPv4 proxy (EINVAL). */
-    int sockDomain = BRPeerHasSocksProxy() ? PF_INET : domain;
+    /* The route is read once: a proxy cleared part-way through must not turn this dial into a direct one. */
+    int useSocks = BRPeerHasSocksProxy();
+    int sockDomain = useSocks ? PF_INET : domain;
+
+    ctx->viaSocks = 0;
+#ifndef TOR_GATE_UNFIXED
+    if (BRPeerTorRequired() && ! useSocks) {   // Tor required: through the proxy or not at all
+        peer_log(peer, "tor required and no SOCKS proxy: not dialling directly");
+        if (error) *error = EHOSTUNREACH;
+        return 0;
+    }
+#endif
+
+    /* Direct to an IPv4 peer: dial what this network can route (BRPeerDialAddress.h). The same
+     * IPv4 address on a network with IPv4; a NAT64-synthesized IPv6 address on an IPv6-only
+     * network, where the IPv4-mapped address the core used to dial routes nowhere. */
+    struct sockaddr_storage dialAddr;
+    socklen_t dialLen = 0;
+    int dialFamily = 0;
+
+    if (! useSocks && domain == PF_INET6 && _BRPeerIsIPv4(peer)) {
+        dialFamily = BRPeerDialAddress(peer->address, peer->port, &dialAddr, &dialLen);
+        sockDomain = (dialFamily == AF_INET6) ? PF_INET6 : PF_INET;
+    }
+
     ctx->socket = socket(sockDomain, SOCK_STREAM, 0);
 
     if (ctx->socket < 0) {
@@ -2016,7 +2097,7 @@ static int _BRPeerOpenSocket(BRPeer *peer, int domain, double timeout, int *erro
         /* If a SOCKS5 proxy is configured, connect to the proxy instead of the peer.
          * The SOCKS5 handshake (performed after TCP connect) establishes the tunnel
          * to the actual peer address. Only IPv4 peer addresses are supported via proxy. */
-        if (BRPeerHasSocksProxy()) {
+        if (useSocks) {
             /* Snapshot proxy settings under lock */
             struct in_addr proxyAddr;
             pthread_mutex_lock(&g_socksMutex);
@@ -2071,14 +2152,19 @@ static int _BRPeerOpenSocket(BRPeer *peer, int domain, double timeout, int *erro
                         r = 0;
                     } else {
                         peer_log(peer, "SOCKS5 tunnel established via %s:%d", proxyHost, proxyPort);
+                        ctx->viaSocks = 1;
                         /* Re-apply non-blocking so the caller's restoration below is consistent */
                         fcntl(ctx->socket, F_SETFL, arg | O_NONBLOCK);
                     }
                 }
             }
         } else {
-            /* Direct connection — original code path */
-            if (domain == PF_INET6) {
+            /* Direct connection */
+            if (dialLen > 0) {
+                memcpy(&addr, &dialAddr, dialLen);
+                addrLen = dialLen;
+            }
+            else if (domain == PF_INET6) {
                 ((struct sockaddr_in6 *)&addr)->sin6_family = AF_INET6;
                 ((struct sockaddr_in6 *)&addr)->sin6_addr = *(struct in6_addr *)&peer->address;
                 ((struct sockaddr_in6 *)&addr)->sin6_port = htons(peer->port);
@@ -2091,6 +2177,13 @@ static int _BRPeerOpenSocket(BRPeer *peer, int domain, double timeout, int *erro
                 addrLen = sizeof(struct sockaddr_in);
             }
 
+#ifndef TOR_GATE_UNFIXED
+            if (BRPeerTorRequired()) {   // Tor was switched on after the route was read: no direct dial
+                peer_log(peer, "tor required: not dialling directly");
+                err = EHOSTUNREACH;
+            }
+            else
+#endif
             if (connect(ctx->socket, (struct sockaddr *)&addr, addrLen) < 0) err = errno;
 
             if (err == EINPROGRESS) {
@@ -2104,8 +2197,17 @@ static int _BRPeerOpenSocket(BRPeer *peer, int domain, double timeout, int *erro
                     r = 0;
                 }
             }
-            else if (err && domain == PF_INET6 && _BRPeerIsIPv4(peer)) {
-                return _BRPeerOpenSocket(peer, PF_INET, timeout, error); // fallback to IPv4
+            else if (err && dialFamily == AF_INET6) {
+                /* The synthesized IPv6 dial failed at once: try the IPv4 address itself. Close
+                 * this socket first (the retry opens its own; before 2026-10 the retry
+                 * overwrote ctx->socket and leaked it), unless a disconnect already took it. */
+                int s = ctx->socket;
+                if (s < 0) r = 0;
+                else {
+                    ctx->socket = -1;
+                    close(s);
+                    return _BRPeerOpenSocket(peer, PF_INET, timeout, error);
+                }
             }
             else if (err) r = 0;
         }
@@ -2209,8 +2311,28 @@ static void *_peerThreadRoutine(void *arg)
                     _BRPeerNoteClose(ctx, BR_CLOSE_LOCAL_PROTOCOL); // LEDGER
                 }
                 else {
+#ifndef PING_ECHO_UNFIXED
+                    // The buffer grows to the largest message read, and is given back once a small one
+                    // follows a large one (4.1.2 row 31): eight peers each held their high-water mark,
+                    // up to 32 MiB apiece. A grow that cannot be satisfied drops the peer, not the app.
+                    if (payloadLen > PAYLOAD_KEEP && msgLen <= PAYLOAD_KEEP) {
+                        uint8_t *smaller = realloc(payload, PAYLOAD_KEEP);
+                        if (smaller) { payload = smaller; payloadLen = PAYLOAD_KEEP; }
+                    }
+                    if (msgLen > payloadLen) {
+                        uint8_t *bigger = realloc(payload, msgLen);
+                        if (! bigger) {
+                            peer_log(peer, "error reading %s: no memory for a %"PRIu32"-byte message", type, msgLen);
+                            error = ENOMEM;
+                            _BRPeerNoteClose(ctx, BR_CLOSE_LOCAL_PROTOCOL); // LEDGER
+                            continue;
+                        }
+                        payload = bigger; payloadLen = msgLen;
+                    }
+#else
                     if (msgLen > payloadLen) payload = realloc(payload, (payloadLen = msgLen));
                     assert(payload != NULL);
+#endif
                     len = 0;
                     socket = ctx->socket;
                     msgTimeout = time + MESSAGE_TIMEOUT;
@@ -2482,7 +2604,7 @@ double BRPeerCurrentMessageSecs(BRPeer *peer)
 }
 
 // open connection to peer and perform handshake
-void BRPeerConnect(BRPeer *peer)
+int BRPeerConnect(BRPeer *peer)
 {
     BRPeerContext *ctx = (BRPeerContext *)peer;
     struct timeval tv;
@@ -2516,8 +2638,13 @@ void BRPeerConnect(BRPeer *peer)
                 ctx->status = BRPeerStatusDisconnected;
                 //if (ctx->disconnected) ctx->disconnected(ctx->info, error);
             }
+            else pthread_attr_destroy(&attr);
         }
     }
+
+    // A started thread may already have ended and marked the peer disconnected, so the status is no
+    // answer to "did a thread start"; only error is.
+    return (error == 0);
 }
 
 // close connection to peer
@@ -2728,6 +2855,14 @@ static void _BRPeerSendMessageTimeout(BRPeer *peer, const uint8_t *msg, size_t m
         msgLen = 0;
         socket = ctx->socket;
         if (socket < 0) error = ENOTCONN;
+#ifndef TOR_GATE_UNFIXED
+        // Tor required: nothing goes out on a connection that was not opened through the proxy (one made before Tor
+        // was switched on); the message is dropped and the peer disconnected below.
+        if (! error && ! ctx->viaSocks && BRPeerTorRequired()) {
+            peer_log(peer, "tor required: not sending %s on a direct connection", type);
+            error = EHOSTUNREACH;
+        }
+#endif
 
         // Independent send deadline. ctx->disconnectTime is DBL_MAX for idle /
         // fully-synced peers, so it cannot bound this loop: on a half-dead or
@@ -2935,7 +3070,7 @@ void BRPeerSendInv(BRPeer *peer, const UInt256 txHashes[], size_t txCount)
     // concurrent _BRPeerAddKnownTxHashes on another thread could realloc the buffer between any
     // two of those steps, so the message was built out of a freed allocation. Reached constantly
     // via _BRPeerManagerLoadMempools, which walks EVERY connected peer from one peer's thread.
-    UInt256 added[txCount];
+    UInt256 added[BR_VLA_LEN(txCount)];
 
     _BRPeerAddKnownTxHashesInternal(peer, txHashes, txCount, added, &addedCount);
 

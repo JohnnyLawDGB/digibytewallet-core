@@ -602,7 +602,32 @@ static int _BRTransactionStoreMissing(const void *store)
 
 // buf must contain a serialized tx
 // retruns a transaction that must be freed by calling BRTransactionFree()
+static BRTransaction *_BRTransactionParse(const uint8_t *buf, size_t bufLen, int allowUnsigned);
+
+// Parses a transaction this wallet serialized itself, signed OR in its internal unsigned form (each
+// input's scriptPubKey and amount where the signature will go) -- the bytes a prepared send carries
+// between review and signature. Bytes from anywhere else are signed by definition: BRTransactionParseSigned.
 BRTransaction *BRTransactionParse(const uint8_t *buf, size_t bufLen)
+{
+    return _BRTransactionParse(buf, bufLen, 1);
+}
+
+// Parses a transaction in the network's (signed) format only (4.1.2 row 9, N2). BRTransactionParse
+// decides per input whether it is reading the unsigned internal form from the script bytes: a signed
+// input whose scriptSig is push-only and also reads as a scriptPubKey (OP_0 PUSH20 / PUSH32) was taken
+// for an unsigned one -- 8 bytes of what followed read as its amount, the rest of the transaction
+// misparsed, and the txid wrong. Every transaction from a peer, a node, an indexer or a publish is
+// parsed here.
+BRTransaction *BRTransactionParseSigned(const uint8_t *buf, size_t bufLen)
+{
+#ifdef TX_PARSE_SIGNED_UNFIXED
+    return _BRTransactionParse(buf, bufLen, 1);
+#else
+    return _BRTransactionParse(buf, bufLen, 0);
+#endif
+}
+
+static BRTransaction *_BRTransactionParse(const uint8_t *buf, size_t bufLen, int allowUnsigned)
 {
     assert(buf != NULL || bufLen == 0);
     if (! buf) return NULL;
@@ -673,7 +698,7 @@ BRTransaction *BRTransactionParse(const uint8_t *buf, size_t bufLen)
         }
 #endif
 
-        if (off + sLen <= bufLen && BRAddressFromScriptPubKey(NULL, 0, &buf[off], sLen) > 0) {
+        if (allowUnsigned && off + sLen <= bufLen && BRAddressFromScriptPubKey(NULL, 0, &buf[off], sLen) > 0) {
             BRTxInputSetScript(input, &buf[off], sLen);
             if (_BRTransactionStoreMissing(input->script)) { BRTransactionFree(tx); return NULL; }
             input->amount = (off + sLen + sizeof(uint64_t) <= bufLen) ? UInt64GetLE(&buf[off + sLen]) : 0;
@@ -1003,7 +1028,7 @@ int BRTransactionIsSigned(const BRTransaction *tx)
 // returns true if tx is signed
 int BRTransactionSign(BRTransaction *tx, int forkId, BRKey keys[], size_t keysCount)
 {
-    UInt160 pkh[keysCount];
+    UInt160 pkh[BR_VLA_LEN(keysCount)];
     size_t i, j;
     int l = 0;
     
@@ -1188,7 +1213,7 @@ int BRTransactionSign(BRTransaction *tx, int forkId, BRKey keys[], size_t keysCo
     if (tx && BRTransactionIsSigned(tx)) {
         uint8_t data[BRTransactionSerialize(tx, NULL, 0)];
         size_t len = BRTransactionSerialize(tx, data, sizeof(data));
-        BRTransaction *t = BRTransactionParse(data, len);
+        BRTransaction *t = BRTransactionParseSigned(data, len);   // signed now: no input is read as unsigned
         
 #ifndef TX_SIGN_REPARSE_UNFIXED
         // invariant: the hashes come from a re-parse that succeeded. When it could not be made,
@@ -1267,7 +1292,7 @@ int BRTransactionVerifyInput(const BRTransaction *tx, size_t index)
 
         if (in->sigLen == 0 || in->sigLen > 1 + 73 + 1 + 65) return 0;   // two pushes: <= 73-byte sig, <= 65-byte key
 
-        const uint8_t *elems[BRScriptElements(NULL, 0, in->signature, in->sigLen)];
+        const uint8_t *elems[BR_VLA_LEN(BRScriptElements(NULL, 0, in->signature, in->sigLen))];
         size_t count = BRScriptElements(elems, sizeof(elems)/sizeof(*elems), in->signature, in->sigLen);
 
         if (count != 2) return 0;

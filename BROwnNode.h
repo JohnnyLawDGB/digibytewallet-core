@@ -46,7 +46,7 @@
 //    Unicode decimal digit (Character.digit), so Android accepts "host:" followed by 12024 in
 //    Arabic-Indic digits (U+0661 U+0662 U+0660 U+0662 U+0664) and dials port 12024. The C refuses
 //    it: a port should be the digits it shows in ASCII, and refusing is the safer side. Android's
-//    CustomNode.parse is to follow (ASCII digits only).
+//    CustomNode.parse refuses it too from Android PR #169.
 //  - A host longer than the caller's buffer (BR_OWN_NODE_HOST_MAX holds any DNS name, 253).
 //  - Letters outside ASCII in a dgbnode:// host (Android's lookup does not resolve them either).
 //
@@ -188,7 +188,10 @@ static inline int _BROwnNodeHex(unsigned char c)
 // '+' is a space; each run of %XX is bytes, and XX must be two ASCII hex digits (libcore's
 // isValidHexChar: 0-9, a-f, A-F; so "%+F", "%-0" and a non-ASCII digit all throw, unlike desktop
 // Java); a '%' that cannot start a full escape throws. Returns the decoded length, or -1 where
-// URLDecoder throws (the caller then uses the raw value).
+// URLDecoder throws (the caller then uses the raw value). Escapes that decode to malformed UTF-8
+// ("%FF", a lone "%C3") pass through here as raw bytes, where Android's String puts U+FFFD: only
+// the label can hold them (net matches ASCII words only), so a caller that shows the label
+// decodes it with replacement.
 static inline long _BROwnNodeUrlDecode(const char *s, size_t len, char *out)
 {
     size_t i = 0, n = 0;

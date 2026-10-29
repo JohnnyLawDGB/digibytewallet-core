@@ -218,7 +218,7 @@ int64_t BRDigiDollarOutputAmount(const BRTransaction *tx, size_t voutIndex)
         // is not that exact form from binding to an amount slot.
         if (o->scriptLen == 34 && o->script && o->script[0] == 0x51 && o->script[1] == 0x20) {
             if (i == voutIndex) {
-                int64_t amt;
+                int64_t amt = -1;   // set only when the walk finds the ordinal
                 return _ddAmountAtOrdinal(tx, k, &amt) ? amt : -1;                 // walk to this ordinal
             }
             k++;                                                                   // advance for every DD output

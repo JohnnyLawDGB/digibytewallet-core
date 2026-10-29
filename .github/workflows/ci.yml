@@ -206,6 +206,11 @@ jobs:
       - name: Native host KATs (shard ${{ matrix.shard }})
         env:
           SHARD: ${{ matrix.shard }}
+          # LeakSanitizer on for every ASan arm. LSAN_OPTIONS is read after ASAN_OPTIONS, so this
+          # overrides a run.sh's detect_leaks=0; a run.sh that sets LSAN_OPTIONS itself for one run
+          # (a comparison arm whose defect is the leak another case asserts) keeps its own. A suite
+          # must free what it allocates, so a leak in the core shows up as a failing suite.
+          LSAN_OPTIONS: detect_leaks=1
         run: |
           mkdir -p results
           bash android/native/src/main/jni/digibytewallet-core/.github/kat-shards/run-shard.sh \

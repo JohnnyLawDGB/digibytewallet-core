@@ -36,7 +36,24 @@
 //  BROwnNodeHealthFor (refreshOwnNodeHealth): BRPeerManagerCompactFilterPeerStatus 3 (connected
 //  and answering cfheaders) is serving, 1 (in the pool, not yet connected) is connecting, and
 //  anything else is dark: 2 (connected but serving no filters, a node without
-//  peerblockfilters=1) is exactly the misconfiguration this status exists to show.
+//  peerblockfilters=1) is exactly the misconfiguration this status exists to show. It has no
+//  memory, so a platform's health poll calls BROwnNodeHealthObserve, which adds the time limit.
+//  BROwnNodeHealthObserve (refreshOwnNodeHealth, each health poll): BROwnNodeHealthFor with a
+//  time limit on "connecting". Status 1 alone cannot tell a dial in progress from a node that
+//  never answers: with an exclusive own node that is down there are no peers, the platform's 0-peer
+//  keepalive re-adds the node every 10 s, a failed dial lasts up to about 20 s (CONNECT_TIMEOUT
+//  then the handshake), and the 30 s poll nearly always lands mid-dial, so "connecting" showed
+//  forever. The platform keeps one BROwnNodeHealthTrack per paired node (zeroed when the node is
+//  paired, changed or unpaired) and passes a monotonic clock in seconds. A run of polls that sees
+//  no connection (status 0 or 1) starts at its first poll; status 1 reads connecting until the run
+//  is BR_OWN_NODE_CONNECT_GRACE_SECS old and dark from then on. Status 2 or 3 (a connection) ends
+//  the run. A poll more than BR_OWN_NODE_HEALTH_GAP_SECS after the previous one (the app was
+//  suspended or the loop frozen, so nobody watched the dials) starts a new run, as does a clock
+//  that went backwards. The values follow Android's timing: 60 s is two 30 s polls past the first,
+//  room for at least two full dials and the keepalive's re-adds between them, and the same 60 s
+//  Android allows its keepalive loop before it calls it stale; 120 s is four poll intervals.
+//  BROwnNodeWatchdogMayPin: while an own node is pinned, the sync watchdogs leave the pin slot
+//  alone (see the function).
 //
 //  Where this refuses what Kotlin accepts (iOS shows the address as invalid):
 //  - A port written in non-ASCII digits. A deliberate difference: Kotlin's toIntOrNull reads any
@@ -48,7 +65,8 @@
 //  - Letters outside ASCII in a dgbnode:// host (Android's lookup does not resolve them either).
 //
 //  Host KAT: digibytewallet-android native/src/test/host/own_node_kat/ (CustomNodeTest,
-//  OwnNodeUriTest and OwnNodeAddressTest, case for case, plus the edges above).
+//  OwnNodeUriTest and OwnNodeAddressTest, case for case, plus the edges above; the health time
+//  limit, the gap rule and the watchdog rule each have their own red arm).
 //  Header-only, static inline.
 //
 
@@ -68,6 +86,8 @@ extern "C" {
 #define BR_OWN_NODE_HOST_MAX      256     // a host buffer this size holds any DNS name (253) and its NUL
 #define BR_OWN_NODE_IPV4_MAX      16      // "255.255.255.255" and its NUL
 #define BR_OWN_NODE_LABEL_UNITS   32      // the platform's display cap, in UTF-16 units
+#define BR_OWN_NODE_CONNECT_GRACE_SECS 60  // status 1 reads connecting this long, then dark
+#define BR_OWN_NODE_HEALTH_GAP_SECS    120 // a longer gap between polls starts a new run
 
 typedef enum {
     BROwnNodeNetUnspecified = 0,
@@ -349,6 +369,58 @@ static inline BROwnNodeHealth BROwnNodeHealthFor(int compactFilterPeerStatus)
 {
     return compactFilterPeerStatus == 3 ? BROwnNodeHealthServing
          : compactFilterPeerStatus == 1 ? BROwnNodeHealthConnecting : BROwnNodeHealthDark;
+}
+
+// The run of health polls that has seen no connection. Zero it (all fields 0) when the own node is
+// paired, changed or unpaired; BROwnNodeHealthObserve keeps it from then on.
+typedef struct {
+    int64_t runStart;   // monotonic seconds of the run's first poll
+    int64_t lastPoll;   // monotonic seconds of the previous poll in the run
+    int64_t inRun;      // 1 while a run is open (int64_t so a platform can hold it in a long[3])
+} BROwnNodeHealthTrack;
+
+static inline BROwnNodeHealth BROwnNodeHealthObserve(BROwnNodeHealthTrack *track, int compactFilterPeerStatus,
+                                                     int64_t nowSecs)
+{
+    const BROwnNodeHealth h = BROwnNodeHealthFor(compactFilterPeerStatus);
+
+    if (! track) return h;
+    if (compactFilterPeerStatus == 2 || compactFilterPeerStatus == 3) {   // a connection ends the run
+        track->inRun = 0; track->runStart = 0; track->lastPoll = 0;
+        return h;
+    }
+#ifndef OWN_NODE_RED_GAP
+    // RED ARM SEAM (own_node_kat, -DOWN_NODE_RED_GAP): without this, a poll after a suspension
+    // counts the time nobody watched, so a node that is dialling on resume reads dark at once.
+    if (track->inRun && (nowSecs < track->lastPoll || nowSecs - track->lastPoll > BR_OWN_NODE_HEALTH_GAP_SECS))
+        track->inRun = 0;
+#endif
+    if (! track->inRun) { track->inRun = 1; track->runStart = nowSecs; }
+    track->lastPoll = nowSecs;
+#ifndef OWN_NODE_RED_HEALTH
+    // RED ARM SEAM (own_node_kat, -DOWN_NODE_RED_HEALTH): without the limit, a node that never
+    // answers reads connecting forever.
+    if (h == BROwnNodeHealthConnecting && nowSecs - track->runStart >= BR_OWN_NODE_CONNECT_GRACE_SECS)
+        return BROwnNodeHealthDark;
+#endif
+    return h;
+}
+
+// The sync watchdogs' canon-peer pin (BRSyncWatchdog.h: the fast tip-stall tier and the corrupt-
+// chain heal) shares the peer manager's single pin slot with the own node. While an own node is
+// pinned, the watchdogs neither pin a canon peer nor clear the slot when the scan recovers: the
+// own node stays the pin, and an exclusive own node stays exclusive. Before this rule Android's
+// SyncService watchdogs pinned and cleared regardless, which dropped an exclusive own node to
+// public peers for the rest of the session; both platforms now ask this before they pin or clear.
+static inline int BROwnNodeWatchdogMayPin(int ownNodePinned)
+{
+#ifdef OWN_NODE_RED_PIN
+    // RED ARM SEAM (own_node_kat, -DOWN_NODE_RED_PIN): the watchdogs pin over the own node.
+    (void)ownNodePinned;
+    return 1;
+#else
+    return ownNodePinned ? 0 : 1;
+#endif
 }
 
 #ifdef __cplusplus

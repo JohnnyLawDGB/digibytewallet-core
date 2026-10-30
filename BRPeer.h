@@ -393,7 +393,7 @@ double BRPeerLastRecvTime(BRPeer *peer);
 // any peer connects and clear it (NULL) only after every peer has ended; *tap must stay valid and unchanged
 // from the set until then. fn runs on the reading peer's thread or the sender's, so it must be thread-safe
 // and must not call into the peer or its manager.
-#if defined(NDEBUG) && ! defined(BR_PEER_MESSAGE_TAP_ALLOW_NDEBUG)
+#ifdef NDEBUG
 #error "BR_PEER_MESSAGE_TAP is a test-only flag and must not reach a release (NDEBUG) build"
 #endif
 typedef struct {

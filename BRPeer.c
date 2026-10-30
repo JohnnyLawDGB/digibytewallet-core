@@ -2221,6 +2221,34 @@ static int _BRPeerOpenSocket(BRPeer *peer, int domain, double timeout, int *erro
     return r;
 }
 
+// MESSAGE TAP (BRPeer.h). The pair is published info first, then the function, and read function
+// first, so a reader that sees a tap sees its info.
+static void *volatile _messageTapInfo = NULL;
+static volatile BRPeerMessageTap _messageTap = NULL;
+
+void BRPeerSetMessageTap(BRPeerMessageTap tap, void *info)
+{
+    if (tap) {
+        __atomic_store_n(&_messageTapInfo, info, __ATOMIC_RELEASE);
+        __atomic_store_n(&_messageTap, tap, __ATOMIC_RELEASE);
+    }
+    else {
+        __atomic_store_n(&_messageTap, (BRPeerMessageTap)NULL, __ATOMIC_RELEASE);
+        __atomic_store_n(&_messageTapInfo, NULL, __ATOMIC_RELEASE);
+    }
+}
+
+static void _BRPeerTapMessage(const BRPeer *peer, int outbound, const char *type, const uint8_t *msg, size_t msgLen)
+{
+    BRPeerMessageTap tap = __atomic_load_n(&_messageTap, __ATOMIC_ACQUIRE);
+
+#ifdef REPLAY_TAP_RED
+    // RED ARM SEAM (replay_snapshot_kat): the hook is never called, so nothing is recorded.
+    tap = NULL;
+#endif
+    if (tap) tap(__atomic_load_n(&_messageTapInfo, __ATOMIC_ACQUIRE), peer, outbound, type, msg, msgLen);
+}
+
 static void *_peerThreadRoutine(void *arg)
 {
     BRPeer *peer = arg;
@@ -2385,6 +2413,7 @@ static void *_peerThreadRoutine(void *arg)
                             ctx->acceptType[ti] = '\0';
                             ctx->acceptStart = time;   // nonzero == "in dispatch"
 
+                            _BRPeerTapMessage(peer, 0, type, payload, msgLen);
                             int ok = _BRPeerAcceptMessage(peer, payload, msgLen, type);
 
                             ctx->acceptStart = 0;      // cleared even on the failure path below
@@ -2835,6 +2864,8 @@ static void _BRPeerSendMessageTimeout(BRPeer *peer, const uint8_t *msg, size_t m
         ssize_t n = 0;
         struct timeval tv;
         int socket, error = 0;
+
+        _BRPeerTapMessage(peer, 1, type, msg, msgLen);
 
         if (! buf) {
             peer_log(peer, "failed to send %s, out of memory for %zu bytes", type, bufLen);

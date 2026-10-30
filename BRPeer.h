@@ -382,6 +382,17 @@ double BRPeerLastRecvTime(BRPeer *peer);
 // O(peerCount * sendTimeout).
 #define KEEPALIVE_TICK_BUDGET 1.5
 
+// MESSAGE TAP: the replay harness's recording hook (replay/BRReplay.h, docs/replay-harness.md). When set,
+// it is called with every complete, checksum-valid message read from a peer, before it is handled
+// (outbound 0), and with every message handed to a peer's socket (outbound 1); payload is the message
+// body without the 24-byte frame header. Process-wide. Set it before any peer connects and clear it
+// (NULL) only after every peer has ended. It runs on the reading peer's thread or the sender's, so it
+// must be thread-safe and must not call into the peer or its manager. NULL, the default, records nothing
+// and costs one load per message.
+typedef void (*BRPeerMessageTap)(void *info, const BRPeer *peer, int outbound, const char *type,
+                                 const uint8_t *payload, size_t payloadLen);
+void BRPeerSetMessageTap(BRPeerMessageTap tap, void *info);
+
 // sends a bitcoin protocol message to peer
 void BRPeerSendMessage(BRPeer *peer, const uint8_t *msg, size_t msgLen, const char *type);
 void BRPeerSendMempool(BRPeer *peer, const UInt256 knownTxHashes[], size_t knownTxCount, void *info,

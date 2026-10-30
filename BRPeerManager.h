@@ -696,6 +696,11 @@ BRServerHeightResult BRPeerManagerApplyServerHeight(BRPeerManager *manager, UInt
 // current proof-of-work verified best block timestamp (time interval since unix epoch)
 uint32_t BRPeerManagerLastBlockTimestamp(BRPeerManager *manager);
 
+// The best block's height and hash, read together under the manager's lock (the replay harness's
+// snapshot, replay/BRReplay.h, compares both). Returns the height; *hash gets the hash, or zero with no
+// block yet. hash may be NULL.
+uint32_t BRPeerManagerLastBlockInfo(BRPeerManager *manager, UInt256 *hash);
+
 // current network sync progress from 0 to 1
 // startHeight is the block height of the most recent fully completed sync
 double BRPeerManagerSyncProgress(BRPeerManager *manager, uint32_t startHeight);

@@ -8743,6 +8743,22 @@ uint32_t BRPeerManagerLastBlockTimestamp(BRPeerManager *manager)
     return atomic_load_explicit(&manager->cachedLastTimestamp, memory_order_relaxed);
 }
 
+uint32_t BRPeerManagerLastBlockInfo(BRPeerManager *manager, UInt256 *hash)
+{
+    uint32_t height = 0;
+    UInt256 h = UINT256_ZERO;
+
+    assert(manager != NULL);
+    MGR_LOCK(manager);
+    if (manager->lastBlock) {
+        height = manager->lastBlock->height;
+        h = manager->lastBlock->blockHash;
+    }
+    MGR_UNLOCK(manager);
+    if (hash) *hash = h;
+    return height;
+}
+
 // current network sync progress from 0 to 1
 // startHeight is the block height of the most recent fully completed sync
 double  BRPeerManagerSyncProgress(BRPeerManager *manager, uint32_t startHeight)

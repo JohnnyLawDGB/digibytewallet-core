@@ -382,6 +382,29 @@ double BRPeerLastRecvTime(BRPeer *peer);
 // O(peerCount * sendTimeout).
 #define KEEPALIVE_TICK_BUDGET 1.5
 
+#ifdef BR_PEER_MESSAGE_TAP
+// MESSAGE TAP: the replay harness's recording hook (replay/BRReplay.h, docs/replay-harness.md). COMPILED IN
+// ONLY WITH -DBR_PEER_MESSAGE_TAP, which no app build defines: a shipped core has neither these declarations
+// nor any tap code, and setting the flag together with NDEBUG (every release build) is a compile error.
+//
+// When set, tap->fn is called with every complete, checksum-valid message read from a peer, before it is
+// handled (outbound 0), and with every message about to go out on a peer's socket, after the send gates
+// (outbound 1); payload is the message body without the 24-byte frame header. Process-wide. Set it before
+// any peer connects and clear it (NULL) only after every peer has ended; *tap must stay valid and unchanged
+// from the set until then. fn runs on the reading peer's thread or the sender's, so it must be thread-safe
+// and must not call into the peer or its manager.
+#if defined(NDEBUG) && ! defined(BR_PEER_MESSAGE_TAP_ALLOW_NDEBUG)
+#error "BR_PEER_MESSAGE_TAP is a test-only flag and must not reach a release (NDEBUG) build"
+#endif
+typedef struct {
+    void (*fn)(void *info, const BRPeer *peer, int outbound, const char *type, const uint8_t *payload,
+               size_t payloadLen);
+    void *info;
+} BRPeerMessageTap;
+
+void BRPeerSetMessageTap(const BRPeerMessageTap *tap);
+#endif
+
 // sends a bitcoin protocol message to peer
 void BRPeerSendMessage(BRPeer *peer, const uint8_t *msg, size_t msgLen, const char *type);
 void BRPeerSendMempool(BRPeer *peer, const UInt256 knownTxHashes[], size_t knownTxCount, void *info,

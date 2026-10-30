@@ -2221,6 +2221,32 @@ static int _BRPeerOpenSocket(BRPeer *peer, int domain, double timeout, int *erro
     return r;
 }
 
+#ifdef BR_PEER_MESSAGE_TAP
+// MESSAGE TAP (BRPeer.h; test builds only). One atomic pointer to the caller's {fn, info} pair, so a reader
+// never sees a function with another tap's info.
+static const BRPeerMessageTap *volatile _messageTap = NULL;
+
+void BRPeerSetMessageTap(const BRPeerMessageTap *tap)
+{
+    __atomic_store_n(&_messageTap, tap, __ATOMIC_RELEASE);
+}
+
+static void _BRPeerTapMessage(const BRPeer *peer, int outbound, const char *type, const uint8_t *msg, size_t msgLen)
+{
+    const BRPeerMessageTap *tap = __atomic_load_n(&_messageTap, __ATOMIC_ACQUIRE);
+
+#ifdef REPLAY_TAP_RED
+    // RED ARM SEAM (replay_snapshot_kat): the hook is never called, so nothing is recorded.
+    tap = NULL;
+#endif
+    if (tap && tap->fn) tap->fn(tap->info, peer, outbound, type, msg, msgLen);
+}
+#else
+// No tap in this build: the two calls below expand to nothing, so a release BRPeer.c compiles to what it
+// did before the tap existed (no function, no data, not even a local symbol in an unoptimised build).
+#define _BRPeerTapMessage(peer, outbound, type, msg, msgLen) ((void)0)
+#endif
+
 static void *_peerThreadRoutine(void *arg)
 {
     BRPeer *peer = arg;
@@ -2385,6 +2411,7 @@ static void *_peerThreadRoutine(void *arg)
                             ctx->acceptType[ti] = '\0';
                             ctx->acceptStart = time;   // nonzero == "in dispatch"
 
+                            _BRPeerTapMessage(peer, 0, type, payload, msgLen);
                             int ok = _BRPeerAcceptMessage(peer, payload, msgLen, type);
 
                             ctx->acceptStart = 0;      // cleared even on the failure path below
@@ -2863,6 +2890,9 @@ static void _BRPeerSendMessageTimeout(BRPeer *peer, const uint8_t *msg, size_t m
             error = EHOSTUNREACH;
         }
 #endif
+        // After the gates: only a message that is about to go on the wire is recorded (msgLen was zeroed
+        // above as the send cursor; the body is bufLen - HEADER_LENGTH bytes at msg).
+        if (! error) _BRPeerTapMessage(peer, 1, type, msg, bufLen - HEADER_LENGTH);
 
         // Independent send deadline. ctx->disconnectTime is DBL_MAX for idle /
         // fully-synced peers, so it cannot bound this loop: on a half-dead or

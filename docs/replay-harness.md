@@ -31,11 +31,18 @@ pair is published as one atomic pointer. `BRReplayRecorderStart` installs a tap 
 recording format below.
 
 **The tap exists only in a test build.** It is compiled in with `-DBR_PEER_MESSAGE_TAP`, which
-no app build defines; without it the declarations are absent and the two call sites are an empty
-inline, so a release `BRPeer.c` carries no tap code and no tap symbol (the Android KAT checks
+no app build defines; without it the declarations are absent and the two call sites expand to
+nothing, so a release `BRPeer.c` carries no tap code and no tap symbol (the Android KAT checks
 the symbol table of a build without the flag). The flag together with `NDEBUG`, which every
-release build defines, is a compile error. The recorder (`replay/`) is under the same flag;
-replaying needs no hook and runs against any core, a release one included.
+release build defines, is a compile error, with no override. The recorder (`replay/`) is under
+the same flag; replaying needs no hook and runs against any core, a release one included.
+
+**Never commit a tap recording of any wallet but the public test seed.** A recording holds every
+message the wallet exchanged: its addresses and transactions (in the blocks its filters matched
+and in anything it sends), and the network addresses of the machine that recorded it (the peers'
+version messages carry it, and the recorder writes each peer's address). Only a recording of a
+public test seed, with those address fields zeroed as `replay/tools/fetch_window.py` zeroes them,
+belongs in a repository.
 
 The replay needs no hook at all: the server is an ordinary peer on 127.0.0.1, and the wallet
 reaches it through the same path a user's own node takes (`BRPeerManagerAddPeer` +

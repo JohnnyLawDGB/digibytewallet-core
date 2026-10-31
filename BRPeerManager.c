@@ -655,6 +655,14 @@ struct BRPeerManagerStruct {
     _Atomic uint32_t cfCorroboratedThrough;  // highest 1000-multiple above the compiled table a
                                              // peer OTHER than the cfheaders source confirmed
     _Atomic uint32_t cfCheckptDisagreeCount; // cfcheckpt replies that disagreed with our chain
+    // 4.1.3 G5: each non-source peer's FIRST cfcheckpt mismatch with our chain (height, its value). When a strict
+    // majority of connected filter peers -- at least two -- report the same value at the same height, our chain is the
+    // outlier: the cfheaders source is banned and the chain is rebuilt from below the lie. Under manager->lock.
+    UInt128  cfCkDisPeers[CF_DISAGREED_CAP];
+    uint16_t cfCkDisPorts[CF_DISAGREED_CAP];
+    uint32_t cfCkDisHeights[CF_DISAGREED_CAP];
+    UInt256  cfCkDisValues[CF_DISAGREED_CAP];
+    uint8_t  cfCkDisCount;
 
     // ── Abandoned-band backfill (2026-08-21) ──────────────────────────────
     // Re-fetching the block headers under an abandoned band so the band can be
@@ -1375,8 +1383,17 @@ static void _BRPeerManagerRequestUnrelayedTx(BRPeerManager *manager, BRPeer *pee
 {
     BRPeerCallbackInfo *info;
     size_t hashCount = 0, txCount = BRWalletTxUnconfirmedBefore(manager->wallet, NULL, 0, TX_UNCONFIRMED);
+#ifndef UNRELAYED_TX_STACK_UNFIXED
+    // On the heap: the count is however many unconfirmed records the wallet holds, which a peer can raise, and a
+    // stack table that size can run past the peer thread's stack (4.1.3 G2)
+    BRTransaction **tx = calloc(BR_VLA_LEN(txCount), sizeof(*tx));
+    UInt256 *txHashes = calloc(BR_VLA_LEN(txCount), sizeof(*txHashes));
+
+    assert(tx != NULL && txHashes != NULL);
+#else
     BRTransaction *tx[BR_VLA_LEN(txCount)];
     UInt256 txHashes[BR_VLA_LEN(txCount)];
+#endif
     
     txCount = BRWalletTxUnconfirmedBefore(manager->wallet, tx, txCount, TX_UNCONFIRMED);
     
@@ -1401,6 +1418,10 @@ static void _BRPeerManagerRequestUnrelayedTx(BRPeerManager *manager, BRPeer *pee
         }
     }
     else peer->flags |= PEER_FLAG_SYNCED;
+#ifndef UNRELAYED_TX_STACK_UNFIXED
+    free(txHashes);
+    free(tx);
+#endif
 }
 
 static void _BRPeerManagerPublishPendingTx(BRPeerManager *manager, BRPeer *peer)
@@ -1554,9 +1575,16 @@ static void _BRPeerManagerFindPeers(BRPeerManager *manager)
         manager->peers[0].timestamp = now;
     }
 #ifndef PROXY_DISCOVERY_LOOKUP_UNFIXED
+#ifndef TOR_REQUIRED_LOOKUP_UNFIXED
+    else if (BRPeerHasSocksProxy() || BRPeerTorRequired()) {
+#else
     else if (BRPeerHasSocksProxy()) {
+#endif
         // Peer connections go through a SOCKS proxy (Tor), so discovery makes no local name
         // lookup: resolving the seed names would go to the device's resolver beside the proxy.
+        // The same holds while Tor is required and its proxy is not wired yet: every dial then
+        // waits for it, and a lookup made meanwhile would still leave by the device's resolver
+        // (4.1.3 G4).
         // The peers already held (the seeder list fetched through the proxy, the compiled-in
         // priority peers, saved peers) are left as they are, ordered as below.
         qsort(manager->peers, array_count(manager->peers), sizeof(*manager->peers), _peerTimestampCompare);
@@ -2085,7 +2113,7 @@ static void _peerConnected(void *info)
         _BRPeerManagerPublishPendingTx(manager, peer);
             
         if (manager->lastBlock->height < BRPeerLastBlock(peer)) { // start blockchain sync
-            UInt256 locators[_BRPeerManagerBlockLocators(manager, NULL, 0)];
+            UInt256 locators[BR_VLA_LEN(_BRPeerManagerBlockLocators(manager, NULL, 0))];
             size_t count = _BRPeerManagerBlockLocators(manager, locators, sizeof(locators)/sizeof(*locators));
             
             if (! _cfConvoyCanStartHeaderRequest(manager)) {
@@ -2288,7 +2316,7 @@ static void _BRPeerManagerAdoptDownloadPeer(BRPeerManager *manager, BRPeer *peer
     _BRPeerManagerPublishPendingTx(manager, peer);
 
     if (manager->lastBlock->height < BRPeerLastBlock(peer) && _cfConvoyCanStartHeaderRequest(manager)) {
-        UInt256 locators[_BRPeerManagerBlockLocators(manager, NULL, 0)];
+        UInt256 locators[BR_VLA_LEN(_BRPeerManagerBlockLocators(manager, NULL, 0))];
         size_t count = _BRPeerManagerBlockLocators(manager, locators, sizeof(locators)/sizeof(*locators));
 
         BRPeerScheduleDisconnectTagged(peer, PROTOCOL_TIMEOUT, BR_DISC_TAG_SYNC); // schedule sync timeout
@@ -2582,7 +2610,7 @@ static void _peerRelayedTx(void *info, BRTransaction *tx)
     size_t relayCount = 0;
     
     MGR_LOCK(manager);
-    peer_log(peer, "relayed tx: %.12s", u256hex(tx->txHash));
+    peer_log(peer, "relayed tx: %s", BR_LOG_TX(tx->txHash));
 #ifndef CF_GAP_RESCAN_UNFIXED
     // The address-set size before this tx is registered: a registration that extends a chain
     // while a requested block is being handed over invalidates the filters already judged at
@@ -2713,7 +2741,7 @@ static void _peerHasTx(void *info, UInt256 txHash)
     
     MGR_LOCK(manager);
     tx = BRWalletTransactionForHash(manager->wallet, txHash);
-    peer_log(peer, "has tx: %.12s", u256hex(txHash));
+    peer_log(peer, "has tx: %s", BR_LOG_TX(txHash));
 
     for (size_t i = array_count(manager->publishedTx); i > 0; i--) { // see if tx is in list of published tx
         if (UInt256Eq(manager->publishedTxHashes[i - 1], txHash)) {
@@ -2771,7 +2799,7 @@ static void _peerRejectedTx(void *info, UInt256 txHash, uint8_t code)
     int wasRelaying;
 
     MGR_LOCK(manager);
-    peer_log(peer, "rejected tx: %.12s", u256hex(txHash));
+    peer_log(peer, "rejected tx: %s", BR_LOG_TX(txHash));
     // Copies (4.1.2 row 5, K2): the manager lock does not hold the wallet's records -- a JNI remove frees
     // them under the wallet lock alone -- so this and the parent below are read from copies taken under it.
 #ifdef WALLET_TX_WALK_UNFIXED
@@ -4123,7 +4151,7 @@ static BRMerkleBlock *_peerRelayedBlockOnce(void *info, BRMerkleBlock *block)
     BRPeer *peer = ((BRPeerCallbackInfo *)info)->peer;
     BRPeerManager *manager = ((BRPeerCallbackInfo *)info)->manager;
     size_t txCount = BRMerkleBlockTxHashes(block, NULL, 0);
-    UInt256 _txHashes[(sizeof(UInt256)*txCount <= 0x1000) ? txCount : 0],
+    UInt256 _txHashes[BR_VLA_LEN((sizeof(UInt256)*txCount <= 0x1000) ? txCount : 0)],
             *txHashes = (sizeof(UInt256)*txCount <= 0x1000) ? _txHashes : malloc(txCount*sizeof(*txHashes));
     size_t i, saveCount = 0;
     BRMerkleBlock orphan, *b, *b2, *prev, *next = NULL;
@@ -4187,7 +4215,7 @@ static BRMerkleBlock *_peerRelayedBlockOnce(void *info, BRMerkleBlock *block)
             // lastOrphan/prevBlock link), and at most once per minimum interval per peer,
             // since each request builds the full block locators under the lock.
             if (_BRPeerManagerShouldReanchorForOrphanLocked(manager, peer, block, nowT)) {
-                UInt256 locators[_BRPeerManagerBlockLocators(manager, NULL, 0)];
+                UInt256 locators[BR_VLA_LEN(_BRPeerManagerBlockLocators(manager, NULL, 0))];
                 size_t locatorsCount = _BRPeerManagerBlockLocators(manager, locators,
                                                                    sizeof(locators)/sizeof(*locators));
 
@@ -4831,7 +4859,7 @@ static void _peerRelayedBlockInv(void *info, UInt256 blockHash)
 #endif
         ! CF_CONVOY_HDR_GATED(manager) &&
         ! BRSetGet(manager->blocks, &blockHash)) { // header not yet known — pull it from our tip
-        UInt256 locators[_BRPeerManagerBlockLocators(manager, NULL, 0)];
+        UInt256 locators[BR_VLA_LEN(_BRPeerManagerBlockLocators(manager, NULL, 0))];
         size_t count = _BRPeerManagerBlockLocators(manager, locators, sizeof(locators)/sizeof(*locators));
 
         peer_log(peer, "cf-only: block inv %s — requesting headers from tip %"PRIu32,
@@ -6825,16 +6853,89 @@ static void _peerRelayedCFilter(void *info, uint8_t filterType, UInt256 blockHas
     MGR_UNLOCK(manager);
 }
 
+#ifndef CF_CORROBORATE_ACT_UNFIXED
+// A peer other than the cfheaders source reported `value` at 1000-multiple `h` where our chain disagrees (4.1.3 G5).
+// Record it (one entry per peer, its latest first mismatch). When a strict majority of the connected filter peers,
+// at least two, report the same value at the same height, our chain -- anchored on the source's word above the
+// compiled table -- is the outlier: the source is banned and the chain is rebuilt from the first height that can
+// hold the lie (the majority matched us at h - 1000, or the chain's start is the lie), so the blocks the false
+// filters "cleared" are scanned again. Below the block floor that range cannot be refetched and is surfaced instead.
+// Charged to the re-anchor budget. Caller holds manager->lock.
+static void _BRPeerManagerCFCheckptDisagreedLocked(BRPeerManager *manager, BRPeer *peer, uint32_t h, UInt256 value)
+{
+    uint8_t i, k = manager->cfCkDisCount;
+
+    for (i = 0; i < manager->cfCkDisCount; i++) {
+        if (UInt128Eq(manager->cfCkDisPeers[i], peer->address) && manager->cfCkDisPorts[i] == peer->port) { k = i; break; }
+    }
+    if (k == manager->cfCkDisCount) {
+        if (manager->cfCkDisCount >= CF_DISAGREED_CAP) return;
+        manager->cfCkDisCount++;
+    }
+    manager->cfCkDisPeers[k] = peer->address;
+    manager->cfCkDisPorts[k] = peer->port;
+    manager->cfCkDisHeights[k] = h;
+    manager->cfCkDisValues[k] = value;
+
+    uint8_t agree = 0;
+    for (i = 0; i < manager->cfCkDisCount; i++) {
+        if (manager->cfCkDisHeights[i] == h && UInt256Eq(manager->cfCkDisValues[i], value)) agree++;
+    }
+    int connected = _BRPeerManagerConnectedFilterPeerCount(manager);
+    if (agree < 2 || agree <= connected / 2 || manager->cfReanchorCount >= CF_CONTINUITY_REANCHOR_MAX ||
+        ! manager->compactFilterChain) return;
+
+    uint32_t chainStart = BRCompactFilterChainStartHeight(manager->compactFilterChain);
+    uint32_t from = (h > 999u && h - 999u > chainStart) ? h - 999u : chainStart;
+    uint32_t floor = _BRPeerManagerBlockFloor(manager);
+
+    peer_log(peer, "cf-corroborate: %u of %d filter peers report height %u differently from our chain — "
+             "our chain is the outlier: banning its source, rebuilding from %u (attempt %u/%u)",
+             agree, connected, h, from, manager->cfReanchorCount + 1, CF_CONTINUITY_REANCHOR_MAX);
+    for (size_t j = array_count(manager->connectedPeers); j > 0; j--) {
+        BRPeer *src = manager->connectedPeers[j - 1];
+        if (src != peer && UInt128Eq(src->address, manager->cfHeadersPeerAddr)) {
+            _BRPeerManagerPeerMisbehavin(manager, src);
+            break;
+        }
+    }
+    manager->cfReanchorCount++;
+    if (floor > 0 && from < floor) {
+        _BRPeerManagerSurfaceUnscannableLocked(manager, from, floor, "CF chain rebuilt below the block floor");
+        from = floor;
+    }
+
+    BRCompactFilterChainFree(manager->compactFilterChain);
+    manager->compactFilterChain = NULL;
+    manager->autoFetchCFiltersEnabled  = 1;
+    manager->autoFetchCFiltersStart    = from;
+    manager->autoFetchCFiltersThrough  = from > 0 ? from - 1 : 0;
+    BRCFScanLedgerInit(&manager->cfLedger, from);
+    _BRPeerManagerClearSolicitedBlocksLocked(manager);
+#if CF_LEDGER_DRIVE_REREQUEST
+    BRCFScanLedgerClearFilterBuffer(&manager->cfLedger);
+#endif
+    manager->cfHeadersRequestedThrough = 0;
+    manager->cfDisagreedCount          = 0;
+    manager->cfSingleDisagreeRounds    = 0;
+    manager->cfCleanAppendsSinceReanchor = 0;
+    manager->cfCkDisCount              = 0;
+    atomic_store_explicit(&manager->cfCorroboratedThrough, 0, memory_order_relaxed);
+    // the new chain's first batch comes from a peer of the majority, never the banned source
+    _BRPeerManagerRequestNextCFHeaders(manager, peer, /*isConvoyAdvance=*/0);
+}
+#endif
+
 // cfcheckpt: a peer's filter headers at every 1000-multiple up to the stop block,
 // requested once per filter-capable connect (see the connect hook below) with a
-// 1000-multiple block we hold and the peer has announced as the stop. OBSERVE-ONLY corroboration of the range above the top
+// 1000-multiple block we hold and the peer has announced as the stop. Corroboration of the range above the top
 // compiled checkpoint: each returned header that lies inside our chain is compared
 // with BRCompactFilterChainHeader. A match from a peer whose address differs from
 // the current cfheaders source (cfHeadersPeerAddr — the peer whose batches are
 // building the chain) raises cfCorroboratedThrough; a mismatch raises
-// cfCheckptDisagreeCount and is logged. Nothing else moves: no re-anchor, no
-// disconnect, no ban, no watchdog input, no change to the quorum path. Same
-// staging as the compiled-checkpoint table (an observe pass preceded enforcement).
+// cfCheckptDisagreeCount and is logged. A mismatch from a non-source peer is also
+// recorded, and a strict majority agreeing on it rebuilds the chain without its source
+// (4.1.3 G5, _BRPeerManagerCFCheckptDisagreedLocked); short of that nothing else moves.
 //
 // Bounds: the stop block must be one we hold (we asked for a block from our own
 // set; anything else is unsolicited) and the count may not exceed the number of 1000-multiples at or
@@ -6894,6 +6995,12 @@ static void _peerRelayedCFCheckpt(void *info, uint8_t filterType, UInt256 stopHa
         peer_log(peer, "cf-corroborate: height %u MISMATCH ours=%s peer=%s (disagreements %u)", h,
                  log_u256_hex_encode(BRCompactFilterChainHeader(chain, h)), log_u256_hex_encode(filterHeaders[i]),
                  atomic_load_explicit(&manager->cfCheckptDisagreeCount, memory_order_relaxed));
+#ifndef CF_CORROBORATE_ACT_UNFIXED
+        if (! fromSource) {
+            _BRPeerManagerCFCheckptDisagreedLocked(manager, peer, h, filterHeaders[i]);
+            if (! manager->compactFilterChain) { MGR_UNLOCK(manager); return; }   // rebuilt: nothing left to compare
+        }
+#endif
         break;
     }
 
@@ -8433,7 +8540,7 @@ void BRPeerManagerKeepAlive(BRPeerManager *manager)
             if (CF_CONVOY_HDR_REKICK_DUE(manager, backoff)) {
                 BRPeer *dp = _BRPeerManagerHeaderSyncPeer(manager);
                 if (dp) {
-                    UInt256 locators[_BRPeerManagerBlockLocators(manager, NULL, 0)];
+                    UInt256 locators[BR_VLA_LEN(_BRPeerManagerBlockLocators(manager, NULL, 0))];
                     size_t locatorsCount = _BRPeerManagerBlockLocators(manager, locators,
                                                                        sizeof(locators)/sizeof(*locators));
                     peer_log(dp, "paced convoy: re-kicking held header continuation from tip %"PRIu32
@@ -8931,7 +9038,7 @@ int BRPeerManagerStemPublishTx(BRPeerManager *manager, BRTransaction *tx, void *
     _BRPeerManagerPublishPendingTx(manager, stem);      // inv(inv_tx) to the stem peer only
     BRPeerSendPing(stem, peerInfo, _publishTxInvDone);  // ping→pong confirms the inv was sent
 
-    peer_log(stem, "dandelion: stem-submitted tx %.12s to single peer", u256hex(txHash));
+    peer_log(stem, "dandelion: stem-submitted tx %s to single peer", BR_LOG_TX(txHash));
     MGR_UNLOCK(manager);
     _BRPeerManagerFlushAnswers(manager);
     return 1;
@@ -8969,7 +9076,7 @@ void BRPeerManagerFluffTx(BRPeerManager *manager, UInt256 txHash)
     // the bare BR_PEER_NONE sentinel to peer_log casts it to BRPeerContext* and writes
     // inet_ntop's host string past the end of the ~40-byte stack temporary — a stack
     // buffer overflow (-fstack-protector abort). Use the peer-less _peer_log.
-    _peer_log("dandelion: embargo fluff — flooded tx %.12s to all peers\n", u256hex(txHash));
+    _peer_log("dandelion: embargo fluff — flooded tx %s to all peers\n", BR_LOG_TX(txHash));
     MGR_UNLOCK(manager);
 }
 
@@ -9489,6 +9596,7 @@ static int _BRPeerManagerReanchorAtFloorLocked(BRPeerManager *manager, int force
 #endif
     manager->cfHeadersRequestedThrough = 0;
     manager->cfDisagreedCount          = 0;   // fresh disagreement window
+    manager->cfCkDisCount              = 0;   // and a fresh cfcheckpt disagreement window (4.1.3 G5)
     manager->cfSingleDisagreeRounds    = 0;   // fresh single-peer diverged-round window
     manager->cfCleanAppendsSinceReanchor = 0; // the refund counts clean appends from here
 
@@ -9750,7 +9858,7 @@ int BRPeerManagerRerequestHeadersFromTip(BRPeerManager *manager)
     MGR_LOCK(manager);
     int sent = 0;
     if (manager->isConnected && array_count(manager->connectedPeers) > 0) {
-        UInt256 locators[_BRPeerManagerBlockLocators(manager, NULL, 0)];
+        UInt256 locators[BR_VLA_LEN(_BRPeerManagerBlockLocators(manager, NULL, 0))];
         size_t locatorsCount = _BRPeerManagerBlockLocators(manager, locators,
                                                            sizeof(locators) / sizeof(*locators));
         for (size_t i = array_count(manager->connectedPeers); i > 0; i--) {
@@ -10131,8 +10239,9 @@ size_t BRPeerManagerRequestCompactFilters(BRPeerManager *manager,
 // the wallet holds is re-checked over the peer-to-peer path instead -- a filter peer is asked for that block's filter,
 // and a match fetches the block, which confirms the transaction through the same solicited, merkle-checked delivery as
 // any other (the transaction stays pending until then, and a call with no filter peer connected is simply repeated by
-// the next reconcile). Only a height below everything the wallet holds, pinned by a checkpoint at or below its tip, is
-// taken as reported, and the record stays signature-checked at that height (BRWalletUpdateTransactionsUnproven).
+// the next reconcile). A height nothing the wallet holds can check -- below every header it holds, or on a held header
+// below the filter chain's start -- is UNPROVABLE and changes nothing either: the caller may offer a scan from that
+// height, which proves a real transaction over the peer-to-peer path (4.1.3 row 1; until then it was taken as reported).
 BRServerHeightResult BRPeerManagerApplyServerHeight(BRPeerManager *manager, UInt256 txHash, uint32_t height,
                                                     uint32_t timestamp)
 {
@@ -10176,17 +10285,23 @@ BRServerHeightResult BRPeerManagerApplyServerHeight(BRPeerManager *manager, UInt
     MGR_UNLOCK(manager);
     if (checkable) return BR_SERVER_HEIGHT_RECHECKING;
 #ifndef SERVER_HEIGHT_HELD_UNFIXED
-    // a held header the scan can still reach is never the server's word. Below the filter chain's start no filter can
-    // ever check it -- a restore whose birth height came too late -- so that height, like one below everything held,
-    // is taken as reported, signature-checked (the residual; refusing it left a real receive pending for good)
+    // a held header the scan can still reach is never the server's word
     if (headerHeld && coverable) return BR_SERVER_HEIGHT_RECHECKING;
 #else
     (void)coverable;
 #endif
 #endif
 
+#if !defined(SERVER_HEIGHT_RESIDUAL_UNFIXED) && !defined(SERVER_HEIGHT_HELD_UNFIXED) && \
+    !defined(SERVER_HEIGHT_HINT_UNFIXED) && !defined(SERVER_HEIGHT_OVERWRITE_UNFIXED)
+    // below the filter chain's start (a restore whose birth height came too late) or below everything held, nothing
+    // the wallet holds can check the block: the server's word is all there is, and it is never the proof
+    return BR_SERVER_HEIGHT_UNPROVABLE;
+#else
+    // the comparison arms: each earlier release took what fell through here on the server's word
     BRWalletUpdateTransactionsUnproven(manager->wallet, &txHash, 1, height, timestamp);
     return BR_SERVER_HEIGHT_TAKEN;
+#endif
 }
 
 void BRPeerManagerEnableAutoCompactFilterFetch(BRPeerManager *manager, uint32_t startHeight)

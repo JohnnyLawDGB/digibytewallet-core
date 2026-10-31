@@ -1047,7 +1047,7 @@ int BRTransactionSign(BRTransaction *tx, int forkId, BRKey keys[], size_t keysCo
         // find it. Handle it here as a distinct path (and always `continue` afterward so
         // the hash160 loop never continue-skips an unhandled P2TR input).
         {
-            const uint8_t *twElems[BRScriptElements(NULL, 0, input->script, input->scriptLen)];
+            const uint8_t *twElems[BR_VLA_LEN(BRScriptElements(NULL, 0, input->script, input->scriptLen))];
             size_t twCount = BRScriptElements(twElems, sizeof(twElems)/sizeof(*twElems),
                                               input->script, input->scriptLen);
 
@@ -1099,7 +1099,7 @@ int BRTransactionSign(BRTransaction *tx, int forkId, BRKey keys[], size_t keysCo
         // from it. The pointer is restored immediately; nothing outside this block sees
         // the swap, and the input's own scriptPubKey is not serialized anyway.
         {
-            const uint8_t *shElems[BRScriptElements(NULL, 0, input->script, input->scriptLen)];
+            const uint8_t *shElems[BR_VLA_LEN(BRScriptElements(NULL, 0, input->script, input->scriptLen))];
             size_t shCount = BRScriptElements(shElems, sizeof(shElems)/sizeof(*shElems),
                                               input->script, input->scriptLen);
 
@@ -1119,7 +1119,7 @@ int BRTransactionSign(BRTransaction *tx, int forkId, BRKey keys[], size_t keysCo
                 }
 
                 if (sj < keysCount) {
-                    uint8_t shPubKey[BRKeyPubKey(&keys[sj], NULL, 0)];
+                    uint8_t shPubKey[BR_VLA_LEN(BRKeyPubKey(&keys[sj], NULL, 0))];
                     size_t shPkLen = BRKeyPubKey(&keys[sj], shPubKey, sizeof(shPubKey));
                     memcpy(&redeem[2], pkh[sj].u8, 20);
 
@@ -1129,7 +1129,7 @@ int BRTransactionSign(BRTransaction *tx, int forkId, BRKey keys[], size_t keysCo
                     input->script = redeem;
                     input->scriptLen = sizeof(redeem);
 
-                    uint8_t shData[_BRTransactionWitnessData(tx, NULL, 0, i, forkId | SIGHASH_ALL)];
+                    uint8_t shData[BR_VLA_LEN(_BRTransactionWitnessData(tx, NULL, 0, i, forkId | SIGHASH_ALL))];
                     size_t shDataLen = _BRTransactionWitnessData(tx, shData, sizeof(shData), i,
                                                                  forkId | SIGHASH_ALL);
                     input->script = savedScript;
@@ -1165,16 +1165,16 @@ int BRTransactionSign(BRTransaction *tx, int forkId, BRKey keys[], size_t keysCo
         while (j < keysCount && (! hash || ! UInt160Eq(pkh[j], UInt160Get(hash)))) j++;
         if (j >= keysCount) continue;
 
-        const uint8_t *elems[BRScriptElements(NULL, 0, input->script, input->scriptLen)];
+        const uint8_t *elems[BR_VLA_LEN(BRScriptElements(NULL, 0, input->script, input->scriptLen))];
         size_t elemsCount = BRScriptElements(elems, sizeof(elems)/sizeof(*elems), input->script, input->scriptLen);
-        uint8_t pubKey[BRKeyPubKey(&keys[j], NULL, 0)];
+        uint8_t pubKey[BR_VLA_LEN(BRKeyPubKey(&keys[j], NULL, 0))];
         size_t pkLen = BRKeyPubKey(&keys[j], pubKey, sizeof(pubKey));
         uint8_t sig[73], script[1 + sizeof(sig) + 1 + sizeof(pubKey)];
         size_t sigLen, scriptLen;
         UInt256 md = UINT256_ZERO;        
 
         if (elemsCount == 2 && *elems[0] == OP_0 && *elems[1] == 20) { // pay-to-witness-pubkey-hash
-            uint8_t data[_BRTransactionWitnessData(tx, NULL, 0, i, forkId | SIGHASH_ALL)];
+            uint8_t data[BR_VLA_LEN(_BRTransactionWitnessData(tx, NULL, 0, i, forkId | SIGHASH_ALL))];
             size_t dataLen = _BRTransactionWitnessData(tx, data, sizeof(data), i, forkId | SIGHASH_ALL);
             
             BRSHA256_2(&md, data, dataLen);
@@ -1186,7 +1186,7 @@ int BRTransactionSign(BRTransaction *tx, int forkId, BRKey keys[], size_t keysCo
             BRTxInputSetWitness(input, script, scriptLen);
         }
         else if (elemsCount >= 2 && *elems[elemsCount - 2] == OP_EQUALVERIFY) { // pay-to-pubkey-hash
-            uint8_t data[_BRTransactionData(tx, NULL, 0, i, forkId | SIGHASH_ALL)];
+            uint8_t data[BR_VLA_LEN(_BRTransactionData(tx, NULL, 0, i, forkId | SIGHASH_ALL))];
             size_t dataLen = _BRTransactionData(tx, data, sizeof(data), i, forkId | SIGHASH_ALL);
             
             BRSHA256_2(&md, data, dataLen);
@@ -1198,7 +1198,7 @@ int BRTransactionSign(BRTransaction *tx, int forkId, BRKey keys[], size_t keysCo
             BRTxInputSetWitness(input, script, 0);
         }
         else { // pay-to-pubkey
-            uint8_t data[_BRTransactionData(tx, NULL, 0, i, forkId | SIGHASH_ALL)];
+            uint8_t data[BR_VLA_LEN(_BRTransactionData(tx, NULL, 0, i, forkId | SIGHASH_ALL))];
             size_t dataLen = _BRTransactionData(tx, data, sizeof(data), i, forkId | SIGHASH_ALL);
 
             BRSHA256_2(&md, data, dataLen);
@@ -1211,7 +1211,7 @@ int BRTransactionSign(BRTransaction *tx, int forkId, BRKey keys[], size_t keysCo
     }
     
     if (tx && BRTransactionIsSigned(tx)) {
-        uint8_t data[BRTransactionSerialize(tx, NULL, 0)];
+        uint8_t data[BR_VLA_LEN(BRTransactionSerialize(tx, NULL, 0))];
         size_t len = BRTransactionSerialize(tx, data, sizeof(data));
         BRTransaction *t = BRTransactionParseSigned(data, len);   // signed now: no input is read as unsigned
         

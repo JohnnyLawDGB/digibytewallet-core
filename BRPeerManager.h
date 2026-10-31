@@ -685,7 +685,9 @@ int BRPeerManagerHeightConfirmable(BRPeerManager *manager, uint32_t height);
 typedef enum {
     BR_SERVER_HEIGHT_REFUSED = 0,     // the wallet's chain does not vouch for the height: nothing changes
     BR_SERVER_HEIGHT_RECHECKING = 1,  // the block is re-checked over P2P (or will be, next call); the tx stays pending
-    BR_SERVER_HEIGHT_TAKEN = 2,       // below everything the wallet holds, checkpoint-pinned: confirmed there, unproven
+    BR_SERVER_HEIGHT_TAKEN = 2,       // never returned since 4.1.3 (kept for the value): was "confirmed there, unproven"
+    BR_SERVER_HEIGHT_UNPROVABLE = 3,  // nothing the wallet holds can check the height (below every held header, or below
+                                      // the filter chain's start): nothing changes; a scan from that height is the proof
 } BRServerHeightResult;
 
 // Apply a confirmation height a server reported for the wallet's pending tx `txHash`. A server's height is never the

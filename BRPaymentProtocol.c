@@ -168,7 +168,7 @@ static void _ProtoBufSetInt(uint8_t *buf, size_t bufLen, uint64_t i, uint64_t ke
 static void _ProtoBufUnknown(uint8_t **unknown, uint64_t key, uint64_t i, const void *data, size_t dataLen)
 {
     size_t bufLen = 10 + ((key & 0x07) == PROTOBUF_LENDELIM ? dataLen : 0);
-    uint8_t _buf[(bufLen <= 0x1000) ? bufLen : 0], *buf = (bufLen <= 0x1000) ? _buf : malloc(bufLen);
+    uint8_t _buf[BR_VLA_LEN((bufLen <= 0x1000) ? bufLen : 0)], *buf = (bufLen <= 0x1000) ? _buf : malloc(bufLen);
     size_t off = 0, o = 0, l;
     uint64_t k;
     
@@ -701,7 +701,7 @@ BRPaymentProtocolPayment *BRPaymentProtocolPaymentNew(const uint8_t *merchantDat
     array_new(payment->refundTo, refundToCount);
         
     for (size_t i = 0; i < refundToCount; i++) {
-        uint8_t script[BRAddressScriptPubKey(NULL, 0, refundToAddresses[i].s)];
+        uint8_t script[BR_VLA_LEN(BRAddressScriptPubKey(NULL, 0, refundToAddresses[i].s))];
         size_t scriptLen = BRAddressScriptPubKey(script, sizeof(script), refundToAddresses[i].s);
             
         array_add(payment->refundTo, _BRPaymentProtocolOutput(refundToAmounts[i], script, scriptLen));
@@ -736,7 +736,7 @@ BRPaymentProtocolPayment *BRPaymentProtocolPaymentParse(const uint8_t *buf, size
         uint64_t i = 0, key = _ProtoBufField(&i, &data, buf, &dLen, &off);
         
         switch (key >> 3) {
-            case payment_transactions: tx = BRTransactionParse(data, dLen); break;
+            case payment_transactions: tx = BRTransactionParseSigned(data, dLen); break;   // a payment carries signed txs (4.1.3, review R15)
             case payment_refund_to: out = _BRPaymentProtocolOutputParse(data, dLen); break;
             case payment_memo: _ProtoBufString(&payment->memo, data, dLen); break;
             case payment_merch_data: payment->merchDataLen = _ProtoBufBytes(&payment->merchantData, data, dLen); break;

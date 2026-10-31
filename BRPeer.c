@@ -1107,14 +1107,14 @@ static int _BRPeerAcceptTxMessage(BRPeer *peer, const uint8_t *msg, size_t msgLe
     // connection.
     else if (! _BRPeerTakeRequested(ctx, &ctx->requestedTxHashes, tx->txHash) &&
              ! _BRPeerCurrentBlockHasTx(ctx, tx->txHash)) {
-        peer_log(peer, "%s %.12s was not requested from this peer, ignoring", is_dandelion ? "dandeliontx" : "tx",
-                 log_u256_hex_encode(tx->txHash));
+        peer_log(peer, "%s %s was not requested from this peer, ignoring", is_dandelion ? "dandeliontx" : "tx",
+                 BR_LOG_TX(tx->txHash));
         BRTransactionFree(tx);
     }
 #endif
     else {
         txHash = tx->txHash;
-        peer_log(peer, "got tx: %.12s", log_u256_hex_encode(txHash));
+        peer_log(peer, "got tx: %s", BR_LOG_TX(txHash));
 
         if (ctx->relayedTx) {
             ctx->relayedTx(ctx->info, tx);
@@ -1320,7 +1320,7 @@ static int _BRPeerAcceptGetdataMessage(BRPeer *peer, const uint8_t *msg, size_t 
                     tx = ctx->requestedTx ? ctx->requestedTx(ctx->info, hash) : NULL;
 
                     if (tx && BRTransactionSize(tx) < TX_MAX_SIZE) {
-                        uint8_t buf[BRTransactionSerialize(tx, NULL, 0)];
+                        uint8_t buf[BR_VLA_LEN(BRTransactionSerialize(tx, NULL, 0))];
                         size_t bufLen = BRTransactionSerialize(tx, buf, sizeof(buf));
                         char txHex[bufLen*2 + 1];
 
@@ -1560,8 +1560,8 @@ static int _BRPeerAcceptRejectMessage(BRPeer *peer, const uint8_t *msg, size_t m
             off += hashLen;
 
             if (! UInt256IsZero(txHash)) {
-                peer_log(peer, "rejected %s code: 0x%x reason: \"%s\" txid: %.12s", type, code, reason,
-                         log_u256_hex_encode(txHash));
+                peer_log(peer, "rejected %s code: 0x%x reason: \"%s\" tx: %s", type, code, reason,
+                         BR_LOG_TX(txHash));
                 if (ctx->rejectedTx) ctx->rejectedTx(ctx->info, txHash, code);
             }
             else peer_log(peer, "rejected %s code: 0x%x reason: \"%s\"", type, code, reason);

@@ -1036,3 +1036,51 @@ void BROdocrypt(const char* input, const uint32_t nTime, uint32_t interval, uint
     Odocrypt_Init(&odo, key);
     Odocrypt_Hash(&odo, input, input + 80, (char*) output);
 }
+
+// ---- log tags (4.1.3, review R7) ---------------------------------------------------------------------------------
+
+static uint8_t _logTagKey[32];
+static int _logTagKeySet = 0;
+
+void BRLogTagSetKey(const uint8_t key[32])
+{
+    if (! key) return;
+    memcpy(_logTagKey, key, sizeof(_logTagKey));
+    __atomic_store_n(&_logTagKeySet, 1, __ATOMIC_RELEASE);
+}
+
+const char *BRLogTxTagHex(const char *txidDisplayHex, char out[9])
+{
+    static const char digits[] = "0123456789abcdef";
+    char hex[64];
+    uint8_t mac[32];
+    size_t i;
+
+    memcpy(out, "--------", 9);
+    if (! txidDisplayHex || ! __atomic_load_n(&_logTagKeySet, __ATOMIC_ACQUIRE)) return out;
+    for (i = 0; i < 64; i++) {
+        char c = txidDisplayHex[i];
+        if (c >= 'A' && c <= 'F') c = (char)(c - 'A' + 'a');
+        if (! ((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) return out;   // not a txid: no tag
+        hex[i] = c;
+    }
+    BRHMAC(mac, BRSHA256, 32, _logTagKey, sizeof(_logTagKey), hex, sizeof(hex));
+    for (i = 0; i < 4; i++) { out[2*i] = digits[mac[i] >> 4]; out[2*i + 1] = digits[mac[i] & 0x0f]; }
+    out[8] = '\0';
+    return out;
+}
+
+const char *BRLogTxTag(const uint8_t txHashLE[32], char out[9])
+{
+    static const char digits[] = "0123456789abcdef";
+    char hex[65];
+    size_t i;
+
+    if (! txHashLE) { memcpy(out, "--------", 9); return out; }
+    for (i = 0; i < 32; i++) {   // display order is the internal hash reversed
+        uint8_t b = txHashLE[31 - i];
+        hex[2*i] = digits[b >> 4]; hex[2*i + 1] = digits[b & 0x0f];
+    }
+    hex[64] = '\0';
+    return BRLogTxTagHex(hex, out);
+}

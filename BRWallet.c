@@ -1645,6 +1645,28 @@ static int _BRWalletOutputSignable(const BRTxOutput *out)
     return 0;
 }
 
+// The virtual size an input spending `out` adds once signed, by its script (an output that is not
+// signable is never selected; 148, the P2PKH size, is the fallback).
+static size_t _BRWalletInputVSize(const BRTxOutput *out)
+{
+    if (out->scriptLen == 22) return 68;    // P2WPKH: 41 base + 107/4 witness, rounded up
+    if (out->scriptLen == 34) return 58;    // P2TR key path: 41 base + 66/4 witness, rounded up
+    if (out->scriptLen == 23) return 91;    // P2SH-P2WPKH: 64 base + 107/4 witness, rounded up
+    return TX_INPUT_SIZE;                   // P2PKH
+}
+
+// 1 if spending `out` at `feePerKb` brings in more than the fee its own input adds (4.1.3 G3). A coin that
+// does not is worth less than nothing to a send: it is taken only when nothing else covers the send.
+static int _BRWalletOutputEconomic(const BRTxOutput *out, uint64_t feePerKb)
+{
+#ifndef EFFECTIVE_VALUE_UNFIXED
+    return out->amount > _txFee(feePerKb, _BRWalletInputVSize(out));
+#else
+    (void)out; (void)feePerKb;
+    return 1;
+#endif
+}
+
 // True when an unconfirmed tx is the wallet's own: every input spends an output paying a wallet address
 // that is itself confirmed or, in turn, the wallet's own unconfirmed tx, and it pays out no more than it
 // spends. That is a send or its change. It cannot be counterfeited: an unconfirmed tx that spends a
@@ -1713,14 +1735,19 @@ size_t BRWalletSelectableUTXOs(BRWallet *wallet, BRUTXO *utxos, size_t utxosCoun
     pthread_mutex_lock(&wallet->lock);
     n = array_count(wallet->utxos);
 
-    for (k = 0; k < 2*n && (! utxos || w < utxosCount); k++) {
+    // Three passes, in selection's order: confirmed economic coins, the wallet's own unconfirmed economic
+    // change, then any of those a send would lose fee on (4.1.3 G3), last.
+    for (k = 0; k < 3*n && (! utxos || w < utxosCount); k++) {
         BRUTXO *o = &wallet->utxos[k % n];
         BRTransaction *tx = BRSetGet(wallet->allTx, o);
+        size_t pass = k / n;
 
         if (! tx || o->n >= tx->outCount) continue;
         if (BRWalletUtxoIsAsset(wallet, o)) continue;
         if (! _BRWalletOutputSignable(&tx->outputs[o->n])) continue;
-        if (! _BRWalletUtxoSelectable(wallet, tx, k >= n, &budget)) continue;
+        if ((pass < 2) != _BRWalletOutputEconomic(&tx->outputs[o->n], wallet->feePerKb)) continue;
+        if (pass < 2 ? ! _BRWalletUtxoSelectable(wallet, tx, (int)pass, &budget)
+                     : ! _BRWalletUtxoSelectableAny(wallet, tx, &budget)) continue;
         if (utxos) utxos[w] = *o;
         w++;
     }
@@ -1791,9 +1818,12 @@ static BRTransaction *_BRWalletCreateTxForOutputsAt(BRWallet *wallet, const BRTx
     // TODO: avoid combining addresses in a single transaction when possible to reduce information leakage
     // TODO: use up UTXOs received from any of the output scripts that this transaction sends funds to, to mitigate an
     //       attacker double spending and requesting a refund
-    // Two passes over the UTXOs (k < nUtxos, then the rest): confirmed coins first, then the wallet's
-    // own unconfirmed change (_BRWalletUtxoSelectable).
-    for (k = 0, nUtxos = array_count(wallet->utxos); k < 2*nUtxos; k++) {
+    // Three passes over the UTXOs: confirmed coins first, then the wallet's own unconfirmed change
+    // (_BRWalletUtxoSelectable) -- each taking only coins worth more than their own input's fee -- and last
+    // any coin that is not, so a send never pays to spend dust while an economic coin would do (4.1.3 G3).
+    for (k = 0, nUtxos = array_count(wallet->utxos); k < 3*nUtxos; k++) {
+        size_t pass = k / nUtxos;
+
         i = k % nUtxos;
         o = &wallet->utxos[i];
         tx = BRSetGet(wallet->allTx, o);
@@ -1801,7 +1831,11 @@ static BRTransaction *_BRWalletCreateTxForOutputsAt(BRWallet *wallet, const BRTx
         if (! tx || o->n >= tx->outCount) continue;
         if (BRWalletUtxoIsAsset(wallet, o)) continue;
         if (! _BRWalletOutputSignable(&tx->outputs[o->n])) continue;   // never select what cannot be signed
-        if (! _BRWalletUtxoSelectable(wallet, tx, k >= nUtxos, &budget)) continue;
+        if ((pass < 2) != _BRWalletOutputEconomic(&tx->outputs[o->n], feePerKb)) continue;
+        // the last resort is for a send the economic coins do not cover, never for rounding up to change
+        if (pass == 2 && balance >= amount + feeAmount) break;
+        if (pass < 2 ? ! _BRWalletUtxoSelectable(wallet, tx, (int)pass, &budget)
+                     : ! _BRWalletUtxoSelectableAny(wallet, tx, &budget)) continue;
 
         BRTransactionAddInput(transaction, tx->txHash, o->n, tx->outputs[o->n].amount,
                               tx->outputs[o->n].script, tx->outputs[o->n].scriptLen, NULL, 0, NULL, 0, TXIN_SEQUENCE);
@@ -1864,7 +1898,7 @@ static BRTransaction *_BRWalletCreateTxForOutputsAt(BRWallet *wallet, const BRTx
     }
     else if (transaction && balance - (amount + feeAmount) > minAmount) { // add change output
         BRWalletUnusedAddrs(wallet, &addr, 1, 1, 1);
-        uint8_t script[BRAddressScriptPubKey(NULL, 0, addr.s)];
+        uint8_t script[BR_VLA_LEN(BRAddressScriptPubKey(NULL, 0, addr.s))];
         size_t scriptLen = BRAddressScriptPubKey(script, sizeof(script), addr.s);
         
         BRTransactionAddOutput(transaction, balance - (amount + feeAmount), script, scriptLen);
@@ -2188,13 +2222,13 @@ int BRWalletGetAddressPrivateKey(BRWallet* wallet, BRKey* key, const char* addre
 int BRWalletSignTransaction(BRWallet *wallet, BRTransaction *tx, int forkId, const void *seed, size_t seedLen)
 {
     // BIP84 (primary) chain indices — use BRBIP32PrivKeyListBIP84 for these
-    uint32_t j, bip84InternalIdx[tx->inCount], bip84ExternalIdx[tx->inCount];
+    uint32_t j, bip84InternalIdx[BR_VLA_LEN(tx->inCount)], bip84ExternalIdx[BR_VLA_LEN(tx->inCount)];
     size_t i, bip84InternalCount = 0, bip84ExternalCount = 0;
     // Legacy chain indices — use BRBIP32PrivKeyList (DigiByte seed, m/0H) for these
-    uint32_t legacyInternalIdx[tx->inCount], legacyExternalIdx[tx->inCount];
+    uint32_t legacyInternalIdx[BR_VLA_LEN(tx->inCount)], legacyExternalIdx[BR_VLA_LEN(tx->inCount)];
     size_t legacyInternalCount = 0, legacyExternalCount = 0;
     // Taproot chain indices — use BRBIP32PrivKeyListBIP86 (m/86'/20'/0') for these
-    uint32_t taprootInternalIdx[tx->inCount], taprootExternalIdx[tx->inCount];
+    uint32_t taprootInternalIdx[BR_VLA_LEN(tx->inCount)], taprootExternalIdx[BR_VLA_LEN(tx->inCount)];
     size_t taprootInternalCount = 0, taprootExternalCount = 0;
     int r = 0;
 
@@ -3171,6 +3205,8 @@ uint64_t BRWalletMaxOutputAmount(BRWallet *wallet)
         if (! tx || o->n >= tx->outCount) continue;
         if (! _BRWalletOutputSignable(&tx->outputs[o->n])) continue;   // what selection would skip
         if (! _BRWalletUtxoSelectableAny(wallet, tx, &budget)) continue;
+        // a coin worth less than its own input's fee lowers what a send of everything delivers (4.1.3 G3)
+        if (! _BRWalletOutputEconomic(&tx->outputs[o->n], wallet->feePerKb)) continue;
         inCount++;
         amount = _BRMoneyAdd(amount, tx->outputs[o->n].amount);
         

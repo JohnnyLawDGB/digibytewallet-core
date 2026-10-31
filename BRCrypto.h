@@ -131,6 +131,16 @@ inline static void _var_clean(size_t size, ...)
     va_end(args);
 }
     
+// A transaction's tag for a log line: the first 8 hex characters of HMAC-SHA256(this install's key, the txid
+// in display order, as 64 lowercase hex characters) (4.1.3, review R7). A txid prefix is near-unique on
+// chain, so it ties a captured log to the wallet's transactions; the tag only correlates lines of this
+// install's own logs. Until BRLogTagSetKey has run every tag reads "--------". `out` must hold 9 bytes.
+void BRLogTagSetKey(const uint8_t key[32]);
+const char *BRLogTxTag(const uint8_t txHashLE[32], char out[9]);        // a UInt256 txHash (internal order)
+const char *BRLogTxTagHex(const char *txidDisplayHex, char out[9]);     // a txid as shown (64 hex characters)
+// A UInt256 txHash's tag, for a peer_log / LOG* argument.
+#define BR_LOG_TX(h) BRLogTxTag((h).u8, (char[9]){0})
+
 #ifdef __cplusplus
 }
 #endif

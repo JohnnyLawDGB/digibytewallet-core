@@ -368,6 +368,23 @@ size_t BRAddressFromWitness(char *addr, size_t addrLen, const uint8_t *witness, 
     return 0; // TODO: XXX implement
 }
 
+// A decoded bech32/bech32m witness program the wallet will pay to: version 0 with a 20- or 32-byte
+// program (P2WPKH, P2WSH), or version 1 with a 32-byte program (Taproot). BIP341 leaves a version-1
+// output of any other length unencumbered, so anyone can spend it, and versions 2 to 16 are not yet
+// defined, so a payment to either is a payment nobody controls. data is <version opcode> <length>
+// <program>, as BRBech32Decode writes it.
+static int _BRWitnessProgramIsPayable(const uint8_t *data, size_t dataLen)
+{
+#ifdef WITNESS_PROGRAM_LEN_UNFIXED
+    return (dataLen > 2 && (data[0] != OP_0 || data[1] == 20 || data[1] == 32));
+#else
+    if (dataLen < 2 || dataLen != 2u + data[1]) return 0;
+    if (data[0] == OP_0) return (data[1] == 20 || data[1] == 32);
+    if (data[0] == OP_1) return (data[1] == 32);
+    return 0;
+#endif
+}
+
 // writes the scriptPubKey for addr to script
 // returns the number of bytes written, or scriptLen needed if script is NULL
 size_t BRAddressScriptPubKey(uint8_t *script, size_t scriptLen, const char *addr)
@@ -412,7 +429,7 @@ size_t BRAddressScriptPubKey(uint8_t *script, size_t scriptLen, const char *addr
     else {
         dataLen = BRBech32Decode(hrp, data, addr);
         
-        if (dataLen > 2 && strcmp(hrp, bech32Prefix) == 0 && (data[0] != OP_0 || data[1] == 20 || data[1] == 32)) {
+        if (dataLen > 2 && strcmp(hrp, bech32Prefix) == 0 && _BRWitnessProgramIsPayable(data, dataLen)) {
             if (script && dataLen <= scriptLen) memcpy(script, data, dataLen);
             r = (! script || dataLen <= scriptLen) ? dataLen : 0;
         }
@@ -439,8 +456,9 @@ int BRAddressIsValid(const char *addr)
             if (!r) r = (data[0] == DIGIBYTE_SCRIPT_ADDRESS); // check new multisig
         }
     }
-    else if (BRBech32Decode(hrp, data, addr) > 2) {
-        r = (strcmp(hrp, BRDigiByteBech32Hrp()) == 0 && (data[0] != OP_0 || data[1] == 20 || data[1] == 32));
+    else {
+        size_t dataLen = BRBech32Decode(hrp, data, addr);
+        r = (dataLen > 2 && strcmp(hrp, BRDigiByteBech32Hrp()) == 0 && _BRWitnessProgramIsPayable(data, dataLen));
     }
 
     return r;

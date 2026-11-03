@@ -11,6 +11,10 @@
 //  Until 2026-10 these rules lived in Android-only code: the service parse in
 //  PeerServicesPolicy.kt (parseSeederServicesHex), the default tag in the JNI bridge
 //  (jni_peer.c, INJECT_DEFAULT_SERVICES) and the refresh interval in SyncService.kt.
+//  The refresh decision (BRSeederShouldRefresh) is now the one copy on both platforms: iOS
+//  imports it, Android calls it through JNI (jni_seeder_refresh.c; it replaced
+//  SeederRefreshPolicy.isStale, which took the interval as an argument; every caller passed
+//  one hour).
 //
 //  The rules:
 //    - services_hex: ASCII-trimmed, one leading "0x"/"0X" removed, then 1 to 16 hex digits with
@@ -27,7 +31,9 @@
 //  An own-node in exclusive mode adds no seeder peer at all; that state is the platform's (it
 //  pins the node), so the platform skips this call then.
 //
-//  Host KAT: digibytewallet-android native/src/test/host/seeder_peers_kat/.
+//  Host KAT: digibytewallet-android native/src/test/host/seeder_peers_kat/. Two comparison
+//  seams, each failing only its own cases: SEEDER_PEERS_RED (the service parse and tag) and
+//  SEEDER_REFRESH_RED (the refresh decision).
 //  Header-only, static inline.
 //
 
@@ -86,12 +92,20 @@ static inline uint64_t BRSeederPeerServices(uint64_t parsed)
 #endif
 }
 
-// Whether a cached list fetched at lastFetchMs (0: never) is fetched again at nowMs. Time
-// differences wrap as Kotlin's Long does.
+// Whether a cached list fetched at lastFetchMs (0: never) is fetched again at nowMs: it is
+// empty, or more than BR_SEEDER_REFRESH_MS old (exactly one hour old is kept). A clock that went
+// back gives a negative age, which keeps the list. Time differences wrap as Kotlin's Long does.
 static inline int BRSeederShouldRefresh(int64_t lastFetchMs, int64_t nowMs, size_t cachedCount)
 {
     int64_t age = (int64_t)((uint64_t)nowMs - (uint64_t)lastFetchMs);
+#ifdef SEEDER_REFRESH_RED
+    // RED ARM SEAM (seeder_peers_kat): an empty cache waits out the hour, and an hour-old list is
+    // refetched (SyncWorker's ">=" before Android #187).
+    (void)cachedCount;
+    return age >= BR_SEEDER_REFRESH_MS;
+#else
     return cachedCount == 0 || age > BR_SEEDER_REFRESH_MS;
+#endif
 }
 
 // Parses an IPv4 dotted-quad literal into the manager's IPv4-mapped form. Returns 1 on success.

@@ -11,10 +11,11 @@
 //  Until 2026-10 these rules lived in Android-only code: the service parse in
 //  PeerServicesPolicy.kt (parseSeederServicesHex), the default tag in the JNI bridge
 //  (jni_peer.c, INJECT_DEFAULT_SERVICES) and the refresh interval in SyncService.kt.
-//  The refresh decision (BRSeederShouldRefresh) is now the one copy on both platforms: iOS
-//  imports it, Android calls it through JNI (jni_seeder_refresh.c; it replaced
-//  SeederRefreshPolicy.isStale, which took the interval as an argument; every caller passed
-//  one hour).
+//  Each is now the one copy on both platforms: iOS imports these functions, and Android calls
+//  them through JNI (jni_seeder_peers.c: BRSeederShouldRefresh replaced
+//  SeederRefreshPolicy.isStale, which took the interval as an argument; every caller passed one
+//  hour. BRSeederServicesParse replaced parseSeederServicesHex, and jni_peer.c's injectPeerByIp
+//  tags and adds with BRSeederPeerServices, BRSeederPeerAddress and BRSeederPeerAdd).
 //
 //  The rules:
 //    - services_hex: ASCII-trimmed, one leading "0x"/"0X" removed, then 1 to 16 hex digits with
@@ -25,15 +26,19 @@
 //    - only an IPv4 dotted-quad literal is added (the seeder serves IPv4), as IPv4-mapped;
 //    - the cached list is fetched again when it is empty or older than
 //      BR_SEEDER_REFRESH_MS (one hour).
-//  Differences from the Kotlin: trimming is ASCII only, and a sign is not accepted ("-1" was -1,
-//  i.e. every service bit). The seeder writes plain "0x44d".
+//  The Kotlin parse (trim(), removePrefix("0x"), removePrefix("0X"), toLongOrNull(16)) read more
+//  than this, and those forms are now 0: a sign ("-1" was -1, every service bit; "+44d" was
+//  0x44d), leading zeros past 16 digits, a second prefix ("0x0X44d" was 0x44d), non-ASCII digits
+//  (Character.digit reads fullwidth and other Unicode digits) and non-ASCII or U+001C..U+001F
+//  space around the value. The seeder writes plain "0x44d", which both read the same.
 //
 //  An own-node in exclusive mode adds no seeder peer at all; that state is the platform's (it
 //  pins the node), so the platform skips this call then.
 //
-//  Host KAT: digibytewallet-android native/src/test/host/seeder_peers_kat/. Two comparison
-//  seams, each failing only its own cases: SEEDER_PEERS_RED (the service parse and tag) and
-//  SEEDER_REFRESH_RED (the refresh decision).
+//  Host KAT: digibytewallet-android native/src/test/host/seeder_peers_kat/. Three comparison
+//  seams, each failing only its own cases: SEEDER_PEERS_RED (the service parse and tag),
+//  SEEDER_SERVICES_RED (the Kotlin parse's ASCII leniencies) and SEEDER_REFRESH_RED (the
+//  refresh decision).
 //  Header-only, static inline.
 //
 
@@ -64,11 +69,22 @@ static inline uint64_t BRSeederServicesParse(const char *s, size_t len)
     size_t a = 0, b = len, i;
     uint64_t v = 0;
 
+#ifdef SEEDER_SERVICES_RED
+    int neg = 0;
+#endif
+
     if (! s) return 0;
     while (a < b && _BRSeederIsSpace(s[a])) a++;
     while (b > a && _BRSeederIsSpace(s[b - 1])) b--;
-#ifdef SEEDER_PEERS_RED
+#if defined(SEEDER_PEERS_RED)
     // RED ARM SEAM (seeder_peers_kat): the prefix is not removed, so "0x44d" reads as 0.
+#elif defined(SEEDER_SERVICES_RED)
+    // RED ARM SEAM (seeder_peers_kat): the Kotlin copy's ASCII leniencies (Android's
+    // parseSeederServicesHex): "0x" and then "0X" removed, a sign, any number of leading zeros.
+    if (b - a >= 2 && s[a] == '0' && s[a + 1] == 'x') a += 2;
+    if (b - a >= 2 && s[a] == '0' && s[a + 1] == 'X') a += 2;
+    if (b - a >= 2 && (s[a] == '+' || s[a] == '-')) neg = (s[a++] == '-');
+    while (b - a > 16 && s[a] == '0') a++;
 #else
     if (b - a >= 2 && s[a] == '0' && (s[a + 1] == 'x' || s[a + 1] == 'X')) a += 2;
 #endif
@@ -79,6 +95,9 @@ static inline uint64_t BRSeederServicesParse(const char *s, size_t len)
         if (d < 0) return 0;
         v = v << 4 | (uint64_t)d;
     }
+#ifdef SEEDER_SERVICES_RED
+    if (neg) return (v > (uint64_t)INT64_MAX + 1) ? 0 : (uint64_t)0 - v;
+#endif
     return (v > (uint64_t)INT64_MAX) ? 0 : v;
 }
 
@@ -100,7 +119,8 @@ static inline int BRSeederShouldRefresh(int64_t lastFetchMs, int64_t nowMs, size
     int64_t age = (int64_t)((uint64_t)nowMs - (uint64_t)lastFetchMs);
 #ifdef SEEDER_REFRESH_RED
     // RED ARM SEAM (seeder_peers_kat): an empty cache waits out the hour, and an hour-old list is
-    // refetched (SyncWorker's ">=" before Android #187).
+    // refetched. Only the hour half is history: SyncWorker compared with ">=" before Android #187,
+    // but it fetched at once when nothing was cached.
     (void)cachedCount;
     return age >= BR_SEEDER_REFRESH_MS;
 #else

@@ -44,8 +44,9 @@
 //  window's old answer).
 //
 //  The DigiDollar scan's window (Android 4.1.2 row 19, m/86'/20'/0') is the second half of this
-//  header, BRRecoveryDigiDollarGap*: the same idea with its own gaps, one cap, no whole-gap step and
-//  no round bound. It shares the outcome values above.
+//  header, BRRecoveryDigiDollarGap*: the same rule (the whole-gap step and the round bound, through
+//  the shared helpers below) with its own gaps and one cap for both chains. It shares the outcome
+//  values above.
 //
 //  Header-only, static inline. No I/O, no locking, libc only.
 //
@@ -77,6 +78,23 @@ static inline int32_t _BRRecoveryGapMin(int32_t a, int32_t b) { return a < b ? a
 static inline int32_t _BRRecoveryGapOf(int chain) { return chain == 0 ? BR_RECOVERY_GAP_EXTERNAL : BR_RECOVERY_GAP_INTERNAL; }
 static inline int32_t _BRRecoveryMaxOf(int chain) { return chain == 0 ? BR_RECOVERY_MAX_EXTERNAL : BR_RECOVERY_MAX_INTERNAL; }
 
+// The step both scans take, with a scan's gap and cap: a window count that wants to reach wanted (a
+// gap past the last use) grows to it, by at least a whole gap, never above max and never below
+// count; count when it already reaches wanted.
+static inline int32_t _BRRecoveryGapGrow(int32_t count, int32_t wanted, int32_t gap, int32_t max)
+{
+    if (wanted <= count) return count;
+    return _BRRecoveryGapMax(count, _BRRecoveryGapMin(_BRRecoveryGapMax(wanted, _BRRecoveryGapAdd(count, gap)), max));
+}
+
+// The round bound both scans take, per chain: more rounds than a window can take to reach max from
+// start growing by a whole gap, ceil(max(0, max - start) / gap) + 2.
+static inline int32_t _BRRecoveryGapRounds(int32_t start, int32_t gap, int32_t max)
+{
+    int32_t room = _BRRecoveryGapMax(0, _BRRecoveryGapSub(max, start));
+    return _BRRecoveryGapAdd(_BRRecoveryGapSub(_BRRecoveryGapAdd(room, gap), 1) / gap, 2);
+}
+
 // The window count (addresses 0 until count) of chain should grow to, given highestUsed (< 0:
 // nothing used): count when it already reaches the chain's gap past it. Never above the chain's
 // cap, never below count. A window that grows grows by at least a whole gap, so a lookup that
@@ -95,7 +113,7 @@ static inline int32_t BRRecoveryGapNext(int chain, int32_t count, int32_t highes
     // RED ARM SEAM (recovery_gap_window_kat): grow only to a gap past the last use.
     return _BRRecoveryGapMax(count, _BRRecoveryGapMin(wanted, max));
 #else
-    return _BRRecoveryGapMax(count, _BRRecoveryGapMin(_BRRecoveryGapMax(wanted, _BRRecoveryGapAdd(count, gap)), max));
+    return _BRRecoveryGapGrow(count, wanted, gap, max);
 #endif
 }
 
@@ -112,12 +130,8 @@ static inline int BRRecoveryGapCapped(int chain, int32_t highestUsed)
 // ceil(max(0, cap - start) / gap) + 2. 2 for a chain that is neither 0 nor 1 (it never grows).
 static inline int32_t BRRecoveryGapRoundBound(int chain, int32_t start)
 {
-    int32_t gap, room;
-
     if (chain != 0 && chain != 1) return 2;
-    gap = _BRRecoveryGapOf(chain);
-    room = _BRRecoveryGapMax(0, _BRRecoveryGapSub(_BRRecoveryMaxOf(chain), start));
-    return _BRRecoveryGapAdd(_BRRecoveryGapSub(_BRRecoveryGapAdd(room, gap), 1) / gap, 2);
+    return _BRRecoveryGapRounds(start, _BRRecoveryGapOf(chain), _BRRecoveryMaxOf(chain));
 }
 
 // The scan's round bound: the larger chain bound, from the smallest starting windows among the
@@ -160,23 +174,29 @@ static inline int BRRecoveryGapOutcome(int32_t external, int32_t internal, int32
 //  lost the dollars of any wallet past about ten such sends, and recovery reported itself complete.
 //  Each chain's window therefore starts at its gap (BR_RECOVERY_DIGIDOLLAR_GAP_EXTERNAL /
 //  _INTERNAL) and, while an address within that gap of the window's end has been used (any
-//  transaction touched it), grows to the gap past the last used index, up to
-//  BR_RECOVERY_DIGIDOLLAR_MAX addresses per chain, so a misbehaving lookup cannot make it ask
-//  forever. A window the cap stopped is not a finished answer.
+//  transaction touched it), grows to the gap past the last used index, by at least a whole gap each
+//  time, up to BR_RECOVERY_DIGIDOLLAR_MAX addresses per chain, and the scan stops after
+//  BRRecoveryDigiDollarGapRoundBound rounds, so a misbehaving lookup cannot make it ask forever. A
+//  window the cap or the round bound stopped is not a finished answer.
 //
-//  It differs from the plain-DGB rule above, deliberately and as the Kotlin did: the gaps are short
-//  (each DigiDollar address is its own request, not part of a batch), one cap serves both chains,
-//  a grown window grows only to a gap past the last use (not by a whole gap), and there is no round
-//  bound (every round derives at least one new address and the cap bounds the windows, and the
-//  platform asks each address once however often the window grows).
+//  This is the plain-DGB rule above (the same _BRRecoveryGapGrow step and _BRRecoveryGapRounds
+//  bound) with DigiDollar's own constants: short gaps (each DigiDollar address is its own request,
+//  not part of a batch) and one cap for both chains. Until 2026-11 a grown window grew only to a gap
+//  past the last use, with no round bound, as the Kotlin had; a lookup that kept answering "used
+//  one gap from the far end" then walked the window one address per round, about 1000 rounds, each
+//  re-deriving the window and re-reading every funded address's transactions. The whole-gap step
+//  bounds that at the round bound. Measured against the old rule on the platform's loop: the same
+//  used addresses found or more, never more rounds when the same addresses are found, at most a gap
+//  less one more addresses per chain (19 external, 9 internal).
 //
 //  A platform's scan loop:
 //    external = BRRecoveryDigiDollarGapStart(0); internal = BRRecoveryDigiDollarGapStart(1);
-//    each round, after asking the lookup about the derived addresses:
+//    bound = BRRecoveryDigiDollarGapRoundBound();
+//    each round (from 1), after asking the lookup about the derived addresses:
 //      nextExternal = BRRecoveryDigiDollarGapNext(0, external, usedExternal);
 //      nextInternal = BRRecoveryDigiDollarGapNext(1, internal, usedInternal);
 //      BRRecoveryDigiDollarGapOutcome(external, internal, nextExternal, nextInternal,
-//                                     usedExternal, usedInternal)
+//                                     usedExternal, usedInternal, round, bound)
 //        BR_RECOVERY_GAP_ASK_AGAIN  derive at the next windows and ask again;
 //        BR_RECOVERY_GAP_FINISHED   this round's answer is the scan's answer;
 //        BR_RECOVERY_GAP_CAPPED     this round's answer is kept, marked incomplete;
@@ -187,8 +207,10 @@ static inline int BRRecoveryGapOutcome(int32_t external, int32_t internal, int32
 //  empty, never grows and always reads as capped.
 //
 //  Test seams (host KAT digidollar_gap_window_kat in the Android repo), each failing only its own
-//  cases: DIGIDOLLAR_GAP_RED (the fixed window: a window never grows, the 4.1.2 row 19 bug) and
-//  DIGIDOLLAR_CAP_RED (a scan the cap stopped is reported finished).
+//  cases: DIGIDOLLAR_GAP_RED (the fixed window: a window never grows, the 4.1.2 row 19 bug),
+//  DIGIDOLLAR_STEP_RED (a grown window grows only to a gap past the last use, not by a whole gap:
+//  the rule before 2026-11) and DIGIDOLLAR_CAP_RED (a scan the cap or the round bound stopped is
+//  reported finished).
 
 #define BR_RECOVERY_DIGIDOLLAR_GAP_EXTERNAL 20
 #define BR_RECOVERY_DIGIDOLLAR_GAP_INTERNAL 10
@@ -207,22 +229,26 @@ static inline int32_t BRRecoveryDigiDollarGapStart(int chain)
     return _BRRecoveryDigiDollarGapOf(chain);
 }
 
-// The window count of chain should grow to, given highestUsed (< 0: nothing used): the chain's gap
-// past the last use, never above BR_RECOVERY_DIGIDOLLAR_MAX; count when it already reaches that.
-// As Kotlin's minOf(wanted, MAX): a count already above the cap that still wants to grow falls to
-// the cap. The scan never reaches that (its windows start at the gaps and only this grows them).
+// The window count of chain should grow to, given highestUsed (< 0: nothing used): count when it
+// already reaches the chain's gap past the last use; otherwise that, by at least a whole gap, never
+// above BR_RECOVERY_DIGIDOLLAR_MAX and never below count.
 static inline int32_t BRRecoveryDigiDollarGapNext(int chain, int32_t count, int32_t highestUsed)
 {
-    int32_t wanted;
+    int32_t gap, wanted;
 
     if ((chain != 0 && chain != 1) || highestUsed < 0) return count;
-    wanted = _BRRecoveryGapAdd(_BRRecoveryGapAdd(highestUsed, _BRRecoveryDigiDollarGapOf(chain)), 1);
-#ifdef DIGIDOLLAR_GAP_RED
+    gap = _BRRecoveryDigiDollarGapOf(chain);
+    wanted = _BRRecoveryGapAdd(_BRRecoveryGapAdd(highestUsed, gap), 1);
+#if defined(DIGIDOLLAR_GAP_RED)
     // RED ARM SEAM (digidollar_gap_window_kat): the fixed window, which never grows.
     (void)wanted;
     return count;
+#elif defined(DIGIDOLLAR_STEP_RED)
+    // RED ARM SEAM (digidollar_gap_window_kat): grow only to a gap past the last use.
+    if (wanted <= count) return count;
+    return _BRRecoveryGapMax(count, _BRRecoveryGapMin(wanted, BR_RECOVERY_DIGIDOLLAR_MAX));
 #else
-    return wanted > count ? _BRRecoveryGapMin(wanted, BR_RECOVERY_DIGIDOLLAR_MAX) : count;
+    return _BRRecoveryGapGrow(count, wanted, gap, BR_RECOVERY_DIGIDOLLAR_MAX);
 #endif
 }
 
@@ -236,20 +262,35 @@ static inline int BRRecoveryDigiDollarGapCapped(int chain, int32_t highestUsed)
     return _BRRecoveryGapAdd(_BRRecoveryGapAdd(highestUsed, _BRRecoveryDigiDollarGapOf(chain)), 1) > BR_RECOVERY_DIGIDOLLAR_MAX;
 }
 
-// What one round's answer is for a scan whose windows were external/internal and should now be
-// nextExternal/nextInternal (BRRecoveryDigiDollarGapNext): asked again while either window grows;
-// once neither does, capped when the cap stopped either chain (BRRecoveryDigiDollarGapCapped),
-// otherwise finished.
-static inline int BRRecoveryDigiDollarGapOutcome(int32_t external, int32_t internal, int32_t nextExternal,
-                                                 int32_t nextInternal, int32_t usedExternal, int32_t usedInternal)
+// The scan's round bound: the larger chain bound from the starting windows
+// (BRRecoveryDigiDollarGapStart), growing by a whole gap to BR_RECOVERY_DIGIDOLLAR_MAX. 101 (the
+// internal chain: ceil(990 / 10) + 2).
+static inline int32_t BRRecoveryDigiDollarGapRoundBound(void)
 {
-    if (nextExternal != external || nextInternal != internal) return BR_RECOVERY_GAP_ASK_AGAIN;
+    return _BRRecoveryGapMax(
+        _BRRecoveryGapRounds(BRRecoveryDigiDollarGapStart(0), BR_RECOVERY_DIGIDOLLAR_GAP_EXTERNAL, BR_RECOVERY_DIGIDOLLAR_MAX),
+        _BRRecoveryGapRounds(BRRecoveryDigiDollarGapStart(1), BR_RECOVERY_DIGIDOLLAR_GAP_INTERNAL, BR_RECOVERY_DIGIDOLLAR_MAX));
+}
+
+// What one round's answer is for a scan whose windows were external/internal and should now be
+// nextExternal/nextInternal (BRRecoveryDigiDollarGapNext), on round (from 1) of at most bound
+// (BRRecoveryDigiDollarGapRoundBound): asked again while either window grows, until the round
+// bound; once neither does, capped when the cap stopped either chain
+// (BRRecoveryDigiDollarGapCapped), otherwise finished. A scan the round bound stopped while it still
+// grew is capped.
+static inline int BRRecoveryDigiDollarGapOutcome(int32_t external, int32_t internal, int32_t nextExternal,
+                                                 int32_t nextInternal, int32_t usedExternal, int32_t usedInternal,
+                                                 int32_t round, int32_t bound)
+{
+    int grew = nextExternal != external || nextInternal != internal;
+
+    if (grew && round < bound) return BR_RECOVERY_GAP_ASK_AGAIN;
 #ifdef DIGIDOLLAR_CAP_RED
     // RED ARM SEAM (digidollar_gap_window_kat): a stopped scan is a finished answer, cap or not.
     (void)usedExternal; (void)usedInternal;
     return BR_RECOVERY_GAP_FINISHED;
 #else
-    if (BRRecoveryDigiDollarGapCapped(0, usedExternal) || BRRecoveryDigiDollarGapCapped(1, usedInternal))
+    if (grew || BRRecoveryDigiDollarGapCapped(0, usedExternal) || BRRecoveryDigiDollarGapCapped(1, usedInternal))
         return BR_RECOVERY_GAP_CAPPED;
     return BR_RECOVERY_GAP_FINISHED;
 #endif

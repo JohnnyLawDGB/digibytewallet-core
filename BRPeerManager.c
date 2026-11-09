@@ -655,19 +655,17 @@ struct BRPeerManagerStruct {
     _Atomic uint32_t cfCorroboratedThrough;  // highest 1000-multiple above the compiled table a
                                              // peer OTHER than the cfheaders source confirmed
     _Atomic uint32_t cfCheckptDisagreeCount; // cfcheckpt replies that disagreed with our chain
-    // 4.1.3 G5: each non-source peer's FIRST cfcheckpt mismatch with our chain (height, its value). When a strict
-    // majority of the non-source peers that ANSWERED -- at least CF_CKPT_QUORUM_MIN -- report the same value at the
-    // same height (G5-QUORUM), our chain is the outlier: the cfheaders source is banned and the chain is rebuilt from
-    // below the disagreement. A peer whose later reply agrees with our chain loses its record. Under manager->lock.
-    UInt128  cfCkDisPeers[CF_DISAGREED_CAP];
-    uint16_t cfCkDisPorts[CF_DISAGREED_CAP];
-    uint32_t cfCkDisHeights[CF_DISAGREED_CAP];
-    UInt256  cfCkDisValues[CF_DISAGREED_CAP];
-    uint8_t  cfCkDisCount;
-    // G5-QUORUM: the non-source peers whose cfcheckpt reply compared at least one height above the compiled table in
-    // the current window -- the decision's denominator. Cleared with cfCkDisCount. Under manager->lock.
+    // G5-QUORUM voters: the non-source peers (address and port) whose cfcheckpt reply or single-height probe answer,
+    // in their CURRENT connection, compared at least one height above the compiled table. Each entry also holds that
+    // peer's current dispute, if any (4.1.3 G5): its first mismatch with our chain, as (height, its value). Dispute
+    // and reply share one entry, so every vote is inside the denominator by construction and one capacity and one
+    // eviction rule govern both. A later agreeing answer withdraws the dispute; a reconnect forgets the entry; a
+    // rebuild clears the table. Under manager->lock.
     UInt128  cfCkRepPeers[CF_CKPT_PEER_CAP];
     uint16_t cfCkRepPorts[CF_CKPT_PEER_CAP];
+    uint8_t  cfCkRepDisputes[CF_CKPT_PEER_CAP];     // 1: this entry holds a dispute
+    uint32_t cfCkRepDisHeights[CF_CKPT_PEER_CAP];
+    UInt256  cfCkRepDisValues[CF_CKPT_PEER_CAP];
     uint8_t  cfCkRepCount;
     // G5-QUORUM: per-peer re-check cursor -- the highest 1000-multiple each filter peer has been asked to cover that
     // our chain could also compare when we asked. A peer is asked again only when that bound would rise, so at most
@@ -683,8 +681,11 @@ struct BRPeerManagerStruct {
     uint32_t cfCkProbeHeight[CF_CKPT_PEER_CAP];
     uint8_t  cfCkAskCount;
     // G5-QUORUM: diverged cfheaders rounds above the compiled table during which the lone connected filter peer was
-    // refused a re-anchor for want of a second, agreeing peer. Saturating; diagnostic only.
+    // refused a re-anchor for want of a second, agreeing peer. Saturating.
     uint32_t cfLoneStallCount;
+    // G5-QUORUM: 1 while the cfheaders driver is held back after a refused lone-peer round (the backoff); released
+    // by a new filter peer's connect or a clean append.
+    uint8_t  cfLoneStallHeld;
 
     // ── Abandoned-band backfill (2026-08-21) ──────────────────────────────
     // Re-fetching the block headers under an abandoned band so the band can be
@@ -1692,9 +1693,24 @@ unsigned long _cfMainChainWalkSteps = 0;
 static unsigned long _cfBlockFloorWalks = 0;
 #endif
 static int _BRPeerManagerConnectedFilterPeerCount(BRPeerManager *manager); // defined below; used by the cfheaders stall-drop floor guard
+
+// An address's network group: an IPv4 address's /16, any other address's /32 -- the grouping DigiByte
+// Core uses to keep its connections diverse, so that addresses one operator holds count once. The one
+// copy of the rule: reject quorums (_BRPeerNetGroup) and the G5-QUORUM host counts both use it.
+static uint64_t _BRAddressNetGroup(UInt128 address)
+{
+    const UInt128 *a = &address;
+
+    if (a->u64[0] == 0 && a->u16[4] == 0 && a->u16[5] == 0xffff) {   // IPv4-mapped
+        return (4ULL << 32) | ((uint64_t)a->u8[12] << 8) | a->u8[13];
+    }
+
+    return (6ULL << 32) | ((uint64_t)a->u8[0] << 24) | ((uint64_t)a->u8[1] << 16) |
+           ((uint64_t)a->u8[2] << 8) | a->u8[3];
+}
 static void _cfCkNotePeerHeightLocked(BRPeerManager *manager, BRPeer *peer, uint32_t height); // G5-QUORUM, defined below
 static void _BRPeerManagerCFCheckptRecheckLocked(BRPeerManager *manager); // G5-QUORUM, defined below
-static int _cfCkTakeProbeAnswerLocked(BRPeerManager *manager, BRPeer *peer, UInt256 stopHash,
+static int _cfCkTakeProbeAnswerLocked(BRPeerManager *manager, BRPeer *peer, uint8_t filterType, UInt256 stopHash,
                                       UInt256 prevFilterHeader, const UInt256 *filterHashes, size_t count); // G5-QUORUM
 static void _BRPeerManagerProbeOtherFilterPeersForCFHeaders(BRPeerManager *manager, BRPeer *current,
                                                             uint8_t filterType, uint32_t startHeight,
@@ -5881,6 +5897,10 @@ static void _BRPeerManagerProbeOtherFilterPeersForCFHeaders(BRPeerManager *manag
 // bounded by CF_CONTINUITY_REANCHOR_MAX total re-anchors per session.
 #define CF_SINGLE_PEER_REANCHOR_ROUNDS 3
 
+// G5-QUORUM: the cfheaders driver's hold after a refused lone-peer round, doubling per stall.
+#define CF_LONE_STALL_BACKOFF_MIN_SECS 30u
+#define CF_LONE_STALL_BACKOFF_MAX_SECS 600u
+
 // Count connected peers eligible to serve BIP 158 messages in the current sync
 // mode. Mirrors the per-peer guards in the active-probe loop above
 // (_BRPeerManagerProbeOtherFilterPeersForCFHeaders). Caller must hold manager->lock.
@@ -5942,7 +5962,7 @@ static void _peerRelayedCFHeaders(void *info, uint8_t filterType, UInt256 stopHa
 
     // G5-QUORUM: the answer to this peer's outstanding single-height re-check probe is judged as a corroboration
     // and consumed here -- never appended, never taken for a sync batch, never touching the sync driver's state.
-    if (_cfCkTakeProbeAnswerLocked(manager, peer, stopHash, prevFilterHeader, filterHashes, count)) {
+    if (_cfCkTakeProbeAnswerLocked(manager, peer, filterType, stopHash, prevFilterHeader, filterHashes, count)) {
         MGR_UNLOCK(manager);
         return;
     }
@@ -6240,12 +6260,12 @@ static void _peerRelayedCFHeaders(void *info, uint8_t filterType, UInt256 stopHa
         // fire. With a single connected filter peer that path can never fire (the probe
         // reaches no other filter peer), and cfheaders would not advance. Count
         // CONSECUTIVE diverged rounds instead; after N of them a re-anchor may follow,
-        // still bounded by the same CF_CONTINUITY_REANCHOR_MAX total budget. There is
-        // no second data path behind a re-anchor: bloom was excised in v4.0.0, so a
-        // chain re-anchored onto a lying peer's word is the chain the wallet scans
-        // with. Hence G5-QUORUM below: above the top compiled checkpoint (where no pin
-        // can check the new chain) one peer's word never moves the chain. The moment
-        // a 2nd filter peer arrives the round counter resets and the quorum path decides.
+        // still bounded by the same CF_CONTINUITY_REANCHOR_MAX total budget.
+        // INVARIANT (G5-QUORUM): the filter-header chain the wallet scans with is the
+        // only data path (bloom was excised in v4.0.0), so above the top compiled
+        // checkpoint, where no pin can check a new chain, it moves only on the word of
+        // more than one host. The moment a 2nd filter peer arrives the round counter
+        // resets and the quorum path decides.
         if (_BRPeerManagerConnectedFilterPeerCount(manager) <= 1) {
             if (manager->cfSingleDisagreeRounds < UINT8_MAX) manager->cfSingleDisagreeRounds++;
 #ifndef CF_LONE_PEER_REANCHOR_UNFIXED
@@ -6256,11 +6276,14 @@ static void _peerRelayedCFHeaders(void *info, uint8_t filterType, UInt256 stopHa
             // only peer, so it keeps the hatch. Anyone else must be corroborated: at
             // least CF_CONTINUITY_REANCHOR_K disagreers of this window (connected or
             // not -- the hatch runs precisely because the others are gone) must have
-            // claimed the same prevFilterHeader from that many DISTINCT addresses.
-            // Disagreers are kept per address and port (canonical nodes can share an
-            // IP behind tunnels), but ports on one host are one host's word. Short of
-            // that the stall is recorded and the chain kept; a later peer that agrees
-            // with either side resolves it.
+            // claimed the same prevFilterHeader from that many distinct HOSTS, a host
+            // being a network group (_BRAddressNetGroup), the same rule as the cfcheckpt
+            // quorum. Disagreers are kept per address and port (canonical nodes can share
+            // an IP behind tunnels), but one operator's ports and addresses count once.
+            // Short of that the stall is recorded and the chain kept; the cfheaders driver
+            // is held back (a doubling backoff, not a re-ask every round), and a slot is
+            // freed for another filter peer if the pool is full. A new filter peer's
+            // connect releases the hold.
             int loneRefused = 0;
             int ownNodeOnly = manager->pinnedExclusive && manager->pinnedPort != 0 &&
                               BRPeerIsPinned(manager->pinnedAddr, manager->pinnedPort, peer->address, peer->port);
@@ -6269,15 +6292,20 @@ static void _peerRelayedCFHeaders(void *info, uint8_t filterType, UInt256 stopHa
             if (aboveTable && ! ownNodeOnly &&
                 manager->cfSingleDisagreeRounds >= CF_SINGLE_PEER_REANCHOR_ROUNDS &&
                 manager->cfReanchorCount < CF_CONTINUITY_REANCHOR_MAX) {
-                uint8_t corroborating = 0;   // most distinct addresses behind one claimed prevFilterHeader
+                uint8_t corroborating = 0;   // most distinct hosts behind one claimed prevFilterHeader
                 for (uint8_t i = 0; i < manager->cfDisagreedCount; i++) {
                     uint8_t hosts = 0;
                     for (uint8_t j = 0; j < manager->cfDisagreedCount; j++) {
                         if (! UInt256Eq(manager->cfDisagreedPrev[i], manager->cfDisagreedPrev[j])) continue;
                         int seen = 0;
                         for (uint8_t k = 0; k < j && ! seen; k++) {
-                            seen = UInt256Eq(manager->cfDisagreedPrev[i], manager->cfDisagreedPrev[k]) &&
-                                   UInt128Eq(manager->cfDisagreedPeers[k], manager->cfDisagreedPeers[j]);
+#ifdef CF_CKPT_G5R2_UNFIXED
+                            int sameHost = UInt128Eq(manager->cfDisagreedPeers[k], manager->cfDisagreedPeers[j]);
+#else
+                            int sameHost = _BRAddressNetGroup(manager->cfDisagreedPeers[k]) ==
+                                           _BRAddressNetGroup(manager->cfDisagreedPeers[j]);
+#endif
+                            seen = UInt256Eq(manager->cfDisagreedPrev[i], manager->cfDisagreedPrev[k]) && sameHost;
                         }
                         if (! seen) hosts++;
                     }
@@ -6286,9 +6314,45 @@ static void _peerRelayedCFHeaders(void *info, uint8_t filterType, UInt256 stopHa
                 if (corroborating < CF_CONTINUITY_REANCHOR_K) {
                     loneRefused = 1;
                     if (manager->cfLoneStallCount < UINT32_MAX) manager->cfLoneStallCount++;
-                    peer_log(peer, "cfheaders: lone filter peer diverges above the compiled table at %u "
-                             "(%u rounds, stall %u) — chain kept until a second peer corroborates",
-                             contestedHeight, manager->cfSingleDisagreeRounds, manager->cfLoneStallCount);
+                    uint32_t stall = manager->cfLoneStallCount;
+                    int report = (stall & (stall - 1)) == 0;   // log and seek on stalls 1, 2, 4, 8, ...
+#ifndef CF_CKPT_G5R2_UNFIXED
+                    // Back off: hold the driver on the contested batch (its serialize guard waits while
+                    // cfHeadersRequestedThrough covers `next` and the request is younger than the timeout), for
+                    // CF_LONE_STALL_BACKOFF_MIN_SECS doubling per stall up to CF_LONE_STALL_BACKOFF_MAX_SECS,
+                    // plus the timeout. The lone peer is not re-asked every round.
+                    uint32_t shift = stall > 1 ? stall - 1 : 0;
+                    uint32_t backoff = shift >= 5 ? CF_LONE_STALL_BACKOFF_MAX_SECS
+                                                  : (uint32_t)CF_LONE_STALL_BACKOFF_MIN_SECS << shift;
+                    if (backoff > CF_LONE_STALL_BACKOFF_MAX_SECS) backoff = CF_LONE_STALL_BACKOFF_MAX_SECS;
+                    manager->cfHeadersRequestedThrough = contestedHeight;
+                    manager->cfHeadersRequestTime = time(NULL) + (time_t)backoff;
+                    manager->cfLoneStallHeld = 1;
+                    // Seek another filter peer. Below the connection target the platform's periodic top-up
+                    // (BRPeerManagerSetMaxConnectCount -> BRPeerManagerNeedsTopUp) dials one, filter peers first;
+                    // at the target, every slot but this one may hold a peer that serves no filters, and nothing
+                    // dials -- so free one such slot (never the download peer, never the pinned node); its
+                    // disconnect re-dials, filter peers first.
+                    if (report && array_count(manager->connectedPeers) >= (size_t)manager->maxConnectCount) {
+                        for (size_t i = array_count(manager->connectedPeers); i > 0; i--) {
+                            BRPeer *p = manager->connectedPeers[i - 1];
+                            if (p == peer || p == manager->downloadPeer) continue;
+                            if (BRPeerConnectStatus(p) != BRPeerStatusConnected) continue;
+                            if (_BRPeerManagerPeerSupportsCompactFilters(manager, p)) continue;
+                            if (BRPeerIsPinned(manager->pinnedAddr, manager->pinnedPort, p->address, p->port)) continue;
+                            peer_log(p, "cfheaders: freeing this slot for a second filter peer (lone-peer stall %u)", stall);
+                            BRPeerScheduleDisconnectTagged(p, 0, BR_DISC_TAG_CF_STALL);
+                            break;
+                        }
+                    }
+#else
+                    report = 1;
+#endif
+                    if (report) {
+                        peer_log(peer, "cfheaders: lone filter peer diverges above the compiled table at %u "
+                                 "(%u rounds, stall %u) — chain kept until a second host corroborates",
+                                 contestedHeight, manager->cfSingleDisagreeRounds, stall);
+                    }
                 }
             }
 #else
@@ -6460,6 +6524,7 @@ static void _peerRelayedCFHeaders(void *info, uint8_t filterType, UInt256 stopHa
     manager->cfHeadersRequestedThrough = chainTip;
     manager->cfDisagreedCount = 0;   // appended cleanly — clear the disagreement window
     manager->cfSingleDisagreeRounds = 0;   // ...and the single-peer diverged-round counter
+    manager->cfLoneStallHeld = 0;          // ...and any lone-peer hold (G5-QUORUM)
 #ifndef CF_REANCHOR_REFUND_UNFIXED
     // The re-anchor budget bounds a run of failures, not the manager's life: enough
     // clean appends onto an existing chain after a re-anchor end the run. See
@@ -6937,129 +7002,187 @@ static void _peerRelayedCFilter(void *info, uint8_t filterType, UInt256 blockHas
     MGR_UNLOCK(manager);
 }
 
-#ifndef CF_CORROBORATE_ACT_UNFIXED
 // G5-QUORUM bookkeeping. Every helper below runs under manager->lock and touches only bounded arrays.
+//
+// IDENTITY. A voter, a re-check cursor, a probe tag and the source exclusion are keyed by address AND port: some
+// canonical filter nodes share one public IP behind reverse tunnels, and each is a distinct node we talk to. A HOST,
+// for counting votes, is a network group (_BRAddressNetGroup: IPv4 /16, otherwise /32), the codebase's "one operator
+// counts once" rule: any number of ports, or of addresses in one group, are one host's word.
 
-// Is the peer at addr:port connected (any state but disconnected)?
+// Is the peer at addr:port Connected (handshake done)? A Connecting peer has answered nothing and does not vote.
 static int _cfCkPeerIsConnected(BRPeerManager *manager, UInt128 addr, uint16_t port)
 {
     for (size_t i = array_count(manager->connectedPeers); i > 0; i--) {
         BRPeer *p = manager->connectedPeers[i - 1];
-        if (UInt128Eq(p->address, addr) && p->port == port &&
-            BRPeerConnectStatus(p) != BRPeerStatusDisconnected) return 1;
+        if (! UInt128Eq(p->address, addr) || p->port != port) continue;
+#ifdef CF_CKPT_G5R2_UNFIXED
+        if (BRPeerConnectStatus(p) != BRPeerStatusDisconnected) return 1;   // reference arm: Connecting counted
+#else
+        if (BRPeerConnectStatus(p) == BRPeerStatusConnected) return 1;
+#endif
     }
     return 0;
 }
 
-// Drop addr:port's cfcheckpt mismatch record, if it has one.
-static void _cfCkDisForget(BRPeerManager *manager, UInt128 addr, uint16_t port)
+static int _cfCkFind(BRPeerManager *manager, UInt128 addr, uint16_t port)
 {
-    for (uint8_t i = 0; i < manager->cfCkDisCount; i++) {
-        if (! UInt128Eq(manager->cfCkDisPeers[i], addr) || manager->cfCkDisPorts[i] != port) continue;
-        uint8_t last = manager->cfCkDisCount - 1;
-        manager->cfCkDisPeers[i]   = manager->cfCkDisPeers[last];
-        manager->cfCkDisPorts[i]   = manager->cfCkDisPorts[last];
-        manager->cfCkDisHeights[i] = manager->cfCkDisHeights[last];
-        manager->cfCkDisValues[i]  = manager->cfCkDisValues[last];
-        manager->cfCkDisCount = last;
-        return;
+    for (uint8_t i = 0; i < manager->cfCkRepCount; i++) {
+        if (UInt128Eq(manager->cfCkRepPeers[i], addr) && manager->cfCkRepPorts[i] == port) return i;
     }
+    return -1;
 }
 
-// Count `peer` among the repliers of the current window (one entry per address and port). When the set is full, a
-// slot held by a peer no longer connected is reused, and that peer's mismatch record goes with it, so every vote
-// stays inside the denominator. Returns 0 only if every slot belongs to a connected peer (cannot happen while
-// CF_CKPT_PEER_CAP exceeds the connection cap); the caller then lets the reply cast no vote.
+static void _cfCkRemoveAt(BRPeerManager *manager, uint8_t i)
+{
+    uint8_t last = manager->cfCkRepCount - 1;
+    manager->cfCkRepPeers[i]      = manager->cfCkRepPeers[last];
+    manager->cfCkRepPorts[i]      = manager->cfCkRepPorts[last];
+    manager->cfCkRepDisputes[i]   = manager->cfCkRepDisputes[last];
+    manager->cfCkRepDisHeights[i] = manager->cfCkRepDisHeights[last];
+    manager->cfCkRepDisValues[i]  = manager->cfCkRepDisValues[last];
+    manager->cfCkRepCount = last;
+}
+
+// Forget addr:port's vote, reply and dispute alike.
+static void _cfCkForgetPeer(BRPeerManager *manager, UInt128 addr, uint16_t port)
+{
+    int i = _cfCkFind(manager, addr, port);
+    if (i >= 0) _cfCkRemoveAt(manager, (uint8_t)i);
+}
+
+// Entries holding a dispute (diagnostic and KAT read-out).
+static uint8_t _cfCkDisputeCount(BRPeerManager *manager)
+{
+    uint8_t n = 0;
+    for (uint8_t i = 0; i < manager->cfCkRepCount; i++) n += manager->cfCkRepDisputes[i] ? 1 : 0;
+    return n;
+}
+
+// Count `peer` among the voters and return its entry. A full table evicts an entry whose peer is not Connected
+// first; only if every entry's peer is Connected (more than CF_CKPT_PEER_CAP connections, which the connection cap
+// rules out) is the lowest index evicted. Either way the evicted peer's dispute leaves with it, so a vote is always
+// inside the denominator and no departed peer can hold a slot a live one needs.
 static int _cfCkRecordReplier(BRPeerManager *manager, const BRPeer *peer)
 {
-    uint8_t i;
-    for (i = 0; i < manager->cfCkRepCount; i++) {
-        if (UInt128Eq(manager->cfCkRepPeers[i], peer->address) && manager->cfCkRepPorts[i] == peer->port) return 1;
-    }
+    int i = _cfCkFind(manager, peer->address, peer->port);
+    if (i >= 0) return i;
     if (manager->cfCkRepCount < CF_CKPT_PEER_CAP) i = manager->cfCkRepCount++;
     else {
         for (i = 0; i < manager->cfCkRepCount; i++) {
             if (! _cfCkPeerIsConnected(manager, manager->cfCkRepPeers[i], manager->cfCkRepPorts[i])) break;
         }
-        if (i == manager->cfCkRepCount) return 0;
-        _cfCkDisForget(manager, manager->cfCkRepPeers[i], manager->cfCkRepPorts[i]);
+#ifdef CF_CKPT_G5R2_UNFIXED
+        if (i == manager->cfCkRepCount) return -1;   // reference arm: a table of live peers refused the newcomer
+#else
+        if (i == manager->cfCkRepCount) i = 0;
+#endif
     }
-    manager->cfCkRepPeers[i] = peer->address;
-    manager->cfCkRepPorts[i] = peer->port;
-    return 1;
+    manager->cfCkRepPeers[i]      = peer->address;
+    manager->cfCkRepPorts[i]      = peer->port;
+    manager->cfCkRepDisputes[i]   = 0;
+    manager->cfCkRepDisHeights[i] = 0;
+    manager->cfCkRepDisValues[i]  = UINT256_ZERO;
+    return i;
 }
 
+// An answer from `peer` that agrees with our chain through `matched` withdraws a dispute it raised at or below that.
+static void _cfCkWithdraw(BRPeerManager *manager, const BRPeer *peer, uint32_t matched)
+{
+    int i = _cfCkFind(manager, peer->address, peer->port);
+    if (i >= 0 && manager->cfCkRepDisputes[i] && manager->cfCkRepDisHeights[i] <= matched) {
+        manager->cfCkRepDisputes[i] = 0;
+    }
+}
+
+#ifndef CF_CORROBORATE_ACT_UNFIXED
 // The G5-QUORUM rebuild decision for a mismatch at (h, value). INVARIANTS:
-//  * Only peers that answered AND are still connected count, on either side. A peer that answered and then left is
-//    neither a vote nor part of the denominator (its entries stay, inert, until it reconnects or the window resets).
-//  * Votes are per address AND port: some canonical filter nodes share one public IP behind reverse tunnels, so
-//    counting by address alone would undercount honest agreement.
-//  * But ports cannot manufacture a quorum: the agreeing dissenters must span at least CF_CKPT_QUORUM_MIN DISTINCT
-//    addresses, so any number of ports on one host is one host's word.
-//  * Every entry at the current cfheaders source's address is excluded from votes and from the denominator: the
-//    source can neither vouch for its own chain nor out-vote a dissent through a second port.
-// Acts only when at least CF_CKPT_QUORUM_MIN connected repliers, on at least CF_CKPT_QUORUM_MIN distinct addresses,
-// report this exact (h, value) and they are a strict majority of the connected repliers.
+//  * Only voters whose peer is Connected now count, on either side (a departed or Connecting peer is inert).
+//  * Counting is per HOST (network group, see IDENTITY above), numerator and denominator alike: a host is "for" if
+//    any of its live voters disputes exactly (h, value), and every host with a live voter is in the denominator.
+//    Many ports, or many addresses in one group, can neither manufacture a quorum nor out-vote one.
+//  * The source is excluded by address (a voter at cfHeadersPeerAddr) AND by its network group: the source's
+//    operator can neither vouch for its own chain nor dispute it, so peers in that group are neither for nor against.
+//    Decided deliberately: the cost is that an honest node sharing the source's group cannot vote while that peer is
+//    the source -- never a false rebuild, at worst a later one.
+// Acts only when at least CF_CKPT_QUORUM_MIN hosts dispute exactly (h, value) and they are a strict majority of the
+// hosts with a live voter.
 static int _cfCkQuorumMet(BRPeerManager *manager, uint32_t h, UInt256 value, uint8_t *agreeOut, uint8_t *ofOut)
 {
-    uint8_t i, j, agree = 0, hosts = 0, of = 0;
+    uint8_t i, j, agree = 0, of = 0;
 #ifdef CF_CKPT_QUORUM_UNFIXED
-    // Reference arm for cf_corroboration_kat only: the earlier rule -- every recorded dissent, connected or not, per
+    // Reference arm for cf_corroboration_kat only: the 4.1.3 rule -- every recorded dispute, connected or not, per
     // address and port, over a denominator of every connected filter peer.
-    (void)j; (void)hosts;
-    for (i = 0; i < manager->cfCkDisCount; i++) {
-        if (manager->cfCkDisHeights[i] == h && UInt256Eq(manager->cfCkDisValues[i], value)) agree++;
+    (void)j;
+    for (i = 0; i < manager->cfCkRepCount; i++) {
+        if (manager->cfCkRepDisputes[i] && manager->cfCkRepDisHeights[i] == h &&
+            UInt256Eq(manager->cfCkRepDisValues[i], value)) agree++;
     }
     of = (uint8_t)_BRPeerManagerConnectedFilterPeerCount(manager);
     *agreeOut = agree; *ofOut = of;
     return agree >= 2 && agree > of / 2;
-#else
-    for (i = 0; i < manager->cfCkDisCount; i++) {
-        if (UInt128Eq(manager->cfCkDisPeers[i], manager->cfHeadersPeerAddr)) continue;
-        if (manager->cfCkDisHeights[i] != h || ! UInt256Eq(manager->cfCkDisValues[i], value)) continue;
-        if (! _cfCkPeerIsConnected(manager, manager->cfCkDisPeers[i], manager->cfCkDisPorts[i])) continue;
+#elif defined(CF_CKPT_G5R2_UNFIXED)
+    // Reference arm for cf_corroboration_kat only: the f795f60 rule -- votes and denominator per address and port,
+    // distinct hosts by exact address among the "for" side only, source excluded by address only.
+    uint8_t hosts = 0;
+    for (i = 0; i < manager->cfCkRepCount; i++) {
+        if (UInt128Eq(manager->cfCkRepPeers[i], manager->cfHeadersPeerAddr)) continue;
+        if (! _cfCkPeerIsConnected(manager, manager->cfCkRepPeers[i], manager->cfCkRepPorts[i])) continue;
+        of++;
+        if (! manager->cfCkRepDisputes[i] || manager->cfCkRepDisHeights[i] != h ||
+            ! UInt256Eq(manager->cfCkRepDisValues[i], value)) continue;
         agree++;
-        int seen = 0;   // a new host only if no earlier counted entry shares its address
+        int seen = 0;
         for (j = 0; j < i && ! seen; j++) {
-            seen = UInt128Eq(manager->cfCkDisPeers[j], manager->cfCkDisPeers[i]) &&
-                   ! UInt128Eq(manager->cfCkDisPeers[j], manager->cfHeadersPeerAddr) &&
-                   manager->cfCkDisHeights[j] == h && UInt256Eq(manager->cfCkDisValues[j], value) &&
-                   _cfCkPeerIsConnected(manager, manager->cfCkDisPeers[j], manager->cfCkDisPorts[j]);
+            seen = UInt128Eq(manager->cfCkRepPeers[j], manager->cfCkRepPeers[i]) && manager->cfCkRepDisputes[j] &&
+                   manager->cfCkRepDisHeights[j] == h && UInt256Eq(manager->cfCkRepDisValues[j], value) &&
+                   _cfCkPeerIsConnected(manager, manager->cfCkRepPeers[j], manager->cfCkRepPorts[j]);
         }
         if (! seen) hosts++;
     }
-    for (i = 0; i < manager->cfCkRepCount; i++) {
-        if (UInt128Eq(manager->cfCkRepPeers[i], manager->cfHeadersPeerAddr)) continue;
-        if (_cfCkPeerIsConnected(manager, manager->cfCkRepPeers[i], manager->cfCkRepPorts[i])) of++;
-    }
     *agreeOut = agree; *ofOut = of;
     return agree >= CF_CKPT_QUORUM_MIN && hosts >= CF_CKPT_QUORUM_MIN && 2u * agree > of;
+#else
+    int haveSource = ! UInt128IsZero(manager->cfHeadersPeerAddr);
+    uint64_t sourceGroup = _BRAddressNetGroup(manager->cfHeadersPeerAddr);
+    uint64_t groups[CF_CKPT_PEER_CAP];
+    uint8_t  isFor[CF_CKPT_PEER_CAP];
+    for (i = 0; i < manager->cfCkRepCount; i++) {
+        if (UInt128Eq(manager->cfCkRepPeers[i], manager->cfHeadersPeerAddr)) continue;
+        uint64_t g = _BRAddressNetGroup(manager->cfCkRepPeers[i]);
+        if (haveSource && g == sourceGroup) continue;
+        if (! _cfCkPeerIsConnected(manager, manager->cfCkRepPeers[i], manager->cfCkRepPorts[i])) continue;
+        int dispute = manager->cfCkRepDisputes[i] && manager->cfCkRepDisHeights[i] == h &&
+                      UInt256Eq(manager->cfCkRepDisValues[i], value);
+        for (j = 0; j < of && groups[j] != g; j++);
+        if (j == of) { groups[of] = g; isFor[of] = 0; of++; }
+        if (dispute) isFor[j] = 1;
+    }
+    for (j = 0; j < of; j++) agree += isFor[j];
+    *agreeOut = agree; *ofOut = of;
+    return agree >= CF_CKPT_QUORUM_MIN && 2u * agree > of;
 #endif
 }
 
 // A peer other than the cfheaders source reported `value` at 1000-multiple `h` where our chain disagrees (4.1.3 G5).
-// Record it (one entry per peer, its latest first mismatch). When the G5-QUORUM rule holds (_cfCkQuorumMet: a strict
-// majority of the non-source peers that answered, at least CF_CKPT_QUORUM_MIN, report the same value at the same
-// height), our chain -- anchored on the source's word above the compiled table -- is the outlier: the source is
-// banned and the chain is rebuilt from the first height that can hold the disagreement (the majority matched us at
-// h - 1000, or the chain's start is where it lies), so the blocks the disputed filters "cleared" are scanned again.
-// Below the block floor that range cannot be refetched and is surfaced instead. Charged to the re-anchor budget.
-// Caller holds manager->lock and has already counted `peer` as a replier.
+// Record it as that peer's dispute (one per peer, its latest first mismatch). When the G5-QUORUM rule holds
+// (_cfCkQuorumMet: a strict majority of the live answering hosts, at least CF_CKPT_QUORUM_MIN, none in the source's
+// network group, report the same value at the same height), our chain -- anchored on the source's word above the
+// compiled table -- is the outlier: the source is banned and the chain is rebuilt from the first height that can
+// hold the disagreement (the majority matched us at h - 1000, or the chain's start is where it lies), so the blocks
+// the disputed filters "cleared" are scanned again. Below the block floor that range cannot be refetched and is
+// surfaced instead. Charged to the re-anchor budget. Caller holds manager->lock and has already counted `peer` as a
+// voter (_cfCkRecordReplier).
 static void _BRPeerManagerCFCheckptDisagreedLocked(BRPeerManager *manager, BRPeer *peer, uint32_t h, UInt256 value)
 {
-    uint8_t i, k = manager->cfCkDisCount;
-
-    for (i = 0; i < manager->cfCkDisCount; i++) {
-        if (UInt128Eq(manager->cfCkDisPeers[i], peer->address) && manager->cfCkDisPorts[i] == peer->port) { k = i; break; }
-    }
-    if (k == manager->cfCkDisCount) {
-        if (manager->cfCkDisCount >= CF_DISAGREED_CAP) return;
-        manager->cfCkDisCount++;
-    }
-    manager->cfCkDisPeers[k] = peer->address;
-    manager->cfCkDisPorts[k] = peer->port;
-    manager->cfCkDisHeights[k] = h;
-    manager->cfCkDisValues[k] = value;
+    int k = _cfCkFind(manager, peer->address, peer->port);
+    if (k < 0) return;
+#ifdef CF_CKPT_G5R2_UNFIXED
+    // Reference arm: the f795f60 dispute table held at most CF_DISAGREED_CAP disputes and dropped any new one.
+    if (! manager->cfCkRepDisputes[k] && _cfCkDisputeCount(manager) >= CF_DISAGREED_CAP) return;
+#endif
+    manager->cfCkRepDisputes[k]   = 1;
+    manager->cfCkRepDisHeights[k] = h;
+    manager->cfCkRepDisValues[k]  = value;
 
     uint8_t agree = 0, of = 0;
     if (! _cfCkQuorumMet(manager, h, value, &agree, &of)) {
@@ -7103,8 +7226,7 @@ static void _BRPeerManagerCFCheckptDisagreedLocked(BRPeerManager *manager, BRPee
     manager->cfDisagreedCount          = 0;
     manager->cfSingleDisagreeRounds    = 0;
     manager->cfCleanAppendsSinceReanchor = 0;
-    manager->cfCkDisCount              = 0;
-    manager->cfCkRepCount              = 0;   // G5-QUORUM: a fresh window of repliers for the new chain
+    manager->cfCkRepCount              = 0;   // G5-QUORUM: a fresh window of voters for the new chain
     manager->cfCkAskCount              = 0;   // ...and every peer is asked again once the new chain can compare
     atomic_store_explicit(&manager->cfCorroboratedThrough, 0, memory_order_relaxed);
     // the new chain's first batch comes from a peer of the majority, never the banned source
@@ -7174,7 +7296,7 @@ static void _peerRelayedCFCheckpt(void *info, uint8_t filterType, UInt256 stopHa
         compared++;
 #ifndef CF_CORROBORATE_ACT_UNFIXED
         // G5-QUORUM: a non-source peer that compared at least one height has answered, and joins the denominator.
-        if (compared == 1 && ! fromSource) votes = _cfCkRecordReplier(manager, peer);
+        if (compared == 1 && ! fromSource) votes = (_cfCkRecordReplier(manager, peer) >= 0);
 #endif
         if (UInt256Eq(BRCompactFilterChainHeader(chain, h), filterHeaders[i])) {
             matched = h;
@@ -7198,14 +7320,7 @@ static void _peerRelayedCFCheckpt(void *info, uint8_t filterType, UInt256 stopHa
 #ifndef CF_CORROBORATE_ACT_UNFIXED
     // G5-QUORUM: a later reply that agrees with our chain at or above the height this peer once disputed withdraws
     // that dispute (re-checks are continuous, so an old mismatch must not outlive the peer's current answer).
-    if (! fromSource && ! mismatched && matched > 0) {
-        for (uint8_t d = 0; d < manager->cfCkDisCount; d++) {
-            if (UInt128Eq(manager->cfCkDisPeers[d], peer->address) && manager->cfCkDisPorts[d] == peer->port) {
-                if (manager->cfCkDisHeights[d] <= matched) _cfCkDisForget(manager, peer->address, peer->port);
-                break;
-            }
-        }
-    }
+    if (! fromSource && ! mismatched && matched > 0) _cfCkWithdraw(manager, peer, matched);
 #else
     (void)mismatched; (void)votes;
 #endif
@@ -7339,23 +7454,43 @@ static void _BRPeerManagerRequestCFCheckptLocked(BRPeerManager *manager, BRPeer 
 // G5-QUORUM: if this cfheaders reply is the answer to `peer`'s outstanding single-height probe (same peer, same stop
 // block, exactly one filter hash), consume it: clear the tag, fold the peer's header at h (dSHA256(filterHash ||
 // prevFilterHeader)) and judge it against our chain at h with the same (height, value) semantics, and the same
-// replier and dissent tables, as a cfcheckpt entry. Returns 1 when consumed (the caller must not treat the reply as a
-// batch), 0 otherwise. Nothing here appends, re-anchors on its own, or touches the sync driver. Caller holds
-// manager->lock.
-static int _cfCkTakeProbeAnswerLocked(BRPeerManager *manager, BRPeer *peer, UInt256 stopHash,
+// voter table, as a cfcheckpt entry. A single-hash reply with no live tag (its tag was dropped by a rebuild, a
+// re-anchor or a slot eviction) whose stop is a block on our best chain at least CF_CORROBORATE_STOP_MARGIN deep, and
+// whose one header is NOT the height the sync path expects next (the chain's next height, or the armed restart
+// height when there is no chain), is consumed unjudged: it cannot be a sync batch, which always starts there, so
+// handing it to the sync path would only reset the in-flight marker. Returns 1 when
+// consumed (the caller must not treat the reply as a batch), 0 otherwise. Nothing here appends, re-anchors on its
+// own, or touches the sync driver. Caller holds manager->lock.
+static int _cfCkTakeProbeAnswerLocked(BRPeerManager *manager, BRPeer *peer, uint8_t filterType, UInt256 stopHash,
                                       UInt256 prevFilterHeader, const UInt256 *filterHashes, size_t count)
 {
     if (count != 1 || UInt256IsZero(stopHash)) return 0;
+    const BRCompactFilterChain *chain = manager->compactFilterChain;
     int k = _cfCkAskSlot(manager, peer, 0);
-    if (k < 0 || ! UInt256Eq(manager->cfCkProbeStop[k], stopHash)) return 0;
+    if (k < 0 || ! UInt256Eq(manager->cfCkProbeStop[k], stopHash)) {
+#ifndef CF_CKPT_G5R2_UNFIXED
+        BRMerkleBlock *stopBlock = BRSetGet(manager->blocks, &stopHash);
+        uint32_t expected = chain ? BRCompactFilterChainNextHeight(chain)
+                                  : (manager->autoFetchCFiltersEnabled ? manager->autoFetchCFiltersStart : 0);
+        if (manager->lastBlock && stopBlock && stopBlock->height != BLOCK_UNKNOWN_HEIGHT &&
+            stopBlock->height + CF_CORROBORATE_STOP_MARGIN <= manager->lastBlock->height &&
+            stopBlock->height != expected &&
+            UInt256Eq(_BRPeerManagerBlockHashAtHeight(manager, stopBlock->height), stopHash)) {
+            peer_log(peer, "cf-corroborate: late single-height answer for %u (no live probe) — consumed, not judged",
+                     stopBlock->height);
+            return 1;
+        }
+#endif
+        return 0;
+    }
     uint32_t h = manager->cfCkProbeHeight[k];
     manager->cfCkProbeStop[k] = UINT256_ZERO;
     manager->cfCkProbeHeight[k] = 0;
 
-    const BRCompactFilterChain *chain = manager->compactFilterChain;
     uint32_t topCompiled = (manager->params->standardPort == BRMainNetParams.standardPort)
                            ? BRCFTopCheckpointHeight() : 0;
     if (! chain || BRCompactFilterChainCount(chain) == 0 || h <= topCompiled ||
+        filterType != BRCompactFilterChainType(chain) ||
         h < BRCompactFilterChainStartHeight(chain) || h >= BRCompactFilterChainNextHeight(chain) ||
         ! UInt256Eq(_BRPeerManagerBlockHashAtHeight(manager, h), stopHash)) {
         peer_log(peer, "cf-corroborate: probe answer for height %u no longer comparable — consumed, not judged", h);
@@ -7369,16 +7504,11 @@ static int _cfCkTakeProbeAnswerLocked(BRPeerManager *manager, BRPeer *peer, UInt
     UInt256 theirs = BRGCSFilterHeader(filterHashes[0], prevFilterHeader);
     UInt256 ours = BRCompactFilterChainHeader(chain, h);
 #ifndef CF_CORROBORATE_ACT_UNFIXED
-    int votes = _cfCkRecordReplier(manager, peer);
+    int votes = (_cfCkRecordReplier(manager, peer) >= 0);
 #endif
     if (UInt256Eq(theirs, ours)) {
 #ifndef CF_CORROBORATE_ACT_UNFIXED
-        for (uint8_t d = 0; d < manager->cfCkDisCount; d++) {   // an agreeing answer withdraws an older dispute
-            if (UInt128Eq(manager->cfCkDisPeers[d], peer->address) && manager->cfCkDisPorts[d] == peer->port) {
-                if (manager->cfCkDisHeights[d] <= h) _cfCkDisForget(manager, peer->address, peer->port);
-                break;
-            }
-        }
+        _cfCkWithdraw(manager, peer, h);   // an agreeing answer withdraws an older dispute
 #endif
         if (h > atomic_load_explicit(&manager->cfCorroboratedThrough, memory_order_relaxed)) {
             atomic_store_explicit(&manager->cfCorroboratedThrough, h, memory_order_relaxed);
@@ -7428,6 +7558,12 @@ static void _BRPeerManagerOnFilterCapablePeerConnected(BRPeerManager *manager, v
     if (!_BRPeerManagerPeerSupportsCompactFilters(manager, peer)) return;
 
     BRPeerSetCompactFilterCallbacks(peer, _peerRelayedCFHeaders, _peerRelayedCFilter, _peerRelayedCFCheckpt);
+    // G5-QUORUM: a lone-peer stall holds the cfheaders driver back; another filter peer arriving is what it waits
+    // for, so release the hold and let this peer be asked the contested batch now.
+    if (manager->cfLoneStallHeld && ! UInt128Eq(peer->address, manager->cfHeadersPeerAddr)) {
+        manager->cfLoneStallHeld = 0;
+        manager->cfHeadersRequestedThrough = 0;
+    }
     // Maintain the gap+100 look-ahead window on the compact-filter path — the bloom
     // path does this in _BRPeerManagerLoadBloomFilter, which early-returns in
     // CF-only. Without it the cfilter match set decays to the bare gap limit as
@@ -7440,6 +7576,15 @@ static void _BRPeerManagerOnFilterCapablePeerConnected(BRPeerManager *manager, v
     // it would leave the convoy with no starter — a permanent 0-progress wedge.
     _BRPeerManagerRequestNextCFHeaders(manager, peer, /*isConvoyAdvance=*/0);
 #ifndef CF_CORROBORATION_UNFIXED
+#if !defined(CF_CORROBORATE_ACT_UNFIXED) && !defined(CF_CKPT_G5R2_UNFIXED)
+    // G5-QUORUM: a vote belongs to the connection that cast it. A peer (re)connecting at an address and port we hold
+    // a vote or a probe tag for starts over: it is asked again just below.
+    _cfCkForgetPeer(manager, peer->address, peer->port);
+    {
+        int k = _cfCkAskSlot(manager, peer, 0);
+        if (k >= 0) { manager->cfCkProbeStop[k] = UINT256_ZERO; manager->cfCkProbeHeight[k] = 0; }
+    }
+#endif
     // Ask this peer for its filter-header checkpoints so the range above the compiled
     // table gets a second opinion (see _peerRelayedCFCheckpt). Once per connect here;
     // afterwards once per 1000-multiple crossed (G5-QUORUM, _BRPeerManagerCFCheckptRecheckLocked).
@@ -9576,18 +9721,10 @@ void BRPeerManagerRemoveTransaction(BRPeerManager *manager, UInt256 txHash)
     _BRPeerManagerFlushAnswers(manager);
 }
 
-// A peer's network group: an IPv4 address's /16, any other address's /32 -- the grouping DigiByte
-// Core uses to keep its connections diverse, so that addresses one operator holds count once.
+// A peer's network group: see _BRAddressNetGroup.
 static uint64_t _BRPeerNetGroup(const BRPeer *peer)
 {
-    const UInt128 *a = &peer->address;
-
-    if (a->u64[0] == 0 && a->u16[4] == 0 && a->u16[5] == 0xffff) {   // IPv4-mapped
-        return (4ULL << 32) | ((uint64_t)a->u8[12] << 8) | a->u8[13];
-    }
-
-    return (6ULL << 32) | ((uint64_t)a->u8[0] << 24) | ((uint64_t)a->u8[1] << 16) |
-           ((uint64_t)a->u8[2] << 8) | a->u8[3];
+    return _BRAddressNetGroup(peer->address);
 }
 
 // caller must hold manager->lock. The number of distinct network groups among the peers that
@@ -9970,8 +10107,7 @@ static int _BRPeerManagerReanchorAtFloorLocked(BRPeerManager *manager, int force
 #endif
     manager->cfHeadersRequestedThrough = 0;
     manager->cfDisagreedCount          = 0;   // fresh disagreement window
-    manager->cfCkDisCount              = 0;   // and a fresh cfcheckpt disagreement window (4.1.3 G5)
-    manager->cfCkRepCount              = 0;   // G5-QUORUM: its repliers,
+    manager->cfCkRepCount              = 0;   // a fresh cfcheckpt voter and dispute window (4.1.3 G5, G5-QUORUM)
     manager->cfCkAskCount              = 0;   // and every peer is asked again once the new chain can compare
     manager->cfSingleDisagreeRounds    = 0;   // fresh single-peer diverged-round window
     manager->cfCleanAppendsSinceReanchor = 0; // the refund counts clean appends from here

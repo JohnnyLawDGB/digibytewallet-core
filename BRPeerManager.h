@@ -316,7 +316,9 @@ Remarks:
    persistently-divergent peer can't loop forever.
 
    CF_CONTINUITY_REANCHOR_K is now consulted ONLY by the single-peer escape
-   hatch (CF_SINGLE_PEER_REANCHOR_ROUNDS' companion, one connected filter peer)
+   hatch (CF_SINGLE_PEER_REANCHOR_ROUNDS' companion, one connected filter peer:
+   since G5-QUORUM, above the top compiled checkpoint and outside own-node exclusive
+   mode, that hatch needs this many distinct peers claiming the same prevFilterHeader)
    and by the -DCF_QUORUM_UNFIXED fallback below. The multi-peer quorum re-anchor
    decision itself was widened past raw K (see CF_CONTINUITY_REANCHOR_FLOOR). */
 #define CF_CONTINUITY_REANCHOR_K   2
@@ -386,6 +388,20 @@ Remarks:
 #ifndef CF_DISAGREED_CAP
 #define CF_DISAGREED_CAP PEER_MAX_CONNECTIONS
 #endif
+
+/* G5-QUORUM. The cfcheckpt rebuild decision counts only peers that ANSWERED: its
+   denominator is the distinct (address, port) peers, none at the cfheaders source's
+   address, whose cfcheckpt reply compared at least one height above the compiled
+   table in the current window. Our chain is the outlier only when at least
+   CF_CKPT_QUORUM_MIN of those repliers report the SAME value at the SAME height and
+   they are a strict majority of the repliers. Silent peers and the source are neither
+   for nor against; one replier, however it answers, can never rebuild.
+
+   CF_CKPT_PEER_CAP bounds the replier set and the per-peer re-check cursors. Twice the
+   connection cap, so a slot held by a peer that has since disconnected can always be
+   reused for a connected one (at most PEER_MAX_CONNECTIONS are connected at once). */
+#define CF_CKPT_QUORUM_MIN 2
+#define CF_CKPT_PEER_CAP   (2 * PEER_MAX_CONNECTIONS)
 
 /* Floor of connected filter peers below which the cfheaders stall-recovery must
    NOT disconnect a peer. A batch no peer can serve (e.g. a contested range during

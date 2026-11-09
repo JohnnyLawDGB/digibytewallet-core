@@ -148,6 +148,86 @@ static int _BRAssetPayloadSpan(const BRTxOutput *output, size_t *hdrOff, const u
 #endif
 }
 
+/* (internal)
+ * DigiByte Core's `nulldata` output type (script/standard.cpp Solver): OP_RETURN followed only by
+ * complete push opcodes (CScript::IsPushOnly -- every opcode <= OP_16, every push's data present).
+ * An OP_RETURN followed by anything else is `nonstandard`, and DigiAsset Core does not read it.
+ */
+static int _BRScriptIsNullData(const uint8_t *s, size_t n)
+{
+    size_t pc = 1;
+
+    if (!s || n < 1 || s[0] != OP_RETURN) return 0;
+    while (pc < n) {
+        uint8_t op = s[pc++];
+        uint64_t size = 0;
+
+        if (op > OP_16) return 0;
+        if (op < OP_PUSHDATA1) {
+            size = op;
+        } else if (op == OP_PUSHDATA1) {
+            if (n - pc < 1) return 0;
+            size = s[pc];
+            pc += 1;
+        } else if (op == OP_PUSHDATA2) {
+            if (n - pc < 2) return 0;
+            size = (uint64_t)s[pc] | ((uint64_t)s[pc + 1] << 8);
+            pc += 2;
+        } else if (op == OP_PUSHDATA4) {
+            if (n - pc < 4) return 0;
+            size = (uint64_t)s[pc] | ((uint64_t)s[pc + 1] << 8) | ((uint64_t)s[pc + 2] << 16) |
+                   ((uint64_t)s[pc + 3] << 24);
+            pc += 4;
+        }
+        if ((uint64_t)(n - pc) < size) return 0;
+        pc += (size_t)size;
+    }
+    return 1;
+}
+
+/*
+ * DA-014-REF: the ONE carrier rule, shared with the Kotlin DigiAssetCarrierRule and held to the
+ * same vectors (vectors/da-carrier/vectors.txt). It is DigiAsset Core's: decodeAssetTxHeader reads
+ * the LAST nulldata output of the transaction, of any kind, and nothing else.
+ *
+ *   DA_TX_NONE       no output is tagged "DA": a plain transaction.
+ *   DA_TX_CARRIER    the last nulldata output is a carrier this reader can frame, and no tagged
+ *                    output anywhere is unclassifiable; *carrierIdx is that output.
+ *   DA_TX_UNDECIDED  tagged somewhere, but the reference reads the transaction as plain (its last
+ *                    nulldata output is not a carrier, or it has none), or a tagged carrier cannot be
+ *                    classified: nothing may be credited, and every output is held.
+ */
+int BRTxAssetCarrier(const BRTransaction *transaction, size_t *carrierIdx)
+{
+    int tagged = 0, unclassified = 0, lastFound = 0;
+    size_t last = (size_t)-1;
+
+    if (!transaction) return DA_TX_NONE;
+    for (size_t i = 0; i < transaction->outCount; ++i) {
+        const BRTxOutput *o = &transaction->outputs[i];
+        size_t ho;
+        const uint8_t *pe;
+        int r = _BRAssetPayloadSpan(o, &ho, &pe);
+
+        if (r != DA_CARRIER_NONE) tagged = 1;
+        if (r == DA_CARRIER_UNCLASSIFIED) unclassified = 1;
+#ifdef ASSET_CARRIER_REF_UNFIXED
+        /* UNFIXED arm, built only by the reference-carrier KAT: the earlier rule -- the last output
+         * that frames as a carrier, whatever OP_RETURN follows it. */
+        if (r == DA_CARRIER_FOUND) { last = i; lastFound = 1; }
+#else
+        if (o->script && _BRScriptIsNullData(o->script, o->scriptLen)) {
+            last = i;
+            lastFound = (r == DA_CARRIER_FOUND);
+        }
+#endif
+    }
+    if (!tagged) return DA_TX_NONE;
+    if (unclassified || !lastFound) return DA_TX_UNDECIDED;
+    if (carrierIdx) *carrierIdx = last;
+    return DA_TX_CARRIER;
+}
+
 /*
  * Returns zero if an output is no DigiAsset carrier; otherwise nonzero: the length of the
  * carrier's declared payload (from the "DA" tag on, always >= 4), or DA_UNCLASSIFIED_ANSWER for
@@ -212,8 +292,9 @@ static size_t _BRAssetAmountSpan(const uint8_t *ptr, const uint8_t *end)
 
 /*
  * Returns 1 if an asset was sent to the output -- or, fail closed, if the transaction carries a
- * DigiAsset carrier this reader cannot classify (DA_UNCLASSIFIED_ANSWER): then every output of
- * the transaction is held, whichever one is asked about.
+ * DigiAsset carrier this reader cannot classify, or BRTxAssetCarrier cannot decide it
+ * (DA_UNCLASSIFIED_ANSWER): then every output of the transaction is held, whichever one is asked
+ * about.
  *
  * Unclassifiable: a tagged carrier _BRAssetPayloadSpan cannot frame; a version of 0 or an opcode
  * other than the issuance opcodes 0x01-0x05, transfer 0x15 and burn 0x25; metadata, an issuance
@@ -229,7 +310,8 @@ uint8_t BRTxOutputIsAsset(const BRTransaction* transaction, const BRTxOutput* ou
     BRTxOutput* or_output = NULL;
     size_t hdrOff = 0;
     const uint8_t *payloadEnd = NULL;
-    int unclassified = 0;
+    size_t carrier = 0;
+    int verdict;
 
     uint8_t* ptr;
     uint8_t type;
@@ -237,31 +319,18 @@ uint8_t BRTxOutputIsAsset(const BRTransaction* transaction, const BRTxOutput* ou
     int issuance;
 
     // 1) find `output`'s index in the transaction
-    // 2) find the asset OP_RETURN and the span it declares
     for (size_t i = 0; i < transaction->outCount; ++i) {
-        size_t ho;
-        const uint8_t *pe;
-
         if (&transaction->outputs[i] == output)
             idx = i;
-
-        switch (_BRAssetPayloadSpan(&transaction->outputs[i], &ho, &pe)) {
-            case DA_CARRIER_FOUND:
-                or_output = &transaction->outputs[i];
-                hdrOff = ho;
-                payloadEnd = pe;
-                break;
-            case DA_CARRIER_UNCLASSIFIED:
-                unclassified = 1;
-                break;
-            default:
-                break;
-        }
     }
-
     if (idx == (size_t)-1) return 0;
-    if (unclassified) return DA_UNCLASSIFIED_ANSWER;
-    if (or_output == NULL) return 0;
+
+    // 2) the carrier, by the one rule (BRTxAssetCarrier, DA-014-REF), and the span it declares
+    verdict = BRTxAssetCarrier(transaction, &carrier);
+    if (verdict == DA_TX_NONE) return 0;
+    if (verdict == DA_TX_UNDECIDED) return DA_UNCLASSIFIED_ANSWER;
+    or_output = &transaction->outputs[carrier];
+    if (_BRAssetPayloadSpan(or_output, &hdrOff, &payloadEnd) != DA_CARRIER_FOUND) return DA_UNCLASSIFIED_ANSWER;
 
     /* Every read below is bounded by the DECLARED payload, not the whole script. */
     const uint8_t *end = payloadEnd;

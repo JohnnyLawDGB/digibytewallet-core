@@ -391,11 +391,12 @@ Remarks:
 
 /* G5-QUORUM. The cfcheckpt rebuild decision counts only peers that ANSWERED: its
    denominator is the distinct (address, port) peers, none at the cfheaders source's
-   address, whose cfcheckpt reply compared at least one height above the compiled
-   table in the current window. Our chain is the outlier only when at least
-   CF_CKPT_QUORUM_MIN of those repliers report the SAME value at the SAME height and
-   they are a strict majority of the repliers. Silent peers and the source are neither
-   for nor against; one replier, however it answers, can never rebuild.
+   address and all still connected, whose cfcheckpt reply compared at least one height
+   above the compiled table in the current window. Our chain is the outlier only when at
+   least CF_CKPT_QUORUM_MIN of those repliers, on at least CF_CKPT_QUORUM_MIN DISTINCT
+   addresses, report the SAME value at the SAME height and they are a strict majority of
+   the repliers. Silent and departed peers and the source are neither for nor against;
+   one replier, or one host on many ports, can never rebuild.
 
    CF_CKPT_PEER_CAP bounds the replier set and the per-peer re-check cursors. Twice the
    connection cap, so a slot held by a peer that has since disconnected can always be

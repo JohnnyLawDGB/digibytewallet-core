@@ -6240,10 +6240,13 @@ static void _peerRelayedCFHeaders(void *info, uint8_t filterType, UInt256 stopHa
             // own node in exclusive mode (BRPeerManagerSetPinnedPeer(..., exclusive=1)
             // with this peer as the pin): the user trusts it and it is by design the
             // only peer, so it keeps the hatch. Anyone else must be corroborated: at
-            // least CF_CONTINUITY_REANCHOR_K distinct peers (this window, connected or
-            // not) must have claimed the same prevFilterHeader. Short of that the
-            // stall is recorded and the chain kept; a later peer that agrees with
-            // either side resolves it.
+            // least CF_CONTINUITY_REANCHOR_K disagreers of this window (connected or
+            // not -- the hatch runs precisely because the others are gone) must have
+            // claimed the same prevFilterHeader from that many DISTINCT addresses.
+            // Disagreers are kept per address and port (canonical nodes can share an
+            // IP behind tunnels), but ports on one host are one host's word. Short of
+            // that the stall is recorded and the chain kept; a later peer that agrees
+            // with either side resolves it.
             int loneRefused = 0;
             int ownNodeOnly = manager->pinnedExclusive && manager->pinnedPort != 0 &&
                               BRPeerIsPinned(manager->pinnedAddr, manager->pinnedPort, peer->address, peer->port);
@@ -6252,13 +6255,19 @@ static void _peerRelayedCFHeaders(void *info, uint8_t filterType, UInt256 stopHa
             if (aboveTable && ! ownNodeOnly &&
                 manager->cfSingleDisagreeRounds >= CF_SINGLE_PEER_REANCHOR_ROUNDS &&
                 manager->cfReanchorCount < CF_CONTINUITY_REANCHOR_MAX) {
-                uint8_t corroborating = 0;
+                uint8_t corroborating = 0;   // most distinct addresses behind one claimed prevFilterHeader
                 for (uint8_t i = 0; i < manager->cfDisagreedCount; i++) {
-                    uint8_t same = 0;
+                    uint8_t hosts = 0;
                     for (uint8_t j = 0; j < manager->cfDisagreedCount; j++) {
-                        if (UInt256Eq(manager->cfDisagreedPrev[i], manager->cfDisagreedPrev[j])) same++;
+                        if (! UInt256Eq(manager->cfDisagreedPrev[i], manager->cfDisagreedPrev[j])) continue;
+                        int seen = 0;
+                        for (uint8_t k = 0; k < j && ! seen; k++) {
+                            seen = UInt256Eq(manager->cfDisagreedPrev[i], manager->cfDisagreedPrev[k]) &&
+                                   UInt128Eq(manager->cfDisagreedPeers[k], manager->cfDisagreedPeers[j]);
+                        }
+                        if (! seen) hosts++;
                     }
-                    if (same > corroborating) corroborating = same;
+                    if (hosts > corroborating) corroborating = hosts;
                 }
                 if (corroborating < CF_CONTINUITY_REANCHOR_K) {
                     loneRefused = 1;
@@ -6966,28 +6975,51 @@ static int _cfCkRecordReplier(BRPeerManager *manager, const BRPeer *peer)
     return 1;
 }
 
-// The G5-QUORUM rebuild decision for a mismatch at (h, value). Votes and the denominator both leave out every entry
-// at the current cfheaders source's address (the source can neither vouch for its own chain nor out-vote a dissent
-// through a second port). Acts only when at least CF_CKPT_QUORUM_MIN repliers report this exact (h, value) and they
-// are a strict majority of the repliers. Peers that never answered are not counted on either side.
+// The G5-QUORUM rebuild decision for a mismatch at (h, value). INVARIANTS:
+//  * Only peers that answered AND are still connected count, on either side. A peer that answered and then left is
+//    neither a vote nor part of the denominator (its entries stay, inert, until it reconnects or the window resets).
+//  * Votes are per address AND port: some canonical filter nodes share one public IP behind reverse tunnels, so
+//    counting by address alone would undercount honest agreement.
+//  * But ports cannot manufacture a quorum: the agreeing dissenters must span at least CF_CKPT_QUORUM_MIN DISTINCT
+//    addresses, so any number of ports on one host is one host's word.
+//  * Every entry at the current cfheaders source's address is excluded from votes and from the denominator: the
+//    source can neither vouch for its own chain nor out-vote a dissent through a second port.
+// Acts only when at least CF_CKPT_QUORUM_MIN connected repliers, on at least CF_CKPT_QUORUM_MIN distinct addresses,
+// report this exact (h, value) and they are a strict majority of the connected repliers.
 static int _cfCkQuorumMet(BRPeerManager *manager, uint32_t h, UInt256 value, uint8_t *agreeOut, uint8_t *ofOut)
 {
-    uint8_t i, agree = 0, of = 0;
+    uint8_t i, j, agree = 0, hosts = 0, of = 0;
+#ifdef CF_CKPT_QUORUM_UNFIXED
+    // Reference arm for cf_corroboration_kat only: the earlier rule -- every recorded dissent, connected or not, per
+    // address and port, over a denominator of every connected filter peer.
+    (void)j; (void)hosts;
     for (i = 0; i < manager->cfCkDisCount; i++) {
-        if (UInt128Eq(manager->cfCkDisPeers[i], manager->cfHeadersPeerAddr)) continue;
         if (manager->cfCkDisHeights[i] == h && UInt256Eq(manager->cfCkDisValues[i], value)) agree++;
     }
-#ifdef CF_CKPT_QUORUM_UNFIXED
-    // Reference arm for cf_corroboration_kat only: the earlier denominator, every connected filter peer.
     of = (uint8_t)_BRPeerManagerConnectedFilterPeerCount(manager);
     *agreeOut = agree; *ofOut = of;
     return agree >= 2 && agree > of / 2;
 #else
+    for (i = 0; i < manager->cfCkDisCount; i++) {
+        if (UInt128Eq(manager->cfCkDisPeers[i], manager->cfHeadersPeerAddr)) continue;
+        if (manager->cfCkDisHeights[i] != h || ! UInt256Eq(manager->cfCkDisValues[i], value)) continue;
+        if (! _cfCkPeerIsConnected(manager, manager->cfCkDisPeers[i], manager->cfCkDisPorts[i])) continue;
+        agree++;
+        int seen = 0;   // a new host only if no earlier counted entry shares its address
+        for (j = 0; j < i && ! seen; j++) {
+            seen = UInt128Eq(manager->cfCkDisPeers[j], manager->cfCkDisPeers[i]) &&
+                   ! UInt128Eq(manager->cfCkDisPeers[j], manager->cfHeadersPeerAddr) &&
+                   manager->cfCkDisHeights[j] == h && UInt256Eq(manager->cfCkDisValues[j], value) &&
+                   _cfCkPeerIsConnected(manager, manager->cfCkDisPeers[j], manager->cfCkDisPorts[j]);
+        }
+        if (! seen) hosts++;
+    }
     for (i = 0; i < manager->cfCkRepCount; i++) {
-        if (! UInt128Eq(manager->cfCkRepPeers[i], manager->cfHeadersPeerAddr)) of++;
+        if (UInt128Eq(manager->cfCkRepPeers[i], manager->cfHeadersPeerAddr)) continue;
+        if (_cfCkPeerIsConnected(manager, manager->cfCkRepPeers[i], manager->cfCkRepPorts[i])) of++;
     }
     *agreeOut = agree; *ofOut = of;
-    return agree >= CF_CKPT_QUORUM_MIN && 2u * agree > of;
+    return agree >= CF_CKPT_QUORUM_MIN && hosts >= CF_CKPT_QUORUM_MIN && 2u * agree > of;
 #endif
 }
 

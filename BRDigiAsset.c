@@ -404,15 +404,20 @@ static int _BRCarrierNames(const BRTxOutput *or_output, size_t hdrOff, const uin
  * to the KYC, exchange-rate and encrypted-key readers, and a match there ends the reading. Those
  * matches depend on more than the scripts, so the wallet credits only a transaction whose single
  * nulldata output is its single tagged output -- the reference's first and last nulldata output
- * at once. (Those readers can also take a lone carrier by amounts and input count; that residual
- * is outside this rule.)
+ * at once. The encrypted-key reader (decodeEncryptedKeyTx) can still take such a lone carrier: it
+ * reads no content, only one input, two or three outputs, output 0 worth exactly
+ * DA_ENCRYPTED_KEY_SATS and the nulldata output at index 1. That shape is UNDECIDED too. (The
+ * exchange-rate reader also needs the indexer's own watch list, which the wallet does not have.)
  *
  *   DA_TX_NONE       no output is tagged "DA": a plain transaction.
  *   DA_TX_CARRIER    exactly one output is nulldata, exactly one is tagged, they are the same
- *                    output, and its payload classifies; *carrierIdx is that output.
+ *                    output, its payload classifies, and the transaction is not in the
+ *                    encrypted-key shape; *carrierIdx is that output.
  *   DA_TX_UNDECIDED  anything else with a tagged output: nothing may be credited, and every
  *                    output is held.
  */
+#define DA_ENCRYPTED_KEY_SATS 650   /* output 0 of a DigiAsset Core encrypted-key transaction */
+
 int BRTxAssetCarrier(const BRTransaction *transaction, size_t *carrierIdx)
 {
     size_t tagged = 0, nullData = 0, carrier = (size_t)-1, ho = 0;
@@ -446,6 +451,9 @@ int BRTxAssetCarrier(const BRTransaction *transaction, size_t *carrierIdx)
 #ifndef ASSET_CARRIER_REF_UNFIXED
     if (_BRCarrierNames(&transaction->outputs[carrier], ho, pe, (size_t)-1) == DA_NAMES_UNCLASSIFIED)
         return DA_TX_UNDECIDED;
+    if (carrier == 1 && transaction->inCount == 1 && transaction->outCount >= 2 && transaction->outCount <= 3 &&
+        transaction->outputs[0].amount == DA_ENCRYPTED_KEY_SATS)
+        return DA_TX_UNDECIDED;   /* DigiAsset Core reads it as an encrypted-key transaction */
 #endif
     if (carrierIdx) *carrierIdx = carrier;
     return DA_TX_CARRIER;

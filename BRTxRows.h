@@ -20,14 +20,27 @@
 //          wallet): received - sent.
 //      toOthers = the transaction's outputs minus what it pays the wallet (BRWalletAmountReceivedFromTx),
 //      so every output is counted exactly once, on one side or the other. An input is the wallet's when
-//      the coin it spends is a wallet output (BRWalletAmountSentByTx sees it), or -- for a coin whose
-//      transaction the wallet does not hold -- when the input's own address, or the native-segwit
-//      address of the public key its witness carries, is a wallet address. The second test is what
-//      keeps a send whose parents were never downloaded (a restored wallet) from reading as a receive
-//      of its change.
+//      the coin it spends is a wallet output (BRWalletAmountSentByTx sees it), or -- for a CONFIRMED
+//      transaction spending a coin whose transaction the wallet does not hold -- when the input's own
+//      address (a P2PKH or P2SH scriptSig's, BRAddressFromScriptSig), or the native-segwit address of
+//      the public key its witness carries, is a wallet address. The second test is what keeps a send
+//      whose parents were never downloaded (a restored wallet) from reading as a receive of its change.
+//      It is never applied to an unconfirmed transaction: the key in a scriptSig or witness is public
+//      once the wallet has spent from it, and nothing checks an unconfirmed input whose coin the wallet
+//      cannot see, so anyone could relay a transaction that pays the wallet a little, names the
+//      wallet's key over a made-up coin, and would otherwise read as a large send. A height comes only
+//      from a block the wallet proved, and in a block consensus has checked that the key hashes to the
+//      coin spent. What remains for a confirmed transaction: a spendable P2WSH or P2SH output whose
+//      script is exactly the wallet's 33-byte key would pass the witness test without being the
+//      wallet's coin.
+//      A send to the wallet itself whose parents are missing pays no one else (toOthers 0), so it
+//      reads as received - sent = +received, its fee unknown (tx_rows_amount_kat
+//      self_send_missing_parent).
 //      KNOWN GAP: a Taproot key-path input carries only a signature. With its parent missing nothing in
 //      the transaction says the coin was the wallet's, so such a send still reads as received - sent
 //      (its change, positive). tx_rows_amount_kat pins this (taproot_keypath_missing_parent).
+//      DISPLAY ONLY: amount, rule and ownsInput are for the list a person reads. They must never drive
+//      crediting, asset ingestion, notification gating or the stranded-send sweep.
 //    - FEE (D2). BRWalletFeeForTx: the inputs minus the outputs when the wallet holds every parent;
 //      BR_TX_ROW_FEE_UNKNOWN (UINT64_MAX) otherwise. Unknown is shown as unknown, never as a figure
 //      (not 0, not a partial sum).
@@ -39,7 +52,8 @@
 //      platform lists the same rows in the same order. Platforms never re-sort.
 //
 //  READING A WALLET. BRWalletTxRows copies the wallet's transactions in one lock hold
-//  (BRWalletCopyTransactions), computes every row from those copies, sorts, and writes the first
+//  (BRWalletCopyTransactions; if the copy fills the buffer sized from the count, the wallet may have
+//  grown in between, so it copies again into a larger one), computes every row from those copies, sorts, and writes the first
 //  maxRows. It keeps no pointer into the wallet, does no I/O, and allocates only for the length of
 //  the call. Each wallet call it makes takes the wallet's lock, which is not recursive: the caller
 //  must NOT hold it. The wallet may change while the rows are computed (a peer thread); every row is
@@ -80,7 +94,7 @@ extern "C" {
 // The fee of a row whose fee the wallet cannot know. A literal for Swift; it is UINT64_MAX, the value
 // BRWalletFeeForTx returns.
 #define BR_TX_ROW_FEE_UNKNOWN 0xFFFFFFFFFFFFFFFFULL
-typedef char _BRTxRowFeeUnknownIsFeeForTxs[(BR_TX_ROW_FEE_UNKNOWN == UINT64_MAX) ? 1 : -1];
+typedef char BRTxRowsCheckFeeUnknownIsUint64Max[(BR_TX_ROW_FEE_UNKNOWN == UINT64_MAX) ? 1 : -1];
 
 // Which part of the AMOUNT rule a row took. The zero value is the plain one.
 typedef enum {
@@ -209,6 +223,8 @@ static inline size_t _BRTxRowWitnessAddress(char *addr, size_t addrLen, const ui
 static inline int _BRTxRowOwnsInput(BRWallet *wallet, const BRTransaction *tx, uint64_t sent)
 {
     if (sent > 0) return 1;
+    // A key named over a coin the wallet cannot see is trusted only once a block has checked it.
+    if (tx->blockHeight == TX_UNCONFIRMED) return 0;
     for (size_t i = 0; i < tx->inCount; i++) {
         const BRTxInput *in = &tx->inputs[i];
         char addr[sizeof(in->address)];
@@ -267,21 +283,38 @@ static inline int _BRTxRowQsortCompare(const void *a, const void *b)
 // wallet's lock.
 static inline size_t BRWalletTxRows(BRWallet *wallet, uint32_t now, BRTxRow *rows, size_t maxRows)
 {
-    size_t count, i, n;
-    BRTransaction **txs;
+    size_t count, cap, i, n;
+    int attempt;
+    BRTransaction **txs = NULL;
     BRTxRow *all;
 
     if (! wallet) return 0;
     count = BRWalletTransactions(wallet, NULL, 0);
     if (! rows) return count;
     if (maxRows == 0 || count == 0) return 0;
-    if (count > SIZE_MAX / sizeof(BRTxRow) || count > UINT32_MAX) return 0;
 
-    txs = (BRTransaction **)calloc(count, sizeof(*txs));
+    // The count and the copy are two lock holds: a transaction registered between them would make the
+    // copy stop short of the newest. A copy that fills its buffer may be short, so it is taken again
+    // into a larger one; one that does not fill it holds every transaction, taken in one lock hold.
+    for (attempt = 0, cap = count + 8; ; attempt++) {
+        if (cap > SIZE_MAX / sizeof(BRTxRow) || cap > UINT32_MAX) return 0;
+        txs = (BRTransaction **)calloc(cap, sizeof(*txs));
+        if (! txs) return 0;
+        count = BRWalletCopyTransactions(wallet, txs, cap);
+        if (count < cap || attempt >= 3) break;   // after three regrowths, take what the copy holds
+        for (i = 0; i < count; i++) if (txs[i]) BRTransactionFree(txs[i]);
+        free(txs);
+        txs = NULL;
+        cap *= 2;
+    }
+    if (count == 0) { free(txs); return 0; }
+
     all = (BRTxRow *)calloc(count, sizeof(*all));
-    if (! txs || ! all) { free(txs); free(all); return 0; }
-
-    count = BRWalletCopyTransactions(wallet, txs, count);   // one lock hold; fewer if the wallet shrank
+    if (! all) {
+        for (i = 0; i < count; i++) if (txs[i]) BRTransactionFree(txs[i]);
+        free(txs);
+        return 0;
+    }
     for (i = 0, n = 0; i < count; i++) {
         if (! txs[i]) continue;   // a copy that could not be allocated: no row rather than an empty one
         BRWalletTxRowFill(wallet, txs[i], (uint32_t)i, now, &all[n++]);

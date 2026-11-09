@@ -676,6 +676,11 @@ struct BRPeerManagerStruct {
     uint16_t cfCkAskPorts[CF_CKPT_PEER_CAP];
     uint32_t cfCkAskThrough[CF_CKPT_PEER_CAP];
     uint32_t cfCkAskSeen[CF_CKPT_PEER_CAP];    // highest block height this peer has relayed to us since it connected
+    // G5-QUORUM: the one single-height re-check probe outstanding per peer -- the stop block (zero: none) and its
+    // height. A cfheaders reply from that peer with exactly this stop and one hash is the probe's answer and never a
+    // sync batch.
+    UInt256  cfCkProbeStop[CF_CKPT_PEER_CAP];
+    uint32_t cfCkProbeHeight[CF_CKPT_PEER_CAP];
     uint8_t  cfCkAskCount;
     // G5-QUORUM: diverged cfheaders rounds above the compiled table during which the lone connected filter peer was
     // refused a re-anchor for want of a second, agreeing peer. Saturating; diagnostic only.
@@ -1689,6 +1694,8 @@ static unsigned long _cfBlockFloorWalks = 0;
 static int _BRPeerManagerConnectedFilterPeerCount(BRPeerManager *manager); // defined below; used by the cfheaders stall-drop floor guard
 static void _cfCkNotePeerHeightLocked(BRPeerManager *manager, BRPeer *peer, uint32_t height); // G5-QUORUM, defined below
 static void _BRPeerManagerCFCheckptRecheckLocked(BRPeerManager *manager); // G5-QUORUM, defined below
+static int _cfCkTakeProbeAnswerLocked(BRPeerManager *manager, BRPeer *peer, UInt256 stopHash,
+                                      UInt256 prevFilterHeader, const UInt256 *filterHashes, size_t count); // G5-QUORUM
 static void _BRPeerManagerProbeOtherFilterPeersForCFHeaders(BRPeerManager *manager, BRPeer *current,
                                                             uint8_t filterType, uint32_t startHeight,
                                                             UInt256 stopHash);
@@ -5933,6 +5940,13 @@ static void _peerRelayedCFHeaders(void *info, uint8_t filterType, UInt256 stopHa
 
     MGR_LOCK(manager);
 
+    // G5-QUORUM: the answer to this peer's outstanding single-height re-check probe is judged as a corroboration
+    // and consumed here -- never appended, never taken for a sync batch, never touching the sync driver's state.
+    if (_cfCkTakeProbeAnswerLocked(manager, peer, stopHash, prevFilterHeader, filterHashes, count)) {
+        MGR_UNLOCK(manager);
+        return;
+    }
+
 #ifndef CF_EMPTY_BATCH_UNFIXED
     // An empty batch is not progress (4.1.2 row 26, bobverga 1a163a2c). It returned OK before continuity,
     // so the handler reset cfTriedCount, credited the peer as serving filters and asked the same peer
@@ -7238,6 +7252,8 @@ static int _cfCkAskSlot(BRPeerManager *manager, const BRPeer *peer, int create)
     manager->cfCkAskPorts[i]   = peer->port;
     manager->cfCkAskThrough[i] = 0;
     manager->cfCkAskSeen[i]    = 0;
+    manager->cfCkProbeStop[i]  = UINT256_ZERO;
+    manager->cfCkProbeHeight[i] = 0;
     return i;
 }
 
@@ -7297,13 +7313,90 @@ static void _BRPeerManagerRequestCFCheckptLocked(BRPeerManager *manager, BRPeer 
         if (! recheck) peer_log(peer, "cf-corroborate: no held block at stop height %u — not requesting cfcheckpt", stopHeight);
         return;
     }
+    uint8_t filterType = manager->compactFilterChain ? BRCompactFilterChainType(manager->compactFilterChain)
+                                                     : FILTER_TYPE_BASIC;
+#ifndef CF_CKPT_PROBE_UNFIXED
+    if (recheck) {
+        // G5-QUORUM: the re-check needs ONE value, the filter header at the crossed 1000-multiple h. A single-height
+        // getcfheaders (start h, stop = our block at h) answers with the header at h - 1 and one filter hash, about
+        // 100 bytes, instead of a cfcheckpt reply that carries every 1000-multiple since genesis. The probe is
+        // tagged per peer so its answer is told apart from a sync batch (_cfCkTakeProbeAnswerLocked).
+        peer_log(peer, "cf-corroborate: re-checking height %u by single-height probe (last checked through %u)",
+                 stopHeight, manager->cfCkAskThrough[k]);
+        manager->cfCkProbeStop[k]   = stopHash;
+        manager->cfCkProbeHeight[k] = stopHeight;
+        manager->cfCkAskThrough[k]  = stopHeight;   // once per crossing, answered or not
+        BRPeerSendGetCFHeaders(peer, filterType, stopHeight, stopHash);
+        return;
+    }
+#endif
     if (recheck) peer_log(peer, "cf-corroborate: re-checking at stop height %u (last checked through %u)",
                           stopHeight, manager->cfCkAskThrough[k]);
-    BRPeerSendGetCFCheckpt(peer, manager->compactFilterChain
-                                 ? BRCompactFilterChainType(manager->compactFilterChain)
-                                 : FILTER_TYPE_BASIC,
-                           stopHash);
+    BRPeerSendGetCFCheckpt(peer, filterType, stopHash);
     if (k >= 0) manager->cfCkAskThrough[k] = comparable;
+}
+
+// G5-QUORUM: if this cfheaders reply is the answer to `peer`'s outstanding single-height probe (same peer, same stop
+// block, exactly one filter hash), consume it: clear the tag, fold the peer's header at h (dSHA256(filterHash ||
+// prevFilterHeader)) and judge it against our chain at h with the same (height, value) semantics, and the same
+// replier and dissent tables, as a cfcheckpt entry. Returns 1 when consumed (the caller must not treat the reply as a
+// batch), 0 otherwise. Nothing here appends, re-anchors on its own, or touches the sync driver. Caller holds
+// manager->lock.
+static int _cfCkTakeProbeAnswerLocked(BRPeerManager *manager, BRPeer *peer, UInt256 stopHash,
+                                      UInt256 prevFilterHeader, const UInt256 *filterHashes, size_t count)
+{
+    if (count != 1 || UInt256IsZero(stopHash)) return 0;
+    int k = _cfCkAskSlot(manager, peer, 0);
+    if (k < 0 || ! UInt256Eq(manager->cfCkProbeStop[k], stopHash)) return 0;
+    uint32_t h = manager->cfCkProbeHeight[k];
+    manager->cfCkProbeStop[k] = UINT256_ZERO;
+    manager->cfCkProbeHeight[k] = 0;
+
+    const BRCompactFilterChain *chain = manager->compactFilterChain;
+    uint32_t topCompiled = (manager->params->standardPort == BRMainNetParams.standardPort)
+                           ? BRCFTopCheckpointHeight() : 0;
+    if (! chain || BRCompactFilterChainCount(chain) == 0 || h <= topCompiled ||
+        h < BRCompactFilterChainStartHeight(chain) || h >= BRCompactFilterChainNextHeight(chain) ||
+        ! UInt256Eq(_BRPeerManagerBlockHashAtHeight(manager, h), stopHash)) {
+        peer_log(peer, "cf-corroborate: probe answer for height %u no longer comparable — consumed, not judged", h);
+        return 1;
+    }
+    if (UInt128Eq(peer->address, manager->cfHeadersPeerAddr)) {
+        peer_log(peer, "cf-corroborate: probe answer from the cfheaders source — not counted");
+        return 1;
+    }
+
+    UInt256 theirs = BRGCSFilterHeader(filterHashes[0], prevFilterHeader);
+    UInt256 ours = BRCompactFilterChainHeader(chain, h);
+#ifndef CF_CORROBORATE_ACT_UNFIXED
+    int votes = _cfCkRecordReplier(manager, peer);
+#endif
+    if (UInt256Eq(theirs, ours)) {
+#ifndef CF_CORROBORATE_ACT_UNFIXED
+        for (uint8_t d = 0; d < manager->cfCkDisCount; d++) {   // an agreeing answer withdraws an older dispute
+            if (UInt128Eq(manager->cfCkDisPeers[d], peer->address) && manager->cfCkDisPorts[d] == peer->port) {
+                if (manager->cfCkDisHeights[d] <= h) _cfCkDisForget(manager, peer->address, peer->port);
+                break;
+            }
+        }
+#endif
+        if (h > atomic_load_explicit(&manager->cfCorroboratedThrough, memory_order_relaxed)) {
+            atomic_store_explicit(&manager->cfCorroboratedThrough, h, memory_order_relaxed);
+        }
+        peer_log(peer, "cf-corroborate: probe height %u agrees; corroborated through %u", h,
+                 atomic_load_explicit(&manager->cfCorroboratedThrough, memory_order_relaxed));
+        return 1;
+    }
+    atomic_store_explicit(&manager->cfCheckptDisagreeCount,
+                          atomic_load_explicit(&manager->cfCheckptDisagreeCount, memory_order_relaxed) + 1u,
+                          memory_order_relaxed);
+    peer_log(peer, "cf-corroborate: probe height %u MISMATCH ours=%s peer=%s (disagreements %u)", h,
+             log_u256_hex_encode(ours), log_u256_hex_encode(theirs),
+             atomic_load_explicit(&manager->cfCheckptDisagreeCount, memory_order_relaxed));
+#ifndef CF_CORROBORATE_ACT_UNFIXED
+    if (votes) _BRPeerManagerCFCheckptDisagreedLocked(manager, peer, h, theirs);
+#endif
+    return 1;
 }
 
 // G5-QUORUM: continuous checking. Re-ask each connected filter peer, other than those at the cfheaders source's

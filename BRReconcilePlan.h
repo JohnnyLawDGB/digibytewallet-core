@@ -21,18 +21,23 @@
 //      concatenated): drop each entry whose txid the wallet holds, and each with no txid (all zero);
 //      keep one entry per txid, carrying the HIGHEST height any entry gave it; list the kept txids in
 //      the order each was first seen (BRReconcilePlanHistoryImport). The height is the one registered
-//      with the transaction.
+//      with the transaction. The plan checks no height range: whether a height is one the wallet can
+//      check belongs to the registration (the wallet does not keep a server's height it cannot check),
+//      and a registration refused for it is unrecovered (COVERAGE).
 //    - IMPORT STEP. Each planned transaction is fetched, decoded, checked to BE the transaction asked
 //      for (its own id equals the planned txid), and only then registered, in that order; the first
 //      step that fails is the outcome (BRReconcileImportStepFor). Bytes that are not the transaction
 //      asked for are never registered (BRReconcileImportMayRegister).
-//    - COVERAGE. A pass covered the wallet's addresses iff every planned transaction was registered:
-//      no step failed for any of them, and as many were registered as were planned (an empty plan is
-//      covered). A REFUSED registration is not recovered: with the known set complete, the wallet's
-//      duplicate refusal cannot be reached here, so a refusal means the transaction did not land
-//      (unparseable, unsigned, not the wallet's, or a height the wallet cannot check). Coverage is
-//      all-or-nothing (BRReconcileImportCovered). Only a covered pass may report that history the
-//      compact-filter scan gave up on has been recovered.
+//    - COVERAGE. A pass covered the wallet's addresses iff the list of distinct addresses asked was not
+//      empty, the node answered for every one of them, and every planned transaction was registered: no
+//      step failed for any of them, and as many were registered as were planned (an empty plan is
+//      covered only when the node answered for every address). A history request that failed, in whole
+//      or in part, is never read as an empty plan: the pass records the addresses asked and answered
+//      (BRReconcileImportBegin) and is not covered. A REFUSED registration is not recovered: with the
+//      known set complete, the wallet's duplicate refusal cannot be reached here, so a refusal means
+//      the transaction did not land (unparseable, unsigned, not the wallet's, or a height the wallet
+//      cannot check). Coverage is all-or-nothing (BRReconcileImportCovered). Only a covered pass may
+//      report that history the compact-filter scan gave up on has been recovered.
 //    - PENDING. A wallet transaction is pending iff its blockHeight is TX_UNCONFIRMED
 //      (BRReconcileIsPending); BRReconcilePendingTxHashes lists every such transaction the wallet
 //      holds, in the wallet's oldest-first order.
@@ -42,14 +47,17 @@
 //      removes from an ASCII string).
 //    - DISTINCT OUTPOINTS. The node's unspent rows with each outpoint (txid, output index) once, the
 //      first row kept, before anything is counted or summed (BRReconcileDistinctOutpoints).
+//    The plan and both distinct lists take O(n log n) in their input (the node chooses how many
+//    history entries and unspent rows it returns).
 //
 //  BUFFERS. Every output is a buffer the caller owns; nothing here allocates except the transaction
 //  copies BRReconcilePendingTxHashes takes from the wallet and frees before it returns. A function
 //  that cannot fit its answer says so (BR_RECONCILE_BUFFER_TOO_SMALL / BR_RECONCILE_INCOMPLETE) and
-//  reports a count of 0. Sizes: a plan never has more entries than the history it is planned from, a
-//  distinct list never more than its input; BRReconcileCapacity and BRReconcileArrayBytes size a
-//  buffer with overflow checked. No I/O, no clock, no network. The wallet readers take the wallet's
-//  lock, which is not recursive: the caller must NOT hold it.
+//  reports a count of 0. Sizes: a plan or a distinct list is given a buffer for its whole input (the
+//  buffer is also the working space), so planCap / keepCap / outCap >= the input count always
+//  suffices; BRReconcileCapacity and BRReconcileArrayBytes size a buffer with overflow checked. No
+//  I/O, no clock, no network. The wallet readers take the wallet's lock, which is not recursive: the
+//  caller must NOT hold it.
 //
 //  TXIDS are UInt256 in the wallet's byte order (UInt256.u8); a txid string displays it reversed.
 //  They compare as bytes, so a platform that keeps txids as hex compares them case-insensitively.
@@ -234,6 +242,8 @@ static inline BRReconcileStatus BRReconcilePendingTxHashes(BRWallet *wallet, UIn
         BRTransaction *tx = BRWalletCopyTransactionForHash(wallet, hashes[i]);
         if (! tx) {
             // Removed since the hashes were read, or the copy failed: only the first is not pending.
+            // Defensive: BRTransactionCopy's BRTransactionNew asserts on allocation failure, so with
+            // assertions on a failed copy never returns here.
             if (BRWalletTransactionForHash(wallet, hashes[i]) != NULL) { *count = 0; return BR_RECONCILE_NO_MEMORY; }
             continue;
         }
@@ -368,15 +378,24 @@ static inline int BRReconcileImportStepRecovered(BRReconcileImportStep step)
 
 // The tally of one address-history pass.
 typedef struct {
-    size_t planned;       // entries in the plan
-    size_t imported;      // steps that recovered their transaction
-    size_t unrecovered;   // steps that did not
+    size_t addressesAsked;     // distinct addresses the history was asked for
+    size_t addressesAnswered;  // of those, how many the node's answer covers
+    size_t planned;            // entries in the plan
+    size_t imported;           // steps that recovered their transaction
+    size_t unrecovered;        // steps that did not
 } BRReconcileImportOutcome;
 
-// Starts a pass over a plan of `planned` entries. NULL-safe.
-static inline void BRReconcileImportBegin(BRReconcileImportOutcome *outcome, size_t planned)
+// Starts a pass: the history was asked for addressesAsked distinct addresses (BRReconcileDistinctAddresses),
+// the node's answer covers addressesAnswered of them (all of them when every request succeeded; a failed
+// request answers for none of its addresses), and the plan made from that answer has `planned` entries.
+// A pass whose history request failed is begun with what it answered (0 when it failed outright, plan
+// 0), never skipped: it is then not covered, where an empty plan alone would be. NULL-safe.
+static inline void BRReconcileImportBegin(BRReconcileImportOutcome *outcome, size_t addressesAsked,
+                                          size_t addressesAnswered, size_t planned)
 {
     if (! outcome) return;
+    outcome->addressesAsked = addressesAsked;
+    outcome->addressesAnswered = addressesAnswered;
     outcome->planned = planned;
     outcome->imported = 0;
     outcome->unrecovered = 0;
@@ -392,31 +411,94 @@ static inline void BRReconcileImportRecord(BRReconcileImportOutcome *outcome, BR
     if (*c < SIZE_MAX) (*c)++;
 }
 
-// COVERAGE: 1 iff nothing was unrecovered and every planned transaction was registered. NULL: 0.
+// COVERAGE: 1 iff some addresses were asked, the node answered for every one, nothing was unrecovered
+// and every planned transaction was registered. NULL: 0.
 static inline int BRReconcileImportCovered(const BRReconcileImportOutcome *outcome)
 {
-    return outcome && outcome->unrecovered == 0 && outcome->imported == outcome->planned;
+    return outcome && outcome->addressesAsked > 0 && outcome->addressesAnswered == outcome->addressesAsked &&
+           outcome->unrecovered == 0 && outcome->imported == outcome->planned;
 }
 
 // ---- distinct lists ----------------------------------------------------------------------------
 
+// An in-place heapsort with a context: O(n log n), no allocation (qsort takes no context). The comparisons
+// used here are total orders (each ends on a distinct index), so the result does not depend on the sort
+// being stable.
+typedef int (*_BRReconcileCompareFn)(const void *a, const void *b, const void *ctx);
+
+static inline void _BRReconcileSwap(unsigned char *a, unsigned char *b, size_t size)
+{
+    for (size_t i = 0; i < size; i++) { unsigned char t = a[i]; a[i] = b[i]; b[i] = t; }
+}
+
+static inline void _BRReconcileSiftDown(unsigned char *base, size_t root, size_t n, size_t size,
+                                        _BRReconcileCompareFn cmp, const void *ctx)
+{
+    for (;;) {
+        size_t child = 2 * root + 1, top = root;
+        if (child >= n || child < root) return;   // child < root: 2 * root + 1 overflowed
+        if (cmp(base + top * size, base + child * size, ctx) < 0) top = child;
+        if (child + 1 < n && cmp(base + top * size, base + (child + 1) * size, ctx) < 0) top = child + 1;
+        if (top == root) return;
+        _BRReconcileSwap(base + root * size, base + top * size, size);
+        root = top;
+    }
+}
+
+static inline void _BRReconcileHeapSort(void *base, size_t n, size_t size, _BRReconcileCompareFn cmp, const void *ctx)
+{
+    unsigned char *b = (unsigned char *)base;
+
+    if (! base || n < 2) return;
+    for (size_t i = n / 2; i > 0; i--) _BRReconcileSiftDown(b, i - 1, n, size, cmp, ctx);
+    for (size_t end = n - 1; end > 0; end--) {
+        _BRReconcileSwap(b, b + end * size, size);
+        _BRReconcileSiftDown(b, 0, end, size, cmp, ctx);
+    }
+}
+
+static inline int _BRReconcileIndexCompare(size_t a, size_t b)
+{
+    return (a < b) ? -1 : (a > b) ? 1 : 0;
+}
+
+// Outpoint row indices by (txid, output index, row index).
+static inline int _BRReconcileOutpointCompare(const void *a, const void *b, const void *ctx)
+{
+    const BRUTXO *u = (const BRUTXO *)ctx;
+    size_t i = *(const size_t *)a, j = *(const size_t *)b;
+    int c = BRReconcileTxHashCompare(u[i].hash, u[j].hash);
+    if (c) return c;
+    if (u[i].n != u[j].n) return (u[i].n < u[j].n) ? -1 : 1;
+    return _BRReconcileIndexCompare(i, j);
+}
+
+static inline int _BRReconcileSizeCompare(const void *a, const void *b, const void *ctx)
+{
+    (void)ctx;
+    return _BRReconcileIndexCompare(*(const size_t *)a, *(const size_t *)b);
+}
+
 // The DISTINCT OUTPOINTS: writes to keep[0..*keptCount) the index in utxos of each outpoint's first
-// row, in order.
-//   OK / BUFFER_TOO_SMALL (keepCap >= count always suffices; *keptCount 0) / NULL_ARGUMENT.
+// row, in order. keep[] is also the working space: keepCap must be at least count.
+//   OK / BUFFER_TOO_SMALL (keepCap < count; *keptCount 0) / NULL_ARGUMENT.
 static inline BRReconcileStatus BRReconcileDistinctOutpoints(const BRUTXO utxos[], size_t count,
                                                              size_t keep[], size_t keepCap, size_t *keptCount)
 {
-    size_t i, j, n = 0;
+    size_t i, n = 0;
 
     if (! keptCount) return BR_RECONCILE_NULL_ARGUMENT;
     *keptCount = 0;
     if ((count && ! utxos) || (keepCap && ! keep)) return BR_RECONCILE_NULL_ARGUMENT;
-    for (i = 0; i < count; i++) {
-        for (j = 0; j < n && ! BRUTXOEq(&utxos[keep[j]], &utxos[i]); j++);
-        if (j < n) continue;
-        if (n >= keepCap) return BR_RECONCILE_BUFFER_TOO_SMALL;
-        keep[n++] = i;
+    if (count == 0) return BR_RECONCILE_OK;
+    if (keepCap < count) return BR_RECONCILE_BUFFER_TOO_SMALL;
+    for (i = 0; i < count; i++) keep[i] = i;
+    _BRReconcileHeapSort(keep, count, sizeof(*keep), _BRReconcileOutpointCompare, utxos);
+    for (i = 0; i < count; i++) {   // the first of each group is its first row
+        if (n > 0 && BRUTXOEq(&utxos[keep[n - 1]], &utxos[keep[i]])) continue;
+        keep[n++] = keep[i];
     }
+    _BRReconcileHeapSort(keep, n, sizeof(*keep), _BRReconcileSizeCompare, NULL);
     *keptCount = n;
     return BR_RECONCILE_OK;
 }
@@ -448,14 +530,38 @@ static inline void BRReconcileAddressTrim(const char *s, size_t *offset, size_t 
     if (length) *length = b - a;
 }
 
+// Address spans by (trimmed bytes, then length: a prefix first), then index.
+static inline int _BRReconcileSpanBytesCompare(const BRReconcileAddressSpan *x, const BRReconcileAddressSpan *y,
+                                               const char *const *addrs)
+{
+    size_t len = (x->length < y->length) ? x->length : y->length;
+    int c = memcmp(addrs[x->index] + x->offset, addrs[y->index] + y->offset, len);
+    if (c) return (c < 0) ? -1 : 1;
+    return _BRReconcileIndexCompare(x->length, y->length);
+}
+
+static inline int _BRReconcileSpanCompare(const void *a, const void *b, const void *ctx)
+{
+    const BRReconcileAddressSpan *x = (const BRReconcileAddressSpan *)a, *y = (const BRReconcileAddressSpan *)b;
+    int c = _BRReconcileSpanBytesCompare(x, y, (const char *const *)ctx);
+    return c ? c : _BRReconcileIndexCompare(x->index, y->index);
+}
+
+static inline int _BRReconcileSpanIndexCompare(const void *a, const void *b, const void *ctx)
+{
+    (void)ctx;
+    return _BRReconcileIndexCompare(((const BRReconcileAddressSpan *)a)->index, ((const BRReconcileAddressSpan *)b)->index);
+}
+
 // The DISTINCT ADDRESSES: from addrs[0..count) (NUL-terminated strings; a NULL entry is skipped), writes
-// out[0..*outCount): each trimmed, non-empty address once, first-seen order.
-//   OK / BUFFER_TOO_SMALL (outCap >= count always suffices; *outCount 0) / NULL_ARGUMENT.
+// out[0..*outCount): each trimmed, non-empty address once, first-seen order. out[] is also the working
+// space: it must hold every non-empty entry (outCap >= count always suffices).
+//   OK / BUFFER_TOO_SMALL (*outCount 0) / NULL_ARGUMENT.
 static inline BRReconcileStatus BRReconcileDistinctAddresses(const char *const addrs[], size_t count,
                                                              BRReconcileAddressSpan out[], size_t outCap,
                                                              size_t *outCount)
 {
-    size_t i, j, n = 0, off, len;
+    size_t i, n = 0, m = 0, off, len;
 
     if (! outCount) return BR_RECONCILE_NULL_ARGUMENT;
     *outCount = 0;
@@ -464,17 +570,19 @@ static inline BRReconcileStatus BRReconcileDistinctAddresses(const char *const a
         if (! addrs[i]) continue;
         BRReconcileAddressTrim(addrs[i], &off, &len);
         if (len == 0) continue;
-        for (j = 0; j < n; j++) {
-            if (out[j].length == len && memcmp(addrs[out[j].index] + out[j].offset, addrs[i] + off, len) == 0) break;
-        }
-        if (j < n) continue;
         if (n >= outCap) return BR_RECONCILE_BUFFER_TOO_SMALL;
         out[n].index = i;
         out[n].offset = off;
         out[n].length = len;
         n++;
     }
-    *outCount = n;
+    _BRReconcileHeapSort(out, n, sizeof(*out), _BRReconcileSpanCompare, addrs);
+    for (i = 0; i < n; i++) {   // the first of each group is its first occurrence
+        if (m > 0 && _BRReconcileSpanBytesCompare(&out[m - 1], &out[i], addrs) == 0) continue;
+        out[m++] = out[i];
+    }
+    _BRReconcileHeapSort(out, m, sizeof(*out), _BRReconcileSpanIndexCompare, NULL);
+    *outCount = m;
     return BR_RECONCILE_OK;
 }
 

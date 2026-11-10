@@ -3,7 +3,7 @@
 # Txids as displayed (lowercase hex); addresses as the hex of their bytes, _ = empty string; - = empty list.
 # plan <id> known=<txid,...> history=<txid@height,...> -> <txid@height>...   (the plan, in its order)
 # step <fetched> <decoded> <isTheTx> <registered> <step> <recovered> <mayRegister>
-# covered <id> planned=<n> steps=<step,...> -> imported=<n> unrecovered=<n> covered=<0|1>
+# covered <id> asked=<n> answered=<n> planned=<n> steps=<step,...> -> imported=<n> unrecovered=<n> covered=<0|1>
 # pending <blockHeight> <0|1>                                               (2147483647 = TX_UNCONFIRMED)
 # outpoints <id> <txid:n,...> -> <index of each kept row>...
 # addresses <id> <addr,...> -> <index>:<trimmed addr>...
@@ -35,18 +35,23 @@ step 1 1 0 0 NOT_THE_TX 0 0
 step 1 1 0 1 NOT_THE_TX 0 0
 step 1 1 1 0 REFUSED 0 1
 step 1 1 1 1 REGISTERED 1 1
-covered every_planned_tx_registered planned=3 steps=REGISTERED,REGISTERED,REGISTERED -> imported=3 unrecovered=0 covered=1
-covered nothing_planned planned=0 steps=- -> imported=0 unrecovered=0 covered=1
-covered register_rejection planned=1 steps=REFUSED -> imported=0 unrecovered=1 covered=0
-covered one_rejection_among_many_successes planned=3 steps=REGISTERED,REFUSED,REGISTERED -> imported=2 unrecovered=1 covered=0
-covered fetch_failure planned=1 steps=NOT_FETCHED -> imported=0 unrecovered=1 covered=0
-covered hex_decode_failure planned=1 steps=NOT_DECODED -> imported=0 unrecovered=1 covered=0
-covered all_three_failure_modes planned=4 steps=NOT_FETCHED,NOT_DECODED,REFUSED,REGISTERED -> imported=1 unrecovered=3 covered=0
-covered wide_wallet_can_still_be_covered planned=1 steps=REGISTERED -> imported=1 unrecovered=0 covered=1
-covered bytes_of_another_transaction planned=2 steps=NOT_THE_TX,REGISTERED -> imported=1 unrecovered=1 covered=0
-covered stopped_short_of_the_plan planned=2 steps=REGISTERED -> imported=1 unrecovered=0 covered=0
-covered more_recorded_than_planned planned=1 steps=REGISTERED,REGISTERED -> imported=2 unrecovered=0 covered=0
-covered unknown_step_value planned=1 steps=? -> imported=0 unrecovered=1 covered=0
+covered every_planned_tx_registered asked=3 answered=3 planned=3 steps=REGISTERED,REGISTERED,REGISTERED -> imported=3 unrecovered=0 covered=1
+covered nothing_planned asked=3 answered=3 planned=0 steps=- -> imported=0 unrecovered=0 covered=1
+covered register_rejection asked=3 answered=3 planned=1 steps=REFUSED -> imported=0 unrecovered=1 covered=0
+covered one_rejection_among_many_successes asked=3 answered=3 planned=3 steps=REGISTERED,REFUSED,REGISTERED -> imported=2 unrecovered=1 covered=0
+covered fetch_failure asked=3 answered=3 planned=1 steps=NOT_FETCHED -> imported=0 unrecovered=1 covered=0
+covered hex_decode_failure asked=3 answered=3 planned=1 steps=NOT_DECODED -> imported=0 unrecovered=1 covered=0
+covered all_three_failure_modes asked=3 answered=3 planned=4 steps=NOT_FETCHED,NOT_DECODED,REFUSED,REGISTERED -> imported=1 unrecovered=3 covered=0
+covered wide_wallet_can_still_be_covered asked=3 answered=3 planned=1 steps=REGISTERED -> imported=1 unrecovered=0 covered=1
+covered bytes_of_another_transaction asked=3 answered=3 planned=2 steps=NOT_THE_TX,REGISTERED -> imported=1 unrecovered=1 covered=0
+covered stopped_short_of_the_plan asked=3 answered=3 planned=2 steps=REGISTERED -> imported=1 unrecovered=0 covered=0
+covered more_recorded_than_planned asked=3 answered=3 planned=1 steps=REGISTERED,REGISTERED -> imported=2 unrecovered=0 covered=0
+covered unknown_step_value asked=3 answered=3 planned=1 steps=? -> imported=0 unrecovered=1 covered=0
+covered no_addresses asked=0 answered=0 planned=0 steps=- -> imported=0 unrecovered=0 covered=0
+covered history_request_failed asked=5 answered=0 planned=0 steps=- -> imported=0 unrecovered=0 covered=0
+covered history_partly_answered asked=600 answered=500 planned=1 steps=REGISTERED -> imported=1 unrecovered=0 covered=0
+covered more_answered_than_asked asked=2 answered=3 planned=1 steps=REGISTERED -> imported=1 unrecovered=0 covered=0
+covered every_address_answered_nothing_missing asked=600 answered=600 planned=0 steps=- -> imported=0 unrecovered=0 covered=1
 pending 0 0
 pending 1 0
 pending 23900121 0

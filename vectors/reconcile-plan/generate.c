@@ -70,17 +70,23 @@ static void plan(const char *id, const UInt256 *known, size_t nk, const BRReconc
     printf("\n");
 }
 
-static void covered(const char *id, size_t planned, const BRReconcileImportStep *s, size_t ns)
+static void coveredAsked(const char *id, size_t asked, size_t answered, size_t planned, const BRReconcileImportStep *s, size_t ns)
 {
     BRReconcileImportOutcome o;
     size_t i;
 
-    BRReconcileImportBegin(&o, planned);
+    BRReconcileImportBegin(&o, asked, answered, planned);
     for (i = 0; i < ns; i++) BRReconcileImportRecord(&o, s[i]);
-    printf("covered %s planned=%zu steps=", id, planned);
+    printf("covered %s asked=%zu answered=%zu planned=%zu steps=", id, asked, answered, planned);
     if (ns == 0) printf("-");
     for (i = 0; i < ns; i++) printf("%s%s", i ? "," : "", stepName(s[i]));
     printf(" -> imported=%zu unrecovered=%zu covered=%d\n", o.imported, o.unrecovered, BRReconcileImportCovered(&o));
+}
+
+// The Kotlin tests' passes: the node answered for every address (three of them, here).
+static void covered(const char *id, size_t planned, const BRReconcileImportStep *s, size_t ns)
+{
+    coveredAsked(id, 3, 3, planned, s, ns);
 }
 
 static void outpoints(const char *id, const BRUTXO *u, size_t n)
@@ -125,7 +131,7 @@ int main(void)
     printf("# Txids as displayed (lowercase hex); addresses as the hex of their bytes, _ = empty string; - = empty list.\n");
     printf("# plan <id> known=<txid,...> history=<txid@height,...> -> <txid@height>...   (the plan, in its order)\n");
     printf("# step <fetched> <decoded> <isTheTx> <registered> <step> <recovered> <mayRegister>\n");
-    printf("# covered <id> planned=<n> steps=<step,...> -> imported=<n> unrecovered=<n> covered=<0|1>\n");
+    printf("# covered <id> asked=<n> answered=<n> planned=<n> steps=<step,...> -> imported=<n> unrecovered=<n> covered=<0|1>\n");
     printf("# pending <blockHeight> <0|1>                                               (2147483647 = TX_UNCONFIRMED)\n");
     printf("# outpoints <id> <txid:n,...> -> <index of each kept row>...\n");
     printf("# addresses <id> <addr,...> -> <index>:<trimmed addr>...\n");
@@ -181,6 +187,12 @@ int main(void)
         { BRReconcileImportStep s[] = { R }; covered("stopped_short_of_the_plan", 2, s, 1); }
         { BRReconcileImportStep s[] = { R, R }; covered("more_recorded_than_planned", 1, s, 2); }
         { BRReconcileImportStep s[] = { (BRReconcileImportStep)99 }; covered("unknown_step_value", 1, s, 1); }
+        // the addresses asked and answered (reconcileAddressHistory's early returns)
+        coveredAsked("no_addresses", 0, 0, 0, NULL, 0);
+        coveredAsked("history_request_failed", 5, 0, 0, NULL, 0);
+        { BRReconcileImportStep s[] = { R }; coveredAsked("history_partly_answered", 600, 500, 1, s, 1); }
+        { BRReconcileImportStep s[] = { R }; coveredAsked("more_answered_than_asked", 2, 3, 1, s, 1); }
+        coveredAsked("every_address_answered_nothing_missing", 600, 600, 0, NULL, 0);
     }
 
     {

@@ -153,7 +153,7 @@ static size_t _BRTxInputData(const BRTxInput *input, uint8_t *data, size_t dataL
     if (data && off + sizeof(uint32_t) <= dataLen) UInt32SetLE(&data[off], input->index);
     off += sizeof(uint32_t);
     off += BRVarIntSet((data ? &data[off] : NULL), (off <= dataLen ? dataLen - off : 0), input->sigLen);
-    if (data && off + input->sigLen <= dataLen) memcpy(&data[off], input->signature, input->sigLen); // scriptSig
+    if (data && input->sigLen > 0 && off + input->sigLen <= dataLen) memcpy(&data[off], input->signature, input->sigLen); // scriptSig
     off += input->sigLen;
 
     if (input->amount != 0) {
@@ -217,7 +217,7 @@ static size_t _BRTransactionOutputData(const BRTransaction *tx, uint8_t *data, s
         if (data && off + sizeof(uint64_t) <= dataLen) UInt64SetLE(&data[off], output->amount);
         off += sizeof(uint64_t);
         off += BRVarIntSet((data ? &data[off] : NULL), (off <= dataLen ? dataLen - off : 0), output->scriptLen);
-        if (data && off + output->scriptLen <= dataLen) memcpy(&data[off], output->script, output->scriptLen);
+        if (data && output->scriptLen > 0 && off + output->scriptLen <= dataLen) memcpy(&data[off], output->script, output->scriptLen);
         off += output->scriptLen;
     }
     
@@ -526,7 +526,7 @@ static size_t _BRTransactionData(const BRTransaction *tx, uint8_t *data, size_t 
         }
         
         off += BRVarIntSet((data ? &data[off] : NULL), (off <= dataLen ? dataLen - off : 0), count);
-        if (data && off + input.witLen <= dataLen) memcpy(&data[off], input.witness, input.witLen);
+        if (data && input.witLen > 0 && off + input.witLen <= dataLen) memcpy(&data[off], input.witness, input.witLen);
         off += input.witLen;
     }
     

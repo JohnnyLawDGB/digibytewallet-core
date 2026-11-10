@@ -105,7 +105,16 @@
 //  to the next launch. Every later step runs even when one before it failed: a cleared cache with
 //  the old floor, or a cleared filter chain beside the old ledger, is worse than finishing. A clear
 //  that did not land is repeated by RERUN_ON_LOAD, which holds only because ARM_RERUN landed.
-//  (Android today logs a failed STOP_SYNC, ARM_RERUN or LOWER_FLOOR_TO and continues.)
+//
+//  A FLOOR_FROM_CACHE that fails after ARM_RERUN landed leaves the rerun armed, so stopping there
+//  is a deferral to the next launch, not a clean abort. That is safe: RERUN_ON_LOAD carries the
+//  cache's floor before it clears. A true abort must also disarm the rerun (done back on, in
+//  progress off). Writing ARM_RERUN and FLOOR_FROM_CACHE in one commit, as Android's one-time
+//  rebuild does (its run() commits in-progress and the floor together), removes the case.
+//
+//  (Android today logs a failed STOP_SYNC, ARM_RERUN or LOWER_FLOOR_TO and continues. Its manual
+//  rebuild has no FLOOR_FROM_CACHE step yet: the only cache whose floor it carries is one written
+//  back after the clear, which the rerun at the next start reads.)
 //
 //  Host KAT: digibytewallet-android native/src/test/host/scan_floor_kat/ (the order checked against
 //  the order of the calls in Android's source). Vectors: vectors/scan-floor/. Header-only, static

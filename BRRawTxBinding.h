@@ -45,10 +45,13 @@
 //
 //  THE FEE (BRRawTxBindingFeePaid). What a signed transaction pays, read back from it rather than
 //  estimated: the amounts of the outpoints it spends, less what it pays out. Answered only when the bytes
-//  parse as a signed transaction, spend exactly the outpoints in spent[] (as many inputs as spent[] has
-//  entries, and the same set of outpoints: so none twice), have at least one output, every spent amount
-//  is positive, and both sums fit an int64 with the fee not negative. Android's reader also answered
-//  nothing for an input index above INT32_MAX or an output amount above INT64_MAX; so does this.
+//  parse as a signed transaction, spend exactly the outpoints in spent[], each once (the inputs and
+//  spent[] sorted by outpoint are equal element by element, and no outpoint appears twice on either
+//  side), have at least one output, every spent amount is positive, and both sums fit an int64 with the
+//  fee not negative. Android compares the outpoints as a count and a set, which is the same rule for
+//  what it can pass: its spent outpoints are a map's keys, so never repeated; a caller that could repeat
+//  one (inputs [A,A] against spent [A,A]) gets no fee here. Android's reader also answered nothing for an
+//  input index above INT32_MAX or an output amount above INT64_MAX; so does this.
 //
 //  TXIDS are UInt256 in the parser's internal byte order (BRTransaction.txHash); a platform holding the
 //  display-order hex a lookup gives decodes it first (BRRawTxIdFromDisplayHex: exactly 64 ASCII hex
@@ -59,8 +62,13 @@
 //  COST. The server decides how many coins, parents, inputs and outputs there are, so nothing here is
 //  quadratic: parents, unproven outpoints and a fee's outpoints are sorted (BRRecoveryUtxo.h's in-place
 //  heapsort, O(n log n)), each parent is parsed once, and its outputs' script offsets are computed once.
-//  Allocation: the working space of a check or a fee is allocated here (and the parser allocates), all of
-//  it freed before return; a failed allocation is BR_RAW_TX_BINDING_NO_MEMORY, never a verdict.
+//  ALLOCATION. The working space of a check or a fee is allocated here, and the parser allocates; all of
+//  it is freed before return. In a check, a failed allocation of the working space, of a parent's
+//  re-serialization or of its script offsets is BR_RAW_TX_BINDING_NO_MEMORY (every proof NONE), never a
+//  verdict. The parser (BRTransactionParseSigned) reports an allocation failure inside it as NULL, the
+//  same answer it gives bytes it refuses, so that one cannot be told apart: the parent reads as
+//  unreadable and its coins are UNPROVEN. BRRawTxId answers 0 (no id) on any allocation failure, as the
+//  bridge function it replaces did, and BRRawTxBindingFeePaid answers 0 (no fee).
 //  Header-only, static inline; no I/O, no clock, no locking.
 //
 //  Host KAT (digibytewallet-android native/src/test/host/): raw_tx_binding_kat -- the bridge's raw_tx_id
@@ -85,30 +93,44 @@
 extern "C" {
 #endif
 
-// MACRO CONVENTION: both seams are tested by VALUE (#if). =1 is the host KAT's comparison arm; unset or =0
-// is what ships.
-//   RAW_TX_ID_UNFIXED=1       an id is reported for whatever the parser read: trailing bytes, a truncation
-//                             the parser tolerates and non-canonical encodings are not refused.
-//   RAW_TX_BINDING_UNFIXED=1  three ways the binding goes wrong: a parent whose computed id is not the
-//                             coin's txid is read as if it were; a coin with no readable parent is proven
-//                             at the amount the server reported; and the fee is answered for a transaction
-//                             that does not spend exactly the given outpoints.
+// MACRO CONVENTION: every seam is tested by VALUE (#if). =1 is one of the host KAT's comparison arms, one
+// defect each; unset or =0 is what ships.
+//   RAW_TX_ID_UNFIXED=1                      an id is reported for whatever the parser read: trailing
+//                                            bytes, truncations it tolerates and non-canonical encodings.
+//   RAW_TX_BINDING_OTHER_TX_UNFIXED=1        a parent whose computed id is not the coin's txid is read as
+//                                            if it were the coin's parent.
+//   RAW_TX_BINDING_TRUST_UNPROVEN_UNFIXED=1  a coin with no readable parent is proven at the amount the
+//                                            server reported.
+//   RAW_TX_FEE_OUTPOINTS_UNFIXED=1           the fee is answered without comparing the outpoints spent.
+//   RAW_TX_FEE_SET_UNFIXED=1                 the outpoints are compared as a count and a set, so a
+//                                            repeated outpoint on both sides is accepted.
 #ifndef RAW_TX_ID_UNFIXED
 #define RAW_TX_ID_UNFIXED 0
 #endif
-#ifndef RAW_TX_BINDING_UNFIXED
-#define RAW_TX_BINDING_UNFIXED 0
+#ifndef RAW_TX_BINDING_OTHER_TX_UNFIXED
+#define RAW_TX_BINDING_OTHER_TX_UNFIXED 0
+#endif
+#ifndef RAW_TX_BINDING_TRUST_UNPROVEN_UNFIXED
+#define RAW_TX_BINDING_TRUST_UNPROVEN_UNFIXED 0
+#endif
+#ifndef RAW_TX_FEE_OUTPOINTS_UNFIXED
+#define RAW_TX_FEE_OUTPOINTS_UNFIXED 0
+#endif
+#ifndef RAW_TX_FEE_SET_UNFIXED
+#define RAW_TX_FEE_SET_UNFIXED 0
 #endif
 
 // ---- the id ------------------------------------------------------------------------------------
 
 // The parsed transaction and its id when buf[0..len) is exactly one complete signed transaction (see THE
-// ID); NULL otherwise. The caller frees what is returned.
-static inline BRTransaction *_BRRawTxParseExact(const uint8_t *buf, size_t len)
+// ID); NULL otherwise, with *noMemory (when not NULL) set to 1 only when that is because the
+// re-serialization buffer could not be allocated. The caller frees what is returned.
+static inline BRTransaction *_BRRawTxParseExact(const uint8_t *buf, size_t len, int *noMemory)
 {
     BRTransaction *tx;
     int ok;
 
+    if (noMemory) *noMemory = 0;
     if (!buf || len == 0) return NULL;
     tx = BRTransactionParseSigned(buf, len);
     if (!tx) return NULL;
@@ -119,6 +141,7 @@ static inline BRTransaction *_BRRawTxParseExact(const uint8_t *buf, size_t len)
         ok = (n == len);
         if (ok) {
             uint8_t *again = (uint8_t *)malloc(n);
+            if (!again && noMemory) *noMemory = 1;
             ok = again != NULL
                 && BRTransactionSerialize(tx, again, n) == n
                 && memcmp(again, buf, n) == 0;
@@ -140,7 +163,7 @@ static inline int BRRawTxId(const uint8_t *buf, size_t len, UInt256 *txHashOut)
     BRTransaction *tx;
 
     if (!buf || len == 0 || !txHashOut) return 0;
-    tx = _BRRawTxParseExact(buf, len);
+    tx = _BRRawTxParseExact(buf, len, NULL);
     if (!tx) return 0;
     *txHashOut = tx->txHash;
     BRTransactionFree(tx);
@@ -208,7 +231,8 @@ typedef enum {
     BR_RAW_TX_BINDING_CHECKED = 0,       // nothing disagreed: proofs[] holds PROVEN / UNPROVEN
     BR_RAW_TX_BINDING_CONTRADICTED = 1,  // a parent disagrees: every proof is REFUSED
     BR_RAW_TX_BINDING_BAD_ARGUMENT = 2,  // a required pointer was NULL (or NULL with a nonzero count)
-    BR_RAW_TX_BINDING_NO_MEMORY = 3      // the working space could not be allocated; no answer
+    BR_RAW_TX_BINDING_NO_MEMORY = 3,     // an allocation failed (see ALLOCATION); no answer
+    BR_RAW_TX_BINDING_NOT_RUN = 4        // BRRawTxBindingAdmit refused before the binding: no parent read
 } BRRawTxBindingOutcome;
 
 typedef enum {
@@ -310,34 +334,38 @@ static inline int _BRRawTxScriptOffsets(const BRTransaction *tx, const uint8_t *
     return 1;
 }
 
-static inline void _BRRawTxReadParent(const BRRawTxBindingParent *parent, _BRRawTxParentState *st)
+// Reads one parent into *st. Returns 0 only when an allocation failed (see ALLOCATION), 1 otherwise.
+static inline int _BRRawTxReadParent(const BRRawTxBindingParent *parent, _BRRawTxParentState *st)
 {
     BRTransaction *tx;
     size_t i;
+    int noMemory = 0;
 
     st->state = _BR_RAW_TX_PARENT_UNREADABLE;
-    tx = _BRRawTxParseExact(parent->bytes, parent->len);
-    if (!tx) return;
+    tx = _BRRawTxParseExact(parent->bytes, parent->len, &noMemory);
+    if (!tx) return !noMemory;
     if (!UInt256Eq(tx->txHash, parent->txid)) {
         st->id = tx->txHash;
-#if !RAW_TX_BINDING_UNFIXED
+#if !RAW_TX_BINDING_OTHER_TX_UNFIXED
         st->state = _BR_RAW_TX_PARENT_OTHER;
         BRTransactionFree(tx);
-        return;
+        return 1;
 #endif
     }
     for (i = 0; i < tx->outCount; i++) {
-        if (tx->outputs[i].amount > (uint64_t)INT64_MAX) { BRTransactionFree(tx); return; }
+        if (tx->outputs[i].amount > (uint64_t)INT64_MAX) { BRTransactionFree(tx); return 1; }
     }
     st->scriptOffset = (size_t *)malloc((tx->outCount ? tx->outCount : 1) * sizeof(size_t));
-    if (!st->scriptOffset || !_BRRawTxScriptOffsets(tx, parent->bytes, parent->len, st->scriptOffset)) {
+    if (!st->scriptOffset) { BRTransactionFree(tx); return 0; }
+    if (!_BRRawTxScriptOffsets(tx, parent->bytes, parent->len, st->scriptOffset)) {
         free(st->scriptOffset);
         st->scriptOffset = NULL;
         BRTransactionFree(tx);
-        return;
+        return 1;
     }
     st->tx = tx;
     st->state = _BR_RAW_TX_PARENT_READ;
+    return 1;
 }
 
 // Whether the reported script text is the script's hex, ignoring ASCII case.
@@ -408,9 +436,12 @@ static inline BRRawTxBindingOutcome BRRawTxBindingCheck(const BRRawTxBindingUtxo
         _BRRawTxParentState *st = (k == SIZE_MAX) ? NULL : &states[k];
         const BRTxOutput *out;
 
-        if (st && st->state == _BR_RAW_TX_PARENT_UNREAD) _BRRawTxReadParent(&parents[k], st);
+        if (st && st->state == _BR_RAW_TX_PARENT_UNREAD && !_BRRawTxReadParent(&parents[k], st)) {
+            outcome = BR_RAW_TX_BINDING_NO_MEMORY;
+            break;
+        }
         if (!st || st->state == _BR_RAW_TX_PARENT_UNREADABLE) {
-#if RAW_TX_BINDING_UNFIXED
+#if RAW_TX_BINDING_TRUST_UNPROVEN_UNFIXED
             _BRRawTxProofClear(&proofs[i], BR_RAW_TX_PROOF_PROVEN);
             proofs[i].amount = u->amount;
 #else
@@ -452,7 +483,9 @@ static inline BRRawTxBindingOutcome BRRawTxBindingCheck(const BRRawTxBindingUtxo
         proofs[i].scriptLen = out->scriptLen;
     }
 
-    if (outcome == BR_RAW_TX_BINDING_CONTRADICTED) {
+    if (outcome == BR_RAW_TX_BINDING_NO_MEMORY) {
+        for (i = 0; i < count; i++) _BRRawTxProofClear(&proofs[i], BR_RAW_TX_PROOF_NONE);
+    } else if (outcome == BR_RAW_TX_BINDING_CONTRADICTED) {
         for (i = 0; i < count; i++) _BRRawTxProofClear(&proofs[i], BR_RAW_TX_PROOF_REFUSED);
     } else {
         // The first coin of each unproven outpoint is the one listed.
@@ -491,7 +524,8 @@ typedef enum {
 
 // Whether anything on a profile whose coins are utxos[0..count) may be signed (see ADMISSION).
 // backendReachable is nonzero when the lookup was answered. proofs[] and *verdict as BRRawTxBindingCheck;
-// on a refusal before the binding every proof is REFUSED.
+// on a refusal before the binding (UNREACHABLE, NON_POSITIVE) every proof is REFUSED and verdict->outcome is
+// BR_RAW_TX_BINDING_NOT_RUN.
 static inline BRRawTxAdmission BRRawTxBindingAdmit(int backendReachable, const BRRawTxBindingUtxo utxos[], size_t count,
                                                    const BRRawTxBindingParent parents[], size_t parentCount,
                                                    BRRawTxProof proofs[], BRRawTxBindingVerdict *verdict)
@@ -506,9 +540,13 @@ static inline BRRawTxAdmission BRRawTxBindingAdmit(int backendReachable, const B
         return BR_RAW_TX_REFUSE_BAD_ARGUMENT;
     }
     for (i = 0; i < count; i++) _BRRawTxProofClear(&proofs[i], BR_RAW_TX_PROOF_REFUSED);
-    if (!backendReachable) return BR_RAW_TX_REFUSE_UNREACHABLE;
+    if (!backendReachable) {
+        verdict->outcome = BR_RAW_TX_BINDING_NOT_RUN;
+        return BR_RAW_TX_REFUSE_UNREACHABLE;
+    }
     for (i = 0; i < count; i++) {
         if (!BRRecoveryUtxoAmountIsSweepable(utxos[i].amount)) {
+            verdict->outcome = BR_RAW_TX_BINDING_NOT_RUN;
             verdict->utxo = i;
             return BR_RAW_TX_REFUSE_NON_POSITIVE;
         }
@@ -554,7 +592,28 @@ static inline int _BRRawTxSpentCompare(const size_t *a, const size_t *b, const v
     return _BRRecoveryUtxoIndexCompare(a[0], b[0]);
 }
 
-// Whether the sorted inputs and the sorted spent outpoints are the same SET of outpoints.
+// Whether count sorted inputs and count sorted spent outpoints are the same outpoints, each once: equal
+// element by element, with no outpoint repeated on either side.
+static inline int _BRRawTxSameOutpointsOnce(const BRTransaction *tx, const size_t *ins,
+                                            const BRRawTxBindingSpent *spent, const size_t *sp, size_t count)
+{
+    size_t i;
+
+    for (i = 0; i < count; i++) {
+        const BRTxInput *in = &tx->inputs[ins[2 * i]];
+        const BRRawTxBindingSpent *s = &spent[sp[2 * i]];
+        if (!UInt256Eq(in->txHash, s->txid) || (int64_t)in->index != s->vout) return 0;
+        if (i > 0) {
+            const BRTxInput *pin = &tx->inputs[ins[2 * (i - 1)]];
+            const BRRawTxBindingSpent *ps = &spent[sp[2 * (i - 1)]];
+            if (UInt256Eq(pin->txHash, in->txHash) && pin->index == in->index) return 0;
+            if (UInt256Eq(ps->txid, s->txid) && ps->vout == s->vout) return 0;
+        }
+    }
+    return 1;
+}
+
+// The comparison before the review (RAW_TX_FEE_SET_UNFIXED only): the same SET of outpoints.
 static inline int _BRRawTxSameOutpointSet(const BRTransaction *tx, const size_t *ins, size_t inCount,
                                           const BRRawTxBindingSpent *spent, const size_t *sp, size_t spCount)
 {
@@ -592,7 +651,7 @@ static inline int BRRawTxBindingFeePaid(const uint8_t *buf, size_t len, const BR
 
     for (i = 0; i < tx->inCount; i++) if (tx->inputs[i].index > (uint32_t)INT32_MAX) goto done;
     for (i = 0; i < tx->outCount; i++) if (tx->outputs[i].amount > (uint64_t)INT64_MAX) goto done;
-#if !RAW_TX_BINDING_UNFIXED
+#if !RAW_TX_FEE_OUTPOINTS_UNFIXED
     if (tx->inCount != count) goto done;
     if (count > SIZE_MAX / (2 * sizeof(size_t))) goto done;
     ins = (size_t *)malloc((count ? 2 * count : 1) * sizeof(size_t));
@@ -603,9 +662,13 @@ static inline int BRRawTxBindingFeePaid(const uint8_t *buf, size_t len, const BR
     ctx.spent = spent;
     _BRRecoveryUtxoHeapSort(ins, count, _BRRawTxInputCompare, &ctx);
     _BRRecoveryUtxoHeapSort(sp, count, _BRRawTxSpentCompare, &ctx);
+#if RAW_TX_FEE_SET_UNFIXED
     if (!_BRRawTxSameOutpointSet(tx, ins, count, spent, sp, count)) goto done;
 #else
-    (void)ctx; (void)_BRRawTxSameOutpointSet; (void)_BRRawTxInputCompare; (void)_BRRawTxSpentCompare;
+    if (!_BRRawTxSameOutpointsOnce(tx, ins, spent, sp, count)) goto done;
+#endif
+#else
+    (void)ctx; (void)_BRRawTxInputCompare; (void)_BRRawTxSpentCompare;
 #endif
     if (tx->outCount == 0) goto done;
     for (i = 0; i < count; i++) if (spent[i].amount <= 0) goto done;

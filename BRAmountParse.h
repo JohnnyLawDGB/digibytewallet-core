@@ -15,6 +15,15 @@
 //   - a LONE comma with no dot is the decimal point ("0,29": seven of the app's languages,
 //     and the platform decimal keyboard, write it that way); several commas with no dot are
 //     ambiguous and refused;
+//   - EXCEPT that a lone comma (no dot) followed by EXACTLY three digits is ambiguous and
+//     refused: "1,000" is one thousand to an English reader and one to a German one, and
+//     "25,500" and "0,123" are read either way too. "Exactly three digits" is the run of ASCII
+//     digits that starts right after the comma, in the text with its surrounding whitespace
+//     already dropped: it is three long and the next character is not a digit, whatever that
+//     character is (the end of the text, an exponent, anything else) and whatever comes before
+//     the comma. So "1,000", " 1,000 ", "1,000e2", "1,000E-2", ",123" and "0,000" are refused;
+//     "1,5", "0,29", "12,3456", "1,0000", "1,00e2" and "1," keep the comma as the point, and
+//     "1,000.50" and "1,234,567.8" keep commas around a dot as grouping;
 //   - the number follows java.math.BigDecimal's grammar: an optional sign, digits with an
 //     optional point ("5", "5.", ".5"), an optional exponent ("1e2" is 100 DGB);
 //   - more than eight decimals is refused, never rounded; trailing zeros do not count;
@@ -22,10 +31,14 @@
 //     it means;
 //   - the magnitude is bounded BEFORE any scaling, so "1e50000000" costs nothing.
 //
-//  Where this is stricter than Kotlin, deliberately: only ASCII whitespace and ASCII digits.
-//  Kotlin's trim() and BigDecimal also accept Unicode spaces and non-ASCII decimal digits
-//  (Devanagari, Arabic-Indic). Those are refused here; a platform that wants them maps them to
-//  ASCII before calling.
+//  Only ASCII whitespace and ASCII digits. Kotlin's trim() also takes Unicode spaces (the
+//  no-break space, U+2000..U+200A, U+3000, ...); those are refused here. Non-ASCII decimal digits
+//  (Arabic-Indic, Persian, Devanagari, full width) are refused here too, as they were by Kotlin's
+//  String.toBigDecimalOrNull (it screens the text for ASCII digits before java.math.BigDecimal,
+//  which alone would take them). The platforms map every Unicode decimal digit (category Nd) to
+//  its ASCII digit BEFORE calling, exactly as they do for dollar text (BRUsdCentsParse): iOS
+//  FiatText.asciiDigits, Android UsdCents.asciiDigits. The Arabic decimal and thousands
+//  separators (U+066B, U+066C) are not mapped, so "\u0665\u066B\u0665" is no amount anywhere.
 //
 //  Host KAT: digibytewallet-android native/src/test/host/amount_parse_kat/.
 //  Header-only, static inline; no allocation, no locale, no floating point.
@@ -71,14 +84,22 @@ static inline int BRAmountParseDGB(const char *text, size_t len, int64_t *sats)
 
     // BigDecimal grammar: [+-] (digits [. digits*] | . digits) [(e|E) [+-] digits], read after
     // the one separator rule: commas are grouping around a point, a lone comma IS the point,
-    // and several commas with no point are ambiguous.
+    // and several commas with no point, or a lone comma before exactly three digits, are
+    // ambiguous.
     for (i = start; i < end; i++) {
         char c = text[i];
 
         if (c == ',') {
             if (dots > 0) continue;
-            if (commas == 1) c = '.';
-            else return 0;
+            if (commas != 1) return 0;
+            {
+                size_t j = i + 1;
+                while (j < end && text[j] >= '0' && text[j] <= '9') j++;
+#ifndef AMOUNT_PARSE_COMMA_THOUSANDS_UNFIXED
+                if (j - (i + 1) == 3) return 0;   // "1,000": a thousand or one? Refused.
+#endif
+            }
+            c = '.';
         }
         if (inExponent) {
             if ((c == '+' || c == '-') && signAllowed) { expNegative = (c == '-'); signAllowed = 0; continue; }

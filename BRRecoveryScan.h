@@ -17,26 +17,36 @@
 //    2. Each round (round counts from 1): derive the pending profiles at their current windows
 //       (BRRecoveryDerive.h), then ask the lookup about them ONE PROFILE AT A TIME, in profile order --
 //       never concurrently (the lookup serialises requests and refuses concurrent ones). A profile with
-//       nothing derived is not asked.
+//       nothing derived is not asked. NOTHING DERIVED IS A FAILURE: every profile starts at a nonzero
+//       window, so an empty derivation (a refused or failed derivation call, never "no addresses") is
+//       kept with addressCount 0, and DONE reads it as incomplete.
 //    3. For each pending profile's answer: the coins are BRRecoveryUtxoSelect's rows; the used addresses
 //       are BRRecoveryScanUsed's (below) over the selected rows' addresses and every transaction the
-//       lookup returned for the profile; then BRRecoveryScanRoundStep says what the answer is:
+//       lookup returned for the profile. When BRRecoveryScanUsedBegin (or the selection) returns anything
+//       but OK, the round has no used set: it is NEVER read as "nothing used" -- the profile's answer for
+//       that round is unreachable (ask BRRecoveryScanRoundStep with reachable 0 and record reachable 0).
+//       Then BRRecoveryScanRoundStep says what the answer is:
 //         ASK_AGAIN        the profile stays pending, at the windows the step gives;
 //         FINISHED         this round's answer is the profile's answer;
 //         CAPPED           this round's answer is kept, marked capped (not a finished answer);
 //         UNREACHABLE      the lookup did not answer: this round's answer is kept, marked unreachable,
 //                          and the profile is not asked again in this scan;
-//         NOTHING_DERIVED  answered, empty: nothing was there to ask about.
+//         NOTHING_DERIVED  nothing was there to ask about: kept with addressCount 0 (incomplete, above).
 //       Any other value is read as CAPPED. The answer a profile keeps is the one from the round that
 //       ended it; a profile that is no longer pending is never asked again.
+//       KNOWN LIMIT (fail-closed, as Kotlin): when a later round of a widening profile is unanswered, that
+//       round's empty, unreachable answer replaces the rows an earlier round found. The scan reports the
+//       profile unreachable and itself incomplete -- never "no funds" -- but the earlier rows are not shown.
 //    4. When nothing is pending, the results are reported in profile order (the table order of
 //       BRDerivationProfiles.h), each summarised as a BRRecoveryScanProfileResult.
 //    5. CACHING. A scan's answer may be reused for an identical request (same profiles, same derived
-//       addresses) only when BRRecoveryScanMayCache holds for it: every profile that was asked was
-//       answered. A partial outage is never remembered, so asking again can reach the paths that failed.
-//    6. NEVER READ AN UNANSWERED LOOKUP AS "NO FUNDS". A profile whose lookup failed stays unreachable in
-//       its result; it is never reported as a profile that was asked and found nothing, and a scan with
-//       one is incomplete (BRRecoveryScanIncomplete) whatever the other profiles found.
+//       addresses) only when BRRecoveryScanMayCache holds for it: every profile was asked and answered.
+//       A partial outage or a failed derivation is never remembered, so asking again can reach the paths
+//       that failed.
+//    6. NEVER READ A FAILURE AS "NO FUNDS". A profile whose lookup failed stays unreachable in its result,
+//       and one whose derivation failed stays at addressCount 0; neither is reported as a profile that was
+//       asked and found nothing, and a scan with either is incomplete (BRRecoveryScanIncomplete) whatever
+//       the other profiles found.
 //
 //  USED (BRRecoveryScanUsed*). A derived address is used when the lookup shows it holding a coin (one of
 //  the profile's selected rows names it) or when a transaction the lookup returned pays it: one of that
@@ -48,8 +58,10 @@
 //  address the core cannot turn into a script is used only through a coin. Coins are matched on the
 //  address string exactly as the lookup wrote it (no case folding). The highest used index of each chain
 //  (BRRecoveryScanUsedHighest) is what BRRecoveryScanRoundStep is asked with; -1 means nothing used.
-//  The raw transactions are bytes: a platform that holds them as hex decodes them first, and a
-//  transaction whose hex does not decode is skipped too.
+//  HEX. The raw transactions are bytes: a platform that holds them as hex decodes them first, and only
+//  strict ASCII hex decodes -- an even number of characters, each 0-9, a-f or A-F; no sign, no
+//  whitespace, no prefix, no non-ASCII digit. A transaction whose hex does not decode is skipped, as one
+//  that does not parse is.
 //  NETWORK. BRAddressScriptPubKey follows BRNetworkIsTestnet() at the call (P2PKH version byte, bech32
 //  prefix): derive and match on the same network.
 //  COST. The lookup decides how many rows and transactions there are, so nothing here is quadratic:
@@ -57,17 +69,19 @@
 //  heapsort, O(n log n), no allocation, no recursion); each coin and each output is then one binary
 //  search, O(log n). Equal addresses (one key written in two encodings can coincide) share one mark.
 //
-//  DONE. A profile was ASKED when addresses were derived for it (addressCount > 0); a profile with none
-//  was never asked and so cannot have failed.
+//  DONE. A profile was ASKED when addresses were derived for it (addressCount > 0).
 //    - BRRecoveryScanAnyUnreachable: some profile was asked and not answered. The scan is then incomplete
 //      even when other profiles found funds (a balance from two paths with a third unchecked reads as
-//      "that is everything").
+//      "that is everything"). A profile with nothing derived is not counted here (it was never asked).
+//    - BRRecoveryScanAnyNothingDerived: some profile has nothing derived -- a failed derivation.
 //    - BRRecoveryScanAllUnreachable: there are results, and every profile that was asked was not
 //      answered -- the lookup is down, not the wallet empty. As Kotlin's: when results exist but no
 //      profile was asked, this holds too (there is no answer to report).
 //    - BRRecoveryScanAnyCapped: some profile's window was stopped by its cap or the round bound.
-//    - BRRecoveryScanIncomplete: AnyUnreachable or AnyCapped -- the `incomplete` the passphrase verdict
-//      and the findings screen read.
+//    - BRRecoveryScanIncomplete: no results at all, or AnyUnreachable, AnyNothingDerived or AnyCapped --
+//      the `incomplete` the passphrase verdict and the findings screen read. So a scan in which no profile
+//      was asked is incomplete, as AllUnreachable says, and its verdict can never be NONE_ANYWHERE.
+//    - BRRecoveryScanMayCache: there are results, none unreachable, none with nothing derived.
 //    - BRRecoveryScanTotal: the sum of the chosen profiles' totals, signed; an overflow is reported.
 //  SWEEP SET (BRRecoveryScanSweeps / BRRecoveryScanSweepSet). The profiles whose coins a sweep takes:
 //  every profile with a positive total. Recovering this wallet's OWN seed leaves the native profiles
@@ -81,14 +95,22 @@
 //  RECOVERABLE VALUE (BRRecoverableValueExists / _Answered). Whether the findings hold anything to offer
 //  a move for: a sweepable finding, or DigiDollar found. A DigiDollar token output carries zero
 //  satoshis, so a wallet holding only dollars has no sweepable finding at all. Whether "nothing found" is
-//  an answer: only when the DigiDollar lookup, if one ran, was answered. The DigiDollar scan itself is
-//  the platform's; this header takes its two facts (cents found, answered or not).
+//  an answer: only when the DigiDollar scan, if one was attempted, was answered. The DigiDollar scan
+//  itself is the platform's; this header takes its state (BRRecoveryDigiDollarScan) and the cents found.
+//  A DigiDollar scan that was ATTEMPTED and failed -- its derivation came back empty, it threw, or any
+//  lookup went unanswered -- is BR_RECOVERY_DD_UNANSWERED (with whatever cents it did find, 0 if none),
+//  never BR_RECOVERY_DD_NOT_RUN. NOT_RUN is only for a scan that by design looks for no DigiDollar (this
+//  wallet's own seed). A state this header does not know is read as UNANSWERED.
 //
-//  Test seam (host KAT recovery_scan_kat in the Android repo): RECOVERY_SCAN_UNFIXED, tested by VALUE.
-//  =1 is the comparison arm, four ways the rules go wrong: an unreachable profile (and an unanswered
-//  DigiDollar lookup) read as an answered, empty one; an incomplete scan ranked ahead of a positive
-//  finding; an address paid and since emptied not counted as used (coins only); the native profiles
-//  swept on the wallet's own seed. Unset or =0 is what ships.
+//  Test seams (host KAT recovery_scan_kat in the Android repo): RECOVERY_SCAN_UNFIXED, tested by VALUE as
+//  a set of bits, one per way the rules go wrong; each comparison arm sets one bit and fails only its own
+//  cases. Unset or =0 is what ships.
+//    1  RECOVERY_SCAN_RED_UNREACHABLE      an unreachable profile read as answered, empty.
+//    2  RECOVERY_SCAN_RED_INCOMPLETE_FIRST an incomplete scan ranked ahead of a positive finding.
+//    4  RECOVERY_SCAN_RED_COINS_ONLY       an address paid and since emptied not counted as used.
+//    8  RECOVERY_SCAN_RED_NATIVE_SWEPT     the native profiles swept on the wallet's own seed.
+//    16 RECOVERY_SCAN_RED_NOTHING_DERIVED  a profile with nothing derived read as answered, empty.
+//    32 RECOVERY_SCAN_RED_DD_UNANSWERED    an unanswered DigiDollar scan read as a zero balance.
 //
 //  Header-only, static inline. No locking, no clock, no I/O. Allocation only inside the core's
 //  transaction parser (BRRecoveryScanUsedMarkRawTx frees what it parsed before returning).
@@ -112,6 +134,13 @@ extern "C" {
 #ifndef RECOVERY_SCAN_UNFIXED
 #define RECOVERY_SCAN_UNFIXED 0
 #endif
+
+#define RECOVERY_SCAN_RED_UNREACHABLE      1
+#define RECOVERY_SCAN_RED_INCOMPLETE_FIRST 2
+#define RECOVERY_SCAN_RED_COINS_ONLY       4
+#define RECOVERY_SCAN_RED_NATIVE_SWEPT     8
+#define RECOVERY_SCAN_RED_NOTHING_DERIVED  16
+#define RECOVERY_SCAN_RED_DD_UNANSWERED    32
 
 #define BR_RECOVERY_SCAN_SCRIPT_MAX 64   // the bridge's scriptPubKey buffer; every address script fits
 
@@ -302,7 +331,7 @@ static inline int BRRecoveryScanUsedMarkScript(BRRecoveryScanUsed *u, const uint
     size_t lo = 0, hi, e;
 
     if (!u || !u->slots || !script || scriptLen == 0) return 0;
-#if RECOVERY_SCAN_UNFIXED
+#if RECOVERY_SCAN_UNFIXED & RECOVERY_SCAN_RED_COINS_ONLY
     // RED ARM SEAM (recovery_scan_kat): coins only; an address paid and since emptied is not used.
     return 0;
 #endif
@@ -374,7 +403,7 @@ typedef enum {
     BR_RECOVERY_SCAN_STEP_FINISHED = BR_RECOVERY_GAP_FINISHED,     // this round's answer is the answer
     BR_RECOVERY_SCAN_STEP_CAPPED = BR_RECOVERY_GAP_CAPPED,         // kept, marked capped
     BR_RECOVERY_SCAN_STEP_UNREACHABLE = 3,                         // kept, marked unreachable; not asked again
-    BR_RECOVERY_SCAN_STEP_NOTHING_DERIVED = 4                      // answered, empty: nothing to ask about
+    BR_RECOVERY_SCAN_STEP_NOTHING_DERIVED = 4                      // a failed derivation: kept, incomplete
 } BRRecoveryScanStep;
 
 // The step a BRRecoveryGapOutcome value means. Any value it does not know is CAPPED.
@@ -388,13 +417,15 @@ static inline BRRecoveryScanStep BRRecoveryScanStepForGapOutcome(int outcome)
 }
 
 // The scan's round bound: BRRecoveryGapScanRoundBound of the smallest starting windows among the
-// count profiles (0 and 0 when there are none). starts may be NULL only when count is 0.
+// count profiles (of windows 0 and 0 when there are none). With count > 0 and either array NULL, 0: a
+// bad argument, and a bound of 0 never asks a path again (a path that would grow is CAPPED at round 1).
 static inline int32_t BRRecoveryScanRoundBound(const int32_t startExternal[], const int32_t startInternal[], size_t count)
 {
     int32_t ext = 0, in = 0;
     size_t i;
 
-    if (count > 0 && startExternal && startInternal) {
+    if (count > 0 && (!startExternal || !startInternal)) return 0;
+    if (count > 0) {
         ext = startExternal[0]; in = startInternal[0];
         for (i = 1; i < count; i++) {
             if (startExternal[i] < ext) ext = startExternal[i];
@@ -404,13 +435,15 @@ static inline int32_t BRRecoveryScanRoundBound(const int32_t startExternal[], co
     return BRRecoveryGapScanRoundBound(ext, in);
 }
 
-// The same bound for profiles of BRDerivationProfiles.h (their gapExternal / gapInternal).
+// The same bound for profiles of BRDerivationProfiles.h (their gapExternal / gapInternal); 0 for
+// count > 0 with profiles NULL, as above.
 static inline int32_t BRRecoveryScanRoundBoundForProfiles(const BRDerivationProfile profiles[], size_t count)
 {
     int32_t ext = 0, in = 0;
     size_t i;
 
-    if (count > 0 && profiles) {
+    if (count > 0 && !profiles) return 0;
+    if (count > 0) {
         ext = profiles[0].gapExternal; in = profiles[0].gapInternal;
         for (i = 1; i < count; i++) {
             if (profiles[i].gapExternal < ext) ext = profiles[i].gapExternal;
@@ -421,7 +454,7 @@ static inline int32_t BRRecoveryScanRoundBoundForProfiles(const BRDerivationProf
 }
 
 // What one round's answer is for a profile asked at windows external/internal: reachable nonzero when
-// the lookup answered; addressCount the addresses derived (and asked about); usedExternal/usedInternal
+// the lookup answered and its used set was built (BRRecoveryScanUsedBegin OK); addressCount the addresses derived (and asked about); usedExternal/usedInternal
 // BRRecoveryScanUsedHighest of each chain (-1: nothing used); round from 1 of at most bound
 // (BRRecoveryScanRoundBound). *nextExternal / *nextInternal (each may be NULL) are the windows to ask
 // at on ASK_AGAIN, and the windows given otherwise.
@@ -436,7 +469,7 @@ static inline BRRecoveryScanStep BRRecoveryScanRoundStep(int reachable, size_t a
     if (nextExternal) *nextExternal = external;
     if (nextInternal) *nextInternal = internal;
     if (addressCount == 0) return BR_RECOVERY_SCAN_STEP_NOTHING_DERIVED;
-#if RECOVERY_SCAN_UNFIXED
+#if RECOVERY_SCAN_UNFIXED & RECOVERY_SCAN_RED_UNREACHABLE
     // RED ARM SEAM (recovery_scan_kat): an unanswered lookup read as an answer with nothing used.
     if (!reachable) { usedExternal = -1; usedInternal = -1; }
 #else
@@ -457,7 +490,7 @@ static inline BRRecoveryScanStep BRRecoveryScanRoundStep(int reachable, size_t a
 
 // One profile's answer, as a finished scan reports it.
 typedef struct {
-    size_t addressCount;   // addresses derived and asked about; 0: never asked
+    size_t addressCount;   // addresses derived and asked about; 0: never asked, a failed derivation
     int reachable;         // nonzero: the lookup answered
     int capped;            // nonzero: the window was stopped by its cap or the round bound (STEP_CAPPED)
     int isNative;          // the profile's BRDerivationProfile.isNative
@@ -467,7 +500,7 @@ typedef struct {
 // Whether r was asked and not answered.
 static inline int BRRecoveryScanIsUnreachable(const BRRecoveryScanProfileResult *r)
 {
-#if RECOVERY_SCAN_UNFIXED
+#if RECOVERY_SCAN_UNFIXED & RECOVERY_SCAN_RED_UNREACHABLE
     // RED ARM SEAM (recovery_scan_kat): an unreachable profile read as one that answered, empty.
     (void)r;
     return 0;
@@ -496,6 +529,27 @@ static inline int BRRecoveryScanAllUnreachable(const BRRecoveryScanProfileResult
     return 1;
 }
 
+// Whether r has nothing derived: a failed derivation (every profile starts at a nonzero window).
+static inline int BRRecoveryScanIsNothingDerived(const BRRecoveryScanProfileResult *r)
+{
+#if RECOVERY_SCAN_UNFIXED & RECOVERY_SCAN_RED_NOTHING_DERIVED
+    // RED ARM SEAM (recovery_scan_kat): a profile with nothing derived read as answered, empty.
+    (void)r;
+    return 0;
+#else
+    return r != NULL && r->addressCount == 0;
+#endif
+}
+
+// Some profile has nothing derived.
+static inline int BRRecoveryScanAnyNothingDerived(const BRRecoveryScanProfileResult results[], size_t count)
+{
+    size_t i;
+    if (!results) return 0;
+    for (i = 0; i < count; i++) if (BRRecoveryScanIsNothingDerived(&results[i])) return 1;
+    return 0;
+}
+
 // Some profile's window was stopped by its cap or the round bound.
 static inline int BRRecoveryScanAnyCapped(const BRRecoveryScanProfileResult results[], size_t count)
 {
@@ -505,17 +559,21 @@ static inline int BRRecoveryScanAnyCapped(const BRRecoveryScanProfileResult resu
     return 0;
 }
 
-// The scan is not a finished answer: some profile unreachable or capped.
+// The scan is not a finished answer: no results, or some profile unreachable, with nothing derived, or
+// capped.
 static inline int BRRecoveryScanIncomplete(const BRRecoveryScanProfileResult results[], size_t count)
 {
-    return BRRecoveryScanAnyUnreachable(results, count) || BRRecoveryScanAnyCapped(results, count);
+    if (!results || count == 0) return 1;
+    return BRRecoveryScanAnyUnreachable(results, count) || BRRecoveryScanAnyNothingDerived(results, count) ||
+           BRRecoveryScanAnyCapped(results, count);
 }
 
-// Whether this answer may be cached for an identical request: every profile that was asked was answered.
+// Whether this answer may be cached for an identical request: there are results, and every profile was
+// asked (something derived) and answered. A capped answer may be cached: asking again gives it again.
 static inline int BRRecoveryScanMayCache(const BRRecoveryScanProfileResult results[], size_t count)
 {
-    if (count > 0 && !results) return 0;
-    return !BRRecoveryScanAnyUnreachable(results, count);
+    if (!results || count == 0) return 0;
+    return !BRRecoveryScanAnyUnreachable(results, count) && !BRRecoveryScanAnyNothingDerived(results, count);
 }
 
 // The signed sum of the totals of results[indices[0..count)] (indices NULL: results[0..count)). *total
@@ -548,7 +606,7 @@ static inline BRRecoveryScanStatus BRRecoveryScanTotal(const BRRecoveryScanProfi
 static inline int BRRecoveryScanSweeps(const BRRecoveryScanProfileResult *r, int isForeign)
 {
     if (!r || r->totalSat <= 0) return 0;
-#if RECOVERY_SCAN_UNFIXED
+#if RECOVERY_SCAN_UNFIXED & RECOVERY_SCAN_RED_NATIVE_SWEPT
     // RED ARM SEAM (recovery_scan_kat): the native profiles swept on the wallet's own seed too.
     (void)isForeign;
     return 1;
@@ -593,7 +651,7 @@ typedef enum {
 static inline BRRecoveryPassphraseOutcome BRRecoveryPassphraseVerdict(int64_t withPassphraseSat, int haveWithout,
                                                                       int64_t withoutPassphraseSat, int incomplete)
 {
-#if RECOVERY_SCAN_UNFIXED
+#if RECOVERY_SCAN_UNFIXED & RECOVERY_SCAN_RED_INCOMPLETE_FIRST
     // RED ARM SEAM (recovery_scan_kat): incompleteness ranked ahead of a positive finding.
     if (incomplete) return BR_RECOVERY_PASSPHRASE_INCOMPLETE;
 #endif
@@ -605,22 +663,39 @@ static inline BRRecoveryPassphraseOutcome BRRecoveryPassphraseVerdict(int64_t wi
 
 // ---- recoverable value ----------------------------------------------------------------------------
 
-// Whether the findings hold value worth offering a move for: sweepableFindings (the profiles of the
-// sweep set) > 0, or a DigiDollar scan ran (ddScanned nonzero) and found ddCents > 0.
-static inline int BRRecoverableValueExists(size_t sweepableFindings, int ddScanned, int64_t ddCents)
+// The state of a scan's DigiDollar lookup. ATTEMPTED AND FAILED (derivation empty, an exception, any
+// lookup unanswered) is UNANSWERED, never NOT_RUN; NOT_RUN only for a scan that by design does not look.
+typedef enum {
+    BR_RECOVERY_DD_NOT_RUN = 0,      // no DigiDollar scan, by design (this wallet's own seed)
+    BR_RECOVERY_DD_ANSWERED = 1,     // ran, and every lookup it made was answered
+    BR_RECOVERY_DD_UNANSWERED = 2    // attempted and failed, in whole or in part
+} BRRecoveryDigiDollarScan;
+
+// The state as these rules read it: any value but NOT_RUN and ANSWERED is UNANSWERED.
+static inline BRRecoveryDigiDollarScan BRRecoveryDigiDollarScanRead(int ddState)
 {
-    return sweepableFindings > 0 || (ddScanned && ddCents > 0);
+    if (ddState == BR_RECOVERY_DD_NOT_RUN) return BR_RECOVERY_DD_NOT_RUN;
+    if (ddState == BR_RECOVERY_DD_ANSWERED) return BR_RECOVERY_DD_ANSWERED;
+    return BR_RECOVERY_DD_UNANSWERED;
 }
 
-// Whether a "nothing found" is an answer rather than a gap: value exists, or no DigiDollar scan ran, or
-// it ran and was answered (ddReachable nonzero). Only meaningful when BRRecoverableValueExists is 0.
-static inline int BRRecoverableValueAnswered(size_t sweepableFindings, int ddScanned, int64_t ddCents, int ddReachable)
+// Whether the findings hold value worth offering a move for: sweepableFindings (the profiles of the
+// sweep set) > 0, or a DigiDollar scan was attempted (ANSWERED or UNANSWERED) and found ddCents > 0.
+static inline int BRRecoverableValueExists(size_t sweepableFindings, int ddState, int64_t ddCents)
 {
-#if RECOVERY_SCAN_UNFIXED
-    // RED ARM SEAM (recovery_scan_kat): an unanswered DigiDollar lookup read as a zero balance.
-    ddReachable = 1;
+    return sweepableFindings > 0 || (BRRecoveryDigiDollarScanRead(ddState) != BR_RECOVERY_DD_NOT_RUN && ddCents > 0);
+}
+
+// Whether a "nothing found" is an answer rather than a gap: value exists, or no DigiDollar scan was run
+// by design, or it ran and was answered. Only meaningful when BRRecoverableValueExists is 0.
+static inline int BRRecoverableValueAnswered(size_t sweepableFindings, int ddState, int64_t ddCents)
+{
+    BRRecoveryDigiDollarScan st = BRRecoveryDigiDollarScanRead(ddState);
+#if RECOVERY_SCAN_UNFIXED & RECOVERY_SCAN_RED_DD_UNANSWERED
+    // RED ARM SEAM (recovery_scan_kat): an unanswered DigiDollar scan read as a zero balance.
+    if (st == BR_RECOVERY_DD_UNANSWERED) st = BR_RECOVERY_DD_ANSWERED;
 #endif
-    return BRRecoverableValueExists(sweepableFindings, ddScanned, ddCents) || !ddScanned || ddReachable;
+    return BRRecoverableValueExists(sweepableFindings, ddState, ddCents) || st != BR_RECOVERY_DD_UNANSWERED;
 }
 
 #ifdef __cplusplus

@@ -29,13 +29,20 @@
 //  Returns 1, having written gapExternal + gapInternal slots. Returns 0 and writes nothing when: out,
 //  seed or hmacKey is NULL; path is NULL with pathLen > 0; seedLen is 0 or above 64; a gap is
 //  negative; addressFormat is not 0..3; or outSlots < gapExternal + gapInternal. Two gaps of 0 is
-//  success with nothing written.
+//  success with nothing written. Also refused: gapExternal + gapInternal slots that would not fit in
+//  SIZE_MAX bytes (a 32-bit build).
+//
+//  NETWORK. Results depend on BRNetworkIsTestnet() at the call: P2PKH's version byte and the bech32 prefix
+//  (P2WPKH, P2TR) follow it; P2SH-P2WPKH always uses DIGIBYTE_SCRIPT_ADDRESS, as the bridge does. Every
+//  vector in vectors/recovery-derivation/ is mainnet.
 //
 //  Seed material (the copy of the phrase and passphrase, the master public key) is zeroed before
 //  return. The caller owns every buffer, and zeroes its own seed. No I/O, no locking, no allocation.
 //
-//  Test seam (derivation_profiles_kat): RECOVERY_SEED_NUL_RED accepts a passphrase with a NUL, which the
-//  derivation then reads only up to the NUL (the pre-4.1.2 shape). Only the NUL refusal case may fail.
+//  Test seams (derivation_profiles_kat): RECOVERY_SEED_NUL_RED accepts a passphrase with a NUL, which the
+//  derivation then reads only up to the NUL (the pre-4.1.2 shape); only the NUL refusal case may fail.
+//  RECOVERY_ENCODER_RED writes P2SH-P2WPKH with the legacy script version byte (5, "3...") instead of
+//  DIGIBYTE_SCRIPT_ADDRESS (63, "S..."); only the cases that encode format 2 may fail.
 //
 //  Header-only, static inline over the core's BIP32/BIP39/key/address functions.
 //
@@ -64,13 +71,17 @@ extern "C" {
 #define BR_RECOVERY_ADDRESS_SLOT       91    // bytes per address slot, NUL included (the bridge's buffer)
 
 // The public key's address in addressFormat, into out (outLen bytes). 1 on success, 0 otherwise (out
-// then holds the empty string). jni_derive.c pubkey_to_address, format for format.
+// then holds the empty string when outLen > 0). jni_derive.c pubkey_to_address, format for format, except
+// that what the core's encoders would assert on is refused here instead: a NULL key, outLen below
+// BR_RECOVERY_ADDRESS_SLOT, and P2WPKH of an uncompressed key.
 static inline int BRRecoveryAddressForKey(BRKey *key, int addressFormat, char *out, size_t outLen)
 {
     size_t n = 0;
 
     if (! out || outLen == 0) return 0;
     out[0] = '\0';
+    if (! key || outLen < BR_RECOVERY_ADDRESS_SLOT) return 0;
+    if (addressFormat == BR_DERIVATION_FORMAT_P2WPKH && ! key->compressed) return 0;
     switch (addressFormat) {
     case BR_DERIVATION_FORMAT_P2PKH:
         n = BRKeyAddress(key, out, outLen);
@@ -87,7 +98,11 @@ static inline int BRRecoveryAddressForKey(BRKey *key, int addressFormat, char *o
         witness[1] = 0x14;
         memcpy(&witness[2], &pkh, 20);
         BRHash160(&scriptHash, witness, sizeof(witness));
+#ifdef RECOVERY_ENCODER_RED
+        data[0] = DIGIBYTE_SCRIPT_ADDRESS_LEGACY;   // RED ARM SEAM (derivation_profiles_kat)
+#else
         data[0] = DIGIBYTE_SCRIPT_ADDRESS;
+#endif
         memcpy(&data[1], &scriptHash, 20);
         n = BRBase58CheckEncode(out, outLen, data, sizeof(data));
         break;
@@ -144,7 +159,10 @@ static inline int BRRecoveryDeriveAddresses(char *out, size_t outSlots,
     if (seedLen == 0 || seedLen > BR_RECOVERY_SEED_LEN) return 0;
     if (gapExternal < 0 || gapInternal < 0) return 0;
     if (addressFormat < 0 || addressFormat >= BR_DERIVATION_FORMAT_COUNT) return 0;
-    total = (size_t)gapExternal + (size_t)gapInternal;
+    total = (size_t)gapExternal + (size_t)gapInternal;   // no wrap: two int32_t maxima fit in a 32-bit size_t
+    // Every slot offset below is slot * BR_RECOVERY_ADDRESS_SLOT with slot < total, so bounding total bounds
+    // them all (a 32-bit build reaches this with gaps in the tens of millions).
+    if (total > SIZE_MAX / BR_RECOVERY_ADDRESS_SLOT) return 0;
     if (outSlots < total) return 0;
     if (total == 0) return 1;
 

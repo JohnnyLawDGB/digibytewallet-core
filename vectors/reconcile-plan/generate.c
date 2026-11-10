@@ -215,6 +215,8 @@ int main(void)
         { const char *a[] = { "\x1c" "D8abc" "\x1f", "D8abc", "\x0b" "D8abc" "\x0c" }; addresses("separators_trimmed", a, 3); }
         { const char *a[] = { "dgb1q aaa", "dgb1qaaa" }; addresses("interior_space_kept", a, 2); }
         { const char *a[] = { "DGB1QAAA", "dgb1qaaa" }; addresses("case_sensitive", a, 2); }
+        { const char *a[] = { "dgb1qaaa", "dgb1qaaab", "dgb1qaaa", "dgb1qaaab" }; addresses("prefix_is_another_address", a, 4); }
+        { const char *a[] = { "dgb1qaaab", "dgb1qaaa " }; addresses("prefix_after_trim", a, 2); }
         addresses("empty", NULL, 0);
     }
     return 0;

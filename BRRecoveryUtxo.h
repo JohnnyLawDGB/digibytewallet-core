@@ -45,11 +45,16 @@
 //
 //  ROWS. A BRRecoveryUtxo carries only what the rules read; the caller keeps the rest of its row (address,
 //  script) beside it and maps back by index. Outputs are INDICES into the caller's array, in a buffer the
-//  caller owns: never more than the input count. A buffer too small is reported
-//  (BR_RECOVERY_UTXO_BUFFER_TOO_SMALL) with a count of 0. TXIDS are the 32 bytes in the order the caller
-//  chooses -- the same order for every row -- and compare as bytes, so a platform that keeps txids as hex
-//  decodes them first (vectors/reconcile-response/ gives lookup txids lowercase).
-//  The one-coin rule compares each row with the rows kept so far: quadratic in one profile's rows.
+//  caller owns, which is also the working space: it holds 2 * count indices
+//  (BRRecoveryUtxoWorkCapacity), and the answer is never more than count of them. A buffer too small is
+//  reported (BR_RECOVERY_UTXO_BUFFER_TOO_SMALL) with a count of 0. TXIDS are the 32 bytes in the order
+//  the caller chooses -- the same order for every row -- and compare as bytes, so a platform that keeps
+//  txids as hex decodes them first (vectors/reconcile-response/ gives lookup txids lowercase).
+//  COST. The server decides how many rows there are, so nothing here is quadratic: the one-coin rule
+//  sorts row indices by (txid, vout, row index) with an in-place heapsort (O(n log n), no allocation,
+//  no recursion), folds each outpoint's group by the rule above in row order, and sorts the kept rows
+//  back into first-seen order. Every comparison ends on a distinct row index, so the answer does not
+//  depend on the sort, and it is the same answer Kotlin's sequential LinkedHashMap fold gives.
 //  No allocation, no I/O, no clock, libc only. Header-only, static inline.
 //
 //  Host KAT (digibytewallet-android native/src/test/host/): recovery_utxo_kat -- DuplicateUtxoTest,
@@ -128,30 +133,107 @@ static inline int BRRecoveryUtxoReplaces(int64_t keptHeight, int64_t laterHeight
 #endif
 }
 
+// The working space the one-coin rule needs for count rows: 2 * count indices. 0 when that would overflow.
+static inline size_t BRRecoveryUtxoWorkCapacity(size_t count)
+{
+    return (count > SIZE_MAX / 2) ? 0 : 2 * count;
+}
+
+// An in-place heapsort of n work pairs (2 * n size_t) with a context: O(n log n), no allocation, no
+// recursion. Used only with total orders, so stability does not matter.
+typedef int (*_BRRecoveryUtxoCompareFn)(const size_t *a, const size_t *b, const void *ctx);
+
+static inline void _BRRecoveryUtxoSwap(size_t *a, size_t *b)
+{
+    size_t t0 = a[0], t1 = a[1];
+    a[0] = b[0]; a[1] = b[1];
+    b[0] = t0; b[1] = t1;
+}
+
+static inline void _BRRecoveryUtxoSiftDown(size_t *base, size_t root, size_t n, _BRRecoveryUtxoCompareFn cmp,
+                                           const void *ctx)
+{
+    for (;;) {
+        size_t child = 2 * root + 1, top = root;
+        if (child >= n || child < root) return;   // child < root: 2 * root + 1 overflowed
+        if (cmp(base + 2 * top, base + 2 * child, ctx) < 0) top = child;
+        if (child + 1 < n && cmp(base + 2 * top, base + 2 * (child + 1), ctx) < 0) top = child + 1;
+        if (top == root) return;
+        _BRRecoveryUtxoSwap(base + 2 * root, base + 2 * top);
+        root = top;
+    }
+}
+
+static inline void _BRRecoveryUtxoHeapSort(size_t *pairs, size_t n, _BRRecoveryUtxoCompareFn cmp, const void *ctx)
+{
+    size_t i, end;
+
+    if (!pairs || n < 2) return;
+    for (i = n / 2; i > 0; i--) _BRRecoveryUtxoSiftDown(pairs, i - 1, n, cmp, ctx);
+    for (end = n - 1; end > 0; end--) {
+        _BRRecoveryUtxoSwap(pairs, pairs + 2 * end);
+        _BRRecoveryUtxoSiftDown(pairs, 0, end, cmp, ctx);
+    }
+}
+
+static inline int _BRRecoveryUtxoIndexCompare(size_t a, size_t b)
+{
+    return (a < b) ? -1 : (a > b) ? 1 : 0;
+}
+
+// Work pairs {row, first} (the row an outpoint's group keeps, and the row that first named it), by the
+// row's (txid, vout), then by row index.
+static inline int _BRRecoveryUtxoOutpointCompare(const size_t *a, const size_t *b, const void *ctx)
+{
+    const BRRecoveryUtxo *u = (const BRRecoveryUtxo *)ctx;
+    size_t i = a[0], j = b[0];
+    int c = memcmp(u[i].txid, u[j].txid, sizeof(u[i].txid));
+    if (c) return c;
+    if (u[i].vout != u[j].vout) return (u[i].vout < u[j].vout) ? -1 : 1;
+    return _BRRecoveryUtxoIndexCompare(i, j);
+}
+
+// Work pairs by the row that first named the outpoint.
+static inline int _BRRecoveryUtxoFirstCompare(const size_t *a, const size_t *b, const void *ctx)
+{
+    (void)ctx;
+    return _BRRecoveryUtxoIndexCompare(a[1], b[1]);
+}
+
 // One index per outpoint into utxos[0..count), in the order each outpoint was first seen, each naming
-// the copy the rule keeps. *keptCount is the number written to kept[] (0 unless OK). kept may be NULL
-// only when count is 0.
+// the copy the rule keeps. kept[] is also the working space: capacity must be at least
+// BRRecoveryUtxoWorkCapacity(count), else BUFFER_TOO_SMALL. *keptCount is the number written to
+// kept[] (0 unless OK); kept[] past it is unspecified. kept may be NULL only when count is 0.
 static inline BRRecoveryUtxoStatus BRRecoveryUtxoDedup(const BRRecoveryUtxo utxos[], size_t count,
                                                        size_t kept[], size_t capacity, size_t *keptCount)
 {
-    size_t n = 0, i, j;
+    size_t need = BRRecoveryUtxoWorkCapacity(count), n = 0, i;
 
     if (!keptCount) return BR_RECOVERY_UTXO_NULL_ARGUMENT;
     *keptCount = 0;
     if (count == 0) return BR_RECOVERY_UTXO_OK;
     if (!utxos || !kept) return BR_RECOVERY_UTXO_NULL_ARGUMENT;
+    if (need == 0 || capacity < need) return BR_RECOVERY_UTXO_BUFFER_TOO_SMALL;
 
+    // kept[2i] = the row a group keeps, kept[2i + 1] = the row that first named it.
+    for (i = 0; i < count; i++) { kept[2 * i] = i; kept[2 * i + 1] = i; }
+    _BRRecoveryUtxoHeapSort(kept, count, _BRRecoveryUtxoOutpointCompare, utxos);
+    // Each group is now in row order, so its first pair is the row that first named it; fold the rest
+    // into it in that order.
     for (i = 0; i < count; i++) {
-        for (j = 0; j < n; j++) {
-            if (BRRecoveryUtxoSameOutpoint(&utxos[kept[j]], &utxos[i])) break;
-        }
-        if (j < n) {
-            if (BRRecoveryUtxoReplaces(utxos[kept[j]].blockHeight, utxos[i].blockHeight)) kept[j] = i;
+        size_t row = kept[2 * i];
+        if (n > 0 && BRRecoveryUtxoSameOutpoint(&utxos[kept[2 * (n - 1)]], &utxos[row])) {
+            if (BRRecoveryUtxoReplaces(utxos[kept[2 * (n - 1)]].blockHeight, utxos[row].blockHeight)) {
+                kept[2 * (n - 1)] = row;
+            }
         } else {
-            if (n == capacity) return BR_RECOVERY_UTXO_BUFFER_TOO_SMALL;
-            kept[n++] = i;
+            kept[2 * n] = row;
+            kept[2 * n + 1] = kept[2 * i + 1];
+            n++;
         }
     }
+    _BRRecoveryUtxoHeapSort(kept, n, _BRRecoveryUtxoFirstCompare, NULL);
+    for (i = 0; i < n; i++) kept[i] = kept[2 * i];
     *keptCount = n;
     return BR_RECOVERY_UTXO_OK;
 }
@@ -170,7 +252,7 @@ static inline int BRRecoveryUtxoIsCoinForFormat(int addressFormat, int64_t amoun
 }
 
 // The one-coin rule, then the coin-for-its-profile rule: the indices of the rows a profile counts and
-// sweeps, in the one-coin rule's order. Same buffer contract as BRRecoveryUtxoDedup.
+// sweeps, in the one-coin rule's order. Same buffer contract as BRRecoveryUtxoDedup (2 * count).
 static inline BRRecoveryUtxoStatus BRRecoveryUtxoSelect(int addressFormat, const BRRecoveryUtxo utxos[],
                                                         size_t count, size_t kept[], size_t capacity,
                                                         size_t *keptCount)

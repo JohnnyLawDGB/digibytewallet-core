@@ -31,15 +31,22 @@
 //       signs P2PKH, P2WPKH, P2SH-P2WPKH and P2TR key-path inputs by their script; a failed sign, or a transaction
 //       that is not then BRTransactionIsSigned (an input no derived key matches)       -> SIGN_FAILED
 //   11. SIGNED: *txOut is the signed transaction; the caller frees it (BRTransactionFree).
-//  On every refusal *txOut is NULL and nothing is left allocated. ARITHMETIC: estSize is size_t; totalIn, fee,
-//  fee * 20 and fee + 546 are uint64_t, all modulo their width, exactly as the bridge computes them (the bridge
-//  casts its jlong amounts and feePerKb to uint64_t; a platform passes what it would have passed the bridge).
+//  On every refusal *txOut is NULL and nothing is left allocated.
+//  ARITHMETIC, uint64_t as the bridge computes it (the bridge casts its jlong amounts and feePerKb to uint64_t; a
+//  platform passes what it would have passed the bridge). Two values can wrap modulo 2^64: the sum totalIn, and the
+//  product estSize * feePerKb. No other can: fee is at most (2^64 - 1) / 1000 or the 1000 floor, so fee * 20 and
+//  fee + 546 fit; and the dust rule leaves fee < totalIn, so the output totalIn - fee never wraps.
+//  FEE RATE. feePerKb must be a trusted constant, or clamped by the platform: nothing here bounds it, and a lone input
+//  is exempt from the 5% rule, so a large rate burns most of a one-coin sweep (one 10 DGB coin at 4.9e9 sat/kB signs
+//  with a fee of 9.996 DGB).
 //  fee (optional) reports what was computed for the platform's log: estSize, fee, totalIn and the output amount
 //  as far as the call got, and the failing input for BAD_INPUT (SIZE_MAX otherwise).
 //
-//  THE GATE. The bridge passes the signed transaction through its signed-spend gate (BRSpendGate.h's
-//  BRSignedSpendGate against its loaded wallet, or the coin reservation alone) before serializing it; that stays
-//  the platform's, around its own wallet lock and clock. Nothing here claims or reads a reservation.
+//  THE GATE. A platform MUST pass *txOut through BRSignedSpendGate (or its reservation) before serializing or
+//  publishing it; a SIGNED result is not permission to broadcast. The bridge does so against its loaded wallet, or
+//  the coin reservation alone, around its own wallet lock and clock. Nothing here claims or reads a reservation.
+//  HEX. The caller decodes and validates the txid and script hex (the bridge did before: a txid of exactly 32 bytes,
+//  a script of 1..128 bytes, even-length hex of 0-9a-fA-F only); this header takes bytes.
 //
 //  KEYS. seed is read, never written or copied. Every derived key is wiped (BRKeyClean) before the key array is
 //  freed, on every path; the path buffer is wiped before it is freed. BRBIP32PrivKeyArrayPath wipes its own
@@ -47,8 +54,11 @@
 //
 //  INPUTS. txHash is the coin's txid in the parser's internal byte order (the bridge reverses the display hex it
 //  is given; BRRawTxIdFromDisplayHex decodes the same 64 digits). The amount and script are the ones the coin was
-//  proven at (BRRawTxBinding.h): BRLegacySweepInputFromProof fills them from a PROVEN proof, pointing into the
-//  caller's parent bytes, which must outlive the call.
+//  proven at (BRRawTxBinding.h). BRLegacySweepInputFromProof(in, utxo, proof, parents, parentCount) fills txHash
+//  and vout from the coin (utxo) and amount and script from its PROVEN proof, pointing into the caller's parent
+//  bytes, which must outlive the call; so a proof is never paired with another outpoint. It refuses (0, in untouched)
+//  a proof that is not PROVEN, a vout outside 0..UINT32_MAX, a parent index or script range outside parents[], and a
+//  parent filed under a txid other than the coin's.
 //
 //  NETWORK. BRAddressScriptPubKey follows BRNetworkIsTestnet() at the call.
 //
@@ -149,15 +159,21 @@ typedef struct {
     size_t input;              // BAD_INPUT: the input refused; otherwise SIZE_MAX
 } BRLegacySweepFee;
 
-// Fills in's amount and script from a PROVEN proof of parents[] (BRRawTxBindingCheck); 1 when it did. 0, and in
-// untouched, when proof is not PROVEN, or names a parent or a script range outside what was passed.
-static inline int BRLegacySweepInputFromProof(BRLegacySweepInput *in, const BRRawTxProof *proof,
-                                              const BRRawTxBindingParent parents[], size_t parentCount)
+// Fills in's outpoint from utxo and its amount and script from utxo's PROVEN proof of parents[]
+// (BRRawTxBindingCheck); 1 when it did. 0, and in untouched, otherwise (see INPUTS). chain and index stay the
+// caller's.
+static inline int BRLegacySweepInputFromProof(BRLegacySweepInput *in, const BRRawTxBindingUtxo *utxo,
+                                              const BRRawTxProof *proof, const BRRawTxBindingParent parents[],
+                                              size_t parentCount)
 {
-    if (! in || ! proof || ! parents || proof->state != BR_RAW_TX_PROOF_PROVEN) return 0;
+    if (! in || ! utxo || ! proof || ! parents || proof->state != BR_RAW_TX_PROOF_PROVEN) return 0;
+    if (utxo->vout < 0 || utxo->vout > (int64_t)UINT32_MAX) return 0;
     if (proof->parent >= parentCount || ! parents[proof->parent].bytes) return 0;
+    if (! UInt256Eq(parents[proof->parent].txid, utxo->txid)) return 0;
     if (proof->scriptOffset > parents[proof->parent].len ||
         proof->scriptLen > parents[proof->parent].len - proof->scriptOffset) return 0;
+    in->txHash = utxo->txid;
+    in->vout = (uint32_t)utxo->vout;
     in->amount = (uint64_t)proof->amount;
     in->script = parents[proof->parent].bytes + proof->scriptOffset;
     in->scriptLen = proof->scriptLen;

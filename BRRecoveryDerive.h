@@ -72,16 +72,38 @@ extern "C" {
 
 // The public key's address in addressFormat, into out (outLen bytes). 1 on success, 0 otherwise (out
 // then holds the empty string when outLen > 0). jni_derive.c pubkey_to_address, format for format, except
-// that what the core's encoders would assert on is refused here instead: a NULL key, outLen below
-// BR_RECOVERY_ADDRESS_SLOT, and P2WPKH of an uncompressed key.
+// that what the core's encoders would assert on or misread is refused here instead, for direct callers (the
+// derivation loop never produces these): a NULL key; outLen below BR_RECOVERY_ADDRESS_SLOT; P2WPKH of an
+// uncompressed key; a key with neither a public key nor a secret; and, for P2WPKH and P2SH-P2WPKH, a public
+// key whose BRKeyHash160 is zero (one secp256k1 cannot parse -- P2PKH and P2TR refuse it already).
 static inline int BRRecoveryAddressForKey(BRKey *key, int addressFormat, char *out, size_t outLen)
 {
-    size_t n = 0;
+    size_t n = 0, i, pubLen;
+    int hasPub = 0;
 
     if (! out || outLen == 0) return 0;
     out[0] = '\0';
     if (! key || outLen < BR_RECOVERY_ADDRESS_SLOT) return 0;
+    if (addressFormat < 0 || addressFormat >= BR_DERIVATION_FORMAT_COUNT) return 0;
     if (addressFormat == BR_DERIVATION_FORMAT_P2WPKH && ! key->compressed) return 0;
+
+    // BRKeyPubKey computes a missing public key from the secret with the secp256k1 context, which only
+    // BRKeySetSecret / BRKeySetPubKey (and the signing calls) initialise. A key with neither has nothing to
+    // encode; one whose secret was set by hand gets the context initialised first, by a throwaway
+    // BRKeySetSecret, so the first secp256k1 use in the process never reads a NULL context.
+    pubLen = key->compressed ? 33 : 65;
+    for (i = 0; i < pubLen; i++) if (key->pubKey[i]) { hasPub = 1; break; }
+    if (! hasPub) {
+        static const UInt256 one = { .u8 = { [31] = 1 } };
+        BRKey scratch;
+
+        if (UInt256IsZero(key->secret)) return 0;
+        BRKeySetSecret(&scratch, &one, 1);
+        BRKeyClean(&scratch);
+    }
+    if ((addressFormat == BR_DERIVATION_FORMAT_P2WPKH || addressFormat == BR_DERIVATION_FORMAT_P2SH_P2WPKH) &&
+        UInt160IsZero(BRKeyHash160(key))) return 0;
+
     switch (addressFormat) {
     case BR_DERIVATION_FORMAT_P2PKH:
         n = BRKeyAddress(key, out, outLen);

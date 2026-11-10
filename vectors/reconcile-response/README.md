@@ -114,6 +114,14 @@ same as `unreadable`.
 These come from reading `DgbNodeClient.kt` on android `develop` (2026-11-10). A binding test will confirm
 or correct them; each is a change to the Kotlin parser, not to these fixtures.
 
+- **A JSON `null` read through `optString` (the largest difference on a device).** Android's own
+  org.json returns the string `"null"` from `optString(name, fallback)` when the value is JSON null,
+  not the fallback; the JVM `org.json:json` artifact the unit tests run against returns the fallback.
+  So on a device: `scriptPubKey: null` becomes the script `"null"`; a history `txid: null` becomes the
+  txid `"null"` instead of being skipped; a raw-tx `hex: null` passes the `isBlank` check; and a
+  `blockhash: null` passes the empty check and requests `/explorer/block/null`. The unit tests and the
+  device disagree on all four. Here every one of them is absent (`script-null`, `history`
+  `blank-txid-skipped`, `raw-tx` `hex-null`, `tx-raw` `hex-null-falls-back`).
 - org.json is lenient: it accepts some non-RFC syntax (single quotes, unquoted names, comments), and its
   `getLong`/`optLong`/`getInt` convert numeric strings and truncate fractions. How it treats repeated
   names and integers beyond 64 bits differs between the reference and Android's org.json.
@@ -124,4 +132,13 @@ or correct them; each is a change to the Kotlin parser, not to these fixtures.
 - `tx-raw`: the hex is decoded with `Char.digitToInt(16)`, which also accepts non-ASCII decimal digits
   and fullwidth letters.
 - `tx-confirmation`: the blockhash is used to build the block request without being checked.
+- `reconcile`: `vout` is read with `getInt`, which truncates a value above 2,147,483,647 (INT32_MAX)
+  instead of refusing it; here a `vout` is 0 to 4,294,967,295 and anything else is unreadable.
 - No nesting limit.
+
+Android unit tests that change when its parser is bound to these fixtures:
+- `AddressHistoryParseTest.blank_txid_entries_skipped` keeps the entry with the toy txid `"aa"`; here a
+  txid is 64 hex digits, so that body is unreadable.
+- `AddressHistoryParseTest.parses_raw_tx_hex_and_time_with_supplied_height` uses the 8-digit blockhash
+  `"00044c37"` (and txid `"8096"`); read as a `tx-confirmation`, that body is unreadable here (the
+  fixtures' `raw-tx`/`tx-confirmation` bodies use a 64-digit blockhash beginning `00044c37`).

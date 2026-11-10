@@ -132,6 +132,20 @@ static long _ddFindDDOpReturn(const BRTransaction *tx)
     return -1;
 }
 
+#define DD_OP_DIGIDOLLAR 0xbb   // DigiByte Core script.h OP_DIGIDOLLAR (FindDDOpReturn's format 1)
+
+int BRDigiDollarTxMarked(const BRTransaction *tx)
+{
+    if (! tx) return 0;
+    if ((tx->version & 0xFFFFu) == DD_VERSION_MARKER) return 1;
+    if (_ddFindDDOpReturn(tx) >= 0) return 1;
+    for (size_t i = 0; i < tx->outCount; i++) {
+        const BRTxOutput *o = &tx->outputs[i];
+        if (o->script && o->scriptLen >= 2 && o->script[0] == OP_RETURN && o->script[1] == DD_OP_DIGIDOLLAR) return 1;
+    }
+    return 0;
+}
+
 int BRDigiDollarDecodeAmounts(const BRTransaction *tx, int64_t *amounts, size_t maxAmounts)
 {
     int type = BRDigiDollarTxType(tx);

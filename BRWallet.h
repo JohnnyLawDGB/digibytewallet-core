@@ -442,8 +442,15 @@ BRUTXO * BRGetUTXO(BRWallet *wallet);
 //   0 SPENT, 1 HELD, -1 UNDETECTED (funding tx unknown), -2 CONFLICTED (funding tx known
 // but invalid -- another transaction spent its inputs, i.e. a stuck send that was re-sent).
 // CONFLICTED cannot be derived from spent-ness: nothing ever spends the abandoned attempt's
-// own change output.
+// own change output. -3 OTHER_FAMILY (ONE-FAMILY): the output is a DigiDollar output, or its
+// transaction carries both a DigiDollar marking and a DigiAsset tag; it is never an asset holding.
 int BRWalletOutpointAssetState(BRWallet *wallet, UInt256 txHash, uint32_t n);
+
+// ONE-FAMILY: 1 when the wallet holds txHash and output n of it may be spent by no asset send, no plain
+// send and no sweep -- a DigiDollar output (spent only by BRWalletCreateDigiDollarTransfer), or an output
+// of a transaction marked both DigiDollar and DigiAsset (spent by nothing). 0 otherwise, including when
+// the wallet does not hold txHash.
+int BRWalletOutpointIsOneFamilyHeld(BRWallet *wallet, UInt256 txHash, uint32_t n);
 
 int BRWalletRegisterAssetOutpoint(BRWallet *wallet, UInt256 txHash, uint32_t n);
 

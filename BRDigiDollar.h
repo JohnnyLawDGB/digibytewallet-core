@@ -30,6 +30,12 @@ extern "C" {
 // not a DigiDollar transaction (marker absent or type out of {1,2,3}).
 int BRDigiDollarTxType(const BRTransaction *tx);
 
+// ONE-FAMILY: 1 when tx carries any DigiDollar marking -- the nVersion marker DigiByte Core's
+// HasDigiDollarMarker tests ((version & 0xFFFF) == DD_VERSION_MARKER), or an OP_RETURN output in either
+// form FindDDOpReturn accepts (OP_RETURN OP_DIGIDOLLAR, or OP_RETURN whose first push is "DD") --
+// else 0. Wider than BRDigiDollarTxType on purpose: it decides what is HELD, never what is credited.
+int BRDigiDollarTxMarked(const BRTransaction *tx);
+
 // Decodes the DD OP_RETURN cent-amount list into `amounts` (up to `maxAmounts`
 // entries). Type-aware: TRANSFER -> all remaining pushes, MINT/REDEEM -> first push
 // only. Returns the number of amounts written (>= 0), or -1 if `tx` is not a DD tx

@@ -297,6 +297,41 @@ static int _BRWalletIsAssetOverride(BRWallet *wallet, UInt256 txHash, uint32_t n
     return 0;
 }
 
+// ONE-FAMILY: an output belongs to at most one token family.
+//
+// DigiByte Core decides DigiDollar by consensus: a transaction with the DD nVersion marker is validated by
+// ValidateDigiDollarTransaction, and its zero-value P2TR outputs bound to amount slots ARE DigiDollar. The
+// DigiAsset layer is an indexer convention on top of the same chain (DigiAsset Core reads no nVersion and
+// credits any output its instructions name, whatever it holds). So DigiDollar wins over any DigiAsset
+// reading of an output, and a transaction marked as both is decided by neither: it is held, credited to
+// no balance, and offered to no send at all -- the way an UNDECIDED carrier is held. Spending such an
+// output by either path would destroy what the other family reads on it (consensus lets a transaction
+// without the marker spend a DD output; validation.cpp ValidateDigiDollarTransaction passes it through).
+//
+// _BRTxIsDualFamily: tx carries a DigiDollar marking (BRDigiDollarTxMarked) AND a DigiAsset tag
+// (BRTxAssetCarrier is not NONE). _BRTxOutputOneFamilyHeld: output n may be spent by no asset send, no
+// plain send and no sweep -- it is a DigiDollar output (spendable only by the DD builder, from ddUtxos),
+// or its transaction is dual-family (spendable by nothing).
+static int _BRTxIsDualFamily(const BRTransaction *tx)
+{
+#ifdef ONE_FAMILY_UNFIXED
+    (void)tx;
+    return 0;   // comparison arm: no cross-family exclusion anywhere
+#else
+    return tx && BRDigiDollarTxMarked(tx) && BRTxAssetCarrier(tx, NULL) != DA_TX_NONE;
+#endif
+}
+
+static int _BRTxOutputOneFamilyHeld(const BRTransaction *tx, uint32_t n)
+{
+#ifdef ONE_FAMILY_UNFIXED
+    (void)tx; (void)n;
+    return 0;   // comparison arm
+#else
+    return tx && (_BRTxIsDualFamily(tx) || BRDigiDollarOutputAmount(tx, n) >= 0);
+#endif
+}
+
 // A coin-generation transaction: exactly one input whose previous output is the null outpoint
 // (all-zero hash, index 0xffffffff). Same shape as the reference client's IsCoinBase().
 static int _BRTxIsCoinbase(const BRTransaction *tx)
@@ -501,6 +536,12 @@ static void _BRWalletUpdateBalance(BRWallet *wallet)
                     int64_t ddCents = (tx->blockHeight != TX_UNCONFIRMED && tx->blockHeight >= ddFloor) ?
                                       BRDigiDollarOutputAmount(tx, (uint32_t)j) : -1;
 #endif
+                    if (_BRTxIsDualFamily(tx)) {
+                        // ONE-FAMILY: marked DigiDollar AND tagged DigiAsset. Held: kept out of the plain
+                        // coins (assetUtxos), out of ddUtxos and ddBalance, credited to neither family.
+                        array_add(wallet->assetUtxos, ((BRUTXO) { tx->txHash, (uint32_t)j }));
+                        balance += 0;
+                    } else
 #ifndef DD_COINBASE_UNFIXED
                     if (ddCents >= 0 && _BRTxIsCoinbase(tx)) {
                         // A coinbase is never DigiDollar (consensus T5-02; 4.1.2 row 18, dhikariski11
@@ -1744,6 +1785,7 @@ size_t BRWalletSelectableUTXOs(BRWallet *wallet, BRUTXO *utxos, size_t utxosCoun
 
         if (! tx || o->n >= tx->outCount) continue;
         if (BRWalletUtxoIsAsset(wallet, o)) continue;
+        if (_BRTxOutputOneFamilyHeld(tx, o->n)) continue;   // ONE-FAMILY: never a plain or fee coin
         if (! _BRWalletOutputSignable(&tx->outputs[o->n])) continue;
         if ((pass < 2) != _BRWalletOutputEconomic(&tx->outputs[o->n], wallet->feePerKb)) continue;
         if (pass < 2 ? ! _BRWalletUtxoSelectable(wallet, tx, (int)pass, &budget)
@@ -1830,6 +1872,7 @@ static BRTransaction *_BRWalletCreateTxForOutputsAt(BRWallet *wallet, const BRTx
         
         if (! tx || o->n >= tx->outCount) continue;
         if (BRWalletUtxoIsAsset(wallet, o)) continue;
+        if (_BRTxOutputOneFamilyHeld(tx, o->n)) continue;   // ONE-FAMILY: never a plain coin
         if (! _BRWalletOutputSignable(&tx->outputs[o->n])) continue;   // never select what cannot be signed
         if ((pass < 2) != _BRWalletOutputEconomic(&tx->outputs[o->n], feePerKb)) continue;
         // the last resort is for a send the economic coins do not cover, never for rounding up to change
@@ -2052,7 +2095,7 @@ BRTransaction *BRWalletCreateDigiDollarTransfer(BRWallet *wallet, const uint8_t 
     size_t m = 0;
     for (size_t i = 0; i < ddN; i++) {
         BRTransaction *dt = BRSetGet(wallet->allTx, &wallet->ddUtxos[i].hash);
-        if (! dt) continue;
+        if (! dt || _BRTxIsDualFamily(dt)) continue;   // ONE-FAMILY: a dual-family output is no DD coin
         uint32_t n = wallet->ddUtxos[i].n;
         if (n >= dt->outCount || dt->outputs[n].scriptLen > sizeof(ddsel[m].script)) continue;
         int64_t c = BRDigiDollarOutputAmount(dt, n);
@@ -2101,6 +2144,7 @@ BRTransaction *BRWalletCreateDigiDollarTransfer(BRWallet *wallet, const uint8_t 
         BRUTXO *o = &wallet->utxos[i];
         BRTransaction *ut = BRSetGet(wallet->allTx, o);
         if (! ut || o->n >= ut->outCount || ut->outputs[o->n].scriptLen > sizeof(feesel[fm].script)) continue;
+        if (_BRTxOutputOneFamilyHeld(ut, o->n)) continue;   // ONE-FAMILY: never a fee coin
         if (! _BRWalletOutputSignable(&ut->outputs[o->n])) continue;   // never select what cannot be signed
         if (! _BRWalletUtxoSelectableAny(wallet, ut, &budget)) continue;
         feesel[fm].hash = ut->txHash; feesel[fm].n = o->n; feesel[fm].amt = ut->outputs[o->n].amount;
@@ -3203,6 +3247,7 @@ uint64_t BRWalletMaxOutputAmount(BRWallet *wallet)
         o = &wallet->utxos[i - 1];
         tx = BRSetGet(wallet->allTx, &o->hash);
         if (! tx || o->n >= tx->outCount) continue;
+        if (_BRTxOutputOneFamilyHeld(tx, o->n)) continue;   // what selection would skip (ONE-FAMILY)
         if (! _BRWalletOutputSignable(&tx->outputs[o->n])) continue;   // what selection would skip
         if (! _BRWalletUtxoSelectableAny(wallet, tx, &budget)) continue;
         // a coin worth less than its own input's fee lowers what a send of everything delivers (4.1.3 G3)
@@ -3357,9 +3402,26 @@ int BRWalletOutpointAssetState(BRWallet *wallet, UInt256 txHash, uint32_t n)
 
     tx = _BRWalletTxForRead(wallet, txHash);
     if (! tx) return -1;
+    if (_BRTxOutputOneFamilyHeld(tx, n)) {   // ONE-FAMILY: a DigiDollar output, or a dual-family tx
+        _BRWalletTxReadDone(tx);
+        return -3;
+    }
     int valid = BRWalletTransactionIsValid(wallet, tx);
     _BRWalletTxReadDone(tx);
     return valid ? 1 : -2;
+}
+
+int BRWalletOutpointIsOneFamilyHeld(BRWallet *wallet, UInt256 txHash, uint32_t n)
+{
+    BRTransaction *tx;
+    int held;
+
+    assert(wallet != NULL);
+    tx = _BRWalletTxForRead(wallet, txHash);
+    if (! tx) return 0;
+    held = (n < tx->outCount && _BRTxOutputOneFamilyHeld(tx, n)) ? 1 : 0;
+    _BRWalletTxReadDone(tx);
+    return held;
 }
 
 int BRWalletRegisterAssetOutpoint(BRWallet *wallet, UInt256 txHash, uint32_t n)

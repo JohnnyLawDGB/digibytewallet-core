@@ -21,8 +21,21 @@
 //    - inputs == NULL with inCount > 0 is refused without touching the table; inCount == 0 is granted;
 //    - release drops every entry the owner holds (an owner holding nothing: no change); clear drops every entry.
 //
-//  The core reads no clock: `now` is the caller's, in seconds on a monotonic clock (the Android bridge passes
-//  clock_gettime(CLOCK_MONOTONIC)). Every caller sharing the table must use the same clock.
+//  THE CLOCK. The core reads none: `now` is the caller's, in seconds. The rules for it:
+//    - it is non-decreasing from call to call, and never wall time (a wall clock can be set by the user or by the
+//      network);
+//    - every caller sharing the table, in every thread, takes it from the same clock;
+//    - a forward jump lapses claims early, before their sends are published, which reopens the window in which a
+//      second send is signed on the same coins;
+//    - a backward step keeps the claims already held longer (their expiries stay where they were), which is safe; a
+//      claim made or renewed after the step expires TTL after the stepped `now`;
+//    - a NaN `now` drops the whole table (no expiry compares after NaN) and the claim it makes is granted; its own
+//      entries then lapse at the next claim made with any `now`.
+//  The Android bridge passes clock_gettime(CLOCK_MONOTONIC), which on Linux does not advance while the device is
+//  suspended. On Darwin, CLOCK_MONOTONIC keeps advancing while the device sleeps, so the same call on iOS would lapse
+//  every claim across a sleep of TTL or longer where Android keeps it. An iOS caller that matches Android uses
+//  clock_gettime(CLOCK_UPTIME_RAW) (Darwin, clock_gettime(3): monotonic, does not advance while the system is asleep,
+//  equal to mach_absolute_time converted), and every iOS caller uses that one.
 //
 //  Host KAT: digibytewallet-android native/src/test/host/coin_reservation_core_kat/ (runs the bridge's files and these
 //  side by side and requires the same answers).
@@ -46,8 +59,9 @@ extern "C" {
 // Outpoints held at once; a claim that would not fit is refused (the send is not signed).
 #define BR_COIN_RESERVATION_MAX 512
 
-// Claims inputs[0..inCount) for owner at time now (seconds, monotonic). 1: granted (a claim the owner already holds is
-// renewed); 0: refused -- one of them is held by another owner, or the table is full. A refused claim takes nothing.
+// Claims inputs[0..inCount) for owner at time now (seconds on the caller's one monotonic, non-decreasing clock; see THE
+// CLOCK above). 1: granted (a claim the owner already holds is renewed); 0: refused -- one of them is held by another
+// owner, or the table is full. A refused claim takes nothing.
 int BRCoinReservationClaim(UInt256 owner, const BRTxInput *inputs, size_t inCount, double now);
 
 // Releases every outpoint owner holds.

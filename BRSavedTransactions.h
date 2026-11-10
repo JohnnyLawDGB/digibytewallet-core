@@ -28,7 +28,8 @@
 //  reader moved to BRTransactionParseSigned in 4.1.2; this one must read the same bytes the
 //  same way, or a relaunch restores a different wallet on iOS than on Android.
 //
-//  Host KAT: digibytewallet-android native/src/test/host/saved_transactions_core_kat/.
+//  Host KAT: digibytewallet-android native/src/test/host/saved_transactions_core_kat/ (the reader);
+//  scan_floor_kat (BRSavedTransactionsFloorMinima, the floor a discarded blob leaves).
 //  Header-only, static inline; no locking or I/O.
 //
 
@@ -99,6 +100,61 @@ static inline size_t BRSavedTransactionsDeserialize(const uint8_t *buf, size_t l
 
     *outTxs = txs;
     return loaded;
+}
+
+// What a saved-transactions blob says about the scan floor, read from its framing only (no
+// transaction is parsed): the declared count, the number of whole records, the lowest real block
+// height among them and the lowest record time. A rebuild that discards the blob carries these into
+// the floor record first (BRScanFloorFromDiscardedCache, BRScanFloor.h), so the rescan reaches every
+// transaction the blob held. The rules are Android's HistoryRebuildOnUpgrade.summarize:
+//   - a blob of 4 bytes or fewer (or NULL) is empty: declared count 0;
+//   - a declared count of 0 is empty; above BR_SAVED_TRANSACTIONS_MAX_COUNT it gives no records and
+//     no minima (declaredCount is reported, so the blob is not empty);
+//   - the walk takes whole records while a 12-byte record header fits; a record whose size runs past
+//     the end stops it, and gives nothing;
+//   - the floor height comes only from records at a real height, 0 < height < TX_UNCONFIRMED;
+//   - the floor time comes from records with 1 <= height <= TX_UNCONFIRMED (confirmed, or
+//     unconfirmed: their time is when they were seen) and a time above 0;
+//   - 0 means none for either minimum.
+typedef struct {
+    uint32_t declaredCount;
+    size_t records;
+    int64_t minConfirmedHeight;
+    int64_t minRecordTime;
+} BRSavedTransactionsFloor;
+
+// The blob's floor minima. Never fails; *out is always written (out must not be NULL).
+static inline void BRSavedTransactionsFloorMinima(const uint8_t *buf, size_t len, BRSavedTransactionsFloor *out)
+{
+    size_t pos = 4;
+    uint32_t count;
+
+    out->declaredCount = 0; out->records = 0; out->minConfirmedHeight = 0; out->minRecordTime = 0;
+    if (! buf || len <= 4) return;
+    count = UInt32GetLE(buf);
+    out->declaredCount = count;
+    if (count == 0 || count > BR_SAVED_TRANSACTIONS_MAX_COUNT) return;
+
+    for (uint32_t i = 0; i < count && BR_SAVED_TRANSACTIONS_RECORD_HEADER <= len - pos; i++) {
+        uint32_t size = UInt32GetLE(&buf[pos]);
+        uint32_t height = UInt32GetLE(&buf[pos + 4]);
+        uint32_t time = UInt32GetLE(&buf[pos + 8]);
+
+        pos += BR_SAVED_TRANSACTIONS_RECORD_HEADER;
+        if (size > len - pos) break;   // pos <= len holds here
+        pos += size;
+        out->records++;
+#ifdef SAVED_TRANSACTIONS_FLOOR_SENTINEL_RED
+        // RED ARM SEAM (scan_floor_kat): the unconfirmed sentinel read as a block height.
+        if (height >= 1 && height <= (uint32_t)TX_UNCONFIRMED) {
+#else
+        if (height >= 1 && height < (uint32_t)TX_UNCONFIRMED) {
+#endif
+            if (out->minConfirmedHeight == 0 || height < out->minConfirmedHeight) out->minConfirmedHeight = height;
+        }
+        if (height >= 1 && height <= (uint32_t)TX_UNCONFIRMED && time > 0 &&
+            (out->minRecordTime == 0 || time < out->minRecordTime)) out->minRecordTime = time;
+    }
 }
 
 #ifdef __cplusplus

@@ -12,11 +12,15 @@
 //
 //  THE RULES:
 //    - THE VERDICT for one outpoint (BRSweepClassifyRawTx, BRSweepVerdictOf). The platform fetches the
-//      raw transaction that created the outpoint. No bytes (the fetch failed, threw, or returned an empty
-//      body) is ABSENT. Bytes the core's parser (BRTransactionParseSigned, the network format) cannot
-//      read are UNREADABLE. Otherwise the transaction is ASSET when the core's DigiAsset reader
-//      (BRTXContainsAsset) finds a DigiAsset carrier on ANY of its outputs -- including a tagged carrier
-//      it cannot classify, which BRDigiAsset.c holds as an asset -- and PLAIN otherwise.
+//      raw transaction that created the outpoint, by the outpoint's txid. No bytes (the fetch failed,
+//      threw, or returned an empty body) is ABSENT. The bytes must then BE that transaction: they are
+//      UNREADABLE unless they are exactly one complete signed transaction whose id is the txid asked for
+//      -- the id BRRawTxId (BRRawTxBinding.h) reports: parsed in the network format and re-serialized
+//      byte for byte, so trailing bytes, a non-canonical encoding, or a different transaction (a plain
+//      one served for an asset's txid) are all UNREADABLE. A NULL txid cannot be checked: UNREADABLE.
+//      Otherwise the transaction is ASSET when the core's DigiAsset reader (BRTXContainsAsset) finds a
+//      DigiAsset carrier on ANY of its outputs -- including a tagged carrier it cannot classify, which
+//      BRDigiAsset.c holds as an asset -- and PLAIN otherwise.
 //        ABSENT, UNREADABLE (or any class this header does not know) -> UNKNOWN: not classified.
 //        PLAIN  -> classified, no asset.
 //        ASSET  -> classified, carries an asset, with a transfer-rule state.
@@ -27,6 +31,12 @@
 //      then. A lookup that failed or threw, was not wired, or answered a value this header does not know
 //      reads as UNKNOWN. UNKNOWN and BOUND both mean "do not move this asset": only NONE may move.
 //      For a non-asset verdict ruleState is set to UNKNOWN and means nothing.
+//      KNOWN ANDROID DIFFERENCE, to fix when Android adopts this header: Android's classifier asks JNI
+//      isAssetTransaction, which returns false when BRTransactionParseSigned cannot read the bytes, so an
+//      unparseable fetch reads there as PLAIN and its coin can be swept as DGB -- a fail-open on a coin
+//      that may carry an asset. Android also does not check the fetched bytes' id against the txid, nor
+//      that they re-serialize exactly. Here all three are UNREADABLE, hence UNKNOWN and held. Android's
+//      adoption routes its classifier through BRSweepClassifyRawTx.
 //    - ONE FETCH PER TRANSACTION (BRSweepTxidGroups). Several outpoints of one transaction share one
 //      fetch and one verdict: each row is mapped to the first row that names its txid (the row the
 //      platform fetches for), and every row of the group takes that row's verdict. A row whose verdict
@@ -61,12 +71,16 @@
 //
 //  OUTPOINTS. Rows are BRRecoveryUtxo (BRRecoveryUtxo.h); an outpoint elsewhere is BRSweepOutpoint. TXIDS
 //  are the 32 bytes in the order the caller chooses -- the same order for every row -- and compare as
-//  bytes, so a platform that keeps txids as hex (Android's "txid:vout" strings) decodes them first.
+//  bytes, so a platform that keeps txids as hex (Android's "txid:vout" strings) decodes them first. The
+//  txid BRSweepClassifyRawTx checks is a UInt256 in the parser's internal byte order (BRTransaction.txHash);
+//  the display-order hex a lookup gives decodes with BRRawTxIdFromDisplayHex. A platform that keeps its
+//  rows in that order too can pass a row's txid bytes directly.
 //  COST. Server-controlled counts are never looped over quadratically: grouping by txid, the exclusion
 //  set and the arrived set are each an in-place heapsort (O(n log n), no allocation, no recursion), and
 //  each membership test is a binary search. Buffers are the caller's.
 //  Header-only, static inline. No locking, no clock, no I/O. Allocation only inside the core's
-//  transaction parser (BRSweepClassifyRawTx frees what it parsed before returning).
+//  transaction parser and BRRawTxBinding.h's exact re-serialization (BRSweepClassifyRawTx frees both
+//  before returning; an allocation failure there is UNREADABLE, so held).
 //
 //  Test seams (host KAT sweep_partition_kat in the Android repo): SWEEP_PARTITION_UNFIXED, tested by VALUE
 //  as a set of bits, one per way the rules go wrong; each comparison arm sets one bit and fails only its own
@@ -79,6 +93,7 @@
 //    32  SWEEP_PARTITION_RED_RULE_FAIL_OPEN    a failed or missing rule lookup read as NONE.
 //    64  SWEEP_PARTITION_RED_UNKNOWN_NOT_HELD  the hold-everything predicate counts assets only.
 //    128 SWEEP_PARTITION_RED_TOTAL_ALL         the quoted total counts held coins too.
+//    256 SWEEP_PARTITION_RED_TXID_UNCHECKED    fetched bytes classified without the exact-id check.
 //
 //  Vectors: vectors/sweep-partition/ (generate.c writes vectors.txt from this header).
 //
@@ -87,6 +102,7 @@
 #define BRSweepPartition_h
 
 #include "BRRecoveryUtxo.h"
+#include "BRRawTxBinding.h"
 #include "BRTransaction.h"
 #include "BRDigiAsset.h"
 #include <stddef.h>
@@ -109,13 +125,14 @@ extern "C" {
 #define SWEEP_PARTITION_RED_RULE_FAIL_OPEN     32
 #define SWEEP_PARTITION_RED_UNKNOWN_NOT_HELD   64
 #define SWEEP_PARTITION_RED_TOTAL_ALL          128
+#define SWEEP_PARTITION_RED_TXID_UNCHECKED     256
 
 // ---- the verdict -------------------------------------------------------------------------------
 
 // What the core read in the raw transaction that created an outpoint.
 typedef enum {
     BR_SWEEP_RAW_TX_ABSENT = 0,      // no bytes: the fetch failed, threw or returned an empty body
-    BR_SWEEP_RAW_TX_UNREADABLE = 1,  // bytes the core's parser cannot read
+    BR_SWEEP_RAW_TX_UNREADABLE = 1,  // bytes that are not exactly the transaction with the txid asked for
     BR_SWEEP_RAW_TX_PLAIN = 2,       // a transaction with no DigiAsset carrier
     BR_SWEEP_RAW_TX_ASSET = 3        // a transaction with a DigiAsset carrier on some output
 } BRSweepRawTxClass;
@@ -133,8 +150,9 @@ typedef struct {
     BRSweepRuleState ruleState;  // read only when carriesAsset; UNKNOWN otherwise
 } BRSweepAssetVerdict;
 
-// Classifies raw[0..len) with the core's parser and DigiAsset reader (see THE VERDICT).
-static inline BRSweepRawTxClass BRSweepClassifyRawTx(const uint8_t *raw, size_t len)
+// Classifies raw[0..len), fetched for the transaction txid (internal byte order), with the core's parser
+// and DigiAsset reader (see THE VERDICT).
+static inline BRSweepRawTxClass BRSweepClassifyRawTx(const uint8_t *raw, size_t len, const UInt256 *txid)
 {
     BRTransaction *tx;
     BRSweepRawTxClass c;
@@ -146,7 +164,19 @@ static inline BRSweepRawTxClass BRSweepClassifyRawTx(const uint8_t *raw, size_t 
         return BR_SWEEP_RAW_TX_ABSENT;
 #endif
     }
+#if SWEEP_PARTITION_UNFIXED & SWEEP_PARTITION_RED_TXID_UNCHECKED
+    // RED ARM SEAM (sweep_partition_kat): whatever the parser reads, under whatever id.
+    (void)txid;
     tx = BRTransactionParseSigned(raw, len);
+#else
+    // One parse: the exact one BRRawTxId reports its id from (NULL unless the bytes re-serialize byte for
+    // byte), then the id must be the one asked for.
+    tx = txid ? _BRRawTxParseExact(raw, len, NULL) : NULL;
+    if (tx && !UInt256Eq(tx->txHash, *txid)) {
+        BRTransactionFree(tx);
+        tx = NULL;
+    }
+#endif
     if (!tx) {
 #if SWEEP_PARTITION_UNFIXED & SWEEP_PARTITION_RED_UNREAD_PLAIN
         return BR_SWEEP_RAW_TX_PLAIN;   // RED ARM SEAM (sweep_partition_kat)

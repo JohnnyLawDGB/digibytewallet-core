@@ -43,7 +43,9 @@
 //      strictly: missing, shorter than 2, or a negative count or sum is no answer; a count above
 //      INT32_MAX is read as INT32_MAX (Kotlin's Int).
 //    Outpoints compare as BRUTXO bytes (hash, then index); a platform that keeps txids as hex parses
-//    them first, so two spellings of one txid are one outpoint.
+//    them first, so two spellings of one txid are one outpoint. The same holds for the index: the
+//    line reader accepts several spellings of one index (BROutpointClassify.h, INPUT), so rows are
+//    compared and de-duplicated as parsed BRUTXO values, never as text.
 //
 //  Allocation: the member lists (malloc; BRScanPartitionFree releases them, and is safe on a partition
 //  a failed call zeroed). No wallet, no locking, no I/O. Header-only, static inline. Move takes

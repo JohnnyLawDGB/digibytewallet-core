@@ -14,8 +14,18 @@
 //  at byte 64; the 64 bytes before it are the txid (uint256(), then reversed into the wallet's byte
 //  order); the rest is read by strtoul(..., 10), which must consume at least one character and every
 //  character to the end of the line, with a value no greater than UINT32_MAX. Anything else, and a
-//  NULL line, is UNREADABLE. The txid bytes are expected to be hexadecimal (the platforms send the
-//  node's txids); uint256() is the core's own hex reader.
+//  NULL line, is UNREADABLE.
+//    CALLERS MUST pass a txid of exactly [0-9a-fA-F]{64}. The 64 bytes are NOT checked here: uint256()
+//    is the core's own hex reader, a byte outside that set is undefined behaviour in it (a shift of a
+//    negative value), and in practice such a byte reads as F, so "...zz" and "...ff" name the same
+//    outpoint. A node that lists one outpoint under two spellings is then counted twice.
+//    The index is read as leniently as strtoul reads: leading white space, a sign and leading zeros
+//    are accepted (" 7", "+7", "007" and, by unsigned wrap, some negative spellings all read as an
+//    index), and where long is 32 bits an out-of-range index reads as UINT32_MAX (NOT_HELD) rather
+//    than UNREADABLE. So one outpoint has many spellings: a caller formats the index from a uint32,
+//    builds each line from a validated txid and that index rather than from the node's own strings
+//    (which also keeps an embedded NUL out of the line), and removes duplicates on the parsed BRUTXO,
+//    never on the text.
 //
 //  THE CODES (BRWalletClassifyOutpoints), one per line, in order, first match wins:
 //    -3 UNREADABLE    the line did not parse.
@@ -51,10 +61,16 @@
 //  releases it before returning; no wallet pointer is kept past one of them. The wallet's lock is not
 //  recursive: the caller must NOT hold it. A platform that can free its wallet while another thread
 //  reads it keeps its own guard around the call (Android: WALLET_READ_GUARD).
+//    A build with assertions on (no NDEBUG) aborts when a line names an output of a coin-generation
+//    transaction the wallet holds: the transaction copy adds its null-prevout input, which
+//    BRTransactionAddInput asserts against. The bridge does the same. Shipped builds define NDEBUG.
 //
 //  COST. As the bridge: each line is checked against the spendable and DigiDollar copies by a linear
 //  scan, and each spendable output against the readable lines by a linear scan, so both functions take
 //  time proportional to (lines x outputs). Derived addresses are sorted once and searched by bisection.
+//  The number of lines is the node's choice, and every readable line takes a full copy of its
+//  transaction under the wallet's lock (and, when unconfirmed, a validity walk): a caller that cannot
+//  trust the node bounds the list before calling.
 //
 //  RETURNS 1 with every answer written; 0 (nothing written) when the wallet is NULL, when count > 0 and
 //  lines or an output pointer is NULL, or when an allocation fails -- the cases the bridge answers with

@@ -448,8 +448,9 @@ int BRWalletOutpointAssetState(BRWallet *wallet, UInt256 txHash, uint32_t n);
 
 // ONE-FAMILY: 1 when the wallet holds txHash and output n of it may be spent by no asset send, no plain
 // send and no sweep -- a DigiDollar output (spent only by BRWalletCreateDigiDollarTransfer), or an output
-// of a transaction marked both DigiDollar and DigiAsset (spent by nothing). 0 otherwise, including when
-// the wallet does not hold txHash.
+// of a transaction marked both DigiDollar and DigiAsset (spent by nothing). 0 when it may be spent.
+// -1 when the wallet does not hold txHash or it has no output n: it cannot be judged, and a caller
+// that gates a spend must refuse it.
 int BRWalletOutpointIsOneFamilyHeld(BRWallet *wallet, UInt256 txHash, uint32_t n);
 
 int BRWalletRegisterAssetOutpoint(BRWallet *wallet, UInt256 txHash, uint32_t n);

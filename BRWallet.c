@@ -3100,7 +3100,8 @@ int BRWalletTxHasOwnedTokenOutput(BRWallet *wallet, const BRTransaction *tx)
 
     for (size_t i = 0; tx && ! r && i < tx->outCount; i++) {
         if (tx->outputs[i].address[0] == '\0' || ! BRSetContains(wallet->allAddrs, tx->outputs[i].address)) continue;
-        r = (BRDigiDollarOutputAmount(tx, i) >= 0 ||
+        r = (_BRTxIsDualFamily(tx) ||   // ONE-FAMILY: every owned output of a dual-family tx is held
+             BRDigiDollarOutputAmount(tx, i) >= 0 ||
              BRTxOutputIsAsset(tx, &tx->outputs[i]) ||
              _BRWalletIsAssetOverride(wallet, tx->txHash, (uint32_t)i)) ? 1 : 0;
     }
@@ -3418,8 +3419,8 @@ int BRWalletOutpointIsOneFamilyHeld(BRWallet *wallet, UInt256 txHash, uint32_t n
 
     assert(wallet != NULL);
     tx = _BRWalletTxForRead(wallet, txHash);
-    if (! tx) return 0;
-    held = (n < tx->outCount && _BRTxOutputOneFamilyHeld(tx, n)) ? 1 : 0;
+    if (! tx) return -1;   // not held: nothing here to judge it by
+    held = (n >= tx->outCount) ? -1 : (_BRTxOutputOneFamilyHeld(tx, n) ? 1 : 0);
     _BRWalletTxReadDone(tx);
     return held;
 }

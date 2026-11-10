@@ -16,11 +16,25 @@
 //    - the STORED FLOOR (Android `cf_birth_height` in `dgb_settings`): the height the next scan of a
 //      wallet that has not synced starts from (BRCFRestoreArmHeight in BRCFRestorePreflight.h). It
 //      is present or absent; when absent the scan falls back to the wallet's birth checkpoint.
+//      "Only lowered" is NOT a rule of the stored floor: a restore, a rebuild from chain
+//      (BRChainRebuild.h SET_FLOOR_AT_BIRTH) and a cold-start reset overwrite it with the wallet's
+//      current anchor (or remove it), and committing "has synced" removes it. Only the sync-start
+//      step below lowers it, and only to the anchor.
 //    - the FLOOR RECORD (BRScanFloor; Android `floor_hint`, `floor_time`, `floor_pending` in
 //      `dgb_history_rebuild`): a floor asked for but not yet carried into the stored floor.
 //      `height` is the lowest height the next rescan must reach (0 = none); `time` is the lowest
 //      time (unix seconds) the header anchor must be chosen from (0 = none); `pending` says the
-//      next sync start still has to carry the record into the stored floor.
+//      next sync start still has to carry the record into the stored floor. Every rule below
+//      that changes the record only ever lowers its height and time; only APPLIED and FORGET
+//      remove them.
+//
+//  PER NETWORK. Both values describe one network's chain and are kept per network (iOS keeps the
+//  stored floor per network). Android keeps the floor record per network (`dgb_history_rebuild`
+//  plus the network suffix) but `cf_birth_height` WITHOUT a suffix, in the network-independent
+//  `dgb_settings`: a mainnet/testnet switch before the first sync therefore hands one network's
+//  stored floor to the other (a mainnet floor read by testnet sits above testnet's whole chain, so
+//  its scan sees nothing; a testnet floor read by mainnet only lengthens the scan), and the first
+//  sync on either network removes the other's floor.
 //
 //  THE RULES:
 //    - LOWER (BRScanFloorLower). The lower of two optional floors, 0 meaning "no floor": no floor
@@ -44,7 +58,8 @@
 //      to the oldest confirmed height it held; the time is lowered to its oldest record time
 //      (confirmed or not) and then to the checkpoint time at or below the resulting height (looked
 //      up only when that height is positive); pending is SET to whether either is now non-zero
-//      (it may clear a pending flag that was set).
+//      (it may clear a pending flag that was set). The minima come from the blob's framing:
+//      BRSavedTransactionsFloorMinima (BRSavedTransactions.h).
 //    - ANCHOR REQUEST (BRScanFloorRequestAtAnchor). Pending, nothing else: the next sync start
 //      carries the stored floor down to the wallet's anchor.
 //    - APPLIED (BRScanFloorApplied). The record has been carried into the stored floor: the height
@@ -65,6 +80,9 @@
 //                                                                 else remove the stored floor)
 //                                                                 and clear the record
 //      The target is min(height, anchor): the anchor the floor time chose is at or below the height.
+//      The platform applies clearHint (BRScanFloorApplied) ONLY after the stored-floor write
+//      (setBirth / removeBirth) has landed: a record cleared beside a write that did not land is a
+//      floor lost. (Android's SyncService today applies it whatever the write's commit returned.)
 //      A height below the anchor cannot be resolved by the in-memory header chain (the filter
 //      fetch would clamp it back up), so it waits until the anchor comes down.
 //    - RESTORE TIME (BRScanFloorRestoreCreationTime). The creation time handed to the wallet when
@@ -183,7 +201,12 @@ static inline void BRScanFloorFromDiscardedCache(BRScanFloor *floor, int64_t min
     int64_t time = BRScanFloorLower(BRScanFloorLower(floor->time, minRecordTime), checkpointTime);
     floor->height = height;
     floor->time = time;
+#ifdef SCAN_FLOOR_PENDING_RED
+    // RED ARM SEAM (scan_floor_kat): pending OR'd in, so a run with no floor keeps an old request.
+    floor->pending = floor->pending || height > 0 || time > 0;
+#else
     floor->pending = height > 0 || time > 0;
+#endif
 }
 
 // ANCHOR REQUEST: the next sync start carries the stored floor down to the wallet's anchor.
@@ -253,7 +276,13 @@ static inline BRScanFloorStep BRScanFloorHintStep(int walletLoaded, int64_t anch
 static inline int64_t BRScanFloorRestoreCreationTime(int64_t stored, int64_t floorTime)
 {
     int64_t base = stored > 0 ? stored : BR_SCAN_FLOOR_DEFAULT_RESTORE_CREATION_TIME;
+#ifdef SCAN_FLOOR_RESTORE_RED
+    // RED ARM SEAM (scan_floor_kat): the creation time raised to the floor time, anchoring the
+    // headers above history the record says is there.
+    return floorTime > 0 ? floorTime : base;
+#else
     return (floorTime > 0 && floorTime < base) ? floorTime : base;
+#endif
 }
 
 #ifdef __cplusplus

@@ -5,17 +5,21 @@
 // these are the headers written down, not independent answers; the host KAT scan_floor_kat holds
 // the headers to a line-for-line model of the Kotlin and checks this file is current.
 //
-// The corpus: every pair of a set of heights for the floor rules, a fixed unsorted checkpoint table
+// The corpus: saved-transactions blobs for the floor minima (HistoryRebuildOnUpgradeTest's
+// framing cases, and a base blob truncated at every length and with each byte inverted), every
+// pair of a set of heights for the floor rules, a fixed unsorted checkpoint table
 // for the lookups, every combination of the sync-start step's inputs over a set of heights, and the
-// two rebuild sequences and the kept list.
+// rebuild sequences, the reload steps and the kept list.
 //
 // Regenerate, from this directory:
 //   cc -I ../.. -o /tmp/scan_floor_vectors generate.c && /tmp/scan_floor_vectors > vectors.txt
 
 #include "BRScanFloor.h"
 #include "BRChainRebuild.h"
+#include "BRSavedTransactions.h"
 
 #include <stdio.h>
+#include <string.h>
 
 static const int64_t H[] = {
     INT64_MIN, -1, 0, 1, 2, 999, 1000, 1001, 19000000, 19500000, 20000000, 21000000, 22650000,
@@ -37,6 +41,66 @@ static const BRCheckPoint CP[] = {
 static const int64_t T[] = { -1, 0, 1, 1389388394, 1500000000, 1550000000, 1600000000, 1650000000, 1774252800, 1800000000 };
 #define NT (sizeof(T) / sizeof(*T))
 
+
+// ---- saved-transactions blobs: u32 count, then per record u32 size, u32 height, u32 time, body ----
+typedef struct { uint32_t size, height, time; uint8_t bodyLen; } Rec;
+static size_t blob(uint8_t *b, uint32_t count, const Rec *r, size_t n)
+{
+    size_t pos = 0, i, j;
+    #define PUT(v) do { uint32_t _v = (v); b[pos++] = (uint8_t)_v; b[pos++] = (uint8_t)(_v >> 8); \
+                        b[pos++] = (uint8_t)(_v >> 16); b[pos++] = (uint8_t)(_v >> 24); } while (0)
+    PUT(count);
+    for (i = 0; i < n; i++) {
+        PUT(r[i].size); PUT(r[i].height); PUT(r[i].time);
+        for (j = 0; j < r[i].bodyLen; j++) b[pos++] = (uint8_t)(0xa0 + j);
+    }
+    #undef PUT
+    return pos;
+}
+static void minimaLine(const uint8_t *b, size_t len)
+{
+    BRSavedTransactionsFloor f;
+    BRSavedTransactionsFloorMinima(len ? b : NULL, len, &f);
+    printf("minima ");
+    if (! len) printf("empty");
+    for (size_t i = 0; i < len; i++) printf("%02x", b[i]);
+    printf(" %u %zu %lld %lld\n", f.declaredCount, f.records, (long long)f.minConfirmedHeight, (long long)f.minRecordTime);
+}
+static void minimaCorpus(void)
+{
+    uint8_t b[512], c[512];
+    size_t n, i;
+    static const Rec one[] = { { 3, 21000000, 1650000000u, 3 } };
+    static const Rec mixed[] = {
+        { 3, 23000000, 1700000000u, 3 }, { 2, 0x7fffffffu, 1550000000u, 2 }, { 1, 19500000, 1600000000u, 1 },
+        { 1, 0, 500, 1 }, { 1, 0xfffffff0u, 400, 1 }, { 2, 20000000, 0, 2 },
+    };
+    static const Rec unconf[] = { { 3, 0x7fffffffu, 1700000000u, 3 }, { 1, 0x7fffffffu, 1690000000u, 1 } };
+    static const Rec below[] = { { 3, 22000000, 1690000000u, 3 }, { 1, 0x7fffffffu, 1600000000u, 1 }, { 2, 0x7fffffffu, 0, 2 } };
+    static const Rec two[] = { { 3, 22000000, 1690000000u, 3 }, { 3, 18000000, 1500000000u, 3 } };
+    static const Rec past[] = { { 3, 22000000, 1690000000u, 3 }, { 0xffffffffu, 10000000, 1400000000u, 2 } };
+    static const Rec capped[] = { { 3, 1000, 1400000000u, 3 } };
+    static const uint8_t small[][8] = { { 1, 0, 0 }, { 1, 0, 0, 0 }, { 0xff, 0xff, 0xff, 0xff, 0, 0, 0, 0 } };
+
+    minimaLine(b, 0);
+    minimaLine(small[0], 3); minimaLine(small[1], 4); minimaLine(small[2], 8);
+    n = blob(b, 0, NULL, 0); memset(b + n, 0, 20); minimaLine(b, n + 20);
+    n = blob(b, 1, one, 1); minimaLine(b, n);
+    n = blob(b, 6, mixed, 6); minimaLine(b, n);
+    n = blob(b, 2, unconf, 2); minimaLine(b, n);
+    n = blob(b, 3, below, 3); minimaLine(b, n);
+    n = blob(b, 2, past, 2); minimaLine(b, n);
+    n = blob(b, 10001, capped, 1); minimaLine(b, n);
+    n = blob(b, 10000, capped, 1); minimaLine(b, n);
+    n = blob(b, 3, two, 2); minimaLine(b, n);     // a count above the records present
+    n = blob(b, 1, two, 2); minimaLine(b, n);     // a count below them
+    n = blob(b, 2, two, 2);
+    for (i = 0; i <= n; i++) minimaLine(b, i);    // every truncation
+    for (i = 0; i < n; i++) { memcpy(c, b, n); c[i] ^= 0xff; minimaLine(c, n); }   // each byte inverted
+    n = blob(b, 6, mixed, 6);
+    for (i = 0; i < n; i++) { memcpy(c, b, n); c[i] ^= 0xff; minimaLine(c, n); }
+}
+
 static void floorLine(const BRScanFloor *f)
 {
     printf("%lld %lld %d", (long long)f->height, (long long)f->time, f->pending);
@@ -56,7 +120,10 @@ int main(void)
     printf("# cache <h> <t> <p> <minConfirmedHeight> <minRecordTime> -> <h> <t> <p>\n");
     printf("# step <loaded> <anchor> <persisted or -> <height> <pending> -> <setBirth or -> <remove> <clear> <anchorAbove>\n");
     printf("# restoretime <stored> <floorTime> <result>\n");
-    printf("# rebuild <index> <name> / rebuild-from <index> <name> / kept <index> <name>\n");
+    printf("# minima <blob hex or empty> <declaredCount> <records> <minConfirmedHeight> <minRecordTime>\n");
+    printf("# rebuild <index> <name> / rebuild-from <index> <name> / reload <index> <name> / kept <index> <name>\n");
+
+    minimaCorpus();
 
     for (i = 0; i < NCP; i++) printf("checkpoint %u %u\n", CP[i].height, CP[i].timestamp);
 
@@ -117,6 +184,8 @@ int main(void)
         printf("rebuild %d %s\n", n, BRChainRebuildStepName((BRChainRebuildStep)BRChainRebuildStepAt(0, n)));
     for (int n = 0; n < BRChainRebuildStepCount(1); n++)
         printf("rebuild-from %d %s\n", n, BRChainRebuildStepName((BRChainRebuildStep)BRChainRebuildStepAt(1, n)));
+    for (int n = 0; n < BR_CHAIN_REBUILD_RELOAD_COUNT; n++)
+        printf("reload %d %s\n", n, BRChainRebuildReloadStepName((BRChainRebuildReloadStep)BRChainRebuildReloadStepAt(n)));
     for (int n = 0; n < BR_CHAIN_REBUILD_KEPT_COUNT; n++)
         printf("kept %d %s\n", n, BRChainRebuildKeepName(BRChainRebuildKept[n]));
     return 0;

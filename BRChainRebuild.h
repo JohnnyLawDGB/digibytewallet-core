@@ -4,22 +4,21 @@
 //  What a "rebuild from chain" does, in order: the user's last resort when the transaction history
 //  is wrong (phantom chained sends, missing block heights, phantom coins). It clears everything the
 //  wallet re-derives from the chain, keeps the seed and what cannot be re-derived, floors the scan
-//  at the wallet's birth, and reloads, so every transaction is re-detected and block-stamped by the
-//  compact-filter scan. Until 2026-11 the order lived only in Android's Kotlin
-//  (WalletManager.kt: rebuildFromChainRescan, rebuildFromChainRescanFrom;
-//  HistoryRebuildOnUpgrade.kt: clearTransactionCacheForRebuild, armRerun; the reload is the restart
-//  in ReconcileScreen.kt).
+//  at the wallet's birth or lower, and reloads, so every transaction is re-detected and
+//  block-stamped by the compact-filter scan. Until 2026-11 the order lived only in Android's Kotlin
+//  (WalletManager.kt: rebuildFromChainRescan, rebuildFromChainRescanFrom, restoreFromDisk;
+//  HistoryRebuildOnUpgrade.kt: clearTransactionCacheForRebuild, armRerun, runAtProcessStart;
+//  SyncService.kt: the floor step at sync start; the restart in ReconcileScreen.kt).
 //
 //  ## A SPECIFICATION, not an executor
 //
 //  The steps are I/O on each platform's own stores, and Android's reload is a process restart,
 //  which a C function cannot perform and should not orchestrate. So, like BRRecreateSequence.h,
 //  this header holds the KNOWLEDGE as data: the steps, their order, what each clears or keeps, and
-//  that a failing step does not stop the ones after it. Each platform keeps its executor (Android:
-//  WalletManager plus a process restart; iOS: an in-session executor that tears the wallet down and
-//  loads it again) and its parity test asserts the executor's observed order against
-//  BRChainRebuildStepAt. A reorder then fails a test instead of reloading a wallet whose cache was
-//  written back after it was cleared.
+//  which failures stop the rebuild. Each platform keeps its executor (Android: WalletManager plus a
+//  process restart; iOS: an in-session executor that tears the wallet down and loads it again) and
+//  its parity test asserts the executor's observed order against BRChainRebuildStepAt and
+//  BRChainRebuildReloadStepAt.
 //
 //  ## The sequence (BRChainRebuildSteps)
 //
@@ -29,7 +28,13 @@
 //    ARM_RERUN             BEFORE the clears: mark the one-time history rebuild to run again at the
 //                          next load (not done, in progress), keeping the floor record. A writer
 //                          that puts a cache back between the clears and the reload is then
-//                          cleared again before anything loads it.
+//                          cleared again before anything loads it (RELOAD, RERUN_ON_LOAD).
+//    FLOOR_FROM_CACHE      BEFORE the cache is cleared: carry the cache's oldest confirmed height
+//                          and oldest record time into the floor record
+//                          (BRSavedTransactionsFloorMinima, then BRScanFloorFromDiscardedCache).
+//                          Without it a confirmed transaction below the birth anchor (a wallet
+//                          restored with the default creation time, or a transaction imported from
+//                          a server) is dropped with the cache and never scanned again.
 //    CLEAR_TX_CACHE        the stored transaction graph (Android `saved_transactions`).
 //    CLEAR_FILTER_CHAIN    the compact-filter header chain (key and file store); it re-anchors at
 //                          the floor.
@@ -44,23 +49,45 @@
 //                          ledger would stop the rescan from ever re-covering an abandoned band.
 //    CLEAR_ABANDONMENT     the surfaced abandoned band: with the ledger gone there is nothing left to
 //                          recover.
-//    CLEAR_OUTGOING_STORE  the recorded sends' metadata (the one-time rebuild after an update keeps
-//                          it; this rebuild does not).
-//    SET_FLOOR_AT_BIRTH    the stored floor becomes the wallet's birth checkpoint, or is REMOVED
-//                          when that is 0 or unknown (BRScanFloorBirthToPersist: 0 is never
-//                          written). The floor record (BRScanFloor) is not touched here.
-//    RELOAD                load the wallet again from the cleared stores and start sync; the
-//                          one-time rebuild armed above runs first. Android ends the process and
-//                          starts a new one.
+//    CLEAR_OUTGOING_STORE  the recorded sends' metadata. The rebuild does NOT defer for the wallet's
+//                          own unsettled sends (the one-time rebuild after an update does): it drops
+//                          them with the cache and drops their records here, so an unconfirmed send
+//                          the scan cannot re-learn is forgotten.
+//    SET_FLOOR_AT_BIRTH    the STORED floor is overwritten with the wallet's current birth anchor,
+//                          or REMOVED when that is 0 or unknown (BRScanFloorBirthToPersist: 0 is
+//                          never written). This replaces the stored floor whatever it was, lower or
+//                          higher; it is not a lowering. The floor record (BRScanFloor) is not
+//                          touched here, and carries anything lower into the stored floor at sync
+//                          start (SYNC_START_FLOOR_STEP).
+//    RELOAD                load the wallet again from the cleared stores and start sync: the
+//                          sub-steps below, in order. Android ends the process and starts a new one.
 //
 //  CLEAR_TX_CACHE .. CLEAR_ABANDONMENT are one platform operation on Android
 //  (clearTransactionCacheForRebuild, shared with the one-time rebuild after an update so the two
-//  cannot drift): the keys go in one synchronous commit, then the file stores, then the band, and it
-//  reports whether every one landed. Every write is synchronous: the reload may end the process.
+//  cannot drift): the keys go in one synchronous commit, then the filter chain, saved blocks and
+//  ledger files, then the band. It reports whether the commit landed and the three files are gone;
+//  the band's clear is not checked (its result is ignored). Every write is synchronous: the reload
+//  may end the process.
 //
 //  "Rebuild from a height" (BRChainRebuildFromSteps) is the same sequence after LOWER_FLOOR_TO,
 //  which carries the floor record down to a height a reconcile reported but the wallet could not
 //  check (BRScanFloorLowerTo), so the rescan reaches it.
+//
+//  ## RELOAD (BRChainRebuildReloadSteps)
+//
+//  What an in-session executor must reproduce of Android's next process start, in order:
+//    RERUN_ON_LOAD             the armed one-time rebuild runs before anything reads the stores:
+//                              any cache written back since the clears is carried into the floor
+//                              record (BRScanFloorFromDiscardedCache over its minima), the clears
+//                              run again, and only then is the rebuild stamped done.
+//    LOAD_SKIPS_CACHE          while the rebuild is still in progress (its rerun did not finish),
+//                              the wallet load does not read the transaction cache.
+//    RESTORE_AT_FLOOR_TIME     the wallet is rebuilt from the stored seed with the creation time
+//                              BRScanFloorRestoreCreationTime(stored, record time), so the header
+//                              anchor sits at or below the record.
+//    SYNC_START_FLOOR_STEP     at sync start, BRScanFloorHintStep carries the record into the stored
+//                              floor (record applied only once that write landed), then the scan
+//                              arms at BRCFRestoreArmHeight.
 //
 //  ## What it keeps (BRChainRebuildKept)
 //
@@ -68,9 +95,17 @@
 //    record (BRScanFloor: ARM_RERUN keeps it, and a lower floor recorded for this wallet still
 //    applies); every setting other than the stored floor.
 //
-//  Every step runs even when one before it failed (BRChainRebuildContinuesAfterFailure): this is a
-//  recovery path, and stopping halfway would leave a cleared cache with the old floor, or a cleared
-//  filter chain beside the old ledger. A clear that did not land is repeated by the armed rerun.
+//  ## Failures (BRChainRebuildContinuesAfterFailure)
+//
+//  A step the clears depend on stops the rebuild when it fails: STOP_SYNC (a live session can write
+//  the stores back over the clears), ARM_RERUN (nothing would clear a cache written back after the
+//  clears, and a clear that did not land would not be repeated), FLOOR_FROM_CACHE (the cache's
+//  floor would be lost with it) and LOWER_FLOOR_TO (the rescan would not reach the height the
+//  rebuild is for). An in-session executor aborts there, before any clear, or defers the rebuild
+//  to the next launch. Every later step runs even when one before it failed: a cleared cache with
+//  the old floor, or a cleared filter chain beside the old ledger, is worse than finishing. A clear
+//  that did not land is repeated by RERUN_ON_LOAD, which holds only because ARM_RERUN landed.
+//  (Android today logs a failed STOP_SYNC, ARM_RERUN or LOWER_FLOOR_TO and continues.)
 //
 //  Host KAT: digibytewallet-android native/src/test/host/scan_floor_kat/ (the order checked against
 //  the order of the calls in Android's source). Vectors: vectors/scan-floor/. Header-only, static
@@ -90,20 +125,21 @@ typedef enum {
     BR_CHAIN_REBUILD_LOWER_FLOOR_TO = 0,     // (from a height only) lower the floor record to it
     BR_CHAIN_REBUILD_STOP_SYNC,              // stop sync first: nothing persists over the clears
     BR_CHAIN_REBUILD_ARM_RERUN,              // before the clears: the next load clears again
+    BR_CHAIN_REBUILD_FLOOR_FROM_CACHE,       // before the cache goes: its minima into the record
     BR_CHAIN_REBUILD_CLEAR_TX_CACHE,         // the transaction graph
     BR_CHAIN_REBUILD_CLEAR_FILTER_CHAIN,     // the filter-header chain
     BR_CHAIN_REBUILD_CLEAR_SAVED_BLOCKS,     // the saved header window and its tip
     BR_CHAIN_REBUILD_CLEAR_SYNC_STATE,       // "has synced" and the balance snapshots
     BR_CHAIN_REBUILD_CLEAR_SCAN_LEDGER,      // the filter scan ledger (its abandoned-below floor)
     BR_CHAIN_REBUILD_CLEAR_ABANDONMENT,      // the surfaced abandoned band
-    BR_CHAIN_REBUILD_CLEAR_OUTGOING_STORE,   // recorded sends' metadata
-    BR_CHAIN_REBUILD_SET_FLOOR_AT_BIRTH,     // stored floor = birth, or removed for 0
-    BR_CHAIN_REBUILD_RELOAD,                 // reload the wallet and start sync
+    BR_CHAIN_REBUILD_CLEAR_OUTGOING_STORE,   // recorded sends' metadata (no deferral for them)
+    BR_CHAIN_REBUILD_SET_FLOOR_AT_BIRTH,     // stored floor overwritten with the birth, or removed for 0
+    BR_CHAIN_REBUILD_RELOAD,                 // reload the wallet and start sync: the reload steps
 } BRChainRebuildStep;
 
-#define BR_CHAIN_REBUILD_STEP_KINDS   12   // values of BRChainRebuildStep
-#define BR_CHAIN_REBUILD_STEP_COUNT   11   // steps of a rebuild
-#define BR_CHAIN_REBUILD_FROM_COUNT   12   // steps of a rebuild from a height
+#define BR_CHAIN_REBUILD_STEP_KINDS   13   // values of BRChainRebuildStep
+#define BR_CHAIN_REBUILD_STEP_COUNT   12   // steps of a rebuild
+#define BR_CHAIN_REBUILD_FROM_COUNT   13   // steps of a rebuild from a height
 
 // The rebuild, in order.
 static const BRChainRebuildStep BRChainRebuildSteps[BR_CHAIN_REBUILD_STEP_COUNT] = {
@@ -111,7 +147,14 @@ static const BRChainRebuildStep BRChainRebuildSteps[BR_CHAIN_REBUILD_STEP_COUNT]
 #ifndef CHAIN_REBUILD_ORDER_RED
     BR_CHAIN_REBUILD_ARM_RERUN,
 #endif
+#ifndef CHAIN_REBUILD_FLOOR_RED
+    BR_CHAIN_REBUILD_FLOOR_FROM_CACHE,
+#endif
     BR_CHAIN_REBUILD_CLEAR_TX_CACHE,
+#ifdef CHAIN_REBUILD_FLOOR_RED
+    // RED ARM SEAM (scan_floor_kat): the cache's floor taken after the cache is gone.
+    BR_CHAIN_REBUILD_FLOOR_FROM_CACHE,
+#endif
     BR_CHAIN_REBUILD_CLEAR_FILTER_CHAIN,
     BR_CHAIN_REBUILD_CLEAR_SAVED_BLOCKS,
     BR_CHAIN_REBUILD_CLEAR_SYNC_STATE,
@@ -134,7 +177,13 @@ static const BRChainRebuildStep BRChainRebuildFromSteps[BR_CHAIN_REBUILD_FROM_CO
 #ifndef CHAIN_REBUILD_ORDER_RED
     BR_CHAIN_REBUILD_ARM_RERUN,
 #endif
+#ifndef CHAIN_REBUILD_FLOOR_RED
+    BR_CHAIN_REBUILD_FLOOR_FROM_CACHE,
+#endif
     BR_CHAIN_REBUILD_CLEAR_TX_CACHE,
+#ifdef CHAIN_REBUILD_FLOOR_RED
+    BR_CHAIN_REBUILD_FLOOR_FROM_CACHE,
+#endif
     BR_CHAIN_REBUILD_CLEAR_FILTER_CHAIN,
     BR_CHAIN_REBUILD_CLEAR_SAVED_BLOCKS,
     BR_CHAIN_REBUILD_CLEAR_SYNC_STATE,
@@ -146,6 +195,23 @@ static const BRChainRebuildStep BRChainRebuildFromSteps[BR_CHAIN_REBUILD_FROM_CO
     BR_CHAIN_REBUILD_CLEAR_OUTGOING_STORE,
     BR_CHAIN_REBUILD_SET_FLOOR_AT_BIRTH,
     BR_CHAIN_REBUILD_RELOAD,
+};
+
+// RELOAD's sub-steps, in order.
+typedef enum {
+    BR_CHAIN_REBUILD_RERUN_ON_LOAD = 0,         // the armed rerun: written-back cache's floor, clear again, done
+    BR_CHAIN_REBUILD_LOAD_SKIPS_CACHE,          // a rebuild in progress: the load does not read the cache
+    BR_CHAIN_REBUILD_RESTORE_AT_FLOOR_TIME,     // creation time BRScanFloorRestoreCreationTime(stored, record time)
+    BR_CHAIN_REBUILD_SYNC_START_FLOOR_STEP,     // BRScanFloorHintStep at sync start, then arm the scan
+} BRChainRebuildReloadStep;
+
+#define BR_CHAIN_REBUILD_RELOAD_COUNT 4
+
+static const BRChainRebuildReloadStep BRChainRebuildReloadSteps[BR_CHAIN_REBUILD_RELOAD_COUNT] = {
+    BR_CHAIN_REBUILD_RERUN_ON_LOAD,
+    BR_CHAIN_REBUILD_LOAD_SKIPS_CACHE,
+    BR_CHAIN_REBUILD_RESTORE_AT_FLOOR_TIME,
+    BR_CHAIN_REBUILD_SYNC_START_FLOOR_STEP,
 };
 
 // What a rebuild keeps.
@@ -198,11 +264,25 @@ static inline int BRChainRebuildMustPrecede(int fromHeight, BRChainRebuildStep e
     return a >= 0 && b >= 0 && a < b;
 }
 
-// Whether the executor runs the steps after this one when it fails. Always: see the header.
+// RELOAD's sub-step at position index, or -1 out of range.
+static inline int BRChainRebuildReloadStepAt(int index)
+{
+    return (index >= 0 && index < BR_CHAIN_REBUILD_RELOAD_COUNT) ? (int)BRChainRebuildReloadSteps[index] : -1;
+}
+
+// Whether the executor runs the steps after this one when it fails (see "Failures" above): 0 for
+// the steps the clears depend on, which stop the rebuild; 1 for the rest.
 static inline int BRChainRebuildContinuesAfterFailure(BRChainRebuildStep step)
 {
-    (void)step;
-    return 1;
+    switch (step) {
+        case BR_CHAIN_REBUILD_LOWER_FLOOR_TO:
+        case BR_CHAIN_REBUILD_STOP_SYNC:
+        case BR_CHAIN_REBUILD_ARM_RERUN:
+        case BR_CHAIN_REBUILD_FLOOR_FROM_CACHE:
+            return 0;
+        default:
+            return 1;
+    }
 }
 
 // A stable name for a step, for logs and parity tests on both platforms; NULL for an unknown step.
@@ -212,6 +292,7 @@ static inline const char *BRChainRebuildStepName(BRChainRebuildStep step)
         case BR_CHAIN_REBUILD_LOWER_FLOOR_TO:       return "lowerFloorTo";
         case BR_CHAIN_REBUILD_STOP_SYNC:            return "stopSync";
         case BR_CHAIN_REBUILD_ARM_RERUN:            return "armRerun";
+        case BR_CHAIN_REBUILD_FLOOR_FROM_CACHE:     return "floorFromCache";
         case BR_CHAIN_REBUILD_CLEAR_TX_CACHE:       return "clearTxCache";
         case BR_CHAIN_REBUILD_CLEAR_FILTER_CHAIN:   return "clearFilterChain";
         case BR_CHAIN_REBUILD_CLEAR_SAVED_BLOCKS:   return "clearSavedBlocks";
@@ -222,6 +303,18 @@ static inline const char *BRChainRebuildStepName(BRChainRebuildStep step)
         case BR_CHAIN_REBUILD_SET_FLOOR_AT_BIRTH:   return "setFloorAtBirth";
         case BR_CHAIN_REBUILD_RELOAD:               return "reload";
         default:                                    return NULL;
+    }
+}
+
+// A stable name for a reload sub-step; NULL for an unknown one.
+static inline const char *BRChainRebuildReloadStepName(BRChainRebuildReloadStep step)
+{
+    switch (step) {
+        case BR_CHAIN_REBUILD_RERUN_ON_LOAD:         return "rerunOnLoad";
+        case BR_CHAIN_REBUILD_LOAD_SKIPS_CACHE:      return "loadSkipsCache";
+        case BR_CHAIN_REBUILD_RESTORE_AT_FLOOR_TIME: return "restoreAtFloorTime";
+        case BR_CHAIN_REBUILD_SYNC_START_FLOOR_STEP: return "syncStartFloorStep";
+        default:                                     return NULL;
     }
 }
 

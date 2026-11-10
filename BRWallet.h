@@ -256,6 +256,9 @@ BRTransaction *BRWalletCopyTransactionForHash(BRWallet *wallet, UInt256 txHash);
 //   [4] tx count, then per tx: [4] serialized len, [4] blockHeight, [4] timestamp, [N] tx bytes.
 // If buf == NULL or bufLen is too small, nothing is written and the REQUIRED size is returned;
 // otherwise the blob is written and the number of bytes WRITTEN (== required size) is returned.
+// A wallet holding more than BR_SAVED_TRANSACTIONS_MAX_COUNT transactions (BRSavedTransactions.h,
+// the readers' limit) gets 0 and nothing is written: the wallet never writes a blob its reader
+// refuses (TX-CKPT-CAP).
 size_t BRWalletSerializeTransactions(BRWallet *wallet, uint8_t *buf, size_t bufLen);
 
 // writes transactions registered in the wallet, and that were unconfirmed before blockHeight, to the transactions array

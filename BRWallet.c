@@ -1812,6 +1812,34 @@ size_t BRWalletSelectableUTXOs(BRWallet *wallet, BRUTXO *utxos, size_t utxosCoun
     return w;
 }
 
+// SEND-GATE-SET: 1 when the outpoint (txHash, n) is one of the coins BRWalletSelectableUTXOs lists -- the same
+// predicate, any of its three passes -- asked of that one outpoint, with its own SELECT_WALK_BUDGET. A gate
+// checking a few inputs asks this instead of enumerating the whole set: the enumeration spends one budget
+// on every unconfirmed coin it meets, so it can run out before it reaches a coin that selection, which
+// stops once covered, already took.
+int BRWalletOutpointSelectable(BRWallet *wallet, UInt256 txHash, uint32_t n)
+{
+    int r = 0, budget = SELECT_WALK_BUDGET;
+
+    assert(wallet != NULL);
+    pthread_mutex_lock(&wallet->lock);
+
+    for (size_t i = 0; i < array_count(wallet->utxos); i++) {
+        BRUTXO *o = &wallet->utxos[i];
+        BRTransaction *tx;
+
+        if (o->n != n || ! UInt256Eq(o->hash, txHash)) continue;
+        tx = BRSetGet(wallet->allTx, o);
+        r = tx && o->n < tx->outCount && ! BRWalletUtxoIsAsset(wallet, o) &&
+            ! _BRTxOutputOneFamilyHeld(tx, o->n) && _BRWalletOutputSignable(&tx->outputs[o->n]) &&
+            _BRWalletUtxoSelectableAny(wallet, tx, &budget);
+        break;
+    }
+
+    pthread_mutex_unlock(&wallet->lock);
+    return r;
+}
+
 // BRWalletMinOutputAmount at a given rate.
 static uint64_t _BRMinOutputAmountAt(uint64_t feePerKb)
 {

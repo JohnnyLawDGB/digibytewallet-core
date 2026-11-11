@@ -288,6 +288,10 @@ size_t BRWalletUTXOs(BRWallet *wallet, BRUTXO utxos[], size_t utxosCount);
 // else. Returns the number written, or the total when utxos is NULL.
 size_t BRWalletSelectableUTXOs(BRWallet *wallet, BRUTXO utxos[], size_t utxosCount);
 
+// SEND-GATE-SET: 1 when the outpoint is among the coins BRWalletSelectableUTXOs lists (the same predicate,
+// asked of one outpoint with its own walk budget); 0 otherwise.
+int BRWalletOutpointSelectable(BRWallet *wallet, UInt256 txHash, uint32_t n);
+
 // wallet's unspent DigiDollar token UTXOs (SEND coin-selection input)
 size_t BRWalletDigiDollarUTXOs(BRWallet *wallet, BRUTXO utxos[], size_t utxosCount);
 

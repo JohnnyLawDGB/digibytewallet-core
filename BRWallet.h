@@ -331,19 +331,62 @@ int BRWalletSignTransaction(BRWallet *wallet, BRTransaction *tx, int forkId, con
 // true if the given transaction is associated with the wallet (even if it hasn't been registered)
 int BRWalletContainsTransaction(BRWallet *wallet, const BRTransaction *tx);
 
-// adds a transaction to the wallet, or returns false if it isn't associated with the wallet
+// Who holds tx once a registration returns (REGISTER-RESULT). Every register entry point below
+// reports one of these, decided under the wallet's lock in the same critical section that took or
+// refused tx, so a caller never has to infer ownership from a later lookup.
+typedef enum {
+    BR_WALLET_REGISTER_REFUSED = 0,   // the wallet does not hold tx: it was refused (money range, an unsigned
+                                      // spend of a wallet coin), or it is a non-wallet tx the wallet does not
+                                      // keep (confirmed, or past the kept set's bounds). The CALLER still owns
+                                      // tx and releases it.
+    BR_WALLET_REGISTER_KEPT,          // the wallet holds tx itself as one of its transactions (newly, or tx is
+                                      // the wallet's own record passed back). The WALLET owns tx: the caller
+                                      // must not release it.
+    BR_WALLET_REGISTER_KEPT_FOREIGN,  // the wallet holds tx itself as an unconfirmed non-wallet tx (for the
+                                      // validity and pending checks of its own). The WALLET owns tx: the caller
+                                      // must not release it.
+    BR_WALLET_REGISTER_DUPLICATE,     // the wallet already held a different record of tx's hash and did not
+                                      // take tx (it may have moved its own record into its transactions). The
+                                      // CALLER still owns tx and releases it.
+} BRWalletRegisterOutcome;
+
+// True when the outcome leaves tx with the wallet (KEPT or KEPT_FOREIGN): the caller must not release tx.
+static inline int BRWalletRegisterOutcomeHeld(BRWalletRegisterOutcome outcome)
+{
+    return outcome == BR_WALLET_REGISTER_KEPT || outcome == BR_WALLET_REGISTER_KEPT_FOREIGN;
+}
+
+// How a registration checks an unconfirmed tx's signatures on wallet coins (see the three forms below).
+typedef enum {
+    BR_WALLET_REGISTER_TRUSTED = 0,   // as BRWalletRegisterTransactionTrusted
+    BR_WALLET_REGISTER_CHECKED = 1,   // as BRWalletRegisterTransaction
+    BR_WALLET_REGISTER_UNPROVEN = 2,  // as BRWalletRegisterTransactionUnproven
+} BRWalletRegisterCheck;
+
+// Registers tx with the given check. Returns what the three forms below return, and writes to *outcome
+// (when outcome is not NULL) who holds tx now. Ownership follows *outcome and nothing else:
+// BRWalletRegisterOutcomeHeld(*outcome) -> the wallet owns tx; otherwise the caller still does.
+// Production callers use this form (register_result_kat checks that none uses the three below).
+int BRWalletRegisterTransactionOutcome(BRWallet *wallet, BRTransaction *tx, BRWalletRegisterCheck check,
+                                       BRWalletRegisterOutcome *outcome);
+
+// adds a transaction to the wallet, or returns false if it isn't associated with the wallet.
+// OWNERSHIP: the return value does NOT say who owns tx. 0 is returned both when tx was refused (the
+// caller owns it) and when it was kept as a non-wallet unconfirmed tx (the wallet owns it); 1 is returned
+// both when the wallet took tx and when it already held a different record of the hash (the caller owns
+// tx). A caller that may release tx uses BRWalletRegisterTransactionOutcome.
 int BRWalletRegisterTransaction(BRWallet *wallet, BRTransaction *tx);
 
 // The same, accepting an unconfirmed tx's signatures on the wallet's outputs as they stand now, without
 // checking them. Only for a tx that needs no check: one this wallet signed itself, or one delivered inside
 // a block whose transaction list hashes to its header. The acceptance is not permanent: it is checked
 // again when the tx's wallet-owned inputs change, or when a reorg takes it back to unconfirmed. Every
-// other caller uses BRWalletRegisterTransaction.
+// other caller uses BRWalletRegisterTransaction. OWNERSHIP: as BRWalletRegisterTransaction.
 int BRWalletRegisterTransactionTrusted(BRWallet *wallet, BRTransaction *tx);
 
 // The same as BRWalletRegisterTransaction for a tx whose height the wallet has not proven itself (a
 // server reported it): its signatures on wallet coins are checked at any height, at registration and at
-// every balance rebuild, as an unconfirmed tx's are.
+// every balance rebuild, as an unconfirmed tx's are. OWNERSHIP: as BRWalletRegisterTransaction.
 int BRWalletRegisterTransactionUnproven(BRWallet *wallet, BRTransaction *tx);
 
 // BRWalletUpdateTransactions for heights a server reported: the records stay checked as above.

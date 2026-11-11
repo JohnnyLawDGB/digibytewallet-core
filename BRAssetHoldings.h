@@ -46,10 +46,11 @@
 //      same way (BRAssetPruneDeadBroadcastRows); there a failed lookup is not absence. A row whose txid
 //      is not 64 bytes is never looked up, counted or deleted. A pass that finds the transaction present
 //      forgets the count. The counts are kept per outpoint and per prune in one caller-held table
-//      (BRAssetAbsenceTable); a native pass ends by dropping every count but those of the NATIVE rows
-//      it looked at. The prunes and the ownership half of the
-//      reconcile run only while BRAssetPruneGateOpen is open: synced this session, a peer, progress at
-//      1, a loaded wallet, and a known scan frontier within BR_CF_BEHIND_THRESHOLD of a known tip.
+//      (BRAssetAbsenceTable); a native pass drops every count but those of the NATIVE rows it looks at
+//      before it counts, so a count left by a row that went by other means never takes the room the
+//      pass needs. The prunes and the ownership half of the reconcile run only while
+//      BRAssetPruneGateOpen is open: synced this session, a peer, progress at 1, a loaded wallet, and a
+//      known scan frontier within BR_CF_BEHIND_THRESHOLD of a known tip.
 //    - A DETECTED OUTPUT (BRAssetPersistDetectedOutput). Nothing is written for the change of our own
 //      unconfirmed send (BRAssetTxIsOutgoingUnconfirmed). A row the table already holds is re-tagged
 //      NATIVE; when its credit is not settled (BRAssetCreditIsSettled) a decided credit settles it
@@ -71,7 +72,8 @@
 //      the output is within BRAssetMaxDeliverable's bound; it then settles the row VERIFIED.
 //
 //  Answers that are not decided are never zero units: every enum here that has one keeps it at 0, so a
-//  struct nobody filled reads as it (no answer, keep the row, refused).
+//  struct nobody filled reads as it (no answer, keep the row, refused). A lookup nobody filled
+//  (BRAssetTxLookup 0, HELD) reads as present to both prunes: it deletes nothing and forgets the count.
 //
 //  Scripts are bytes compared byte for byte; ids and txids are NUL-terminated byte strings compared
 //  byte for byte, the caller's own pointers kept in the answers.
@@ -87,9 +89,10 @@
 //  row points into the bytes it was read from. No allocation.
 //
 //  Caller buffers: a balance that `out` cannot hold, a stack answer with more entries than `out` holds,
-//  a prune whose counts the table cannot hold, and a row the buffer cannot hold are refused with
-//  BR_ASSET_HOLDINGS_CAPACITY, before anything is written. No allocation, no wallet, no network, no
-//  clock (the platform passes the times), no I/O. Header-only, static inline; its includes are libc,
+//  a prune whose counts the table cannot hold once the pass is done (at most one per outpoint per
+//  prune), and a row the buffer cannot hold are refused with BR_ASSET_HOLDINGS_CAPACITY, before
+//  anything is written: grow the buffer and call again. No allocation, no wallet, no network, no clock
+//  (the platform passes the times), no I/O. Header-only, static inline; its includes are libc,
 //  BRAssetAllocate.h (BRAssetCredit, BRAssetUnits, BRAssetOutputCredit, BRAssetStackLookup,
 //  BRAssetDeliverable, BRAssetCreditFromIndexer and the credit states, which this header uses and does
 //  not redefine) and BRSyncFrontier.h (BR_CF_BEHIND_THRESHOLD). Nothing in the core calls it yet.
@@ -247,12 +250,15 @@ typedef struct {
     size_t scriptLen;
 } BRAssetTxOutput;
 
-// What the platform found when it asked the native wallet for a row's transaction outputs. FAILED is 0.
+// What the platform found when it asked the native wallet for a row's transaction outputs. HELD is 0:
+// present to both prunes, so a lookup nobody filled keeps the row (and forgets its count). How each prune
+// reads the others: BRAssetPruneRemovedNativeRows takes NOT_HELD and LOOKUP_FAILED as absent,
+// BRAssetPruneDeadBroadcastRows takes NOT_HELD and NO_OUTPUTS as absent; any other value is present.
 typedef enum {
-    BR_ASSET_TX_LOOKUP_FAILED = 0,   // the call failed
-    BR_ASSET_TX_NOT_HELD = 1,        // no such transaction (Kotlin: null)
-    BR_ASSET_TX_NO_OUTPUTS = 2,      // an empty list
-    BR_ASSET_TX_HELD = 3             // its outputs
+    BR_ASSET_TX_HELD = 0,            // its outputs
+    BR_ASSET_TX_NO_OUTPUTS = 1,      // an empty list
+    BR_ASSET_TX_NOT_HELD = 2,        // no such transaction (Kotlin: null)
+    BR_ASSET_TX_LOOKUP_FAILED = 3    // the call failed
 } BRAssetTxLookup;
 
 typedef enum {
@@ -316,21 +322,29 @@ typedef enum {
     BR_ASSET_ASK_NOW = 2                // ask; the platform records the time
 } BRAssetIndexerAsk;
 
+// The platform fills the two structs below from the reply's JSON by these rules, and by no looser ones.
+// "txid" and "assetId" are read only when they are JSON strings: any other type, JSON null included, is
+// NULL, never turned into text. "vout" is read only when it is a JSON number written as a decimal integer
+// (no fraction, no exponent) within int32, and "count" the same within int64: any other value is not a
+// number (vout -1, countIsWhole 0). "error" and "vout" are present whatever their type. A reply that
+// does not then match is no answer: the row stays as it is and is asked about again. This reading is
+// on purpose: a reply of any other shape is never a credit.
+
 // One entry of the indexer's reply, as the platform's JSON reader found it.
 typedef struct {
     int isObject;                       // the entry is a JSON object
-    const char *assetId;                // its "assetId" as text; NULL or "" when absent
-    int countIsWhole;                   // its "count" is a JSON integer that fits int64
+    const char *assetId;                // its "assetId", when a JSON string; NULL otherwise
+    int countIsWhole;                   // its "count" is a JSON integer (as above) within int64
     int64_t count;
 } BRAssetStackAnswerEntry;
 
 // The indexer's reply for one output (GET /digiassets/txout/:txid/:vout), as the platform's JSON reader
 // found it.
 typedef struct {
-    int hasError;                       // it has an "error" member
-    const char *txid;                   // its "txid" as text; NULL or "" when absent
-    int hasVout;                        // it has a "vout" member
-    int32_t vout;                       // that member as an int (-1 when it is not a number)
+    int hasError;                       // it has an "error" member, of any type
+    const char *txid;                   // its "txid", when a JSON string; NULL otherwise
+    int hasVout;                        // it has a "vout" member, of any type
+    int32_t vout;                       // that member, a JSON integer within int32 (as above); else -1
     int hasAssets;                      // its "assets" is an array
     const BRAssetStackAnswerEntry *entries;
     size_t entryCount;
@@ -658,58 +672,96 @@ static inline int _BRAssetHoldGone(BRAssetAbsenceKind kind, BRAssetTxLookup look
     return lookup == BR_ASSET_TX_NOT_HELD || lookup == BR_ASSET_TX_NO_OUTPUTS;
 }
 
+// The first row this prune looks at whose count entry e is, or rowCount. (Kotlin: e's key in liveKeys.)
+static inline size_t _BRAssetHoldAbsenceRow(const BRAssetAbsence *e, BRAssetAbsenceKind kind, const BRAssetRow *rows,
+                                            size_t rowCount)
+{
+    size_t i;
+
+    for (i = 0; i < rowCount; i++) {
+        if (_BRAssetHoldPrunes(&rows[i], kind) && _BRAssetHoldAbsenceIs(e, kind, rows[i].txid, rows[i].vout)) break;
+    }
+    return i;
+}
+
+// Row i found absent once more, its count at `at`: the count goes up, and at BR_ASSET_ABSENCE_PASSES the
+// rows at its outpoint are deleted and the count ends.
+static inline void _BRAssetHoldCountAbsent(BRAssetAbsenceTable *table, size_t at, const BRAssetRow *rows, size_t rowCount,
+                                           size_t i, BRAssetRowChange *changes, size_t *removed)
+{
+    table->entries[at].passes++;
+#if !(ASSET_HOLDINGS_UNFIXED & ASSET_HOLDINGS_RED_NO_DEBOUNCE)
+    if (table->entries[at].passes < BR_ASSET_ABSENCE_PASSES) return;
+#endif
+    *removed += _BRAssetHoldDeleteAt(rows, rowCount, i, changes);
+    _BRAssetHoldAbsenceRemove(table, at);
+}
+
+// One pass of either prune. Kotlin's pass takes the rows one by one; each row touches only its own
+// outpoint's count, and the rows' outpoints are distinct (the table's key), so the order does not change
+// the result. This pass takes them in the order that never needs more room than the table holds at the
+// end: first what frees room (a native pass's retainAll(liveKeys), which Kotlin runs last and which the
+// loop's own counts survive; a count forgotten; a count that ends), then the rows counted for the first
+// time.
 static inline BRAssetHoldingsStatus _BRAssetHoldPrune(BRAssetAbsenceKind kind, const BRAssetRow *rows, size_t rowCount,
                                                       const BRAssetTxLookup *lookups, BRAssetAbsenceTable *table,
                                                       BRAssetRowChange *changes, size_t *removed)
 {
-    size_t i, j, at, need = 0;
+    size_t i, j, at, keep = 0, need = 0;
 
     if (! removed) return BR_ASSET_HOLDINGS_REFUSED;
     *removed = 0;
     if (! table || (table->count > 0 && ! table->entries) || table->count > table->capacity) return BR_ASSET_HOLDINGS_REFUSED;
     if (rowCount > 0 && (! rows || ! lookups || ! changes)) return BR_ASSET_HOLDINGS_REFUSED;
 
-    // Room for every count this pass may add: one per row looked at, found absent, and not yet counted.
+    // What the table holds when the pass is done. The counts kept: of a row this pass does not look at,
+    // only in a dead pass; of a row it looks at, only one found absent again and still short of the
+    // threshold. Beside them one per row found absent and not yet counted.
+    for (j = 0; j < table->count; j++) {
+        i = _BRAssetHoldAbsenceRow(&table->entries[j], kind, rows, rowCount);
+        if (i == rowCount) {
+            if (kind == BR_ASSET_ABSENCE_DEAD) keep++;
+        }
+        else if (_BRAssetHoldGone(kind, lookups[i]) && table->entries[j].passes < BR_ASSET_ABSENCE_PASSES - 1) keep++;
+    }
     for (i = 0; i < rowCount; i++) {
         if (! _BRAssetHoldPrunes(&rows[i], kind) || ! _BRAssetHoldGone(kind, lookups[i])) continue;
         if (_BRAssetHoldAbsenceFind(table, kind, rows[i].txid, rows[i].vout) == table->count) need++;
     }
-    if (need > table->capacity - table->count) return BR_ASSET_HOLDINGS_CAPACITY;
+    if (need > table->capacity - keep) return BR_ASSET_HOLDINGS_CAPACITY;
     if (need > 0 && ! table->entries) return BR_ASSET_HOLDINGS_REFUSED;
 
+    // What frees room.
+    if (kind == BR_ASSET_ABSENCE_NATIVE) {
+        for (j = table->count; j > 0; j--) {
+            if (_BRAssetHoldAbsenceRow(&table->entries[j - 1], kind, rows, rowCount) < rowCount) continue;
+            _BRAssetHoldAbsenceRemove(table, j - 1);
+        }
+    }
     for (i = 0; i < rowCount; i++) changes[i] = BR_ASSET_ROW_KEEP;
     for (i = 0; i < rowCount; i++) {
         if (! _BRAssetHoldPrunes(&rows[i], kind)) continue;
         at = _BRAssetHoldAbsenceFind(table, kind, rows[i].txid, rows[i].vout);
-        if (! _BRAssetHoldGone(kind, lookups[i])) {
-            _BRAssetHoldAbsenceRemove(table, at);
-            continue;
-        }
-        if (at == table->count) {
-            table->entries[at].kind = kind;
-            memcpy(table->entries[at].txid, rows[i].txid, BR_ASSET_TXID_LENGTH);
-            table->entries[at].txid[BR_ASSET_TXID_LENGTH] = '\0';
-            table->entries[at].vout = rows[i].vout;
-            table->entries[at].passes = 0;
-            table->count++;
-        }
-        table->entries[at].passes++;
-#if !(ASSET_HOLDINGS_UNFIXED & ASSET_HOLDINGS_RED_NO_DEBOUNCE)
-        if (table->entries[at].passes < BR_ASSET_ABSENCE_PASSES) continue;
-#endif
-        *removed += _BRAssetHoldDeleteAt(rows, rowCount, i, changes);
-        _BRAssetHoldAbsenceRemove(table, at);
+        if (at == table->count) continue;
+        if (! _BRAssetHoldGone(kind, lookups[i])) _BRAssetHoldAbsenceRemove(table, at);
+        else _BRAssetHoldCountAbsent(table, at, rows, rowCount, i, changes, removed);
     }
 
-    if (kind == BR_ASSET_ABSENCE_NATIVE) {
-        // Keep only the counts of the NATIVE rows this pass looked at.
-        for (j = table->count; j > 0; j--) {
-            for (i = 0; i < rowCount; i++) {
-                if (_BRAssetHoldPrunes(&rows[i], kind) &&
-                    _BRAssetHoldAbsenceIs(&table->entries[j - 1], kind, rows[i].txid, rows[i].vout)) break;
-            }
-            if (i == rowCount) _BRAssetHoldAbsenceRemove(table, j - 1);
-        }
+    // The rows counted for the first time.
+    for (i = 0; i < rowCount; i++) {
+        if (! _BRAssetHoldPrunes(&rows[i], kind) || changes[i] == BR_ASSET_ROW_DELETE) continue;
+        if (! _BRAssetHoldGone(kind, lookups[i])) continue;
+        at = _BRAssetHoldAbsenceFind(table, kind, rows[i].txid, rows[i].vout);
+        // A count there already: this row shares an outpoint with one counted above, which the table's rows
+        // never do. A full table: the same, as `need` counted every other. Both keep the entries in bounds.
+        if (at < table->count || table->count == table->capacity) continue;
+        table->entries[at].kind = kind;
+        memcpy(table->entries[at].txid, rows[i].txid, BR_ASSET_TXID_LENGTH);
+        table->entries[at].txid[BR_ASSET_TXID_LENGTH] = '\0';
+        table->entries[at].vout = rows[i].vout;
+        table->entries[at].passes = 0;
+        table->count++;
+        _BRAssetHoldCountAbsent(table, at, rows, rowCount, i, changes, removed);
     }
     return BR_ASSET_HOLDINGS_OK;
 }
@@ -717,7 +769,9 @@ static inline BRAssetHoldingsStatus _BRAssetHoldPrune(BRAssetAbsenceKind kind, c
 // One pass of the prune of NATIVE rows whose transaction the native wallet no longer holds. lookups[i]
 // is what the platform found for row i's transaction; it is read only for a NATIVE asset row with a txid
 // of 64 bytes. changes[i] is DELETE or KEEP; *removed how many; `table` carries the counts to the next
-// pass. Run it only while BRAssetPruneGateOpen. Kotlin: pruneRemovedNativeAssetRowsImpl.
+// pass, and keeps only those of the NATIVE rows passed. CAPACITY (nothing written) only when the counts
+// the table would hold after the pass do not fit. Run it only while BRAssetPruneGateOpen. Kotlin:
+// pruneRemovedNativeAssetRowsImpl.
 static inline BRAssetHoldingsStatus BRAssetPruneRemovedNativeRows(const BRAssetRow *rows, size_t rowCount,
                                                                   const BRAssetTxLookup *lookups, BRAssetAbsenceTable *table,
                                                                   BRAssetRowChange *changes, size_t *removed)
@@ -726,8 +780,9 @@ static inline BRAssetHoldingsStatus BRAssetPruneRemovedNativeRows(const BRAssetR
 }
 
 // One pass of the prune of rows of a broadcast that never confirmed and that the wallet has dropped,
-// whatever their provenance. As BRAssetPruneRemovedNativeRows otherwise; lookups[i] is read only for an
-// asset row with a txid of 64 bytes and a height of 0 or less. Kotlin: pruneDeadBroadcastRowsImpl.
+// whatever their provenance. As BRAssetPruneRemovedNativeRows otherwise, but it keeps every count already
+// in the table; lookups[i] is read only for an asset row with a txid of 64 bytes and a height of 0 or
+// less. Kotlin: pruneDeadBroadcastRowsImpl.
 static inline BRAssetHoldingsStatus BRAssetPruneDeadBroadcastRows(const BRAssetRow *rows, size_t rowCount,
                                                                   const BRAssetTxLookup *lookups, BRAssetAbsenceTable *table,
                                                                   BRAssetRowChange *changes, size_t *removed)
@@ -975,8 +1030,8 @@ static inline int32_t _BRAssetHoldSigned32(uint32_t u)
 }
 
 // The bytes BRAssetRowEncode writes for `row`, or 0 when the row cannot be stored: no txid, a txid or
-// asset id longer than 255 bytes, a script longer than 65535 bytes or with no bytes, or a source or
-// credit this header does not define.
+// asset id longer than 255 bytes, a script longer than 65535 bytes, a scriptLen above 0 with no bytes
+// pointer, or a source or credit this header does not define. A script of no bytes is stored.
 static inline size_t BRAssetRowWireLength(const BRAssetRow *row)
 {
     size_t t, a;

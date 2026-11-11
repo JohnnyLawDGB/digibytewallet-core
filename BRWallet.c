@@ -1143,6 +1143,20 @@ size_t BRWalletDigiDollarUTXOs(BRWallet *wallet, BRUTXO *utxos, size_t utxosCoun
     return utxosCount;
 }
 
+// ASSET-SIGN-GATE: a copy, taken under the wallet's lock, of the outputs the wallet holds out of the
+// plain coins as DigiAsset holdings (assetUtxos). Not pruned of spends: pair each with
+// BRWalletOutpointAssetState, which answers spent, conflicted and other-family. Returns the number
+// written, or the total when utxos is NULL.
+size_t BRWalletAssetUTXOs(BRWallet *wallet, BRUTXO *utxos, size_t utxosCount)
+{
+    assert(wallet != NULL);
+    pthread_mutex_lock(&wallet->lock);
+    if (! utxos || array_count(wallet->assetUtxos) < utxosCount) utxosCount = array_count(wallet->assetUtxos);
+    for (size_t i = 0; utxos && i < utxosCount; i++) utxos[i] = wallet->assetUtxos[i];
+    pthread_mutex_unlock(&wallet->lock);
+    return utxosCount;
+}
+
 // true if the outpoint (txHash, n) is in the spentOutputs set. spentOutputs is
 // cleared and rebuilt on every _BRWalletUpdateBalance from every registered
 // tx's inputs (see BRSetAdd(wallet->spentOutputs, &tx->inputs[j])), so it is

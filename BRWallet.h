@@ -295,8 +295,17 @@ size_t BRWalletUTXOs(BRWallet *wallet, BRUTXO utxos[], size_t utxosCount);
 // else. Returns the number written, or the total when utxos is NULL.
 size_t BRWalletSelectableUTXOs(BRWallet *wallet, BRUTXO utxos[], size_t utxosCount);
 
+// SEND-GATE-SET: 1 when the outpoint is among the coins BRWalletSelectableUTXOs lists (the same predicate,
+// asked of one outpoint with its own walk budget); 0 otherwise.
+int BRWalletOutpointSelectable(BRWallet *wallet, UInt256 txHash, uint32_t n);
+
 // wallet's unspent DigiDollar token UTXOs (SEND coin-selection input)
 size_t BRWalletDigiDollarUTXOs(BRWallet *wallet, BRUTXO utxos[], size_t utxosCount);
+
+// ASSET-SIGN-GATE: the outputs the wallet holds as DigiAsset holdings (assetUtxos), copied under the
+// wallet's lock. Not pruned of spends: pair each with BRWalletOutpointAssetState. Returns the number
+// written, or the total when utxos is NULL.
+size_t BRWalletAssetUTXOs(BRWallet *wallet, BRUTXO utxos[], size_t utxosCount);
 
 // true if the outpoint (txHash, n) has been spent by a registered tx. Reads the
 // authoritative spentOutputs set (rebuilt every balance update from every

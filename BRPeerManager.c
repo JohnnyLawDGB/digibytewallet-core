@@ -2054,6 +2054,24 @@ static void _cfServedNoteSend(BRPeerManager *manager, const BRPeer *peer, int ki
     if (at >= 0) BRCFServedClockSend(&manager->cfServedClock[at][kind], (int64_t)time(NULL));
 }
 
+// OWNNODE-LIVE: `peer` answered a request of class `kind` with an answer the wallet cannot use
+// because of its own state (a reorg, a re-anchored, trimmed or full chain, a header race). The node
+// did answer, so that class's clock stops; the served ring is NOT joined (credit stays with
+// _recordCFServed, for answers the wallet could use). Caller holds manager->lock; must NOT lock.
+static void _cfServedNoteAnswered(BRPeerManager *manager, const BRPeer *peer, int kind)
+{
+    long at = _cfServedIndex(manager, peer->address, peer->port);
+    if (at >= 0) BRCFServedClockAnswer(&manager->cfServedClock[at][kind]);
+}
+
+// OWNNODE-LIVE: `peer` connected or disconnected. A request sent on the old socket is never
+// answered, so both clocks restart; served-ring membership is kept. Caller holds manager->lock.
+static void _cfServedResetClocks(BRPeerManager *manager, const BRPeer *peer)
+{
+    long at = _cfServedIndex(manager, peer->address, peer->port);
+    if (at >= 0) memset(manager->cfServedClock[at], 0, sizeof(manager->cfServedClock[at]));
+}
+
 // Has (a, p) answered a cfheaders/cfilter this session? Read-only; caller holds
 // manager->lock (only called from the locked status accessor). Must NOT lock.
 static int _cfServedContains(const BRPeerManager *manager, UInt128 a, uint16_t p)
@@ -2086,6 +2104,7 @@ static void _peerConnected(void *info)
     
     MGR_LOCK(manager);
     if (peer->timestamp > now + 2*60*60 || peer->timestamp < now - 2*60*60) peer->timestamp = now; // sanity check
+    _cfServedResetClocks(manager, peer);   // OWNNODE-LIVE: nothing is outstanding on a new socket
 
     // Keep a newly connected peer in the same pacing state as the existing
     // set. Otherwise its BRPeer-side 20,000-header continuation starts ungated
@@ -2415,6 +2434,7 @@ static void _peerDisconnected(void *info, int error)
         MGR_LOCK(manager);
     }
 #endif
+    _cfServedResetClocks(manager, peer);   // OWNNODE-LIVE: requests on a closed socket are never answered
 
     /* ---- DISCONNECT LEDGER: record this close before any teardown touches the peer ----
      * peer is BRPeerFree'd at the bottom of this function, so everything must be read here.
@@ -6027,6 +6047,7 @@ static void _peerRelayedCFHeaders(void *info, uint8_t filterType, UInt256 stopHa
             if (! UInt256IsZero(best) && ! UInt256Eq(best, stopHash)) {
                 peer_log(peer, "cfheaders: batch ends on block %s at %u, which is not on our best chain — "
                          "stale, ignoring", log_u256_hex_encode(stopHash), stopBlock->height);
+                _cfServedNoteAnswered(manager, peer, CF_SERVED_HDR);   // OWNNODE-LIVE: answered; our reorg
                 manager->cfHeadersRequestedThrough = 0;
                 MGR_UNLOCK(manager);
                 return;
@@ -6047,6 +6068,7 @@ static void _peerRelayedCFHeaders(void *info, uint8_t filterType, UInt256 stopHa
                 // expected height instead of seeing cfHeadersRequestedThrough still
                 // set, treating it as a timeout-retry, and rotating the SAME
                 // (unservable) batch forever.
+                _cfServedNoteAnswered(manager, peer, CF_SERVED_HDR);   // OWNNODE-LIVE: answered; our chain moved
                 manager->cfHeadersRequestedThrough = 0;
                 MGR_UNLOCK(manager);
                 return;
@@ -6126,6 +6148,7 @@ static void _peerRelayedCFHeaders(void *info, uint8_t filterType, UInt256 stopHa
                      "scan still needs all of them — holding this batch (not a disagreement)",
                      BRCompactFilterChainCount(manager->compactFilterChain),
                      BRCompactFilterChainStartHeight(manager->compactFilterChain));
+            _cfServedNoteAnswered(manager, peer, CF_SERVED_HDR);   // OWNNODE-LIVE: answered; our store is full
             manager->cfHeadersRequestedThrough = 0;   // re-request once the scan has moved
             MGR_UNLOCK(manager);
             return;
@@ -6842,6 +6865,7 @@ static void _peerRelayedCFilter(void *info, uint8_t filterType, UInt256 blockHas
         manager->cfExitUnknownDrop++;
 #endif
 #endif
+        _cfServedNoteAnswered(manager, peer, CF_SERVED_FLT);   // OWNNODE-LIVE: answered; a header race
         MGR_UNLOCK(manager);
         return;
     }
@@ -6869,6 +6893,7 @@ static void _peerRelayedCFilter(void *info, uint8_t filterType, UInt256 blockHas
 #ifdef CF_RECV_DIAG
             if (kept) manager->cfExitUnknownBuf++; else manager->cfExitVerifyFail++;
 #endif
+            _cfServedNoteAnswered(manager, peer, CF_SERVED_FLT);   // OWNNODE-LIVE: answered; outside our chain
             MGR_UNLOCK(manager);
             return;
         }
@@ -6888,6 +6913,7 @@ static void _peerRelayedCFilter(void *info, uint8_t filterType, UInt256 blockHas
 #ifdef CF_RECV_DIAG
             manager->cfExitVerifyFail++;
 #endif
+            _cfServedNoteAnswered(manager, peer, CF_SERVED_FLT);   // OWNNODE-LIVE: answered; our reorg
             MGR_UNLOCK(manager);
             return;
         }
@@ -7750,8 +7776,9 @@ void BRPeerManagerClearPinnedPeer(BRPeerManager *manager)
 
 // Compact-filter status of the peer at addr:port for the own-node connectivity UI:
 // UNKNOWN (not in pool) / CONNECTING (in pool, not connected) / CONNECTED_NOT_SERVING
-// / SERVING (has answered a cfheaders/cfilter this session, and -- OWNNODE-LIVE -- has let no request
-// of ours stall since: a node that served, then stopped, reads CONNECTED_NOT_SERVING). Takes manager->lock
+// / SERVING (has answered a cfheaders/cfilter this session, and -- OWNNODE-LIVE -- no request of ours
+// to it has stalled since: a node that served, then let a request stall, reads CONNECTED_NOT_SERVING;
+// scope in BRCFServedClock, BRPeerCFStatus.h). Takes manager->lock
 // itself. manager->peers is a BRPeer value array; connectedPeers a BRPeer* array —
 // both store addr/port as plain fields (no BRPeerAddress accessor exists).
 int BRPeerManagerCompactFilterPeerStatus(BRPeerManager *manager, UInt128 addr, uint16_t port)

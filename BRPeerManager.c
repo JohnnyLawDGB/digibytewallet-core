@@ -3063,18 +3063,27 @@ static void _BRPeerManagerSurfaceUnscannableLocked(BRPeerManager *manager, uint3
 // re-Init until a rescan clears it. A re-Init AT or ABOVE the band keeps it as the watermark
 // (abandonedBelow <= start, the state the reorg rebuild already carries). A re-Init BELOW it
 // makes those heights requestable again, which is the rescan, so nothing is carried.
+// A re-Init strictly INSIDE the band (old scannedThrough + 1 < start < band) re-opens only the
+// part at and above `start`; the part below it, [scannedThrough + 1 .. start - 1], was never
+// scanned and stays recorded: abandonedBelow = start. Only a start at or below the band's bottom
+// (the old scannedThrough + 1) is a rescan of the whole band.
 //
 // Every mid-session re-Init in this file goes through here. Caller must hold manager->lock.
 static void _BRPeerManagerReinitCFLedgerLocked(BRPeerManager *manager, uint32_t start)
 {
     uint32_t band = manager->cfLedger.abandonedBelow;
+    uint32_t frontier = manager->cfLedger.scannedThrough + 1;
     BRCFScanLedgerInit(&manager->cfLedger, start);
     // The reorg suite's own red arm restores the shape before ANY carry, so it disables this too.
 #if !defined(CF_BAND_KEPT_UNFIXED) && !defined(CF_REORG_BAND_KEPT_UNFIXED)
     if (band > 0 && band <= start) manager->cfLedger.abandonedBelow = band;
+#ifndef CF_BAND_INSIDE_UNFIXED
+    else if (band > start && frontier < start) manager->cfLedger.abandonedBelow = start;
+#endif
 #else
     (void)band;
 #endif
+    (void)frontier;
 }
 
 // Retire as much of an abandoned band as the RESIDENT block headers can currently
@@ -7313,7 +7322,8 @@ static int _cfCkQuorumMet(BRPeerManager *manager, uint32_t h, UInt256 value, uin
 // network group, report the same value at the same height), our chain -- anchored on the source's word above the
 // compiled table -- is the outlier: the source is banned and the chain is rebuilt from the first height that can
 // hold the disagreement (the majority matched us at h - 1000, or the chain's start is where it lies), so the blocks
-// the disputed filters "cleared" are scanned again. Below the block floor that range cannot be refetched and is
+// the disputed filters "cleared" are scanned again; never above the scan frontier, so no height the scan has not
+// reached reads as scanned (CF-LEDGER-GAPS). Below the block floor that range cannot be refetched and is
 // surfaced instead. Charged to the re-anchor budget. Caller holds manager->lock and has already counted `peer` as a
 // voter (_cfCkRecordReplier).
 static void _BRPeerManagerCFCheckptDisagreedLocked(BRPeerManager *manager, BRPeer *peer, uint32_t h, UInt256 value)
@@ -7339,6 +7349,20 @@ static void _BRPeerManagerCFCheckptDisagreedLocked(BRPeerManager *manager, BRPee
     uint32_t chainStart = BRCompactFilterChainStartHeight(manager->compactFilterChain);
     uint32_t from = (h > 999u && h - 999u > chainStart) ? h - 999u : chainStart;
     uint32_t floor = _BRPeerManagerBlockFloor(manager);
+#ifndef CF_REBUILD_FRONTIER_UNFIXED
+    // CF-LEDGER-GAPS (c): scannedThrough never advances over a height that was never requested and
+    // evaluated. `from` comes from the disputed height, not from the scan, and the convoy lets the
+    // filter-header chain run up to CF_CONVOY_WINDOW ahead of the scan frontier, so a re-Init at
+    // h - 999 would read [frontier .. from - 1] as scanned. Start no higher than the frontier (as the
+    // floor snap and the floor re-anchor do); what then lies below the block floor is surfaced just
+    // below. The chain is dropped either way, so a frontier below the old chain's start is fine:
+    // the new chain is built from wherever the scan resumes.
+    {
+        uint32_t lowestBefore = _cfConvoyScanArmed(manager)
+                                ? BRCFScanLedgerLowestNeededHeight(&manager->cfLedger) : 0;
+        if (lowestBefore > 0 && lowestBefore < from) from = lowestBefore;
+    }
+#endif
 
     peer_log(peer, "cf-corroborate: %u of %u answering non-source peers report height %u differently from our chain — "
              "our chain is the outlier: banning its source, rebuilding from %u (attempt %u/%u)",
@@ -7361,7 +7385,7 @@ static void _BRPeerManagerCFCheckptDisagreedLocked(BRPeerManager *manager, BRPee
     manager->autoFetchCFiltersEnabled  = 1;
     manager->autoFetchCFiltersStart    = from;
     manager->autoFetchCFiltersThrough  = from > 0 ? from - 1 : 0;
-    _BRPeerManagerReinitCFLedgerLocked(manager, from);   // keeps the band surfaced just above
+    _BRPeerManagerReinitCFLedgerLocked(manager, from);   // keeps a band at or below `from`; one `from` lands inside stays below it
     _BRPeerManagerClearSolicitedBlocksLocked(manager);
 #if CF_LEDGER_DRIVE_REREQUEST
     BRCFScanLedgerClearFilterBuffer(&manager->cfLedger);

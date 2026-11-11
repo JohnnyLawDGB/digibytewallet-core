@@ -2100,8 +2100,10 @@ static void _peerConnected(void *info)
         // COMPACT_FILTERS_ONLY. Gossip retention (BRPeerManager.c:1086-1096) is left
         // testnet-only here; its mainnet generalization ships with oracle-bootstrap.
         peer_log(peer, "node doesn't support SPV mode");
-        // Penalize so the CF-first dial loop AND the shotgun fallback skip this bloom-off node for
-        // PEER_PENALTY_SECONDS instead of re-dialing it (mirrors the "node isn't synced" penalty).
+        // Penalize so every dial pass skips this bloom-off node for PEER_PENALTY_SECONDS instead of
+        // re-dialing it (mirrors the "node isn't synced" penalty): the filter-first pass and the
+        // shotgun fallback both check the penalty set (PEER-PENALTY-SHOTGUN; the shotgun exempts
+        // only the pinned own-node and the fixed peer, see _BRPeerManagerShotgunPenalized).
         // Exempt the pinned own-node (see the "node isn't synced" branch above).
         if (! BRPeerIsPinned(manager->pinnedAddr, manager->pinnedPort, peer->address, peer->port))
             _penalize(manager, peer->address, peer->port, now);
@@ -7822,6 +7824,36 @@ static size_t _BRPeerManagerCountDialableFilterPeers(BRPeerManager *manager, tim
     return n;
 }
 
+// PEER-PENALTY-SHOTGUN: may the shotgun fallback dial `p` now? The fallback honours the penalty
+// set exactly as the filter-first pass does: a candidate inside its penalty window is not dialed.
+// With every candidate penalized nothing is dialed, and the wallet waits for the earliest window
+// to lapse (the next connect pass, from the keepalive or a disconnect, dials it).
+// Two peers are exempt, because the wallet must never be starved of them:
+//   - the pinned own-node: the reserved slot dials it with no penalty check, and the shotgun keeps
+//     that rule (it is never _penalize'd, but every disconnect gives it a redial cooldown);
+//   - the fixed peer (BRPeerManagerSetFixedPeer, the rescan's pinned priority peer): it is the
+//     whole candidate set while set, and a disconnect gives it a redial cooldown, so honouring that
+//     here would leave a rescan with nothing to dial. The shotgun has always redialed it.
+// Caller holds manager->lock.
+static int _BRPeerManagerShotgunPenalized(BRPeerManager *manager, const BRPeer *p, time_t now)
+{
+#ifdef PEER_PENALTY_SHOTGUN_UNFIXED
+    // Comparison arm only (peer_penalty_shotgun_kat); never defined in a production build. The
+    // earlier shape: the shotgun never read the penalty set.
+    (void)manager; (void)p; (void)now;
+    return 0;
+#else
+    if (BRPeerIsPinned(manager->pinnedAddr, manager->pinnedPort, p->address, p->port)) return 0;
+#ifndef PEER_PENALTY_SHOTGUN_NO_FIXED_EXEMPT   // comparison arm only (peer_penalty_shotgun_kat)
+    if (! UInt128IsZero(manager->fixedPeer.address) &&
+        UInt128Eq(manager->fixedPeer.address, p->address) && manager->fixedPeer.port == p->port) return 0;
+#endif
+    return BRPeerPenaltyContains(manager->penaltyAddr, manager->penaltyPort, manager->penaltyUntil,
+                                 manager->penaltyCount < PEER_PENALTY_MAX ? manager->penaltyCount : PEER_PENALTY_MAX,
+                                 p->address, p->port, now);
+#endif
+}
+
 // Count connected filter peers whose socket is still LIVE (excludes dead-socket zombies). Combined
 // with the dialable count this answers "do we have any real filter peer to work with" — so the
 // wallet only falls back to the discovery/own-node path when the known filter set is truly
@@ -7869,7 +7901,9 @@ void BRPeerManagerConnect(BRPeerManager *manager)
         // those known peers up, so this rarely trips to exhaustion. Only when the known filter set
         // is TRULY exhausted (all down) do we fall back to discovery — which is the point at which
         // the app should nudge the user toward their own-node option (the sovereignty upgrade)
-        // rather than shotgunning bloom-off nodes. Never wedges at 0 peers (fallback still runs).
+        // rather than shotgunning bloom-off nodes. The fallback dials only peers outside their
+        // penalty window (PEER-PENALTY-SHOTGUN), so with every candidate penalized the wallet waits
+        // at 0 peers until the earliest window lapses, and the next connect pass dials that peer.
         int cfOnly = (manager->syncMode == BR_SYNC_MODE_COMPACT_FILTERS_ONLY);
         int cfExhausted = 1;
         if (cfOnly) {
@@ -7983,6 +8017,9 @@ void BRPeerManagerConnect(BRPeerManager *manager)
         // aren't sorted to the back of a shotgun pass full of non-CF nodes (risk: modern nodes
         // ship bloom OFF by default, so a bloom-keyed prioritization here would starve the exact
         // peers CF-only needs).
+        // Penalized candidates are left out of the list as it is built (PEER-PENALTY-SHOTGUN, see
+        // _BRPeerManagerShotgunPenalized), before the 100-entry cap, so penalized peers can neither
+        // be redialed inside their window nor crowd dialable ones out of the list.
         if (cfExhausted) {
         array_new(peers, 100);
 
@@ -7999,6 +8036,7 @@ void BRPeerManagerConnect(BRPeerManager *manager)
                 if (manager->pinnedExclusive &&
                     ! BRPeerIsPinned(manager->pinnedAddr, manager->pinnedPort,
                                      manager->peers[k].address, manager->peers[k].port)) continue;
+                if (_BRPeerManagerShotgunPenalized(manager, &manager->peers[k], now)) continue;
                 if ((manager->peers[k].services & SERVICES_NODE_COMPACT_FILTERS) == SERVICES_NODE_COMPACT_FILTERS) {
                     array_add(peers, manager->peers[k]);
                     added++;
@@ -8009,6 +8047,7 @@ void BRPeerManagerConnect(BRPeerManager *manager)
                 if (manager->pinnedExclusive &&
                     ! BRPeerIsPinned(manager->pinnedAddr, manager->pinnedPort,
                                      manager->peers[k].address, manager->peers[k].port)) continue;
+                if (_BRPeerManagerShotgunPenalized(manager, &manager->peers[k], now)) continue;
                 if ((manager->peers[k].services & SERVICES_NODE_COMPACT_FILTERS) != SERVICES_NODE_COMPACT_FILTERS) {
                     array_add(peers, manager->peers[k]);
                     added++;

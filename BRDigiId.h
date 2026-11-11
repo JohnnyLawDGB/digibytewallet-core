@@ -13,7 +13,16 @@
 //      every step hardened, where h = SHA256(LE32(i) || uri) and A, B, C, D are h's first 16 bytes read
 //      as four little-endian uint32 (SLIP-0013, the derivation of BitID's BIP draft).
 //    - THE URI is hashed as the bytes given, with no normalisation. The Android app passes the
-//      callback URL DigiIdRequest keeps verbatim ("https://host/path", no query).
+//      callback URL DigiIdRequest keeps verbatim ("https://host/path", no query), and the bridge
+//      reads it with GetStringUTFChars, so the bytes Android hashes are what ART writes for the
+//      URL's UTF-16 code units (BRDigiIdUriBytesFromUtf16): UTF-8, with a surrogate pair as its
+//      four-byte character, except U+0000 as C0 80 and a surrogate without its partner as its own
+//      three bytes. (ART writes four-byte sequences although the JNI specification's modified UTF-8
+//      would write a pair as two three-byte halves. It has done so since Android 8.0, API 26, the
+//      app's minimum, and says it will not change: runtime/jni/jni_internal.cc, kUtfUse4ByteSequence.)
+//      For a URI with no U+0000 and no lone surrogate these are its standard UTF-8 bytes, and a Swift
+//      String never holds a lone surrogate; but a URI that may hold U+0000 must go through
+//      BRDigiIdUriBytesFromUtf16, or its site gets another identity than on Android.
 //    - THE SHARED IDENTITY is the key at m/0'/0/0 (BRBIP32PrivKey, chain 0, index 0): one address for
 //      every site, the identity DigiScope logs in with.
 //    - A MESSAGE is signed over SHA256(SHA256("\x19DigiByte Signed Message:\n" || prefix || message)),
@@ -29,20 +38,30 @@
 //    - REFUSED (BR_DIGIID_REFUSED, and no key, address or answer): no seed (the wallet is locked); no
 //      message; no URI where one is needed; an account index below zero; the shared identity's address
 //      asked for any index but 0. A NULL pointer is "no value": an empty URI or message is a non-NULL
-//      pointer with length 0.
+//      pointer with length 0. The bridge signs an empty message, so a caller with one passes a
+//      non-NULL pointer: Swift does not promise a non-nil baseAddress for an empty buffer (an
+//      UnsafeRawBufferPointer's may be nil), and nil here is REFUSED.
+//    - THE CALLER'S OWN REFUSAL: the bridge also refuses all three calls while there is no wallet
+//      (g_wallet NULL, read under WALLET_READ_GUARD). That check is not here; a caller makes it, and
+//      passes no seed when it fails.
+//    - THE NETWORK: an address, and so every answer, is the mainnet or testnet form as the
+//      process-wide BRNetworkIsTestnet() says when it is called (BRKeyAddress, BRDigiByteBech32Hrp),
+//      as in the bridge. The caller sets the network before it calls.
 //    - CAPACITY (BR_DIGIID_CAPACITY): a caller buffer is too small. `work` holds the bytes that are
 //      hashed (the header allocates nothing), `out` the answer with its NUL. The sizes are below.
 //    - A KEY THAT GIVES NO ADDRESS (BR_DIGIID_NO_ADDRESS) or NO SIGNATURE (BR_DIGIID_NOT_SIGNED) is
 //      refused as the bridge refuses it. Neither happens for a key BIP32 derived.
 //
 //  KEY MATERIAL: every BRKey these functions hold is wiped (BRKeyClean) before they return, on every
-//  path; BRDigiIdSignWithKey wipes the caller's key the same way, as the bridge's sign_with_key did.
+//  path; BRDigiIdSignWithKey and BRDigiIdAddressWithKey wipe the caller's key the same way, as the
+//  bridge's sign_with_key did, and BRDigiIdAddress hands its key to BRDigiIdAddressWithKey.
 //  Nothing here logs, and nothing reads a clock or a random source.
 //
-//  No allocation, no wallet, no network, no clock, no I/O. Header-only, static inline; its includes are
-//  libc, BRKey.h (BRKey, addresses, BRKeyCompactSign, BRKeyClean), BRBIP32Sequence.h (BRBIP32PrivKeyPath,
-//  BRBIP32PrivKey) and BRCrypto.h (BRSHA256, BRSHA256_2), so a program that calls it links BRKey.c,
-//  BRBIP32Sequence.c, BRCrypto.c and what they need. Nothing in the core calls it yet.
+//  No allocation, no wallet, no network I/O (but see THE NETWORK above), no clock, no I/O. Header-only,
+//  static inline; its includes are libc, BRKey.h (BRKey, addresses, BRKeyCompactSign, BRKeyClean),
+//  BRBIP32Sequence.h (BRBIP32PrivKeyPath, BRBIP32PrivKey) and BRCrypto.h (BRSHA256, BRSHA256_2), so a
+//  program that calls it links BRKey.c, BRBIP32Sequence.c, BRCrypto.c and what they need. Nothing in the
+//  core calls it yet.
 //
 //  Test seams (host KAT digiid_core_kat in the Android repo): DIGIID_UNFIXED, tested by VALUE as a set
 //  of bits; each comparison arm sets one bit and fails only its own cases. Unset or =0 is what ships.
@@ -60,6 +79,11 @@
 //    2048  DIGIID_RED_MODIFIED_UTF8       U+0000 is written C0 80 and a surrogate pair as two halves.
 //    4096  DIGIID_RED_SHARED_PATH         the shared identity is m/0'/1/0.
 //    8192  DIGIID_RED_BASE64_UNPADDED     the signature's base64 has no '=' padding.
+//    16384 DIGIID_RED_URI_SPEC_PAIRS      BRDigiIdUriBytesFromUtf16 writes a surrogate pair as two
+//                                         three-byte halves (the JNI specification's form, not ART's).
+//    32768 DIGIID_RED_URI_AS_MESSAGE      BRDigiIdUriBytesFromUtf16 writes U+0000 as one 00 byte and a
+//                                         lone surrogate as '?' (the message's rules).
+//    65536 DIGIID_RED_ADDRESS_KEY_KEPT    BRDigiIdAddressWithKey leaves the caller's key unwiped.
 //
 
 #ifndef BRDigiId_h
@@ -94,6 +118,9 @@ extern "C" {
 #define DIGIID_RED_MODIFIED_UTF8       2048
 #define DIGIID_RED_SHARED_PATH         4096
 #define DIGIID_RED_BASE64_UNPADDED     8192
+#define DIGIID_RED_URI_SPEC_PAIRS      16384
+#define DIGIID_RED_URI_AS_MESSAGE      32768
+#define DIGIID_RED_ADDRESS_KEY_KEPT    65536
 
 typedef enum {
     BR_DIGIID_OK = 0,
@@ -340,6 +367,76 @@ static inline BRDigiIdStatus BRDigiIdUtf8FromUtf16(uint8_t *out, size_t outCap, 
     return BR_DIGIID_OK;
 }
 
+// The bytes Android hashes for a URI of UTF-16 code units units[0, count) (THE URI, above: what ART's
+// GetStringUTFChars writes) into out[0, outCap): a unit 1..0x7F as one byte; U+0000 and 0x80..0x7FF as
+// two; a high surrogate followed by a low one as the pair's four-byte character; every other unit, a
+// lone surrogate included, as three. *outLen is the byte count on BR_DIGIID_OK and on CAPACITY (so a
+// caller can size `out`; nothing is written then); at most 3 * count. Refused: no outLen, no units. No
+// NUL is written, and none can occur in the bytes.
+static inline BRDigiIdStatus BRDigiIdUriBytesFromUtf16(uint8_t *out, size_t outCap, size_t *outLen, const uint16_t *units,
+                                                       size_t count)
+{
+    size_t i, len = 0, pass;
+
+    if (outLen) *outLen = 0;
+    if (! outLen || ! units) return BR_DIGIID_REFUSED;
+
+    for (pass = 0; pass < 2; pass++) {   // pass 0 counts, pass 1 writes
+        if (pass == 1 && (! out || outCap < len)) return BR_DIGIID_CAPACITY;
+        len = 0;
+
+        for (i = 0; i < count; i++) {
+            uint32_t c = units[i];
+            uint8_t b[4];
+            size_t n, k;
+
+#if (DIGIID_UNFIXED & DIGIID_RED_URI_AS_MESSAGE)
+            if (c < 0x80) {
+#else
+            if (c != 0 && c < 0x80) {
+#endif
+                b[0] = (uint8_t)c;
+                n = 1;
+            }
+            else if (c < 0x800) {
+                b[0] = (uint8_t)(0xC0 | (c >> 6));
+                b[1] = (uint8_t)(0x80 | (c & 0x3F));
+                n = 2;
+            }
+#if ! (DIGIID_UNFIXED & DIGIID_RED_URI_SPEC_PAIRS)
+            else if (c >= 0xD800 && c <= 0xDBFF && i + 1 < count && units[i + 1] >= 0xDC00 && units[i + 1] <= 0xDFFF) {
+                uint32_t cp = 0x10000 + ((c - 0xD800) << 10) + ((uint32_t)units[i + 1] - 0xDC00);
+
+                i++;
+                b[0] = (uint8_t)(0xF0 | (cp >> 18));
+                b[1] = (uint8_t)(0x80 | ((cp >> 12) & 0x3F));
+                b[2] = (uint8_t)(0x80 | ((cp >> 6) & 0x3F));
+                b[3] = (uint8_t)(0x80 | (cp & 0x3F));
+                n = 4;
+            }
+#endif
+#if (DIGIID_UNFIXED & DIGIID_RED_URI_AS_MESSAGE)
+            else if (c >= 0xD800 && c <= 0xDFFF) {
+                b[0] = '?';
+                n = 1;
+            }
+#endif
+            else {
+                b[0] = (uint8_t)(0xE0 | (c >> 12));
+                b[1] = (uint8_t)(0x80 | ((c >> 6) & 0x3F));
+                b[2] = (uint8_t)(0x80 | (c & 0x3F));
+                n = 3;
+            }
+
+            if (pass == 1) for (k = 0; k < n; k++) out[len + k] = b[k];
+            len += n;
+        }
+        *outLen = len;
+    }
+
+    return BR_DIGIID_OK;
+}
+
 // ---- signing --------------------------------------------------------------------------------------
 
 // Padded base64 of in[0, inLen) into out with a NUL; the characters written. `out` holds
@@ -366,6 +463,38 @@ static inline size_t _BRDigiIdBase64(char *out, const uint8_t *in, size_t inLen)
     }
     out[pos] = '\0';
     return pos;
+}
+
+// The P2PKH address of *key, an already-derived key marked compressed (the address identityAddress
+// gives), NUL-terminated into out[0, outCap). *key is WIPED before this returns, on every path. On
+// anything but BR_DIGIID_OK out[0] is NUL (when outCap > 0). Refused: no key, no out. NO_ADDRESS: the
+// key gives none. CAPACITY: out cannot hold the address (BR_DIGIID_ADDRESS_CAPACITY always suffices).
+static inline BRDigiIdStatus BRDigiIdAddressWithKey(char *out, size_t outCap, BRKey *key)
+{
+    char addr[BR_DIGIID_ADDRESS_CAPACITY];
+    size_t addrLen;
+
+    if (out && outCap > 0) out[0] = '\0';
+    if (! key) return BR_DIGIID_REFUSED;
+    if (! out) {
+        BRKeyClean(key);
+        return BR_DIGIID_REFUSED;
+    }
+
+#if ! (DIGIID_UNFIXED & DIGIID_RED_UNCOMPRESSED)
+    key->compressed = 1;
+#endif
+    memset(addr, 0, sizeof(addr));
+    BRKeyAddress(key, addr, sizeof(addr));
+#if ! (DIGIID_UNFIXED & DIGIID_RED_ADDRESS_KEY_KEPT)
+    BRKeyClean(key);
+#endif
+    if (addr[0] == '\0') return BR_DIGIID_NO_ADDRESS;
+
+    addrLen = strlen(addr);
+    if (outCap < addrLen + 1) return BR_DIGIID_CAPACITY;
+    memcpy(out, addr, addrLen + 1);
+    return BR_DIGIID_OK;
 }
 
 // Signs msg[0, msgLen) with *key, an already-derived key, and writes the answer "<address>|<base64
@@ -491,10 +620,8 @@ static inline BRDigiIdStatus BRDigiIdAddress(char *out, size_t outCap, const voi
                                              const char *uri, size_t uriLen, int32_t index, uint8_t *work,
                                              size_t workCap)
 {
-    char addr[BR_DIGIID_ADDRESS_CAPACITY];
     BRKey key;
     BRDigiIdStatus status;
-    size_t addrLen;
 
     if (out && outCap > 0) out[0] = '\0';
 #if (DIGIID_UNFIXED & DIGIID_RED_NEGATIVE_INDEX)
@@ -513,19 +640,7 @@ static inline BRDigiIdStatus BRDigiIdAddress(char *out, size_t outCap, const voi
         BRKeyClean(&key);
         return status;
     }
-
-#if ! (DIGIID_UNFIXED & DIGIID_RED_UNCOMPRESSED)
-    key.compressed = 1;
-#endif
-    memset(addr, 0, sizeof(addr));
-    BRKeyAddress(&key, addr, sizeof(addr));
-    BRKeyClean(&key);
-    if (addr[0] == '\0') return BR_DIGIID_NO_ADDRESS;
-
-    addrLen = strlen(addr);
-    if (outCap < addrLen + 1) return BR_DIGIID_CAPACITY;
-    memcpy(out, addr, addrLen + 1);
-    return BR_DIGIID_OK;
+    return BRDigiIdAddressWithKey(out, outCap, &key);   // wipes key
 }
 
 #ifdef __cplusplus

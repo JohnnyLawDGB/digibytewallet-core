@@ -6565,6 +6565,14 @@ static void _peerRelayedCFHeaders(void *info, uint8_t filterType, UInt256 stopHa
                     // chain's start is the re-anchor's business, not the park's.
                     uint32_t chainStart = BRCompactFilterChainStartHeight(manager->compactFilterChain);
                     if (parkAt > resume && resume >= chainStart) parkAt = resume;
+#ifndef CF_PARK_LAG_UNFIXED
+                    // A ledger lagging below the chain's start still must not be carried over
+                    // the in-chain heights [chainStart .. parkAt-1]: those CAN be verified, so
+                    // the cursor stops at the chain's start, the lowest verifiable height. The
+                    // heights below it are not written off here: a lone disagreer must not
+                    // condemn anything, and resolving a ledger below the chain is the re-anchor's.
+                    else if (parkAt > chainStart && resume < chainStart) parkAt = chainStart;
+#endif
                 }
 #endif
                 manager->autoFetchCFiltersStart   = parkAt;

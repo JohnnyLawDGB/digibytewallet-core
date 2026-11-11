@@ -2103,7 +2103,8 @@ static void _peerConnected(void *info)
         // Penalize so every dial pass skips this bloom-off node for PEER_PENALTY_SECONDS instead of
         // re-dialing it (mirrors the "node isn't synced" penalty): the filter-first pass and the
         // shotgun fallback both check the penalty set (PEER-PENALTY-SHOTGUN; the shotgun exempts
-        // only the pinned own-node and the fixed peer, see _BRPeerManagerShotgunPenalized).
+        // only the pinned own-node and the fixed peer, and stops honouring a filter peer's ban in
+        // its last PEER_REDIAL_COOLDOWN_SECONDS, see _BRPeerManagerShotgunPenalized).
         // Exempt the pinned own-node (see the "node isn't synced" branch above).
         if (! BRPeerIsPinned(manager->pinnedAddr, manager->pinnedPort, peer->address, peer->port))
             _penalize(manager, peer->address, peer->port, now);
@@ -7825,15 +7826,30 @@ static size_t _BRPeerManagerCountDialableFilterPeers(BRPeerManager *manager, tim
 }
 
 // PEER-PENALTY-SHOTGUN: may the shotgun fallback dial `p` now? The fallback honours the penalty
-// set exactly as the filter-first pass does: a candidate inside its penalty window is not dialed.
-// With every candidate penalized nothing is dialed, and the wallet waits for the earliest window
-// to lapse (the next connect pass, from the keepalive or a disconnect, dials it).
-// Two peers are exempt, because the wallet must never be starved of them:
+// set as the filter-first pass does, with one deliberate difference for filter peers:
+//   - a NON-filter candidate inside any penalty window (a 10-minute ban or a 30-second redial
+//     cooldown) is not dialed, exactly as in the filter-first pass;
+//   - a FILTER-capable candidate is left out only while a penalty runs past the redial cooldown,
+//     i.e. while it holds a ban for cause ("node isn't synced", "doesn't support SPV mode"). A
+//     filter peer that merely dropped (every disconnect, clean or not, gives a peer a
+//     PEER_REDIAL_COOLDOWN_SECONDS cooldown, see _peerDisconnected) stays dialable here.
+// Why the difference: the shotgun runs only once the known filter set is exhausted, and the
+// filter-first pass counts a cooling-down filter peer as not dialable. After a mass disconnect (a
+// network handoff, a Doze resume) every canon filter peer (the hardcoded priority set and the
+// seeder's filter peers) is cooling down at once. Honouring those cooldowns here would leave every
+// canon peer out and fill the slots from the non-filter pool, the junk pool the wallet must not
+// roam. Redialing them at once, ahead of non-filter peers, is what the shotgun always did. The
+// cost: a ban in its last PEER_REDIAL_COOLDOWN_SECONDS no longer keeps a filter peer out of the
+// shotgun (the ring stores a deadline, not the penalty's kind); a still-behind peer is rejected
+// and banned again at the handshake.
+// Two peers are exempt from every penalty, because the wallet must never be starved of them:
 //   - the pinned own-node: the reserved slot dials it with no penalty check, and the shotgun keeps
-//     that rule (it is never _penalize'd, but every disconnect gives it a redial cooldown);
+//     that rule (it is never _penalize'd while pinned, but a ban it took before it was pinned can
+//     still be in the set, and every disconnect gives it a redial cooldown). The reserved slot runs
+//     first and normally dials it; this is the second line behind it;
 //   - the fixed peer (BRPeerManagerSetFixedPeer, the rescan's pinned priority peer): it is the
-//     whole candidate set while set, and a disconnect gives it a redial cooldown, so honouring that
-//     here would leave a rescan with nothing to dial. The shotgun has always redialed it.
+//     whole candidate set while set, so honouring a ban on it here would leave a rescan with
+//     nothing to dial. The shotgun has always redialed it.
 // Caller holds manager->lock.
 static int _BRPeerManagerShotgunPenalized(BRPeerManager *manager, const BRPeer *p, time_t now)
 {
@@ -7843,14 +7859,24 @@ static int _BRPeerManagerShotgunPenalized(BRPeerManager *manager, const BRPeer *
     (void)manager; (void)p; (void)now;
     return 0;
 #else
+#ifndef PEER_PENALTY_SHOTGUN_NO_PINNED_EXEMPT  // comparison arm only (peer_penalty_shotgun_kat)
     if (BRPeerIsPinned(manager->pinnedAddr, manager->pinnedPort, p->address, p->port)) return 0;
+#endif
 #ifndef PEER_PENALTY_SHOTGUN_NO_FIXED_EXEMPT   // comparison arm only (peer_penalty_shotgun_kat)
     if (! UInt128IsZero(manager->fixedPeer.address) &&
         UInt128Eq(manager->fixedPeer.address, p->address) && manager->fixedPeer.port == p->port) return 0;
 #endif
+    time_t at = now;
+#ifdef PEER_PENALTY_SHOTGUN_STALE_CLOCK        // comparison arm only: windows read against time 0
+    at = 0;
+#endif
+#ifndef PEER_PENALTY_SHOTGUN_HONOUR_COOLDOWN    // comparison arm only: filter peers' cooldowns honoured
+    if ((p->services & SERVICES_NODE_COMPACT_FILTERS) == SERVICES_NODE_COMPACT_FILTERS)
+        at += PEER_REDIAL_COOLDOWN_SECONDS;     // in the set iff the penalty outlasts a cooldown
+#endif
     return BRPeerPenaltyContains(manager->penaltyAddr, manager->penaltyPort, manager->penaltyUntil,
                                  manager->penaltyCount < PEER_PENALTY_MAX ? manager->penaltyCount : PEER_PENALTY_MAX,
-                                 p->address, p->port, now);
+                                 p->address, p->port, at);
 #endif
 }
 
@@ -7901,9 +7927,14 @@ void BRPeerManagerConnect(BRPeerManager *manager)
         // those known peers up, so this rarely trips to exhaustion. Only when the known filter set
         // is TRULY exhausted (all down) do we fall back to discovery — which is the point at which
         // the app should nudge the user toward their own-node option (the sovereignty upgrade)
-        // rather than shotgunning bloom-off nodes. The fallback dials only peers outside their
-        // penalty window (PEER-PENALTY-SHOTGUN), so with every candidate penalized the wallet waits
-        // at 0 peers until the earliest window lapses, and the next connect pass dials that peer.
+        // rather than shotgunning bloom-off nodes. The fallback leaves penalized candidates out
+        // (PEER-PENALTY-SHOTGUN, see _BRPeerManagerShotgunPenalized): non-filter peers inside any
+        // window, filter peers only while banned for cause, so filter peers that merely dropped
+        // are redialed ahead of the non-filter pool. If un-penalized non-filter peers remain once
+        // the filter candidates are used up, they are dialed. If no candidate is left, nothing is
+        // dialed this pass: the tail below reports syncStopped(ENETUNREACH) (which clears the
+        // bridge's rescan latch and resets syncStartHeight), and the next pass (the keepalive's
+        // reconnect or the Kotlin 0-peer recreate) retries.
         int cfOnly = (manager->syncMode == BR_SYNC_MODE_COMPACT_FILTERS_ONLY);
         int cfExhausted = 1;
         if (cfOnly) {
@@ -7923,7 +7954,13 @@ void BRPeerManagerConnect(BRPeerManager *manager)
         // array_add's it to connectedPeers, so the count checks below see it filled.
         // No penalty check: the pinned node is the never-churn reserved slot (it is
         // also exempt from _penalize, see _peerConnected).
+        // PEER_PENALTY_SHOTGUN_NO_RESERVED_SLOT: comparison arm only (peer_penalty_shotgun_kat), so
+        // the KAT can show the shotgun's own pinned exemption is the second line it claims to be.
+#ifndef PEER_PENALTY_SHOTGUN_NO_RESERVED_SLOT
         if (manager->pinnedPort != 0 &&
+#else
+        if (0 &&
+#endif
             array_count(manager->connectedPeers) < manager->maxConnectCount) {
             int already = 0;
             for (size_t i = 0; i < array_count(manager->connectedPeers); i++) {
@@ -8019,7 +8056,8 @@ void BRPeerManagerConnect(BRPeerManager *manager)
         // peers CF-only needs).
         // Penalized candidates are left out of the list as it is built (PEER-PENALTY-SHOTGUN, see
         // _BRPeerManagerShotgunPenalized), before the 100-entry cap, so penalized peers can neither
-        // be redialed inside their window nor crowd dialable ones out of the list.
+        // be redialed inside their window nor crowd dialable ones out of the list. A filter peer
+        // under only a redial cooldown is not penalized for this list.
         if (cfExhausted) {
         array_new(peers, 100);
 

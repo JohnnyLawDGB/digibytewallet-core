@@ -1143,6 +1143,20 @@ size_t BRWalletDigiDollarUTXOs(BRWallet *wallet, BRUTXO *utxos, size_t utxosCoun
     return utxosCount;
 }
 
+// ASSET-SIGN-GATE: a copy, taken under the wallet's lock, of the outputs the wallet holds out of the
+// plain coins as DigiAsset holdings (assetUtxos). Not pruned of spends: pair each with
+// BRWalletOutpointAssetState, which answers spent, conflicted and other-family. Returns the number
+// written, or the total when utxos is NULL.
+size_t BRWalletAssetUTXOs(BRWallet *wallet, BRUTXO *utxos, size_t utxosCount)
+{
+    assert(wallet != NULL);
+    pthread_mutex_lock(&wallet->lock);
+    if (! utxos || array_count(wallet->assetUtxos) < utxosCount) utxosCount = array_count(wallet->assetUtxos);
+    for (size_t i = 0; utxos && i < utxosCount; i++) utxos[i] = wallet->assetUtxos[i];
+    pthread_mutex_unlock(&wallet->lock);
+    return utxosCount;
+}
+
 // true if the outpoint (txHash, n) is in the spentOutputs set. spentOutputs is
 // cleared and rebuilt on every _BRWalletUpdateBalance from every registered
 // tx's inputs (see BRSetAdd(wallet->spentOutputs, &tx->inputs[j])), so it is
@@ -1796,6 +1810,34 @@ size_t BRWalletSelectableUTXOs(BRWallet *wallet, BRUTXO *utxos, size_t utxosCoun
 
     pthread_mutex_unlock(&wallet->lock);
     return w;
+}
+
+// SEND-GATE-SET: 1 when the outpoint (txHash, n) is one of the coins BRWalletSelectableUTXOs lists -- the same
+// predicate, any of its three passes -- asked of that one outpoint, with its own SELECT_WALK_BUDGET. A gate
+// checking a few inputs asks this instead of enumerating the whole set: the enumeration spends one budget
+// on every unconfirmed coin it meets, so it can run out before it reaches a coin that selection, which
+// stops once covered, already took.
+int BRWalletOutpointSelectable(BRWallet *wallet, UInt256 txHash, uint32_t n)
+{
+    int r = 0, budget = SELECT_WALK_BUDGET;
+
+    assert(wallet != NULL);
+    pthread_mutex_lock(&wallet->lock);
+
+    for (size_t i = 0; i < array_count(wallet->utxos); i++) {
+        BRUTXO *o = &wallet->utxos[i];
+        BRTransaction *tx;
+
+        if (o->n != n || ! UInt256Eq(o->hash, txHash)) continue;
+        tx = BRSetGet(wallet->allTx, o);
+        r = tx && o->n < tx->outCount && ! BRWalletUtxoIsAsset(wallet, o) &&
+            ! _BRTxOutputOneFamilyHeld(tx, o->n) && _BRWalletOutputSignable(&tx->outputs[o->n]) &&
+            _BRWalletUtxoSelectableAny(wallet, tx, &budget);
+        break;
+    }
+
+    pthread_mutex_unlock(&wallet->lock);
+    return r;
 }
 
 // BRWalletMinOutputAmount at a given rate.
@@ -2536,12 +2578,18 @@ static void _BRWalletForgetForeignTx(BRWallet *wallet, const BRTransaction *tx)
 // (_BRWalletInputsSigned), or it is refused until a block delivers it. A peer can relay any unconfirmed
 // tx and nothing else checks it, so without this a tx with a junk scriptSig would mark the wallet's coin
 // spent and stand in for it as unconfirmed change. A refused tx -- this, or out of the money range -- is
-// not kept at all: the caller still owns it.
+// not kept at all.
 // checkInputs: 0 trusted (accepted as of now, rechecked if its wallet-owned inputs change or a reorg
 // unconfirms it), 1 checked while unconfirmed, 2 checked at any height.
-static int _BRWalletRegisterTx(BRWallet *wallet, BRTransaction *tx, int checkInputs)
+// The return value is the legacy answer (see BRWallet.h) and does not say who owns tx; *outcome does
+// (REGISTER-RESULT). It is read from the wallet's sets before the lock is released, so it says what the
+// wallet holds as of this registration, never what a later lookup happens to find: the wallet owns tx
+// exactly when tx itself -- not another record of its hash -- is in allTx.
+static int _BRWalletRegisterTx(BRWallet *wallet, BRTransaction *tx, int checkInputs, BRWalletRegisterOutcome *outcome)
 {
     int wasAdded = 0, r = 1;
+    BRTransaction *const passed = tx;   // the caller's object (tx may be re-pointed at the wallet's record)
+    BRWalletRegisterOutcome held = BR_WALLET_REGISTER_REFUSED;
     
     assert(wallet != NULL);
     assert(tx != NULL && BRTransactionIsSigned(tx));
@@ -2608,10 +2656,26 @@ static int _BRWalletRegisterTx(BRWallet *wallet, BRTransaction *tx, int checkInp
             }
         }
 #endif
+
+#ifndef REGISTER_RESULT_UNFIXED
+        {
+            BRTransaction *rec = BRSetGet(wallet->allTx, passed);
+
+            if (rec == passed) held = (BRSetGet(wallet->foreignTx, passed) == passed) ? BR_WALLET_REGISTER_KEPT_FOREIGN
+                                                                                      : BR_WALLET_REGISTER_KEPT;
+            else if (rec) held = BR_WALLET_REGISTER_DUPLICATE;
+        }
+#else
+        // Comparison arm only (register_result_kat); never defined in a production build. The earlier
+        // shape: the only answer was the return value, so a caller read "held" from it.
+        held = r ? BR_WALLET_REGISTER_KEPT : BR_WALLET_REGISTER_REFUSED;
+#endif
     
         pthread_mutex_unlock(&wallet->lock);
     }
     else r = 0;
+
+    if (outcome) *outcome = held;
 
     if (wasAdded) {
         // when a wallet address is used in a transaction, generate a new address to replace it
@@ -2647,19 +2711,29 @@ static int _BRWalletRegisterTx(BRWallet *wallet, BRTransaction *tx, int checkInp
     return r;
 }
 
+int BRWalletRegisterTransactionOutcome(BRWallet *wallet, BRTransaction *tx, BRWalletRegisterCheck check,
+                                       BRWalletRegisterOutcome *outcome)
+{
+    int checkInputs = (check == BR_WALLET_REGISTER_TRUSTED) ? 0 : (check == BR_WALLET_REGISTER_UNPROVEN) ? 2 : 1;
+
+    assert(outcome != NULL);   // the outcome is the only answer that says who owns tx (REGISTER-RESULT)
+
+    return _BRWalletRegisterTx(wallet, tx, checkInputs, outcome);
+}
+
 int BRWalletRegisterTransaction(BRWallet *wallet, BRTransaction *tx)
 {
-    return _BRWalletRegisterTx(wallet, tx, 1);
+    return _BRWalletRegisterTx(wallet, tx, 1, NULL);
 }
 
 int BRWalletRegisterTransactionTrusted(BRWallet *wallet, BRTransaction *tx)
 {
-    return _BRWalletRegisterTx(wallet, tx, 0);
+    return _BRWalletRegisterTx(wallet, tx, 0, NULL);
 }
 
 int BRWalletRegisterTransactionUnproven(BRWallet *wallet, BRTransaction *tx)
 {
-    return _BRWalletRegisterTx(wallet, tx, 2);
+    return _BRWalletRegisterTx(wallet, tx, 2, NULL);
 }
 
 static void _BRWalletUpdateTransactions(BRWallet *wallet, const UInt256 txHashes[], size_t txCount,

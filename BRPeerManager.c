@@ -1120,13 +1120,16 @@ static void _BRPeerManagerPurgeReleasedRecords(BRPeerManager *manager, const int
 // Caller holds manager->lock. Registering a listed object into the wallet makes the wallet that
 // object's owner, so the listed entry follows the object to owned = 0: the wallet is its one
 // owner and releases it, and the publish list never does. Ownership following the object keeps
-// every object released exactly once. A no-op when the wallet's record for txHash is a separate
-// object (the list keeps ownership of its own), or when no entry points at the wallet's record.
-static void _BRPeerManagerOwnershipFollowsObject(BRPeerManager *manager, UInt256 txHash)
+// every object released exactly once. A no-op when the wallet did not take tx -- it refused it, or
+// its record of the hash is a separate object (the list keeps ownership of its own) -- or when no
+// entry points at tx. Whether the wallet took tx is the registration's own answer, `held`
+// (REGISTER-RESULT), read under the wallet's lock, not a lookup made after it.
+static void _BRPeerManagerOwnershipFollowsObject(BRPeerManager *manager, const BRTransaction *tx,
+                                                 BRWalletRegisterOutcome held)
 {
-    BRTransaction *rec = BRWalletTransactionForHash(manager->wallet, txHash);
-    for (size_t i = array_count(manager->publishedTx); rec && i > 0; i--) {
-        if (manager->publishedTx[i - 1].tx == rec) manager->publishedTx[i - 1].owned = 0;
+    if (! tx || ! BRWalletRegisterOutcomeHeld(held)) return;
+    for (size_t i = array_count(manager->publishedTx); i > 0; i--) {
+        if (manager->publishedTx[i - 1].tx == tx) manager->publishedTx[i - 1].owned = 0;
     }
 }
 
@@ -2142,8 +2145,11 @@ static void _peerConnected(void *info)
         // COMPACT_FILTERS_ONLY. Gossip retention (BRPeerManager.c:1086-1096) is left
         // testnet-only here; its mainnet generalization ships with oracle-bootstrap.
         peer_log(peer, "node doesn't support SPV mode");
-        // Penalize so the CF-first dial loop AND the shotgun fallback skip this bloom-off node for
-        // PEER_PENALTY_SECONDS instead of re-dialing it (mirrors the "node isn't synced" penalty).
+        // Penalize so every dial pass skips this bloom-off node for PEER_PENALTY_SECONDS instead of
+        // re-dialing it (mirrors the "node isn't synced" penalty): the filter-first pass and the
+        // shotgun fallback both check the penalty set (PEER-PENALTY-SHOTGUN; the shotgun exempts
+        // only the pinned own-node and the fixed peer, and stops honouring a filter peer's ban in
+        // its last PEER_REDIAL_COOLDOWN_SECONDS, see _BRPeerManagerShotgunPenalized).
         // Exempt the pinned own-node (see the "node isn't synced" branch above).
         if (! BRPeerIsPinned(manager->pinnedAddr, manager->pinnedPort, peer->address, peer->port))
             _penalize(manager, peer->address, peer->port, now);
@@ -2733,8 +2739,9 @@ static void _peerRelayedTx(void *info, BRTransaction *tx)
         int trusted = BRPeerIsDeliveringBlockTxs(peer) && BRWalletContainsTransaction(manager->wallet, tx) &&
                       _BRPeerManagerDeliveryIsTrustedLocked(manager, BRPeerDeliveringBlockHash(peer));
 #endif
-        isWalletTx = trusted ? BRWalletRegisterTransactionTrusted(manager->wallet, tx)
-                             : BRWalletRegisterTransaction(manager->wallet, tx);
+        BRWalletRegisterOutcome held = BR_WALLET_REGISTER_REFUSED;
+        isWalletTx = BRWalletRegisterTransactionOutcome(manager->wallet, tx, trusted ? BR_WALLET_REGISTER_TRUSTED
+                                                                                     : BR_WALLET_REGISTER_CHECKED, &held);
 #ifdef PUBLISH_RELAY_OBJECT_UNFIXED
         // Comparison arm only: the shape that left the parsed object unreleased whenever the
         // wallet already held a record of its hash.
@@ -2744,10 +2751,13 @@ static void _peerRelayedTx(void *info, BRTransaction *tx)
         // held no record of the hash; when the wallet's record is a different object (it already
         // held the hash — a peer echoing one of this wallet's own sends, or a block delivering
         // it), the parsed object has no owner left and is released here. Nothing else holds it:
-        // the relay and request lists hold hashes.
-        BRTransaction *rec = BRWalletTransactionForHash(manager->wallet, tx->txHash);
-        if (rec != tx) { BRTransactionFree(tx); tx = NULL; }
-        if (isWalletTx) tx = rec;
+        // the relay and request lists hold hashes. Whether the wallet took it is the registration's
+        // own answer (REGISTER-RESULT), not a later lookup: a lookup after the wallet's lock is
+        // released can miss an object the wallet took and has since released (a double release) or
+        // find one it never took.
+        UInt256 txHash = tx->txHash;
+        if (! BRWalletRegisterOutcomeHeld(held)) { BRTransactionFree(tx); tx = NULL; }
+        if (isWalletTx) tx = BRWalletTransactionForHash(manager->wallet, txHash);
 #endif
     }
     else {
@@ -2847,11 +2857,15 @@ static void _peerHasTx(void *info, UInt256 txHash)
 
     if (tx) {
         // tx is the wallet's own record or a tx this wallet published (signed itself)
-        isWalletTx = BRWalletRegisterTransactionTrusted(manager->wallet, tx);
+        BRTransaction *registered = tx;
+        BRWalletRegisterOutcome held = BR_WALLET_REGISTER_REFUSED;
+        isWalletTx = BRWalletRegisterTransactionOutcome(manager->wallet, tx, BR_WALLET_REGISTER_TRUSTED, &held);
         if (isWalletTx) tx = BRWalletTransactionForHash(manager->wallet, tx->txHash);
         // If the wallet took a listed object here, the entry follows it to the wallet's ownership.
 #ifndef PUBLISH_OWNED_FOLLOWS_UNFIXED
-        _BRPeerManagerOwnershipFollowsObject(manager, txHash);
+        _BRPeerManagerOwnershipFollowsObject(manager, registered, held);
+#else
+        (void)registered;
 #endif
 
         // reschedule sync timeout
@@ -5056,10 +5070,11 @@ static BRTransaction *_peerRequestedTx(void *info, UInt256 txHash)
         // The stem peer taking a stem is not the network relaying it back: counting it would tell
         // the wallet's embargo the stem propagated when the stem peer may yet drop it.
         if (! _BRPeerManagerIsStemming(manager, txHash)) _BRTxPeerListAddPeer(&manager->txRelays, txHash, peer);
-        BRWalletRegisterTransactionTrusted(manager->wallet, tx);   // a tx this wallet published (signed itself)
+        BRWalletRegisterOutcome held = BR_WALLET_REGISTER_REFUSED;
+        BRWalletRegisterTransactionOutcome(manager->wallet, tx, BR_WALLET_REGISTER_TRUSTED, &held);   // a tx this wallet published (signed itself)
         // If the wallet took the listed object here, the entry follows it to the wallet's ownership.
 #ifndef PUBLISH_OWNED_FOLLOWS_UNFIXED
-        _BRPeerManagerOwnershipFollowsObject(manager, txHash);
+        _BRPeerManagerOwnershipFollowsObject(manager, tx, held);
 #endif
     }
 
@@ -7886,6 +7901,61 @@ static size_t _BRPeerManagerCountDialableFilterPeers(BRPeerManager *manager, tim
     return n;
 }
 
+// PEER-PENALTY-SHOTGUN: may the shotgun fallback dial `p` now? The fallback honours the penalty
+// set as the filter-first pass does, with one deliberate difference for filter peers:
+//   - a NON-filter candidate inside any penalty window (a 10-minute ban or a 30-second redial
+//     cooldown) is not dialed, exactly as in the filter-first pass;
+//   - a FILTER-capable candidate is left out only while a penalty runs past the redial cooldown,
+//     i.e. while it holds a ban for cause ("node isn't synced", "doesn't support SPV mode"). A
+//     filter peer that merely dropped (every disconnect, clean or not, gives a peer a
+//     PEER_REDIAL_COOLDOWN_SECONDS cooldown, see _peerDisconnected) stays dialable here.
+// Why the difference: the shotgun runs only once the known filter set is exhausted, and the
+// filter-first pass counts a cooling-down filter peer as not dialable. After a mass disconnect (a
+// network handoff, a Doze resume) every canon filter peer (the hardcoded priority set and the
+// seeder's filter peers) is cooling down at once. Honouring those cooldowns here would leave every
+// canon peer out and fill the slots from the non-filter pool, the junk pool the wallet must not
+// roam. Redialing them at once, ahead of non-filter peers, is what the shotgun always did. The
+// cost: a ban in its last PEER_REDIAL_COOLDOWN_SECONDS no longer keeps a filter peer out of the
+// shotgun (the ring stores a deadline, not the penalty's kind); a still-behind peer is rejected
+// and banned again at the handshake.
+// Two peers are exempt from every penalty, because the wallet must never be starved of them:
+//   - the pinned own-node: the reserved slot dials it with no penalty check, and the shotgun keeps
+//     that rule (it is never _penalize'd while pinned, but a ban it took before it was pinned can
+//     still be in the set, and every disconnect gives it a redial cooldown). The reserved slot runs
+//     first and normally dials it; this is the second line behind it;
+//   - the fixed peer (BRPeerManagerSetFixedPeer, the rescan's pinned priority peer): it is the
+//     whole candidate set while set, so honouring a ban on it here would leave a rescan with
+//     nothing to dial. The shotgun has always redialed it.
+// Caller holds manager->lock.
+static int _BRPeerManagerShotgunPenalized(BRPeerManager *manager, const BRPeer *p, time_t now)
+{
+#ifdef PEER_PENALTY_SHOTGUN_UNFIXED
+    // Comparison arm only (peer_penalty_shotgun_kat); never defined in a production build. The
+    // earlier shape: the shotgun never read the penalty set.
+    (void)manager; (void)p; (void)now;
+    return 0;
+#else
+#ifndef PEER_PENALTY_SHOTGUN_NO_PINNED_EXEMPT  // comparison arm only (peer_penalty_shotgun_kat)
+    if (BRPeerIsPinned(manager->pinnedAddr, manager->pinnedPort, p->address, p->port)) return 0;
+#endif
+#ifndef PEER_PENALTY_SHOTGUN_NO_FIXED_EXEMPT   // comparison arm only (peer_penalty_shotgun_kat)
+    if (! UInt128IsZero(manager->fixedPeer.address) &&
+        UInt128Eq(manager->fixedPeer.address, p->address) && manager->fixedPeer.port == p->port) return 0;
+#endif
+    time_t at = now;
+#ifdef PEER_PENALTY_SHOTGUN_STALE_CLOCK        // comparison arm only: windows read against time 0
+    at = 0;
+#endif
+#ifndef PEER_PENALTY_SHOTGUN_HONOUR_COOLDOWN    // comparison arm only: filter peers' cooldowns honoured
+    if ((p->services & SERVICES_NODE_COMPACT_FILTERS) == SERVICES_NODE_COMPACT_FILTERS)
+        at += PEER_REDIAL_COOLDOWN_SECONDS;     // in the set iff the penalty outlasts a cooldown
+#endif
+    return BRPeerPenaltyContains(manager->penaltyAddr, manager->penaltyPort, manager->penaltyUntil,
+                                 manager->penaltyCount < PEER_PENALTY_MAX ? manager->penaltyCount : PEER_PENALTY_MAX,
+                                 p->address, p->port, at);
+#endif
+}
+
 // Count connected filter peers whose socket is still LIVE (excludes dead-socket zombies). Combined
 // with the dialable count this answers "do we have any real filter peer to work with" — so the
 // wallet only falls back to the discovery/own-node path when the known filter set is truly
@@ -7933,7 +8003,14 @@ void BRPeerManagerConnect(BRPeerManager *manager)
         // those known peers up, so this rarely trips to exhaustion. Only when the known filter set
         // is TRULY exhausted (all down) do we fall back to discovery — which is the point at which
         // the app should nudge the user toward their own-node option (the sovereignty upgrade)
-        // rather than shotgunning bloom-off nodes. Never wedges at 0 peers (fallback still runs).
+        // rather than shotgunning bloom-off nodes. The fallback leaves penalized candidates out
+        // (PEER-PENALTY-SHOTGUN, see _BRPeerManagerShotgunPenalized): non-filter peers inside any
+        // window, filter peers only while banned for cause, so filter peers that merely dropped
+        // are redialed ahead of the non-filter pool. If un-penalized non-filter peers remain once
+        // the filter candidates are used up, they are dialed. If no candidate is left, nothing is
+        // dialed this pass: the tail below reports syncStopped(ENETUNREACH) (which clears the
+        // bridge's rescan latch and resets syncStartHeight), and the next pass (the keepalive's
+        // reconnect or the Kotlin 0-peer recreate) retries.
         int cfOnly = (manager->syncMode == BR_SYNC_MODE_COMPACT_FILTERS_ONLY);
         int cfExhausted = 1;
         if (cfOnly) {
@@ -7953,7 +8030,13 @@ void BRPeerManagerConnect(BRPeerManager *manager)
         // array_add's it to connectedPeers, so the count checks below see it filled.
         // No penalty check: the pinned node is the never-churn reserved slot (it is
         // also exempt from _penalize, see _peerConnected).
+        // PEER_PENALTY_SHOTGUN_NO_RESERVED_SLOT: comparison arm only (peer_penalty_shotgun_kat), so
+        // the KAT can show the shotgun's own pinned exemption is the second line it claims to be.
+#ifndef PEER_PENALTY_SHOTGUN_NO_RESERVED_SLOT
         if (manager->pinnedPort != 0 &&
+#else
+        if (0 &&
+#endif
             array_count(manager->connectedPeers) < manager->maxConnectCount) {
             int already = 0;
             for (size_t i = 0; i < array_count(manager->connectedPeers); i++) {
@@ -8047,6 +8130,10 @@ void BRPeerManagerConnect(BRPeerManager *manager)
         // aren't sorted to the back of a shotgun pass full of non-CF nodes (risk: modern nodes
         // ship bloom OFF by default, so a bloom-keyed prioritization here would starve the exact
         // peers CF-only needs).
+        // Penalized candidates are left out of the list as it is built (PEER-PENALTY-SHOTGUN, see
+        // _BRPeerManagerShotgunPenalized), before the 100-entry cap, so penalized peers can neither
+        // be redialed inside their window nor crowd dialable ones out of the list. A filter peer
+        // under only a redial cooldown is not penalized for this list.
         if (cfExhausted) {
         array_new(peers, 100);
 
@@ -8063,6 +8150,7 @@ void BRPeerManagerConnect(BRPeerManager *manager)
                 if (manager->pinnedExclusive &&
                     ! BRPeerIsPinned(manager->pinnedAddr, manager->pinnedPort,
                                      manager->peers[k].address, manager->peers[k].port)) continue;
+                if (_BRPeerManagerShotgunPenalized(manager, &manager->peers[k], now)) continue;
                 if ((manager->peers[k].services & SERVICES_NODE_COMPACT_FILTERS) == SERVICES_NODE_COMPACT_FILTERS) {
                     array_add(peers, manager->peers[k]);
                     added++;
@@ -8073,6 +8161,7 @@ void BRPeerManagerConnect(BRPeerManager *manager)
                 if (manager->pinnedExclusive &&
                     ! BRPeerIsPinned(manager->pinnedAddr, manager->pinnedPort,
                                      manager->peers[k].address, manager->peers[k].port)) continue;
+                if (_BRPeerManagerShotgunPenalized(manager, &manager->peers[k], now)) continue;
                 if ((manager->peers[k].services & SERVICES_NODE_COMPACT_FILTERS) != SERVICES_NODE_COMPACT_FILTERS) {
                     array_add(peers, manager->peers[k]);
                     added++;

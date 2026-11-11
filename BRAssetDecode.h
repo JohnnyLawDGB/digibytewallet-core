@@ -52,6 +52,7 @@
 //      version 3; an issuance's amount is the header's; every instruction reads, the reading ends
 //      exactly on the issuance's flags (or on the last bit), and the instructions are the given list
 //      field for field. Anything else is 0, and the platform then decides nothing from the list.
+//      It is asked with a BR_ASSET_SCRIPT_ASSET header decoded from the same script (its CONTRACT).
 //    - THE METADATA CID (BRAssetMetadataCid): CIDv1 of the raw codec over the header's SHA256: the
 //      bytes 01 55 12 20 and the 32 hash bytes, RFC 4648 base32 in lower case without padding, after
 //      the letter 'b' (59 characters). A header without a hash, or with a hash of 32 zero bytes, has
@@ -520,9 +521,15 @@ static inline BRAssetScriptKind BRAssetDecodeInstructions(const uint8_t *script,
 
 // ---- the strict re-read (Android: AssetPayloadCheck.readsExactly) --------------------------------
 
-// Was `script` read EXACTLY as `header` and insts[0, instCount) say (see THE RULES)? 1 or 0. The
-// header is taken as given: its version, opcode, operation and quantity are compared with the
-// script's, so a header that is not this script's is answered 0 by the comparison.
+// Was `script` read EXACTLY as `header` and insts[0, instCount) say (see THE RULES)? 1 or 0.
+//
+// THE CONTRACT: the answer means something only for a header whose kind is BR_ASSET_SCRIPT_ASSET and
+// that was decoded from this same script, with the list decoded beside it. Check the kind, then ask.
+// The header is taken as given. Its version and opcode are compared with the script's, its operation
+// says whether an amount and a flags byte are read (and whether output 31 destroys), and an
+// issuance's quantity is compared with the amount read; its kind is not read, nor any other field.
+// For a header of another kind (the zeroed header of a script the decoder did not classify) or of
+// another script, the function still returns 1 or 0, and that value says nothing about the script.
 static inline int BRAssetPayloadReadsExactly(const uint8_t *script, size_t scriptLen, const BRAssetHeader *header,
                                              const BRAssetTransferInstruction *insts, size_t instCount)
 {

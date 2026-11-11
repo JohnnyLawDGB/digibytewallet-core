@@ -515,10 +515,17 @@ struct BRPeerManagerStruct {
     // that could move it: the `blocks` set identity + cardinality, and lastBlock's
     // identity + height. Every mutator of manager->blocks either adds or removes
     // (so cardinality moves) and every prune (_BRPeerManagerClearMemory) runs only
-    // from the _peerRelayedBlock branch that has just moved lastBlock, so a stale
-    // hit is not reachable — and _BRPeerManagerClearMemory additionally
-    // invalidates explicitly. floorMemoValid == 0 on a calloc'd manager, so the
-    // first read always walks. Guarded by manager->lock like the rest of these.
+    // from the _peerRelayedBlock branch that has just moved lastBlock, and
+    // _BRPeerManagerClearMemory additionally invalidates explicitly. The key does NOT
+    // see a same-hash REPLACE: swapping a checkpoint stub (prevBlock 0) for its real
+    // header keeps the count, the set and the tip, yet connects the chain downward
+    // and lowers the floor (CF-LEDGER-GAPS). So both replace sites -- the "we already
+    // have the block" branch of _peerRelayedBlockOnce and
+    // _BRPeerManagerInstallSavedBlock -- drop the memo on every replace, not only when
+    // the displaced block was the tip. Rule: a memo derived from the block chain is
+    // invalidated whenever a block it was derived from is replaced. floorMemoValid == 0
+    // on a calloc'd manager, so the first read always walks. Guarded by manager->lock
+    // like the rest of these.
     // Lock-hold profiler state (see MGR_LOCK/MGR_UNLOCK). manager->lock is initialized with NULL
     // attributes, i.e. NON-RECURSIVE, so exactly one holder exists at a time and a single
     // timestamp cannot be clobbered by nesting.
@@ -3046,6 +3053,30 @@ static void _BRPeerManagerSurfaceUnscannableLocked(BRPeerManager *manager, uint3
 #endif
 }
 
+// Re-initialise the scan ledger at `start` WITHOUT losing a surfaced band (CF-LEDGER-GAPS b).
+//
+// BRCFScanLedgerInit memsets the ledger, abandonedBelow included. Several sites surface a band
+// and re-Init the ledger in the same locked section (KeepAlive C1 then the cfheaders floor snap,
+// the corroborated rebuild, a floor re-anchor after an earlier surfacing). The app polls
+// abandonedBelow under this same lock, so a band zeroed before the unlock was never seen: no
+// record, no banner, and the skipped heights read as scanned. Rule: a recorded band survives any
+// re-Init until a rescan clears it. A re-Init AT or ABOVE the band keeps it as the watermark
+// (abandonedBelow <= start, the state the reorg rebuild already carries). A re-Init BELOW it
+// makes those heights requestable again, which is the rescan, so nothing is carried.
+//
+// Every mid-session re-Init in this file goes through here. Caller must hold manager->lock.
+static void _BRPeerManagerReinitCFLedgerLocked(BRPeerManager *manager, uint32_t start)
+{
+    uint32_t band = manager->cfLedger.abandonedBelow;
+    BRCFScanLedgerInit(&manager->cfLedger, start);
+    // The reorg suite's own red arm restores the shape before ANY carry, so it disables this too.
+#if !defined(CF_BAND_KEPT_UNFIXED) && !defined(CF_REORG_BAND_KEPT_UNFIXED)
+    if (band > 0 && band <= start) manager->cfLedger.abandonedBelow = band;
+#else
+    (void)band;
+#endif
+}
+
 // Retire as much of an abandoned band as the RESIDENT block headers can currently
 // support, and return how many heights were retired (0 if none).
 //
@@ -4503,6 +4534,12 @@ static BRMerkleBlock *_peerRelayedBlockOnce(void *info, BRMerkleBlock *block)
                 manager->floorMemoValid = 0;
             }
             if (manager->floorMemoTip == b) manager->floorMemoValid = 0;
+#ifndef CF_FLOOR_MEMO_UNFIXED
+            // CF-LEDGER-GAPS (a): `block` may carry a parent link `b` did not (a checkpoint
+            // stub has prevBlock 0), so the floor below the tip can move although the memo key
+            // (set, count, tip) did not. Drop the memo on every replace.
+            manager->floorMemoValid = 0;
+#endif
             if (manager->startSyncFrom == b) manager->startSyncFrom = block;
 
 #ifdef CHECKPOINT_STUB_FREE_UNGUARDED_UNFIXED
@@ -5149,6 +5186,12 @@ BRPeerManager *BRPeerManagerNew(const BRChainParams *params, BRWallet *wallet, u
 static void _BRPeerManagerInstallSavedBlock(BRPeerManager *manager, BRMerkleBlock *block)
 {
     BRMerkleBlock *replaced = BRSetAdd(manager->blocks, block);
+#ifndef CF_FLOOR_MEMO_UNFIXED
+    // CF-LEDGER-GAPS (a): a same-hash replace keeps the floor memo's key but may connect the
+    // chain below (a checkpoint stub has prevBlock 0), so the memo goes on every replace --
+    // the stub branch below used to drop it never, the other branch only for the tip.
+    if (replaced && replaced != block) manager->floorMemoValid = 0;
+#endif
 #ifdef CHECKPOINT_STUB_FREE_UNGUARDED_UNFIXED
     // RED ARM ONLY (checkpoint_stub_free_guard_kat) — never defined in a production build.
     // Pre-fix shape: manager->blocks matched `replaced` by HASH but manager->checkpoints
@@ -5818,7 +5861,7 @@ static void _BRPeerManagerRequestNextCFHeaders(BRPeerManager *manager, BRPeer *p
             manager->autoFetchCFiltersEnabled  = 1;
             manager->autoFetchCFiltersStart    = restart;
             manager->autoFetchCFiltersThrough  = restart > 0 ? restart - 1 : 0;
-            BRCFScanLedgerInit(&manager->cfLedger, restart);
+            _BRPeerManagerReinitCFLedgerLocked(manager, restart);   // keeps a band surfaced this tick
             _BRPeerManagerClearSolicitedBlocksLocked(manager); // C1: in-flight solicitations belong to the scan just replaced
 #if CF_LEDGER_DRIVE_REREQUEST
             BRCFScanLedgerClearFilterBuffer(&manager->cfLedger);
@@ -6504,6 +6547,24 @@ static void _peerRelayedCFHeaders(void *info, uint8_t filterType, UInt256 stopHa
                 {
                     uint32_t chainStart = BRCompactFilterChainStartHeight(manager->compactFilterChain);
                     if (parkAt < chainStart) parkAt = chainStart;
+                }
+#endif
+#ifndef CF_PARK_CONTIG_UNFIXED
+                // CF-LEDGER-GAPS (c): the park may move the cursor BACK, never forward. When the
+                // fetch lags below the checkpoint, parking at the checkpoint would start the next
+                // fetch above what the ledger requested, and _cfLedgerAdvance (which assumes
+                // contiguous requests) would carry scannedThrough over [requested+1 .. parkAt-1]
+                // without one of those heights ever being asked for. Rule: scannedThrough never
+                // advances over a height that was never requested and evaluated, so the cursor
+                // never resumes above requestedThrough + 1 (or the surfaced watermark).
+                if (_cfConvoyScanArmed(manager) && BRCFScanLedgerStartHeight(&manager->cfLedger) > 0) {
+                    uint32_t resume = manager->cfLedger.requestedThrough + 1;
+                    if (resume < manager->cfLedger.abandonedBelow) resume = manager->cfLedger.abandonedBelow;
+                    // Only inside the filter-header chain: below its start no cfilter can be
+                    // verified (CF_PARK_BELOW_START above), and a ledger that lags below the
+                    // chain's start is the re-anchor's business, not the park's.
+                    uint32_t chainStart = BRCompactFilterChainStartHeight(manager->compactFilterChain);
+                    if (parkAt > resume && resume >= chainStart) parkAt = resume;
                 }
 #endif
                 manager->autoFetchCFiltersStart   = parkAt;
@@ -7292,7 +7353,7 @@ static void _BRPeerManagerCFCheckptDisagreedLocked(BRPeerManager *manager, BRPee
     manager->autoFetchCFiltersEnabled  = 1;
     manager->autoFetchCFiltersStart    = from;
     manager->autoFetchCFiltersThrough  = from > 0 ? from - 1 : 0;
-    BRCFScanLedgerInit(&manager->cfLedger, from);
+    _BRPeerManagerReinitCFLedgerLocked(manager, from);   // keeps the band surfaced just above
     _BRPeerManagerClearSolicitedBlocksLocked(manager);
 #if CF_LEDGER_DRIVE_REREQUEST
     BRCFScanLedgerClearFilterBuffer(&manager->cfLedger);
@@ -10263,7 +10324,7 @@ static int _BRPeerManagerReanchorAtFloorLocked(BRPeerManager *manager, int force
     manager->autoFetchCFiltersEnabled  = 1;
     manager->autoFetchCFiltersStart    = restart;
     manager->autoFetchCFiltersThrough  = restart > 0 ? restart - 1 : 0;
-    BRCFScanLedgerInit(&manager->cfLedger, restart);
+    _BRPeerManagerReinitCFLedgerLocked(manager, restart);   // keeps a band surfaced earlier this tick
     _BRPeerManagerClearSolicitedBlocksLocked(manager); // C1: in-flight solicitations belong to the scan just replaced
 #if CF_LEDGER_DRIVE_REREQUEST
     // Explicit/defensive (Task 5 EDIT 4): stale buffered raw filter bytes from the
@@ -11035,7 +11096,7 @@ void BRPeerManagerEnableAutoCompactFilterFetch(BRPeerManager *manager, uint32_t 
     // abandonment. The stall was the forward-gap gate freezing the drive while the
     // residual driver slowly retried, not anything special about the anchor. Skipping it
     // would silently drop a height the wallet does scan.
-    BRCFScanLedgerInit(&manager->cfLedger, startHeight);
+    _BRPeerManagerReinitCFLedgerLocked(manager, startHeight);   // a live band at or below the new start stays
     _BRPeerManagerClearSolicitedBlocksLocked(manager); // C1: in-flight solicitations belong to the scan just replaced
 #if CF_LEDGER_DRIVE_REREQUEST
     // Explicit/defensive (Task 5 EDIT 4): re-arm must not carry stale buffered raw

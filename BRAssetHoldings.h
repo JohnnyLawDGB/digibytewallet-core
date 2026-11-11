@@ -328,7 +328,9 @@ typedef enum {
 // (no fraction, no exponent) within int32, and "count" the same within int64: any other value is not a
 // number (vout -1, countIsWhole 0). "error" and "vout" are present whatever their type. A reply that
 // does not then match is no answer: the row stays as it is and is asked about again. This reading is
-// on purpose: a reply of any other shape is never a credit.
+// on purpose: a reply of any other shape is never a credit. It is stricter than Android's org.json
+// reading, which converts a quoted or fractional "vout" ("2", 2.9) and a numeric "assetId" to the asked
+// type and wraps a "vout" past int32; each of those is no answer here.
 
 // One entry of the indexer's reply, as the platform's JSON reader found it.
 typedef struct {

@@ -1117,13 +1117,16 @@ static void _BRPeerManagerPurgeReleasedRecords(BRPeerManager *manager, const int
 // Caller holds manager->lock. Registering a listed object into the wallet makes the wallet that
 // object's owner, so the listed entry follows the object to owned = 0: the wallet is its one
 // owner and releases it, and the publish list never does. Ownership following the object keeps
-// every object released exactly once. A no-op when the wallet's record for txHash is a separate
-// object (the list keeps ownership of its own), or when no entry points at the wallet's record.
-static void _BRPeerManagerOwnershipFollowsObject(BRPeerManager *manager, UInt256 txHash)
+// every object released exactly once. A no-op when the wallet did not take tx -- it refused it, or
+// its record of the hash is a separate object (the list keeps ownership of its own) -- or when no
+// entry points at tx. Whether the wallet took tx is the registration's own answer, `held`
+// (REGISTER-RESULT), read under the wallet's lock, not a lookup made after it.
+static void _BRPeerManagerOwnershipFollowsObject(BRPeerManager *manager, const BRTransaction *tx,
+                                                 BRWalletRegisterOutcome held)
 {
-    BRTransaction *rec = BRWalletTransactionForHash(manager->wallet, txHash);
-    for (size_t i = array_count(manager->publishedTx); rec && i > 0; i--) {
-        if (manager->publishedTx[i - 1].tx == rec) manager->publishedTx[i - 1].owned = 0;
+    if (! tx || ! BRWalletRegisterOutcomeHeld(held)) return;
+    for (size_t i = array_count(manager->publishedTx); i > 0; i--) {
+        if (manager->publishedTx[i - 1].tx == tx) manager->publishedTx[i - 1].owned = 0;
     }
 }
 
@@ -2693,8 +2696,9 @@ static void _peerRelayedTx(void *info, BRTransaction *tx)
         int trusted = BRPeerIsDeliveringBlockTxs(peer) && BRWalletContainsTransaction(manager->wallet, tx) &&
                       _BRPeerManagerDeliveryIsTrustedLocked(manager, BRPeerDeliveringBlockHash(peer));
 #endif
-        isWalletTx = trusted ? BRWalletRegisterTransactionTrusted(manager->wallet, tx)
-                             : BRWalletRegisterTransaction(manager->wallet, tx);
+        BRWalletRegisterOutcome held = BR_WALLET_REGISTER_REFUSED;
+        isWalletTx = BRWalletRegisterTransactionOutcome(manager->wallet, tx, trusted ? BR_WALLET_REGISTER_TRUSTED
+                                                                                     : BR_WALLET_REGISTER_CHECKED, &held);
 #ifdef PUBLISH_RELAY_OBJECT_UNFIXED
         // Comparison arm only: the shape that left the parsed object unreleased whenever the
         // wallet already held a record of its hash.
@@ -2704,10 +2708,13 @@ static void _peerRelayedTx(void *info, BRTransaction *tx)
         // held no record of the hash; when the wallet's record is a different object (it already
         // held the hash — a peer echoing one of this wallet's own sends, or a block delivering
         // it), the parsed object has no owner left and is released here. Nothing else holds it:
-        // the relay and request lists hold hashes.
-        BRTransaction *rec = BRWalletTransactionForHash(manager->wallet, tx->txHash);
-        if (rec != tx) { BRTransactionFree(tx); tx = NULL; }
-        if (isWalletTx) tx = rec;
+        // the relay and request lists hold hashes. Whether the wallet took it is the registration's
+        // own answer (REGISTER-RESULT), not a later lookup: a lookup after the wallet's lock is
+        // released can miss an object the wallet took and has since released (a double release) or
+        // find one it never took.
+        UInt256 txHash = tx->txHash;
+        if (! BRWalletRegisterOutcomeHeld(held)) { BRTransactionFree(tx); tx = NULL; }
+        if (isWalletTx) tx = BRWalletTransactionForHash(manager->wallet, txHash);
 #endif
     }
     else {
@@ -2807,11 +2814,15 @@ static void _peerHasTx(void *info, UInt256 txHash)
 
     if (tx) {
         // tx is the wallet's own record or a tx this wallet published (signed itself)
-        isWalletTx = BRWalletRegisterTransactionTrusted(manager->wallet, tx);
+        BRTransaction *registered = tx;
+        BRWalletRegisterOutcome held = BR_WALLET_REGISTER_REFUSED;
+        isWalletTx = BRWalletRegisterTransactionOutcome(manager->wallet, tx, BR_WALLET_REGISTER_TRUSTED, &held);
         if (isWalletTx) tx = BRWalletTransactionForHash(manager->wallet, tx->txHash);
         // If the wallet took a listed object here, the entry follows it to the wallet's ownership.
 #ifndef PUBLISH_OWNED_FOLLOWS_UNFIXED
-        _BRPeerManagerOwnershipFollowsObject(manager, txHash);
+        _BRPeerManagerOwnershipFollowsObject(manager, registered, held);
+#else
+        (void)registered;
 #endif
 
         // reschedule sync timeout
@@ -5016,10 +5027,11 @@ static BRTransaction *_peerRequestedTx(void *info, UInt256 txHash)
         // The stem peer taking a stem is not the network relaying it back: counting it would tell
         // the wallet's embargo the stem propagated when the stem peer may yet drop it.
         if (! _BRPeerManagerIsStemming(manager, txHash)) _BRTxPeerListAddPeer(&manager->txRelays, txHash, peer);
-        BRWalletRegisterTransactionTrusted(manager->wallet, tx);   // a tx this wallet published (signed itself)
+        BRWalletRegisterOutcome held = BR_WALLET_REGISTER_REFUSED;
+        BRWalletRegisterTransactionOutcome(manager->wallet, tx, BR_WALLET_REGISTER_TRUSTED, &held);   // a tx this wallet published (signed itself)
         // If the wallet took the listed object here, the entry follows it to the wallet's ownership.
 #ifndef PUBLISH_OWNED_FOLLOWS_UNFIXED
-        _BRPeerManagerOwnershipFollowsObject(manager, txHash);
+        _BRPeerManagerOwnershipFollowsObject(manager, tx, held);
 #endif
     }
 

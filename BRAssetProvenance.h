@@ -75,11 +75,11 @@
 //  TXIDS are NUL-terminated strings of at most BR_ASSET_TXID_LENGTH characters, compared byte for byte;
 //  a longer one is refused. Facts' ids are at most BR_ASSET_ID_LENGTH characters. Kotlin nullables are
 //  has/value pairs (`has` zero: null, the value not read). The walk copies every txid it keeps into the
-//  caller's slots (BR_ASSET_WALK_SLOTS(maxHops) of them; fewer is refused, CAPACITY); the named search
-//  keeps the caller's pointers (assetId, startTxid, the parent list), which the caller keeps alive until
-//  it is done. A walk or a search that is REFUSED (an argument, a fed value it cannot hold, too few slots)
-//  has no answer and writes nothing; every enum here has REFUSED or UNAVAILABLE at 0, so a struct nobody
-//  filled reads as no answer.
+//  caller's slots (BR_ASSET_WALK_SLOTS(maxHops), or BRAssetWalkSlots(maxHops), of them; fewer is refused,
+//  CAPACITY); the named search keeps the caller's pointers (assetId, startTxid, the parent list), which
+//  the caller keeps alive until it is done. A walk or a search that is REFUSED (an argument, a fed value
+//  it cannot hold, too few slots) has no answer and writes nothing; every enum here has REFUSED or
+//  UNAVAILABLE at 0, so a struct nobody filled reads as no answer.
 //
 //  No allocation, no wallet, no network, no clock, no I/O. Header-only, static inline; its includes are
 //  libc, BRTransaction.h (BRTransaction, read only, no function of it called), BRAssetDecode.h
@@ -151,8 +151,14 @@ extern "C" {
 #define BR_ASSET_WALK_DEFAULT_MAX_HOPS 50
 
 // The slots a walk with this budget needs: one per hop and one for the start txid. A plain macro over the
-// caller's value; for the default budget, 51.
+// caller's value, so C can size an array with it; for the default budget, 51.
 #define BR_ASSET_WALK_SLOTS(maxHops) ((size_t)((maxHops) > 0 ? (maxHops) : 0) + 1)
+
+// The same count as a function, for callers that cannot use a function-like macro (Swift imports none).
+static inline size_t BRAssetWalkSlots(int32_t maxHops)
+{
+    return BR_ASSET_WALK_SLOTS(maxHops);
+}
 
 // ---- the types -----------------------------------------------------------------------------------
 

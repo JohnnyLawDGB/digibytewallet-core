@@ -79,7 +79,8 @@ static inline BRWalletMasterKeys BRWalletMasterKeysFromSeed(const void *seed, si
 // record and one outside the money range WITHOUT freeing it, so after the call the
 // caller frees every record the wallet does not hold as itself
 // (BRWalletTransactionForHash(wallet, tx->txHash) != tx), and all of them when NULL
-// is returned. The array stays the caller's. Pass NULL, 0 for a wallet with no history.
+// is returned. That lookup is valid only before the wallet is shared with another
+// thread (REGISTER-RESULT; see BRWalletNew). The array stays the caller's. Pass NULL, 0 for a wallet with no history.
 //
 // Records are not checked against these keys: pass only this wallet's own. NULL
 // comes back only if allocation fails. Free with BRWalletFree().

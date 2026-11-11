@@ -95,6 +95,13 @@ inline static int BRUTXOEq(const void *utxo, const void *otherUtxo)
 typedef struct BRWalletStruct BRWallet;
     
 // allocates and populates a BRWallet struct that must be freed by calling BRWalletFree()
+// OWNERSHIP of transactions[] (REGISTER-RESULT): the wallet takes each record it keeps; it skips a
+// repeated hash, an unsigned record and one outside the money range WITHOUT freeing it or saying so, and
+// a skipped record stays the caller's. The caller tells them apart with
+// BRWalletTransactionForHash(wallet, tx->txHash) != tx, which is valid ONLY before the wallet is shared
+// with another thread (a peer manager, a JNI call): once it is, that lookup races with registration and
+// release, and records must be added with BRWalletRegisterTransactionOutcome instead. The same holds for
+// BRWalletNewDual and BRWalletOpenWithKeys (BRWalletOpen.h). The array itself stays the caller's.
 BRWallet *BRWalletNew(BRTransaction *transactions[], size_t txCount, BRMasterPubKey mpk);
 
 // allocates a wallet with dual master key support: mpkBIP84 is the primary BIP84 key (m/84'/20'/0'),
@@ -364,17 +371,26 @@ typedef enum {
 } BRWalletRegisterCheck;
 
 // Registers tx with the given check. Returns what the three forms below return, and writes to *outcome
-// (when outcome is not NULL) who holds tx now. Ownership follows *outcome and nothing else:
+// who holds tx now. outcome must not be NULL (asserted): a caller that does not read the outcome cannot
+// know whether it may release tx. Ownership follows *outcome and nothing else:
 // BRWalletRegisterOutcomeHeld(*outcome) -> the wallet owns tx; otherwise the caller still does.
-// Production callers use this form (register_result_kat checks that none uses the three below).
+// Production callers use this form, pass &<their outcome> and read it with BRWalletRegisterOutcomeHeld
+// (register_result_kat checks both, and that none uses the three below).
 int BRWalletRegisterTransactionOutcome(BRWallet *wallet, BRTransaction *tx, BRWalletRegisterCheck check,
                                        BRWalletRegisterOutcome *outcome);
 
-// adds a transaction to the wallet, or returns false if it isn't associated with the wallet.
-// OWNERSHIP: the return value does NOT say who owns tx. 0 is returned both when tx was refused (the
-// caller owns it) and when it was kept as a non-wallet unconfirmed tx (the wallet owns it); 1 is returned
-// both when the wallet took tx and when it already held a different record of the hash (the caller owns
-// tx). A caller that may release tx uses BRWalletRegisterTransactionOutcome.
+// adds a transaction to the wallet. The return value is the legacy answer, and it says NOTHING about who
+// owns tx, nor whether tx is a wallet tx:
+//   1 -- tx was newly added as a wallet tx (KEPT), or the wallet already held a record of tx's hash and
+//        this call did not refuse it at the money-range or signature check: tx itself (KEPT, or
+//        KEPT_FOREIGN for the wallet's own non-wallet record passed back) or a different object
+//        (DUPLICATE, wallet and non-wallet records alike: the caller still owns tx).
+//   0 -- tx was refused at the money-range or signature check (a hash the wallet did not hold: REFUSED;
+//        a held non-wallet record the call would have moved into the wallet's transactions: KEPT_FOREIGN
+//        when tx is that record, DUPLICATE when tx is another object of its hash), or tx is a hash the
+//        wallet did not hold and a non-wallet tx, whether newly kept as foreign (KEPT_FOREIGN, the wallet
+//        owns it) or not kept (confirmed, or past the kept set's bounds: REFUSED, the caller owns it).
+// OWNERSHIP: read it from BRWalletRegisterTransactionOutcome's *outcome, never from this value.
 int BRWalletRegisterTransaction(BRWallet *wallet, BRTransaction *tx);
 
 // The same, accepting an unconfirmed tx's signatures on the wallet's outputs as they stand now, without

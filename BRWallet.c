@@ -2674,6 +2674,8 @@ int BRWalletRegisterTransactionOutcome(BRWallet *wallet, BRTransaction *tx, BRWa
 {
     int checkInputs = (check == BR_WALLET_REGISTER_TRUSTED) ? 0 : (check == BR_WALLET_REGISTER_UNPROVEN) ? 2 : 1;
 
+    assert(outcome != NULL);   // the outcome is the only answer that says who owns tx (REGISTER-RESULT)
+
     return _BRWalletRegisterTx(wallet, tx, checkInputs, outcome);
 }
 

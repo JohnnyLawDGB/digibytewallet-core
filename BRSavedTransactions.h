@@ -58,9 +58,11 @@ extern "C" {
 //
 // What happens above it (the writer emits nothing):
 //  - a wallet that grows past it keeps its last checkpoint and scan ledger (the app writes
-//    the ledger and "has synced" only after a checkpoint lands). The history after that
-//    checkpoint is not saved: every launch rescans from that point, and sync never reports
-//    complete, for as long as the wallet stays above the limit;
+//    the ledger and "has synced" only after a checkpoint lands), and sync never reports
+//    complete. Launches resume from that frozen ledger only while the saved near-tip header
+//    window still reaches down to it; once the window has moved past it, the next launch
+//    finds the frontier below the window (HEADER_WINDOW_MISSING) and rebuilds from the
+//    birth floor, and so does every launch after it while the wallet stays above the limit;
 //  - a stored checkpoint that is itself above the limit (written before the writer had one)
 //    is refused by the reader, so the app records a short restore and rebuilds from the
 //    birth floor; the rebuilt wallet passes the limit again, nothing replaces that

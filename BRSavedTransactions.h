@@ -55,10 +55,19 @@ extern "C" {
 // anything (8 bytes a record, under 1 MB here), whatever count a corrupt blob claims; the
 // records themselves are bounded by the blob, which ends the walk. It is set well above any
 // wallet the SPV core can hold usably: the balance pass is quadratic in the unspent set.
-// A wallet that does pass it keeps its last checkpoint and scan ledger (the ledger is only
-// written after a checkpoint succeeds), so a relaunch rescans from that point; nothing is
-// dropped. The Kotlin mirror (SavedTransactionsCheckpoint.MAX_RECORDS) is held to this
-// value by a source gate.
+//
+// What happens above it (the writer emits nothing):
+//  - a wallet that grows past it keeps its last checkpoint and scan ledger (the app writes
+//    the ledger and "has synced" only after a checkpoint lands). The history after that
+//    checkpoint is not saved: every launch rescans from that point, and sync never reports
+//    complete, for as long as the wallet stays above the limit;
+//  - a stored checkpoint that is itself above the limit (written before the writer had one)
+//    is refused by the reader, so the app records a short restore and rebuilds from the
+//    birth floor; the rebuilt wallet passes the limit again, nothing replaces that
+//    checkpoint, and so EVERY launch rebuilds from the birth floor.
+// Funds are never hidden (the scan finds them each time); the cost is the rescan. The app
+// leaves a breadcrumb in dgb_diag when the refusal starts. The Kotlin mirror
+// (SavedTransactionsCheckpoint.MAX_RECORDS) is held to this value by a source gate.
 #ifdef TX_CKPT_CAP_UNFIXED
 // RED-gate shape only: the reader limit as it was, with no writer limit. Never defined in
 // a production build.

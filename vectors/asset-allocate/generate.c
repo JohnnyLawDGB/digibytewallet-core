@@ -7,11 +7,13 @@
 //
 // The corpus, in the order it is written:
 //   1. HAND: the transfers, burns and issuances of the Kotlin tests (their scripts, decoded here, or
-//      their instruction lists), over the inputs those tests give;
+//      their instruction lists), over the inputs those tests give; then edges the seeded set seldom
+//      reaches (EDGES): skips after a stack is used up, a pre-v3 transfer whose first input carries
+//      only uncounted entries, a burn's percent instruction to output 31, output counts of 0 and below;
 //   2. a seeded set of transfers, burns and headers of other operations, over seeded inputs;
 //   3. a seeded set of issuances;
-//   4. every one-row input BRAssetBackedInputStack distinguishes, then seeded input totals and
-//      indexer answers;
+//   4. every one-row input BRAssetBackedInputStack distinguishes, input totals with a zeroRows buffer
+//      too small for the rows, then seeded input totals and indexer answers;
 //   5. what the ids the corpus uses say of their aggregation;
 //   6. the ids of the Kotlin tests' and this file's issuances, then a seeded set.
 // A line that an earlier line already states is not written again, so no line occurs twice.
@@ -58,7 +60,7 @@
 //     BRAssetResolveInputUnits. <inputs>: `none`, or per input joined by '/' `r<quantity>:<targeted>`
 //     (a row storing that quantity; yes, no or unknown) or `n:<asset-tx>` (no row; whether the
 //     funding transaction carries a DigiAsset payload). <ask> 1 when zeroRows has room for every
-//     input, 0 when it is NULL. <answer>: `known <units>`, `unknown`, or `unknown <rows> <other>` with
+//     input, 0 when it is NULL, `room<k>` when it has room for k (fewer than the inputs). <answer>: `known <units>`, `unknown`, or `unknown <rows> <other>` with
 //     the input indices joined by ',' and otherUnits.
 //
 //   indexer <lookup> <entries> <answer>
@@ -420,6 +422,43 @@ static const IssueVector ISSUED[] = {   // AssetTransferAllocatorTest, AssetHold
     { "6a0944410305 2016012010", 3, -1 },
 };
 
+static const BuiltVector EDGES[] = {
+    { DA_TRANSFER, 3, "0:3:s 1:0:s 2:2", "La1:3/Ld1:1/La2:3", 3 },          // a skip after a used-up stack, then a skip
+    { DA_TRANSFER, 3, "0:4:s 1:0:s 2:1", "La1:3/La1:1/Ld1:1/La2:2", 3 },   // the same after a draw across stacks
+    { DA_TRANSFER, 3, "0:4:s 1:1:s 2:1", "La1:3,La1:1/Ld1:2/La2:2", 3 },
+    { DA_TRANSFER, 2, "0:2", "La1:0,La2:0/La1:5", 3 },                      // pre-v3, first input's entries all uncounted
+    { DA_TRANSFER, 2, "0:2", "La1:0,La2:-1/La1:5", 3 },
+    { DA_TRANSFER, 3, "0:2", "La1:0,La2:0/La1:5", 3 },
+    { DA_BURN, 3, "31:50:p 0:1", "La1:9", 33 },                             // a burn's percent instruction to output 31
+    { DA_BURN, 3, "31:50:p", "La1:9", 32 },
+    { DA_BURN, 3, "0:1 31:2:p", "La1:9", 3 },
+    { DA_TRANSFER, 3, "0:1", "La1:5", 0 },                                  // output counts of 0 and below
+    { DA_TRANSFER, 3, "0:1", "La1:5", -1 },
+    { DA_TRANSFER, 3, "0:1:r", "La1:5", -2147483647 - 1 },
+};
+
+static void resolveLine(const BRAssetInputFacts *f, size_t n, int ask, size_t room)
+{
+    size_t rows[8], j;
+    BRAssetInputUnits r;
+
+    if (n > N(rows) || room > n) { BROKEN = 1; return; }
+    r = BRAssetResolveInputUnits(f, n, ask ? rows : NULL, ask ? room : 0);
+    OUT("resolve");
+    if (n == 0) OUT(" none");
+    for (j = 0; j < n; j++) {
+        if (f[j].hasRow) OUT("%sr%lld:%s", j ? "/" : " ", (long long)f[j].quantity, FACTS[f[j].rowIsTargeted]);
+        else OUT("%sn:%s", j ? "/" : " ", FACTS[f[j].fundingIsAssetTx]);
+    }
+    if (ask && room < n) OUT(" room%d", (int)room);
+    else OUT(" %d", ask);
+    if (r.known) OUT(" known %lld", (long long)r.units);
+    else OUT(" unknown");
+    for (j = 0; j < r.zeroRowCount; j++) OUT("%s%d", j ? "," : " ", (int)rows[j]);
+    if (r.zeroRowCount) OUT(" %lld", (long long)r.otherUnits);
+    endLine();
+}
+
 static void unspaced(const char *in, char *out)
 {
     while (*in) { if (*in != ' ') *out++ = *in; in++; }
@@ -578,6 +617,11 @@ int main(void)
         inputs(BUILT[i].inputs);
         allocateLine(1, BUILT[i].outputs);
     }
+    for (i = 0; i < N(EDGES); i++) {
+        header(EDGES[i].op, EDGES[i].version, EDGES[i].insts);
+        inputs(EDGES[i].inputs);
+        allocateLine(1, EDGES[i].outputs);
+    }
     for (i = 0; i < N(ISSUED); i++) {
         int exact;
 
@@ -632,11 +676,23 @@ int main(void)
                     for (d = 0; d < 3; d++)
                         for (e = 0; e < 3; e++) stackLine(a, b, quantities[k], ids[c], d, e);
 
+    {   // a zeroRows buffer with room for fewer rows than there are
+        BRAssetInputFacts f[3];
+        size_t j;
+
+        memset(f, 0, sizeof(f));
+        for (j = 0; j < 3; j++) { f[j].hasRow = 1; f[j].rowIsTargeted = BR_ASSET_FACT_YES; }
+        for (j = 0; j < 3; j++) resolveLine(f, 3, 1, j);
+        resolveLine(f, 3, 1, 3);
+        f[1].quantity = 7;
+        for (j = 0; j < 3; j++) resolveLine(f, 3, 1, j);
+        f[1].hasRow = 0; f[1].quantity = 0; f[1].fundingIsAssetTx = BR_ASSET_FACT_NO;
+        for (j = 0; j < 3; j++) resolveLine(f, 3, 1, j);
+    }
     for (i = 0; i < 600; i++) {
         BRAssetInputFacts f[6];
-        size_t rows[6], n = below(6), j;
+        size_t n = below(6), j;
         int ask = (int)below(2);
-        BRAssetInputUnits r;
 
         for (j = 0; j < n; j++) {
             uint32_t q = below(6);
@@ -647,19 +703,7 @@ int main(void)
             f[j].rowIsTargeted = (BRAssetFact)below(3);
             f[j].fundingIsAssetTx = (BRAssetFact)below(3);
         }
-        r = BRAssetResolveInputUnits(f, n, ask ? rows : NULL, ask ? n : 0);
-        OUT("resolve");
-        if (n == 0) OUT(" none");
-        for (j = 0; j < n; j++) {
-            if (f[j].hasRow) OUT("%sr%lld:%s", j ? "/" : " ", (long long)f[j].quantity, FACTS[f[j].rowIsTargeted]);
-            else OUT("%sn:%s", j ? "/" : " ", FACTS[f[j].fundingIsAssetTx]);
-        }
-        OUT(" %d", ask);
-        if (r.known) OUT(" known %lld", (long long)r.units);
-        else OUT(" unknown");
-        for (j = 0; j < r.zeroRowCount; j++) OUT("%s%d", j ? "," : " ", (int)rows[j]);
-        if (r.zeroRowCount) OUT(" %lld", (long long)r.otherUnits);
-        endLine();
+        resolveLine(f, n, ask, n);
     }
 
     for (i = 0; i < 300; i++) {

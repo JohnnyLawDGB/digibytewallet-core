@@ -80,10 +80,11 @@
 //  the answers are the caller's own pointers.
 //
 //  No allocation. The working state of an allocation goes into the caller's `work` buffer (one int64_t
-//  per entry of the input stacks) and its answer into the caller's `out` buffer; an allocation either
-//  buffer cannot hold is INDETERMINATE (BR_ASSET_WHY_CAPACITY), never shortened. No wallet, no network,
-//  no clock, no I/O. Header-only, static inline; its includes are libc, BRAssetData.h (BRAssetOperation),
-//  BRAssetQuantity.h (BRAssetTransferInstruction and the checked sums) and BRAssetDecode.h (BRAssetHeader,
+//  per entry of the input stacks) and its answer into the caller's `out` buffer; an allocation whose
+//  deliveries, voided ones included, `out` cannot hold, or whose inputs `work` cannot hold, is
+//  INDETERMINATE (BR_ASSET_WHY_CAPACITY), never shortened. No wallet, no network, no clock, no I/O.
+//  Header-only, static inline; its includes are libc, BRAssetData.h (BRAssetOperation), BRAssetQuantity.h
+//  (BRAssetTransferInstruction and the checked sums) and BRAssetDecode.h (BRAssetHeader,
 //  BRAssetAggregation), which this header uses and does not redefine. It reads no build-time policy
 //  macro. Nothing in the core calls it yet; BRDigiAsset.c and BRWallet.c are not changed by it.
 //

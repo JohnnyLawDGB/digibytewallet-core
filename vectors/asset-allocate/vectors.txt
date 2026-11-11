@@ -51,6 +51,18 @@ allocate transfer 3 1 3 -r-:3:3 La1:12:1 allocated 1 2:La1:12 -=La1,-=La1,-=La1,
 allocate transfer 3 1 5 -r-:3:7 - none -,-,-,-,-,-,- 7,7,7,7,7,*,0
 allocate transfer 3 1 3 ---:0:9223372036854775807,---:0:1 - none -,-,-,-,- 0,0,0,0,0
 allocate transfer 3 1 4 ---:0:5 ? indeterminate input-unknown -,u,-,-,u,- 0,5,0,0,*,0
+allocate transfer 3 1 3 s--:0:3,s--:1:0,---:2:2 La1:3:1/Ld1:1:1/La2:3:1 allocated 0 0:La1:3,2:La2:3,2:Ld1:1 -,La1:3,-,m,- 0,3,0,*,0
+allocate transfer 3 1 3 s--:0:4,s--:1:0,---:2:1 La1:3:1/La1:1:1/Ld1:1:1/La2:2:1 allocated 0 0:La1:4,2:La2:2,2:Ld1:1 -,La1:4,-,m,- 0,4,0,*,0
+allocate transfer 3 1 3 s--:0:4,s--:1:1,---:2:1 La1:3:1,La1:1:1/Ld1:2:1/La2:2:1 allocated 0 0:La1:4,1:Ld1:1,2:La2:2,2:Ld1:1 -,La1:4,Ld1:1,m,- 0,4,1,*,0
+allocate transfer 2 1 3 ---:0:2 La1:0:1,La2:0:1/La1:5:1 allocated 0 2:La1:5 -=La1,-=La1,-=La1,La1:5,-=La1 0,2,0,*,0
+allocate transfer 2 1 3 ---:0:2 La1:0:1,La2:-1:1/La1:5:1 allocated 0 2:La1:5 -=La1,-=La1,-=La1,La1:5,-=La1 0,2,0,*,0
+allocate transfer 3 1 3 ---:0:2 La1:0:1,La2:0:1/La1:5:1 allocated 0 0:La1:2,2:La1:3 -=La1,La1:2,-=La1,La1:3,-=La1 0,2,0,*,0
+allocate burn 3 1 33 --p:31:50,---:0:1 La1:9:1 indeterminate percent -,u,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,u,u,- 0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,*,0
+allocate burn 3 1 32 --p:31:50 La1:9:1 indeterminate percent -,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,u,- 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,*,0
+allocate burn 3 1 3 ---:0:1,--p:31:2 La1:9:1 indeterminate percent -,u,-,u,- 0,1,0,*,0
+allocate transfer 3 1 0 ---:0:1 La1:5:1 indeterminate no-outputs u,u,- *,1,0
+allocate transfer 3 1 -1 ---:0:1 La1:5:1 indeterminate no-outputs -,u,- 0,1,0
+allocate transfer 3 1 -2147483648 -r-:0:1 La1:5:1 indeterminate no-outputs u,u,- 1,1,0
 issue issuance 1 10 aggregatable 3 ---:0:4 La9 allocated 0 0:La9:4,2:La9:6 -=La9,La9:4,-=La9,La9:6,-=La9
 issue issuance 1 10 aggregatable 3 - La9 allocated 0 2:La9:10 -=La9,-=La9,-=La9,La9:10,-=La9
 issue issuance 0 10 aggregatable 3 - La9 indeterminate payload-not-exact -,-,-,u,-
@@ -2937,6 +2949,16 @@ stack 1 mixed 4611686018427387904 empty no yes ?
 stack 1 mixed 4611686018427387904 empty yes unknown ?
 stack 1 mixed 4611686018427387904 empty yes no ?
 stack 1 mixed 4611686018427387904 empty yes yes ?
+resolve r0:yes/r0:yes/r0:yes room0 unknown
+resolve r0:yes/r0:yes/r0:yes room1 unknown
+resolve r0:yes/r0:yes/r0:yes room2 unknown
+resolve r0:yes/r0:yes/r0:yes 1 unknown 0,1,2 0
+resolve r0:yes/r7:yes/r0:yes room0 unknown
+resolve r0:yes/r7:yes/r0:yes room1 unknown
+resolve r0:yes/r7:yes/r0:yes room2 unknown 0,2 7
+resolve r0:yes/n:no/r0:yes room0 unknown
+resolve r0:yes/n:no/r0:yes room1 unknown
+resolve r0:yes/n:no/r0:yes room2 unknown 0,2 0
 resolve none 0 known 0
 resolve r0:unknown/r25:no/r45:yes/n:unknown 1 unknown
 resolve r4611686018427387904:yes 0 known 4611686018427387904

@@ -729,6 +729,9 @@ struct BRPeerManagerStruct {
     UInt128  cfServedAddr[16];
     uint16_t cfServedPort[16];
     size_t   cfServedCount;
+    // OWNNODE-LIVE: per served entry, one clock per request class (CF_SERVED_HDR / CF_SERVED_FLT),
+    // so "served" means serving now. See BRCFServedClock (BRPeerCFStatus.h).
+    BRCFServedClock cfServedClock[16][2];
     pthread_mutex_t lock;
 };
 
@@ -2017,25 +2020,45 @@ static void _penalize(BRPeerManager *manager, UInt128 addr, uint16_t port, time_
 // manager->lock (both call sites — _peerRelayedCFHeaders/_peerRelayedCFilter —
 // already hold it); this must NOT lock (no double-lock). BRPeer stores addr/port
 // as plain fields (no BRPeerAddress accessor exists), matching _penalize above.
-static void _recordCFServed(BRPeerManager *manager, BRPeer *peer)
+// `kind` is the class of the answer (CF_SERVED_HDR / CF_SERVED_FLT): it stops that class's clock
+// (OWNNODE-LIVE), and only that one.
+enum { CF_SERVED_HDR = 0, CF_SERVED_FLT = 1 };
+
+static long _cfServedIndex(const BRPeerManager *manager, UInt128 a, uint16_t p)
+{
+    size_t n = manager->cfServedCount < 16 ? manager->cfServedCount : 16;
+    for (size_t i = 0; i < n; i++)
+        if (UInt128Eq(manager->cfServedAddr[i], a) && manager->cfServedPort[i] == p) return (long)i;
+    return -1;
+}
+
+static void _recordCFServed(BRPeerManager *manager, BRPeer *peer, int kind)
 {
     UInt128 a = peer->address; uint16_t p = peer->port;
-    for (size_t i = 0; i < manager->cfServedCount && i < 16; i++) {
-        if (UInt128Eq(manager->cfServedAddr[i], a) && manager->cfServedPort[i] == p) return;
-    }
+    long at = _cfServedIndex(manager, a, p);
+    if (at >= 0) { BRCFServedClockAnswer(&manager->cfServedClock[at][kind]); return; }
     size_t idx = manager->cfServedCount % 16;
     manager->cfServedAddr[idx] = a; manager->cfServedPort[idx] = p;
+    memset(manager->cfServedClock[idx], 0, sizeof(manager->cfServedClock[idx]));   // a reused slot starts clean
     manager->cfServedCount++;
+}
+
+// OWNNODE-LIVE: a getcfheaders/getcfilters of class `kind` went to `peer`. Starts (or advances) that
+// class's clock for a peer that has served; a peer that never served already reads not-serving, so it
+// has no clock. Only the sync requests whose answers credit the peer are timed (the cfheaders driver
+// and the one getcfilters sender): a probe whose answer is judged elsewhere never stops a clock, so
+// timing it would darken a healthy node. Caller holds manager->lock; must NOT lock.
+static void _cfServedNoteSend(BRPeerManager *manager, const BRPeer *peer, int kind)
+{
+    long at = _cfServedIndex(manager, peer->address, peer->port);
+    if (at >= 0) BRCFServedClockSend(&manager->cfServedClock[at][kind], (int64_t)time(NULL));
 }
 
 // Has (a, p) answered a cfheaders/cfilter this session? Read-only; caller holds
 // manager->lock (only called from the locked status accessor). Must NOT lock.
 static int _cfServedContains(const BRPeerManager *manager, UInt128 a, uint16_t p)
 {
-    size_t n = manager->cfServedCount < 16 ? manager->cfServedCount : 16;
-    for (size_t i = 0; i < n; i++)
-        if (UInt128Eq(manager->cfServedAddr[i], a) && manager->cfServedPort[i] == p) return 1;
-    return 0;
+    return _cfServedIndex(manager, a, p) >= 0;
 }
 
 // Download-peer election reuses and may reassign _peerConnected's local `peer`.
@@ -5841,6 +5864,7 @@ static void _BRPeerManagerRequestNextCFHeaders(BRPeerManager *manager, BRPeer *p
     peer_log(reqPeer, "cfheaders: requesting [%u..%u] (%u headers)",
              next, batchEnd, batchEnd - next + 1);
     BRPeerSendGetCFHeaders(reqPeer, filterType, next, stopHash);
+    _cfServedNoteSend(manager, reqPeer, CF_SERVED_HDR);   // OWNNODE-LIVE
     manager->cfHeadersRequestedThrough = batchEnd;
     manager->cfHeadersRequestTime = time(NULL);
     manager->cfHeadersPeerAddr = reqPeer->address;
@@ -6543,7 +6567,7 @@ static void _peerRelayedCFHeaders(void *info, uint8_t filterType, UInt256 stopHa
     (void)chainWasNew;
 #endif
     manager->cfTriedCount = 0;       // batch advanced — fresh rotation round for the next one
-    _recordCFServed(manager, peer);  // this peer answered cfheaders (positive CF-served signal)
+    _recordCFServed(manager, peer, CF_SERVED_HDR);  // this peer answered cfheaders (positive CF-served signal)
     peer_log(peer, "cfheaders: chain extended to height %u (added %zu, stop %s)",
              chainTip, count, log_u256_hex_encode(stopHash));
     _BRPeerManagerCFCheckptRecheckLocked(manager);   // G5-QUORUM: re-ask peers whose last check this append outgrew
@@ -6884,7 +6908,7 @@ static void _peerRelayedCFilter(void *info, uint8_t filterType, UInt256 blockHas
 
     // The filter verified against the chain — this peer served a valid cfilter
     // (positive CF-served signal), independent of whether it hits our wallet.
-    _recordCFServed(manager, peer);
+    _recordCFServed(manager, peer, CF_SERVED_FLT);
 
 #ifndef INT_2026_10_09_D_UNFIXED
     // INT-2026-10-09-D. A filter is evaluated only for the block our main chain holds at this height. The bytes are
@@ -7726,7 +7750,8 @@ void BRPeerManagerClearPinnedPeer(BRPeerManager *manager)
 
 // Compact-filter status of the peer at addr:port for the own-node connectivity UI:
 // UNKNOWN (not in pool) / CONNECTING (in pool, not connected) / CONNECTED_NOT_SERVING
-// / SERVING (has answered a cfheaders/cfilter this session). Takes manager->lock
+// / SERVING (has answered a cfheaders/cfilter this session, and -- OWNNODE-LIVE -- has let no request
+// of ours stall since: a node that served, then stopped, reads CONNECTED_NOT_SERVING). Takes manager->lock
 // itself. manager->peers is a BRPeer value array; connectedPeers a BRPeer* array —
 // both store addr/port as plain fields (no BRPeerAddress accessor exists).
 int BRPeerManagerCompactFilterPeerStatus(BRPeerManager *manager, UInt128 addr, uint16_t port)
@@ -7744,7 +7769,19 @@ int BRPeerManagerCompactFilterPeerStatus(BRPeerManager *manager, UInt128 addr, u
         connected = (BRPeerConnectStatus(p) == BRPeerStatusConnected && BRPeerIsSocketOpen(p)) ? 1 : 0;
         break;
     }
+#ifdef OWNNODE_LIVE_UNFIXED
+    // RED ARM SEAM (ownnode_live_kat): "served" as "answered once this session".
     served = _cfServedContains(manager, addr, port);
+#else
+    // OWNNODE-LIVE: serving NOW -- answered, and no cfheaders/cfilter request of ours stalled since.
+    {
+        long at = _cfServedIndex(manager, addr, port);
+        int64_t now = (int64_t)time(NULL), retry = (int64_t)CF_REQUEST_TIMEOUT_SECS();
+        served = at >= 0 &&
+                 ! BRCFServedClockStalled(&manager->cfServedClock[at][CF_SERVED_HDR], now, retry) &&
+                 ! BRCFServedClockStalled(&manager->cfServedClock[at][CF_SERVED_FLT], now, retry);
+    }
+#endif
     MGR_UNLOCK(manager);
     return BRComputeCFPeerStatus(inPool, connected, served);
 }
@@ -10727,6 +10764,7 @@ static size_t _BRPeerManagerRequestCFiltersWithStopHashLocked(BRPeerManager *man
     if (!target) return 0;
 
     BRPeerSendGetCFilters(target, filterType, startHeight, stopHash);
+    _cfServedNoteSend(manager, target, CF_SERVED_FLT);    // OWNNODE-LIVE
     return stopHeight - startHeight + 1;
 }
 

@@ -34,7 +34,8 @@
 //  naming the user's node to whoever watches the network); otherwise the platform looks it up
 //  and dials the first IPv4 address.
 //  BROwnNodeHealthFor (refreshOwnNodeHealth): BRPeerManagerCompactFilterPeerStatus 3 (connected
-//  and answering cfheaders) is serving, 1 (in the pool, not yet connected) is connecting, and
+//  and answering cfheaders/cfilters now -- OWNNODE-LIVE: a node that served, then let a request
+//  stall, is status 2) is serving, 1 (in the pool, not yet connected) is connecting, and
 //  anything else is dark: 2 (connected but serving no filters, a node without
 //  peerblockfilters=1) is exactly the misconfiguration this status exists to show. It has no
 //  memory, so a platform's health poll calls BROwnNodeHealthObserve, which adds the time limit.

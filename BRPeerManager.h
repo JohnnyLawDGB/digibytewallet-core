@@ -657,7 +657,8 @@ void BRPeerManagerClearPinnedPeer(BRPeerManager *manager);
 
 // Compact-filter status of the peer at addr:port, for the own-node connectivity UI:
 // one of BR_CF_PEER_{UNKNOWN,CONNECTING,CONNECTED_NOT_SERVING,SERVING} (see
-// BRPeerCFStatus.h). SERVING means it has answered a cfheaders/cfilter this session.
+// BRPeerCFStatus.h). SERVING means it has answered a cfheaders/cfilter this session and no
+// request of ours to it has stalled since (OWNNODE-LIVE: serving now, not ever).
 int BRPeerManagerCompactFilterPeerStatus(BRPeerManager *manager, UInt128 addr, uint16_t port);
 
 // connect to bitcoin peer-to-peer network (also call this whenever networkIsReachable() status changes)

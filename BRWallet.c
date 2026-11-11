@@ -30,6 +30,7 @@
 #include "BRDigiAsset.h"
 #include "BRDigiDollar.h"
 #include "BRNetwork.h"
+#include "BRSavedTransactions.h"   // BR_SAVED_TRANSACTIONS_MAX_COUNT, the writer's limit too
 #include <stdlib.h>
 #include <inttypes.h>
 #include <limits.h>
@@ -1273,6 +1274,16 @@ size_t BRWalletSerializeTransactions(BRWallet *wallet, uint8_t *buf, size_t bufL
     pthread_mutex_lock(&wallet->lock);
 
     size_t txCount = array_count(wallet->transactions);
+
+#ifndef TX_CKPT_CAP_UNFIXED
+    // TX-CKPT-CAP: never write a blob the reader refuses (BRSavedTransactions.h). Above the
+    // shared limit nothing is written and 0 is returned -- never a valid size, which is at
+    // least the 4-byte count -- so the caller keeps its previous checkpoint.
+    if (txCount > BR_SAVED_TRANSACTIONS_MAX_COUNT) {
+        pthread_mutex_unlock(&wallet->lock);
+        return 0;
+    }
+#endif
 
     // size pass (under the lock): count header + per-tx (len + height + timestamp + data)
     size_t totalSize = 4;

@@ -62,10 +62,11 @@
 //      transaction is never released. The classifier is asked too, and the union decides. Each reading
 //      replays with its own record of totals.
 //    - REFUSALS. The answer is BR_ASSET_HOLD_COMPLETE only when every transaction was read. A NULL where
-//      a value is needed, or two rows for one outpoint that differ in quantity or spent flag, is ARGUMENTS
-//      (rows that are the same are read as one); a transaction that cannot be read (a NULL transaction,
-//      outputs, inputs or script where the counts say there are some, or more than INT32_MAX outputs) is
-//      UNREADABLE; a work buffer smaller than the view's count of transactions, rows or proofs, whichever
+//      a value is needed, or a test seam in a build that does not offer them (TEST SEAMS below), is
+//      ARGUMENTS; two rows for one outpoint that differ in quantity or spent flag are ROWS (rows that are
+//      the same are read as one, by the first of them in the view); a transaction that cannot be read (a
+//      NULL transaction, outputs, inputs or script where the counts say there are some, or more than
+//      INT32_MAX outputs) is UNREADABLE; a work buffer smaller than the view's count of transactions, rows or proofs, whichever
 //      is most, or a held list the buffer cannot hold, is CAPACITY. A refusal reports heldCount 0, and what
 //      `held` then holds is unspecified. The caller must refuse the spend on any status but COMPLETE, never
 //      read a refusal as "nothing held". The status 0 is a refusal, so a result nobody filled refuses.
@@ -76,12 +77,13 @@
 //  txid is its txHash as the struct holds it (BRWallet's order, not the display order); a row is
 //  BRAssetHoldRow (its txid, index, stored quantity and spent flag; one answer per outpoint, as the
 //  Kotlin's table has one row per outpoint); the proof store is the list of txids whose remainder is
-//  proven zero; the owned-script set is the owned callback. The classifier half is BRDigiAsset.c's
-//  unless the view names another (BRAssetHoldClassifier: a test seam for the host KAT's abstract
-//  verdicts; a production caller leaves it NULL, as BRWalletHoldAssetOutputs does). A pass here reads
-//  one snapshot, so the Kotlin's re-listing until the set settles and its caches are not needed: they
-//  change what is read, not what is answered. Its plain-transaction set is kept for the one pass (it answers "no payload" for
-//  a transaction read earlier in the pass that has no outputs); across passes it is not.
+//  proven zero; the owned-script set is the owned callback. The classifier half is BRDigiAsset.c's.
+//  The view's classifier field is a test seam (TEST SEAMS below): a build without ASSET_HOLD_TEST_SEAMS
+//  refuses a view that names one, so a production caller leaves it NULL, as BRWalletHoldAssetOutputs
+//  does. A pass here reads one snapshot, so the Kotlin's re-listing until the set settles and its caches
+//  are not needed: they change what is read, not what is answered. Its plain-transaction set is kept for
+//  the one pass (it answers "no payload" for a transaction read earlier in the pass that has no outputs);
+//  across passes it is not.
 //
 //  BRWalletHoldAssetOutputs runs the pass over the wallet's own transactions under its lock, owned
 //  meaning "an address of the wallet's", and on COMPLETE holds every outpoint in the list
@@ -98,8 +100,14 @@
 //  calls BRDigiAsset.c's classifier. Its includes are libc and the core headers whose types or functions
 //  it uses. It reads no build-time policy macro.
 //
-//  Test seams (host KAT asset_hold_kat in the Android repo): ASSET_HOLD_UNFIXED, tested by VALUE as a
-//  set of bits; each comparison arm sets one bit and fails only its own cases. Unset or =0 is what ships.
+//  TEST SEAMS (host KAT asset_hold_kat in the Android repo). ASSET_HOLD_TEST_SEAMS, tested by VALUE:
+//  unset or =0 is what ships, and then BRAssetHoldOutputs refuses (ARGUMENTS) a view whose classifier is
+//  not NULL, and _BRAssetHoldOutputsReading refuses any choice of readings but both. =1 (the host KAT's
+//  test builds only) honours the view's classifier (abstract verdicts no script has to give) and lets
+//  _BRAssetHoldOutputsReading make one reading alone. No build makes no reading. The view's layout is
+//  the same either way.
+//  ASSET_HOLD_UNFIXED, tested by VALUE as a set of bits; each comparison arm sets one bit and fails only
+//  its own cases. Unset or =0 is what ships.
 //    1     ASSET_HOLD_RED_DECODER_DROPPED     a verdict is the classifier's alone.
 //    2     ASSET_HOLD_RED_CLASSIFIER_DROPPED  a verdict is the decoder's alone.
 //    4     ASSET_HOLD_RED_UNKNOWN_FREE        a verdict neither reader can give is "carries nothing".
@@ -116,6 +124,7 @@
 //    8192  ASSET_HOLD_RED_FACTS_DECODER_ONLY  only the decoder's reading is made.
 //    16384 ASSET_HOLD_RED_SHAPE_FIRST_ONLY    the other reading too reads a funding transaction by its first OP_RETURN.
 //    32768 ASSET_HOLD_RED_DUPLICATE_ROWS      two rows for one outpoint that differ are read, one of them winning.
+//    65536 ASSET_HOLD_RED_SEAMS_OPEN          a build without ASSET_HOLD_TEST_SEAMS honours the test seams.
 //
 //  Permission is hereby granted, free of charge, to any person obtaining a copy
 //  of this software and associated documentation files (the "Software"), to deal
@@ -158,6 +167,10 @@ extern "C" {
 #define ASSET_HOLD_UNFIXED 0
 #endif
 
+#ifndef ASSET_HOLD_TEST_SEAMS
+#define ASSET_HOLD_TEST_SEAMS 0
+#endif
+
 #define ASSET_HOLD_RED_DECODER_DROPPED     1
 #define ASSET_HOLD_RED_CLASSIFIER_DROPPED  2
 #define ASSET_HOLD_RED_UNKNOWN_FREE        4
@@ -174,10 +187,16 @@ extern "C" {
 #define ASSET_HOLD_RED_FACTS_DECODER_ONLY  8192
 #define ASSET_HOLD_RED_SHAPE_FIRST_ONLY    16384
 #define ASSET_HOLD_RED_DUPLICATE_ROWS      32768
+#define ASSET_HOLD_RED_SEAMS_OPEN          65536
 
 // ---- the types -----------------------------------------------------------------------------------
 
-// One wallet row (Android: UtxoEntity), the fields the hold reads.
+// One wallet row (Android: UtxoEntity), the fields the hold reads. The caller gives the current row of
+// each outpoint, once, from a store keyed by outpoint: a txid kept as hex is put in one canonical form
+// (lower case) before it is parsed, so that two spellings of one txid cannot be two rows. Only asset
+// rows (Android: is_asset, as getAssetUtxoAt and getAllAssetUtxosNow read them), never a row for a plain
+// coin: a stored-zero row is read differently from no row. Two rows for one outpoint that differ refuse
+// the pass (ROWS); the same row twice is read once.
 typedef struct {
     UInt256 txHash;                  // the transaction that created the output, as BRTransaction holds it
     uint32_t n;                      // the output's index
@@ -189,8 +208,9 @@ typedef struct {
 typedef int (*BRAssetHoldOwnedFn)(void *info, const BRTransaction *tx, size_t vout);
 
 // The classifier half, when it is not the core's (a test puts verdicts here that no script it has to
-// write gives). Each answers 1 or 0. NULL in the view, or a NULL function: BRDigiAsset.c's. A TEST SEAM:
-// a production caller leaves the view's classifier NULL, since another one can make the union weaker.
+// write gives). Each answers 1 or 0. NULL in the view, or a NULL function: BRDigiAsset.c's. A TEST SEAM,
+// honoured only when ASSET_HOLD_TEST_SEAMS is 1: another classifier can make the union weaker, so a
+// build without the seams refuses a view that names one (ARGUMENTS).
 typedef struct {
     int (*outputIsAsset)(void *info, const BRTransaction *tx, size_t vout);   // BRTxOutputIsAsset
     int (*containsAsset)(void *info, const BRTransaction *tx);                // BRContainsAsset over its outputs
@@ -207,7 +227,7 @@ typedef struct {
     size_t rowCount;
     const UInt256 *proven;           // txids whose last output is proven to carry no units
     size_t provenCount;
-    const BRAssetHoldClassifier *classifier;   // NULL: the core's. A test seam: production callers leave it NULL
+    const BRAssetHoldClassifier *classifier;   // NULL: the core's. A test seam: not NULL refuses unless ASSET_HOLD_TEST_SEAMS
 } BRAssetHoldView;
 
 // One entry of the caller's work buffer: as many as the view has transactions, rows or proofs, whichever
@@ -229,9 +249,10 @@ typedef struct {
 typedef enum {
     BR_ASSET_HOLD_REFUSED = 0,              // nobody filled the result
     BR_ASSET_HOLD_COMPLETE = 1,             // every transaction was read; `held` is the answer
-    BR_ASSET_HOLD_REFUSED_ARGUMENTS = 2,    // a NULL where a value is needed
+    BR_ASSET_HOLD_REFUSED_ARGUMENTS = 2,    // a NULL where a value is needed, or a test seam this build does not offer
     BR_ASSET_HOLD_REFUSED_UNREADABLE = 3,   // a transaction that cannot be read, or a verdict neither reader can give
-    BR_ASSET_HOLD_REFUSED_CAPACITY = 4      // `work` or `held` too small: see workNeeded and heldNeeded
+    BR_ASSET_HOLD_REFUSED_CAPACITY = 4,     // `work` or `held` too small: see workNeeded and heldNeeded
+    BR_ASSET_HOLD_REFUSED_ROWS = 5          // two rows for one outpoint that differ in quantity or spent flag
 } BRAssetHoldStatus;
 
 typedef struct {
@@ -401,9 +422,8 @@ static inline const BRTransaction *_BRAssetHoldTxAt(const _BRAssetHoldState *s, 
     return (i == _BR_ASSET_HOLD_NONE) ? NULL : s->v->txs[i];
 }
 
-// The stored quantity of the row for (txHash, n), in *q, and 1; 0 when there is no row. (Rows for one
-// outpoint that differ were refused before the pass: any of them is the answer.)
-static inline int _BRAssetHoldRowOf(const _BRAssetHoldState *s, UInt256 txHash, uint32_t n, int64_t *q)
+// Where the rows for (txHash, n) start in the sorted rows (their count when there are none).
+static inline size_t _BRAssetHoldRowLowerBound(const _BRAssetHoldState *s, UInt256 txHash, uint32_t n)
 {
     size_t lo = 0, hi = s->v->rowCount, mid;
     const BRAssetHoldRow *r;
@@ -414,6 +434,16 @@ static inline int _BRAssetHoldRowOf(const _BRAssetHoldState *s, UInt256 txHash, 
         if (_BRAssetHoldOutpointCmp(r->txHash, r->n, txHash, n) < 0) lo = mid + 1;
         else hi = mid;
     }
+
+    return lo;
+}
+
+// The stored quantity of the row for (txHash, n), in *q, and 1; 0 when there is no row. (Rows for one
+// outpoint that differ were refused before the pass: any of them is the answer.)
+static inline int _BRAssetHoldRowOf(const _BRAssetHoldState *s, UInt256 txHash, uint32_t n, int64_t *q)
+{
+    size_t lo = _BRAssetHoldRowLowerBound(s, txHash, n);
+    const BRAssetHoldRow *r;
 
     if (lo >= s->v->rowCount) return 0;
     r = &s->v->rows[s->w[lo].row];
@@ -868,8 +898,8 @@ static inline _BRAssetHoldUnits _BRAssetHoldInputUnits(_BRAssetHoldState *s, con
 
 // Adds an outpoint to `held` unless held[0, s->heldSorted) has it. 0 when it does not fit. (Within one
 // phase, the pass or the replay, each outpoint is offered once -- the pass reads each transaction once, and
-// rows for one outpoint agree -- so what was added since the last _BRAssetHoldSettle need not be searched;
-// a copy left there by rows that agree goes at the next settle, and the bound counts every row.)
+// the replay reads only the first row of each outpoint -- so what was added since the last
+// _BRAssetHoldSettle need not be searched, and a held buffer of the answer's size is enough.)
 static inline int _BRAssetHoldAdd(const _BRAssetHoldState *s, BRUTXO *held, size_t heldCap, size_t *count, UInt256 txHash,
                                   uint32_t n)
 {
@@ -1056,6 +1086,9 @@ static inline BRAssetHoldStatus _BRAssetHoldRead(_BRAssetHoldState *s, BRUTXO *h
         const BRTransaction *tx = _BRAssetHoldTxAt(s, _BRAssetHoldFind(s, row->txHash));
         BRAssetFact decoder, verdict;
 
+        // a row listed twice is read once, at its first place in the view (the first in sorted order), so
+        // the rows are still read in the view's order
+        if (s->w[_BRAssetHoldRowLowerBound(s, row->txHash, row->n)].row != k) continue;
         if (row->spent) continue;
         decoder = (row->quantity > 0) ? BR_ASSET_FACT_YES : _BRAssetHoldReplayAnswer(s, row);
         // The classifier holds nothing of a transaction the wallet does not hold.
@@ -1073,8 +1106,9 @@ static inline BRAssetHoldStatus _BRAssetHoldRead(_BRAssetHoldState *s, BRUTXO *h
     return BR_ASSET_HOLD_COMPLETE;
 }
 
-// (internal) BRAssetHoldOutputs with a choice of readings: bit 1 the decoder's, bit 2 the other. The
-// host KAT reads each alone.
+// (internal) BRAssetHoldOutputs with a choice of readings: bit 1 the decoder's, bit 2 the other; 3 both.
+// A choice of neither, or of bits beyond these, refuses. One reading alone is a test seam (TEST SEAMS):
+// the host KAT reads each alone, and a build without ASSET_HOLD_TEST_SEAMS refuses anything but 3.
 static inline BRAssetHoldResult _BRAssetHoldOutputsReading(const BRAssetHoldView *view, BRAssetHoldWork *work,
                                                            size_t workCap, BRUTXO *held, size_t heldCap, int readings)
 {
@@ -1085,8 +1119,13 @@ static inline BRAssetHoldResult _BRAssetHoldOutputsReading(const BRAssetHoldView
 
     memset(&r, 0, sizeof(r));
     if (! view || (view->txCount > 0 && ! view->txs) || (view->rowCount > 0 && ! view->rows) ||
-        (view->provenCount > 0 && ! view->proven) || (heldCap > 0 && ! held) || (workCap > 0 && ! work))
+        (view->provenCount > 0 && ! view->proven) || (heldCap > 0 && ! held) || (workCap > 0 && ! work) ||
+        (readings & 3) == 0 || (readings & ~3) != 0)
         return _BRAssetHoldRefuse(BR_ASSET_HOLD_REFUSED_ARGUMENTS);
+#if !ASSET_HOLD_TEST_SEAMS && !(ASSET_HOLD_UNFIXED & ASSET_HOLD_RED_SEAMS_OPEN)
+    // what ships: the core's classifier and both readings, always
+    if (view->classifier != NULL || readings != 3) return _BRAssetHoldRefuse(BR_ASSET_HOLD_REFUSED_ARGUMENTS);
+#endif
 
     for (i = 0; i < view->txCount; i++) {   // every transaction must be readable before any is read
         const BRTransaction *tx = view->txs[i];
@@ -1112,7 +1151,7 @@ static inline BRAssetHoldResult _BRAssetHoldOutputsReading(const BRAssetHoldView
         _BRAssetHoldSort(view, work, _BR_ASSET_HOLD_BY_TX, view->txCount);
         _BRAssetHoldSort(view, work, _BR_ASSET_HOLD_BY_ROW, view->rowCount);
         _BRAssetHoldSort(view, work, _BR_ASSET_HOLD_BY_PROOF, view->provenCount);
-        if (_BRAssetHoldRowsDisagree(view, work)) return _BRAssetHoldRefuse(BR_ASSET_HOLD_REFUSED_ARGUMENTS);
+        if (_BRAssetHoldRowsDisagree(view, work)) return _BRAssetHoldRefuse(BR_ASSET_HOLD_REFUSED_ROWS);
 
         // the decoder's reading (the Kotlin's), then the one whose facts the classifier informs
         s.classifierInFacts = 0;

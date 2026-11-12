@@ -16,13 +16,18 @@
 //    4. the key array, the transaction or the path buffer cannot be allocated            -> NO_MEMORY
 //    5. per input, in order: a script NULL, empty, or longer than BR_LEGACY_SWEEP_SCRIPT_MAX (128, the bridge's
 //       decode buffer)                                                                   -> BAD_INPUT (fee->input)
+//       then an amount above MAX_MONEY, or one that takes the running total of the amounts so far above
+//       MAX_MONEY                                                                        -> BAD_AMOUNT (fee->input)
 //       otherwise the key at prefixPath/chain/index is derived (BRBIP32PrivKeyArrayPath, HMAC key hmacKey) and
 //       the input added (txHash, vout, amount, script; no signature or witness; TXIN_SEQUENCE). totalIn is the
-//       sum of the amounts.
+//       sum of the amounts, at most MAX_MONEY.
 //    6. BRAddressScriptPubKey(destAddress) into BR_LEGACY_SWEEP_DEST_SCRIPT_MAX (48) bytes is 0 -> BAD_DESTINATION
 //    7. THE FEE. estSize = BR_LEGACY_SWEEP_BASE_BYTES (10) + inputCount * BR_LEGACY_SWEEP_INPUT_BYTES (160)
-//       + BR_LEGACY_SWEEP_OUTPUT_BYTES (34), whatever the input types; fee = estSize * feePerKb / 1000, at
-//       least BR_LEGACY_SWEEP_MIN_FEE (1000).
+//       + BR_LEGACY_SWEEP_OUTPUT_BYTES (34), whatever the input types.
+//       estSize * feePerKb above UINT64_MAX (or estSize above SIZE_MAX)                  -> FEE_OVERFLOW
+//       fee = estSize * feePerKb / 1000, at least BR_LEGACY_SWEEP_MIN_FEE (1000).
+//       feePerKb above BR_LEGACY_SWEEP_MAX_FEE_PER_KB (MAX_FEE_PER_KB, 5,236,126)         -> FEE_RATE_TOO_HIGH
+//       (the product is checked before the rate, so a rate that wraps is named as a wrap; either is refused)
 //    8. inputCount > 1 and totalIn <= fee * BR_LEGACY_SWEEP_FEE_RATIO (20), i.e. the fee is 5% of the inputs or
 //       more                                                                             -> FEE_TOO_HIGH
 //       (a lone input is exempt: a small coin can legitimately pay a large share in fee)
@@ -31,16 +36,27 @@
 //       signs P2PKH, P2WPKH, P2SH-P2WPKH and P2TR key-path inputs by their script; a failed sign, or a transaction
 //       that is not then BRTransactionIsSigned (an input no derived key matches)       -> SIGN_FAILED
 //   11. SIGNED: *txOut is the signed transaction; the caller frees it (BRTransactionFree).
-//  On every refusal *txOut is NULL and nothing is left allocated.
+//  On every refusal *txOut is NULL and nothing is left allocated: a refusal is a status, never a transaction with
+//  a smaller output or a smaller (or zero) fee.
 //  ARITHMETIC, uint64_t as the bridge computes it (the bridge casts its jlong amounts and feePerKb to uint64_t; a
-//  platform passes what it would have passed the bridge). Two values can wrap modulo 2^64: the sum totalIn, and the
-//  product estSize * feePerKb. No other can: fee is at most (2^64 - 1) / 1000 or the 1000 floor, so fee * 20 and
-//  fee + 546 fit; and the dust rule leaves fee < totalIn, so the output totalIn - fee never wraps.
-//  FEE RATE. feePerKb must be a trusted constant, or clamped by the platform: nothing here bounds it, and a lone input
-//  is exempt from the 5% rule, so a large rate burns most of a one-coin sweep (one 10 DGB coin at 4.9e9 sat/kB signs
-//  with a fee of 9.996 DGB).
+//  platform passes what it would have passed the bridge). Nothing wraps. The two values that could wrap modulo 2^64
+//  are refused before they do: the sum totalIn (each amount and the running total at most MAX_MONEY, so the sum is
+//  at most MAX_MONEY: BAD_AMOUNT), and the product estSize * feePerKb (FEE_OVERFLOW). Then fee is at most
+//  (2^64 - 1) / 1000 or the 1000 floor, so fee * 20 and fee + 546 fit; and the dust rule leaves fee < totalIn, so
+//  the output totalIn - fee never wraps. (The bridge, jni_derive.c, still wraps both; the core no longer agrees with
+//  it there, and only there.) A jlong amount that was negative reads as above MAX_MONEY.
+//  FEE RATE. A lone input is exempt from the 5% rule, so without a bound on feePerKb a large rate would burn most of
+//  a one-coin sweep (one 10 DGB coin at 4.9e9 sat/kB would sign with a fee of 9.996 DGB). The bound is the core's
+//  existing ceiling on a fee rate, MAX_FEE_PER_KB (BRWallet.h): the highest rate BRPeerManager will raise the
+//  wallet's own rate to from its peers' feefilter messages, about 52 times DEFAULT_FEE_PER_KB (100,000, DigiByte's
+//  minimum relay rate, which is what the Android caller passes for every sweep). A rate the wallet would never
+//  adopt from the network is not one a sweep should sign at. At the bound a lone input pays at most
+//  204 * 5,236,126 / 1000 = 1,068,169 satoshis (0.0107 DGB) and each further input adds at most 837,780, where the
+//  5% rule also applies. Rates at or below the bound, DEFAULT_FEE_PER_KB among them, sign exactly as before.
 //  fee (optional) reports what was computed for the platform's log: estSize, fee, totalIn and the output amount
-//  as far as the call got, and the failing input for BAD_INPUT (SIZE_MAX otherwise).
+//  as far as the call got (FEE_OVERFLOW leaves fee 0; FEE_RATE_TOO_HIGH reports the fee the rate would have paid;
+//  BAD_AMOUNT leaves totalIn the sum before the refused input), and the failing input for BAD_INPUT and
+//  BAD_AMOUNT (SIZE_MAX otherwise).
 //
 //  THE GATE. A platform MUST pass *txOut through BRSignedSpendGate (or its reservation) before serializing or
 //  publishing it; a SIGNED result is not permission to broadcast. The bridge does so against its loaded wallet, or
@@ -63,7 +79,7 @@
 //  NETWORK. BRAddressScriptPubKey follows BRNetworkIsTestnet() at the call.
 //
 //  Comparison arms for the host KAT only (legacy_sweep_kat in the Android repo), tested by VALUE (#if); unset or
-//  =0 is what ships. Each is one fee rule or the key wipe changed:
+//  =0 is what ships. Each is one fee rule, one refusal or the key wipe changed:
 //    BR_LEGACY_SWEEP_RED_SIZE=1          148 bytes per input instead of 160
 //    BR_LEGACY_SWEEP_RED_FLOOR=1         no 1000-satoshi minimum fee
 //    BR_LEGACY_SWEEP_RED_RATIO=1         the 5% refusal is not applied
@@ -71,6 +87,9 @@
 //    BR_LEGACY_SWEEP_RED_RATIO_SINGLE=1  the 5% refusal applies to a lone input too
 //    BR_LEGACY_SWEEP_RED_DUST=1          the dust refusal applies only below the boundary (totalIn < fee + 546)
 //    BR_LEGACY_SWEEP_RED_NO_WIPE=1       the derived keys are freed without being wiped
+//    BR_LEGACY_SWEEP_RED_FEE_CAP=1       no bound on feePerKb (no FEE_RATE_TOO_HIGH)
+//    BR_LEGACY_SWEEP_RED_MAX_MONEY=1     no MAX_MONEY bound on an amount or the total (no BAD_AMOUNT; the sum wraps)
+//    BR_LEGACY_SWEEP_RED_FEE_OVERFLOW=1  no overflow check on estSize * feePerKb (no FEE_OVERFLOW; the product wraps)
 //  Header-only, static inline; no I/O, no locking, no clock.
 //
 
@@ -82,7 +101,8 @@
 #include "BRAddress.h"
 #include "BRBIP32Sequence.h"
 #include "BRCrypto.h"
-#include "BRTransaction.h"
+#include "BRTransaction.h"   // MAX_MONEY
+#include "BRWallet.h"        // DEFAULT_FEE_PER_KB, MAX_FEE_PER_KB
 #include "BRRawTxBinding.h"
 #include <stddef.h>
 #include <stdint.h>
@@ -113,6 +133,15 @@ extern "C" {
 #ifndef BR_LEGACY_SWEEP_RED_NO_WIPE
 #define BR_LEGACY_SWEEP_RED_NO_WIPE 0
 #endif
+#ifndef BR_LEGACY_SWEEP_RED_FEE_CAP
+#define BR_LEGACY_SWEEP_RED_FEE_CAP 0
+#endif
+#ifndef BR_LEGACY_SWEEP_RED_MAX_MONEY
+#define BR_LEGACY_SWEEP_RED_MAX_MONEY 0
+#endif
+#ifndef BR_LEGACY_SWEEP_RED_FEE_OVERFLOW
+#define BR_LEGACY_SWEEP_RED_FEE_OVERFLOW 0
+#endif
 
 #define BR_LEGACY_SWEEP_SEED_MAX        64u    // a BIP39 seed; the bridge's SEED_BUFFER_MAX
 #define BR_LEGACY_SWEEP_SCRIPT_MAX      128u   // the bridge's scriptBytes[128]
@@ -127,6 +156,11 @@ extern "C" {
 #define BR_LEGACY_SWEEP_MIN_FEE         1000u  // DigiByte's minimum relay fee
 #define BR_LEGACY_SWEEP_FEE_RATIO       20u    // refused when totalIn <= fee * 20 (fee >= 5%), more than one input
 #define BR_LEGACY_SWEEP_DUST            546u
+#define BR_LEGACY_SWEEP_MAX_FEE_PER_KB  ((uint64_t)MAX_FEE_PER_KB)   // 5,236,126 sat/kB: see FEE RATE
+#define BR_LEGACY_SWEEP_MAX_MONEY       ((uint64_t)MAX_MONEY)        // 21e9 DGB in satoshis
+
+// The rate the Android caller passes (DEFAULT_FEE_PER_KB) is under the bound, so the bound changes nothing there.
+typedef char _BRLegacySweepDefaultRateUnderCap[(DEFAULT_FEE_PER_KB <= BR_LEGACY_SWEEP_MAX_FEE_PER_KB) ? 1 : -1];
 
 typedef struct {
     UInt256 txHash;            // the coin's txid, internal byte order
@@ -148,7 +182,10 @@ typedef enum {
     BR_LEGACY_SWEEP_BAD_DESTINATION = 6,  // the destination has no script
     BR_LEGACY_SWEEP_FEE_TOO_HIGH = 7,     // more than one input and the fee is 5% of the inputs or more
     BR_LEGACY_SWEEP_DUST_OUTPUT = 8,      // the inputs do not exceed the fee plus 546
-    BR_LEGACY_SWEEP_SIGN_FAILED = 9       // an input was not signed
+    BR_LEGACY_SWEEP_SIGN_FAILED = 9,      // an input was not signed
+    BR_LEGACY_SWEEP_BAD_AMOUNT = 10,      // an input's amount, or the running total, is above MAX_MONEY
+    BR_LEGACY_SWEEP_FEE_RATE_TOO_HIGH = 11, // feePerKb is above BR_LEGACY_SWEEP_MAX_FEE_PER_KB
+    BR_LEGACY_SWEEP_FEE_OVERFLOW = 12     // estSize * feePerKb does not fit in 64 bits
 } BRLegacySweepResult;
 
 typedef struct {
@@ -156,7 +193,7 @@ typedef struct {
     uint64_t fee;
     uint64_t totalIn;
     uint64_t outAmount;
-    size_t input;              // BAD_INPUT: the input refused; otherwise SIZE_MAX
+    size_t input;              // BAD_INPUT, BAD_AMOUNT: the input refused; otherwise SIZE_MAX
 } BRLegacySweepFee;
 
 // Fills in's outpoint from utxo and its amount and script from utxo's PROVEN proof of parents[]
@@ -229,6 +266,14 @@ static inline BRLegacySweepResult BRLegacySweepBuildAndSign(BRTransaction **txOu
             r = BR_LEGACY_SWEEP_BAD_INPUT;
             goto out;
         }
+#if ! BR_LEGACY_SWEEP_RED_MAX_MONEY
+        // totalIn <= MAX_MONEY here, so MAX_MONEY - totalIn does not wrap, and neither does the sum below.
+        if (in->amount > BR_LEGACY_SWEEP_MAX_MONEY || in->amount > BR_LEGACY_SWEEP_MAX_MONEY - f.totalIn) {
+            f.input = i;
+            r = BR_LEGACY_SWEEP_BAD_AMOUNT;
+            goto out;
+        }
+#endif
         fullPath[prefixLen] = in->chain;
         fullPath[prefixLen + 1] = in->index;
         BRBIP32PrivKeyArrayPath(&keys[i], seed, seedLen, hmacKey, fullPath, prefixLen + 2);
@@ -243,10 +288,30 @@ static inline BRLegacySweepResult BRLegacySweepBuildAndSign(BRTransaction **txOu
     destScriptLen = BRAddressScriptPubKey(destScript, sizeof(destScript), destAddress);
     if (destScriptLen == 0) { r = BR_LEGACY_SWEEP_BAD_DESTINATION; goto out; }
 
+#if ! BR_LEGACY_SWEEP_RED_FEE_OVERFLOW
+    // Unreachable past the key array's calloc on any real host, kept so estSize itself is never a wrapped value.
+    if (inputCount >
+        (SIZE_MAX - BR_LEGACY_SWEEP_BASE_BYTES - BR_LEGACY_SWEEP_OUTPUT_BYTES) / BR_LEGACY_SWEEP_INPUT_BYTES) {
+        r = BR_LEGACY_SWEEP_FEE_OVERFLOW;
+        goto out;
+    }
+#endif
     f.estSize = BR_LEGACY_SWEEP_BASE_BYTES + inputCount * BR_LEGACY_SWEEP_INPUT_BYTES + BR_LEGACY_SWEEP_OUTPUT_BYTES;
+#if ! BR_LEGACY_SWEEP_RED_FEE_OVERFLOW
+    if (feePerKb != 0 && (uint64_t)f.estSize > UINT64_MAX / feePerKb) {
+        r = BR_LEGACY_SWEEP_FEE_OVERFLOW;
+        goto out;
+    }
+#endif
     f.fee = ((uint64_t)f.estSize * feePerKb) / 1000;
 #if ! BR_LEGACY_SWEEP_RED_FLOOR
     if (f.fee < BR_LEGACY_SWEEP_MIN_FEE) f.fee = BR_LEGACY_SWEEP_MIN_FEE;
+#endif
+#if ! BR_LEGACY_SWEEP_RED_FEE_CAP
+    if (feePerKb > BR_LEGACY_SWEEP_MAX_FEE_PER_KB) {
+        r = BR_LEGACY_SWEEP_FEE_RATE_TOO_HIGH;
+        goto out;
+    }
 #endif
 
 #if ! BR_LEGACY_SWEEP_RED_RATIO

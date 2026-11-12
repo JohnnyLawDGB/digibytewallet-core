@@ -95,9 +95,9 @@
 //  quantity, assetId, recipientAddress and approvedFeeSats are the approval the person confirmed: the
 //  units sent, the asset, the address (already without surrounding whitespace) and the highest fee they
 //  saw. A plan for anything else is refused (5, 8, 11, 14), so what is signed is what was approved. The
-//  approval is the caller's to give as the figure the person saw: an approval of INT64_MAX limits
-//  nothing beyond check 13's fee rule, which a plan filled in by hand can still satisfy at a high rate
-//  (the outcome does not carry the rate it was planned at, so the rate is not checked here).
+//  approval is the caller's to give as the figure the person saw: the higher the approval, the less it
+//  limits, and check 13 does not limit the rate (the outcome does not carry the rate it was planned at).
+//  A caller passes the fee the person was shown, never a placeholder.
 //
 //  KEYS. seed is read, never written or copied. The keys are derived and wiped inside
 //  BRWalletSignTransaction (BRKeyClean, every path). Nothing here draws a random number or reads a
@@ -117,17 +117,17 @@
 //  cases. Unset or =0 is what ships.
 //    1      BR_ASSET_TRANSFER_RED_SHAPE        the plan's outputs and source script are not checked (4).
 //    2      BR_ASSET_TRANSFER_RED_ASSET        the asset inputs' asset and units are not checked (5).
-//    4      BR_ASSET_TRANSFER_RED_BOUNDS       a negative vout and out-of-range sats are cast, as the bridge does (6).
+//    4      BR_ASSET_TRANSFER_RED_BOUNDS       a negative vout and out-of-range sats are cast, unchecked (6).
 //    8      BR_ASSET_TRANSFER_RED_CARRIER      the carrier is neither decoded nor compared (10, 12).
 //    16     BR_ASSET_TRANSFER_RED_CARRIER_BYTES the carrier's bytes are not compared, only its reading (12).
 //    32     BR_ASSET_TRANSFER_RED_UNITS        where the units land is not checked (11).
-//    64     BR_ASSET_TRANSFER_RED_FEE          the fee paid is not compared with the plan's (13).
+//    64     BR_ASSET_TRANSFER_RED_FEE          the fee paid is not compared with the plan's, nor held to the plan's fee rule (13).
 //    128    BR_ASSET_TRANSFER_RED_APPROVAL     the fee is not held to the approval (14).
 //    256    BR_ASSET_TRANSFER_RED_CONFLICTED   an input from a replaced send is signed (15).
 //    512    BR_ASSET_TRANSFER_RED_UNKNOWN      an input the wallet holds no transaction for is signed (15).
 //    1024   BR_ASSET_TRANSFER_RED_RECORD       an input's amount and script are not compared with the wallet's (15).
 //    2048   BR_ASSET_TRANSFER_RED_HELD         a held fee input is signed (15).
-//    4096   BR_ASSET_TRANSFER_RED_NOT_PLAIN    a fee input outside the plain spendable coins is signed (15).
+//    4096   BR_ASSET_TRANSFER_RED_NOT_PLAIN    a fee input outside the plain spendable coins, or outside the planner's fee-coin rule, is signed (15).
 //    8192   BR_ASSET_TRANSFER_RED_PRESPENT     a spent input is not refused before signing (15, 16).
 //    16384  BR_ASSET_TRANSFER_RED_GATE         the signed transaction does not pass the spend gate (18).
 //    32768  BR_ASSET_TRANSFER_RED_DUPLICATE    two inputs naming one outpoint are not refused (7).

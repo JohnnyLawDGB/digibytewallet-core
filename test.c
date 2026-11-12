@@ -1625,11 +1625,25 @@ int BRBIP32SequenceTests()
     return r;
 }
 
+// 1 if the n bytes at a and b are equal. An empty script or signature is NULL with length 0, and memcmp
+// with a NULL pointer is undefined even for 0 bytes, so no compare is made for n == 0.
+// TEST_TX_EQUAL_UNFIXED keeps the earlier form for the host KAT's comparison arm only.
+#ifndef TEST_TX_EQUAL_UNFIXED
+#define TEST_TX_EQUAL_UNFIXED 0
+#endif
+static int BRBytesEqual(const void *a, const void *b, size_t n) {
+#if TEST_TX_EQUAL_UNFIXED
+    return 0 == memcmp(a, b, n);
+#else
+    return n == 0 || 0 == memcmp(a, b, n);
+#endif
+}
+
 static int BRTxOutputEqual(BRTxOutput *out1, BRTxOutput *out2) {
     return out1->amount == out2->amount
            && 0 == memcmp (out1->address, out2->address, sizeof (out1->address))
            && out1->scriptLen == out2->scriptLen
-           && 0 == memcmp (out1->script, out2->script, out1->scriptLen * sizeof (uint8_t));
+           && BRBytesEqual(out1->script, out2->script, out1->scriptLen * sizeof (uint8_t));
 }
 
 
@@ -1640,9 +1654,9 @@ static int BRTxInputEqual(BRTxInput *in1, BRTxInput *in2) {
            && 0 == memcmp(in1->address, in2->address, sizeof(in1->address))
            && in1->amount == in2->amount
            && in1->scriptLen == in2->scriptLen
-           && 0 == memcmp(in1->script, in2->script, in1->scriptLen * sizeof(uint8_t))
+           && BRBytesEqual(in1->script, in2->script, in1->scriptLen * sizeof(uint8_t))
            && in1->sigLen == in2->sigLen
-           && 0 == memcmp(in1->signature, in2->signature, in1->sigLen * sizeof(uint8_t))
+           && BRBytesEqual(in1->signature, in2->signature, in1->sigLen * sizeof(uint8_t))
            && in1->sequence == in2->sequence;
 }
 

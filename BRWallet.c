@@ -3390,7 +3390,8 @@ static int _BRWalletAssetHoldOwned(void *info, const BRTransaction *tx, size_t v
 }
 
 // See BRAssetHold.h. The pass reads one snapshot of the transaction set, and its outpoints are held in the same
-// lock hold, so no transaction can arrive between the reading and the holding.
+// lock hold, so no transaction can arrive between the reading and the holding. A caller refuses a plain spend
+// unless this answered COMPLETE after the last transaction was added or removed.
 BRAssetHoldResult BRWalletHoldAssetOutputs(BRWallet *wallet, const BRAssetHoldRow *rows, size_t rowCount,
                                            const UInt256 *proven, size_t provenCount,
                                            BRAssetHoldWork *work, size_t workCap, BRUTXO *held, size_t heldCap)

@@ -19,7 +19,8 @@
 //      otherwise UNKNOWN. Never weaker than either reader. The pass is read twice. The DECODER'S
 //      READING is the Kotlin's, exactly: every fact the walk reads is the decoder's. The OTHER READING
 //      puts the questions the Kotlin puts to its decoder alone -- does this funding transaction carry a
-//      payload, may this funding output carry units -- to both readers, and reads the union. In both,
+//      payload, may this funding output carry units -- to both readers, and reads the union; and it reads
+//      a funding transaction only by the carrier the pass reads that transaction by. In both,
 //      each output's verdict is the decoder's united with the classifier's, and an output either
 //      reading holds is held. (Two readings, not one: a remainder proof turns an unknown total into a
 //      known one, so a reading with more unknowns can hold less; the decoder's reading keeps the pass
@@ -44,14 +45,15 @@
 //      remainder of zero: YES. Otherwise the remainder of the funding transaction decides, and its input
 //      total is resolved the same way, one transaction further back, as far back as the run goes (each
 //      transaction once, on an explicit stack held in the caller's work buffer, so a long run of sends costs
-//      no call depth). The walk reads the funding transaction's FIRST OP_RETURN as its carrier. A transaction
-//      the wallet does not hold, one with no carrier there, and one whose inputs cannot all be read (an index
-//      past INT32_MAX) have no answer. A total taken before everything under it was resolved (a cycle) has no
-//      answer, and that walk records nothing for later walks; every other total a walk resolves is recorded
-//      for the rest of the phase, and the pass records each carrier transaction's own total as it goes. In
-//      the other reading each answer the walk gives, for the output asked about and for every stored-zero
-//      input it reads on the way, is united with the classifier's verdict for that output. The steps are the
-//      Kotlin's in both.
+//      no call depth). The walk reads the funding transaction's FIRST OP_RETURN as its carrier; in the other
+//      reading only when that is also the carrier THE PASS reads it by. A transaction the wallet does not
+//      hold, one with no carrier there (in the other reading: one whose carrier is another output), and one
+//      whose inputs cannot all be read (an index past INT32_MAX) have no answer. A total taken before
+//      everything under it was resolved (a cycle) has no answer, and that walk records nothing for later
+//      walks; every other total a walk resolves is recorded for the rest of the phase, and the pass records
+//      each carrier transaction's own total as it goes. In the other reading each answer the walk gives,
+//      for the output asked about and for every stored-zero input it reads on the way, is united with the
+//      classifier's verdict for that output. The steps are the Kotlin's in both.
 //    - THE REPLAY (Kotlin: replayAssetOutpointExclusions), after the pass, over the rows not spent, with
 //      its own record of totals: a row with a positive quantity is held; any other is held when its
 //      output is targeted -- the pass's rule, except that an input it cannot read is passed over -- or
@@ -60,34 +62,41 @@
 //      transaction is never released. The classifier is asked too, and the union decides. Each reading
 //      replays with its own record of totals.
 //    - REFUSALS. The answer is BR_ASSET_HOLD_COMPLETE only when every transaction was read. A NULL where
-//      a value is needed is ARGUMENTS; a transaction that cannot be read (a NULL transaction, outputs,
-//      inputs or script where the counts say there are some, or more than INT32_MAX outputs) is
-//      UNREADABLE; a work buffer under one entry per transaction, or a held list the buffer cannot hold,
-//      is CAPACITY. A refusal writes no outpoint (heldCount 0): the caller must refuse the spend, never
-//      read it as "nothing held". The status 0 is a refusal, so a result nobody filled refuses.
-//      CAPACITY says what suffices: workNeeded (one per transaction) and heldNeeded (every output of
-//      every transaction, plus every row).
+//      a value is needed, or two rows for one outpoint that differ in quantity or spent flag, is ARGUMENTS
+//      (rows that are the same are read as one); a transaction that cannot be read (a NULL transaction,
+//      outputs, inputs or script where the counts say there are some, or more than INT32_MAX outputs) is
+//      UNREADABLE; a work buffer smaller than the view's count of transactions, rows or proofs, whichever
+//      is most, or a held list the buffer cannot hold, is CAPACITY. A refusal reports heldCount 0, and what
+//      `held` then holds is unspecified. The caller must refuse the spend on any status but COMPLETE, never
+//      read a refusal as "nothing held". The status 0 is a refusal, so a result nobody filled refuses.
+//      CAPACITY says what suffices: workNeeded and heldNeeded (every output of every transaction, plus
+//      every row), as BRAssetHoldBounds gives them.
 //
 //  How the Kotlin's arguments are written here: a transaction is the BRTransaction the wallet holds; a
 //  txid is its txHash as the struct holds it (BRWallet's order, not the display order); a row is
-//  BRAssetHoldRow (its txid, index, stored quantity and spent flag; the first row for an outpoint is
-//  the one read); the proof store is the list of txids whose remainder is proven zero; the owned-script
-//  set is the owned callback. The classifier half is BRDigiAsset.c's unless the view names another
-//  (BRAssetHoldClassifier: the host KAT's abstract verdicts). A pass here reads one snapshot, so the
-//  Kotlin's re-listing until the set settles and its caches are not needed: they change what is read,
-//  not what is answered. Its plain-transaction set is kept for the one pass (it answers "no payload" for
+//  BRAssetHoldRow (its txid, index, stored quantity and spent flag; one answer per outpoint, as the
+//  Kotlin's table has one row per outpoint); the proof store is the list of txids whose remainder is
+//  proven zero; the owned-script set is the owned callback. The classifier half is BRDigiAsset.c's
+//  unless the view names another (BRAssetHoldClassifier: a test seam for the host KAT's abstract
+//  verdicts; a production caller leaves it NULL, as BRWalletHoldAssetOutputs does). A pass here reads
+//  one snapshot, so the Kotlin's re-listing until the set settles and its caches are not needed: they
+//  change what is read, not what is answered. Its plain-transaction set is kept for the one pass (it answers "no payload" for
 //  a transaction read earlier in the pass that has no outputs); across passes it is not.
 //
 //  BRWalletHoldAssetOutputs runs the pass over the wallet's own transactions under its lock, owned
 //  meaning "an address of the wallet's", and on COMPLETE holds every outpoint in the list
 //  (BRWalletRegisterAssetOutpoint's list, one balance rebuild for all of them); newlyHeld counts those
-//  not held before. On a refusal it holds nothing new. Registrations do not survive a restart: run it
-//  after the wallet loads and before every spend.
+//  not held before. On a refusal it holds nothing new. What it holds covers the transactions it read, and
+//  registrations do not survive a restart: run it after the wallet loads, after transactions are added or
+//  removed, and immediately before building any spend from the plain-coin set; refuse the spend when it
+//  answers anything but COMPLETE. (Nothing in the core enforces that order yet.)
 //
-//  No allocation, no network, no clock, no I/O in the pass: the caller's `work` buffer (one entry per
-//  transaction) holds the walk's state and its stack, and the caller's `held` buffer the answer, never
-//  shortened. The pass is static inline; it calls BRDigiAsset.c's classifier. Its includes are libc and
-//  the core headers whose types or functions it uses. It reads no build-time policy macro.
+//  No allocation, no network, no clock, no I/O in the pass: the caller's `work` buffer (BRAssetHoldBounds)
+//  holds the walk's state, its stack and the sorted indexes of transactions, rows and proofs, and the
+//  caller's `held` buffer the answer, never shortened. Every lookup (a transaction, a row, a proof, a
+//  held outpoint) is a binary search over a sorted index, never a scan. The pass is static inline; it
+//  calls BRDigiAsset.c's classifier. Its includes are libc and the core headers whose types or functions
+//  it uses. It reads no build-time policy macro.
 //
 //  Test seams (host KAT asset_hold_kat in the Android repo): ASSET_HOLD_UNFIXED, tested by VALUE as a
 //  set of bits; each comparison arm sets one bit and fails only its own cases. Unset or =0 is what ships.
@@ -105,6 +114,8 @@
 //    2048  ASSET_HOLD_RED_CAPACITY_SHORTENS   a held list the buffer cannot hold is shortened.
 //    4096  ASSET_HOLD_RED_REFUSAL_EMPTY       a pass that cannot complete answers "complete, nothing held".
 //    8192  ASSET_HOLD_RED_FACTS_DECODER_ONLY  only the decoder's reading is made.
+//    16384 ASSET_HOLD_RED_SHAPE_FIRST_ONLY    the other reading too reads a funding transaction by its first OP_RETURN.
+//    32768 ASSET_HOLD_RED_DUPLICATE_ROWS      two rows for one outpoint that differ are read, one of them winning.
 //
 //  Permission is hereby granted, free of charge, to any person obtaining a copy
 //  of this software and associated documentation files (the "Software"), to deal
@@ -161,6 +172,8 @@ extern "C" {
 #define ASSET_HOLD_RED_CAPACITY_SHORTENS   2048
 #define ASSET_HOLD_RED_REFUSAL_EMPTY       4096
 #define ASSET_HOLD_RED_FACTS_DECODER_ONLY  8192
+#define ASSET_HOLD_RED_SHAPE_FIRST_ONLY    16384
+#define ASSET_HOLD_RED_DUPLICATE_ROWS      32768
 
 // ---- the types -----------------------------------------------------------------------------------
 
@@ -176,7 +189,8 @@ typedef struct {
 typedef int (*BRAssetHoldOwnedFn)(void *info, const BRTransaction *tx, size_t vout);
 
 // The classifier half, when it is not the core's (a test puts verdicts here that no script it has to
-// write gives). Each answers 1 or 0. NULL in the view, or a NULL function: BRDigiAsset.c's.
+// write gives). Each answers 1 or 0. NULL in the view, or a NULL function: BRDigiAsset.c's. A TEST SEAM:
+// a production caller leaves the view's classifier NULL, since another one can make the union weaker.
 typedef struct {
     int (*outputIsAsset)(void *info, const BRTransaction *tx, size_t vout);   // BRTxOutputIsAsset
     int (*containsAsset)(void *info, const BRTransaction *tx);                // BRContainsAsset over its outputs
@@ -189,16 +203,18 @@ typedef struct {
     size_t txCount;
     BRAssetHoldOwnedFn owned;        // NULL: every output is the wallet's own (Kotlin: an empty owned set)
     void *info;
-    const BRAssetHoldRow *rows;      // the wallet's rows, spent ones included
+    const BRAssetHoldRow *rows;      // the wallet's rows, spent ones included; one answer per outpoint
     size_t rowCount;
     const UInt256 *proven;           // txids whose last output is proven to carry no units
     size_t provenCount;
-    const BRAssetHoldClassifier *classifier;   // NULL: the core's
+    const BRAssetHoldClassifier *classifier;   // NULL: the core's. A test seam: production callers leave it NULL
 } BRAssetHoldView;
 
-// One entry of the caller's work buffer, one per transaction. The fields are the pass's own.
+// One entry of the caller's work buffer: as many as the view has transactions, rows or proofs, whichever
+// is most (BRAssetHoldBounds). The fields are the pass's own.
 typedef struct {
     size_t sorted;                   // the transactions by txid
+    size_t row, proof;               // the rows by outpoint, the proofs by txid
     size_t stackTx, stackNext;       // the walk's stack
     size_t link;                     // the totals one walk resolved
     uint32_t epoch;                  // the walk the fields below belong to
@@ -220,7 +236,7 @@ typedef enum {
 
 typedef struct {
     BRAssetHoldStatus status;
-    size_t heldCount;                // COMPLETE: the outpoints written to `held`; 0 otherwise
+    size_t heldCount;                // COMPLETE: the outpoints written to `held`; 0 otherwise, and `held` unspecified
     size_t newlyHeld;                // BRWalletHoldAssetOutputs, COMPLETE: those the wallet did not hold before
     size_t workNeeded;               // CAPACITY: work entries that suffice
     size_t heldNeeded;               // CAPACITY: held entries that suffice
@@ -273,6 +289,7 @@ typedef struct {
 typedef struct {
     const BRAssetHoldView *v;
     BRAssetHoldWork *w;
+    size_t heldSorted;               // held[0, heldSorted) is sorted and holds each outpoint once
     uint32_t epoch;                  // the current walk
     int every;                       // no total of this walk was taken before everything under it
     size_t resolved;                 // the totals this walk resolved, linked through w[].link
@@ -303,43 +320,64 @@ static inline int _BRAssetHoldIsOpReturn(const BRTxOutput *o)
     return (o->scriptLen > 0 && o->script[0] == 0x6a) ? 1 : 0;
 }
 
-// The order the work buffer sorts transactions in: by txid, then by place in the wallet.
-static inline int _BRAssetHoldBefore(const BRAssetHoldView *v, size_t i, size_t j)
-{
-    int c = memcmp(v->txs[i]->txHash.u8, v->txs[j]->txHash.u8, sizeof(UInt256));
+// The three indexes the work buffer sorts: the transactions by txid, the rows by outpoint, the proofs by
+// txid; each then by place in the view.
+enum { _BR_ASSET_HOLD_BY_TX, _BR_ASSET_HOLD_BY_ROW, _BR_ASSET_HOLD_BY_PROOF };
 
+static inline size_t *_BRAssetHoldIndex(BRAssetHoldWork *w, int by, size_t k)
+{
+    return (by == _BR_ASSET_HOLD_BY_TX) ? &w[k].sorted : (by == _BR_ASSET_HOLD_BY_ROW) ? &w[k].row : &w[k].proof;
+}
+
+// The outpoint (h, n) against (h2, n2): negative, 0 or positive.
+static inline int _BRAssetHoldOutpointCmp(UInt256 h, uint32_t n, UInt256 h2, uint32_t n2)
+{
+    int c = memcmp(h.u8, h2.u8, sizeof(UInt256));
+
+    return (c != 0) ? c : (n < n2) ? -1 : (n > n2) ? 1 : 0;
+}
+
+static inline int _BRAssetHoldBefore(const BRAssetHoldView *v, int by, size_t i, size_t j)
+{
+    int c;
+
+    if (by == _BR_ASSET_HOLD_BY_TX) c = memcmp(v->txs[i]->txHash.u8, v->txs[j]->txHash.u8, sizeof(UInt256));
+    else if (by == _BR_ASSET_HOLD_BY_ROW)
+        c = _BRAssetHoldOutpointCmp(v->rows[i].txHash, v->rows[i].n, v->rows[j].txHash, v->rows[j].n);
+    else c = memcmp(v->proven[i].u8, v->proven[j].u8, sizeof(UInt256));
     return (c < 0 || (c == 0 && i < j)) ? 1 : 0;
 }
 
-static inline void _BRAssetHoldSiftDown(const BRAssetHoldView *v, BRAssetHoldWork *w, size_t root, size_t end)
+static inline void _BRAssetHoldSiftDown(const BRAssetHoldView *v, BRAssetHoldWork *w, int by, size_t root, size_t end)
 {
     while (2 * root + 1 < end) {
         size_t child = 2 * root + 1, top = root, t;
 
-        if (_BRAssetHoldBefore(v, w[top].sorted, w[child].sorted)) top = child;
-        if (child + 1 < end && _BRAssetHoldBefore(v, w[top].sorted, w[child + 1].sorted)) top = child + 1;
+        if (_BRAssetHoldBefore(v, by, *_BRAssetHoldIndex(w, by, top), *_BRAssetHoldIndex(w, by, child))) top = child;
+        if (child + 1 < end && _BRAssetHoldBefore(v, by, *_BRAssetHoldIndex(w, by, top), *_BRAssetHoldIndex(w, by, child + 1)))
+            top = child + 1;
         if (top == root) return;
-        t = w[root].sorted;
-        w[root].sorted = w[top].sorted;
-        w[top].sorted = t;
+        t = *_BRAssetHoldIndex(w, by, root);
+        *_BRAssetHoldIndex(w, by, root) = *_BRAssetHoldIndex(w, by, top);
+        *_BRAssetHoldIndex(w, by, top) = t;
         root = top;
     }
 }
 
-// Heap sort: no allocation, whatever the count.
-static inline void _BRAssetHoldSort(const BRAssetHoldView *v, BRAssetHoldWork *w, size_t n)
+// Heap sort of one index: no allocation, whatever the count.
+static inline void _BRAssetHoldSort(const BRAssetHoldView *v, BRAssetHoldWork *w, int by, size_t n)
 {
     size_t i, t;
 
-    for (i = 0; i < n; i++) w[i].sorted = i;
+    for (i = 0; i < n; i++) *_BRAssetHoldIndex(w, by, i) = i;
     if (n < 2) return;
-    for (i = n / 2; i-- > 0;) _BRAssetHoldSiftDown(v, w, i, n);
+    for (i = n / 2; i-- > 0;) _BRAssetHoldSiftDown(v, w, by, i, n);
 
     for (i = n - 1; i > 0; i--) {
-        t = w[0].sorted;
-        w[0].sorted = w[i].sorted;
-        w[i].sorted = t;
-        _BRAssetHoldSiftDown(v, w, 0, i);
+        t = *_BRAssetHoldIndex(w, by, 0);
+        *_BRAssetHoldIndex(w, by, 0) = *_BRAssetHoldIndex(w, by, i);
+        *_BRAssetHoldIndex(w, by, i) = t;
+        _BRAssetHoldSiftDown(v, w, by, 0, i);
     }
 }
 
@@ -363,35 +401,64 @@ static inline const BRTransaction *_BRAssetHoldTxAt(const _BRAssetHoldState *s, 
     return (i == _BR_ASSET_HOLD_NONE) ? NULL : s->v->txs[i];
 }
 
-// The stored quantity of the first row for (txHash, n), in *q, and 1; 0 when there is no row.
-static inline int _BRAssetHoldRowOf(const BRAssetHoldView *v, UInt256 txHash, uint32_t n, int64_t *q)
+// The stored quantity of the row for (txHash, n), in *q, and 1; 0 when there is no row. (Rows for one
+// outpoint that differ were refused before the pass: any of them is the answer.)
+static inline int _BRAssetHoldRowOf(const _BRAssetHoldState *s, UInt256 txHash, uint32_t n, int64_t *q)
 {
-    size_t i;
+    size_t lo = 0, hi = s->v->rowCount, mid;
+    const BRAssetHoldRow *r;
 
-    for (i = 0; i < v->rowCount; i++) {
-        if (v->rows[i].n == n && UInt256Eq(v->rows[i].txHash, txHash)) {
-            *q = v->rows[i].quantity;
-            return 1;
-        }
+    while (lo < hi) {
+        mid = lo + (hi - lo) / 2;
+        r = &s->v->rows[s->w[mid].row];
+        if (_BRAssetHoldOutpointCmp(r->txHash, r->n, txHash, n) < 0) lo = mid + 1;
+        else hi = mid;
+    }
+
+    if (lo >= s->v->rowCount) return 0;
+    r = &s->v->rows[s->w[lo].row];
+    if (r->n != n || ! UInt256Eq(r->txHash, txHash)) return 0;
+    *q = r->quantity;
+    return 1;
+}
+
+// Do two rows for one outpoint differ in quantity or spent flag? (The rows are sorted.)
+static inline int _BRAssetHoldRowsDisagree(const BRAssetHoldView *v, const BRAssetHoldWork *w)
+{
+#if (ASSET_HOLD_UNFIXED & ASSET_HOLD_RED_DUPLICATE_ROWS)
+    (void)v;
+    (void)w;
+    return 0;
+#else
+    size_t k;
+
+    for (k = 1; k < v->rowCount; k++) {
+        const BRAssetHoldRow *a = &v->rows[w[k - 1].row], *b = &v->rows[w[k].row];
+
+        if (_BRAssetHoldOutpointCmp(a->txHash, a->n, b->txHash, b->n) == 0 &&
+            (a->quantity != b->quantity || (a->spent != 0) != (b->spent != 0))) return 1;
     }
 
     return 0;
+#endif
 }
 
-static inline int _BRAssetHoldIsProven(const BRAssetHoldView *v, UInt256 txHash)
+static inline int _BRAssetHoldIsProven(const _BRAssetHoldState *s, UInt256 txHash)
 {
 #if (ASSET_HOLD_UNFIXED & ASSET_HOLD_RED_PROOF_IGNORED)
-    (void)v;
+    (void)s;
     (void)txHash;
     return 0;
 #else
-    size_t i;
+    size_t lo = 0, hi = s->v->provenCount, mid;
 
-    for (i = 0; i < v->provenCount; i++) {
-        if (UInt256Eq(v->proven[i], txHash)) return 1;
+    while (lo < hi) {
+        mid = lo + (hi - lo) / 2;
+        if (memcmp(s->v->proven[s->w[mid].proof].u8, txHash.u8, sizeof(UInt256)) < 0) lo = mid + 1;
+        else hi = mid;
     }
 
-    return 0;
+    return (lo < s->v->provenCount && UInt256Eq(s->v->proven[s->w[lo].proof], txHash)) ? 1 : 0;
 #endif
 }
 
@@ -418,8 +485,9 @@ static inline void _BRAssetHoldLayout(const BRTransaction *tx, _BRAssetHoldTx *t
     }
 }
 
-// Kotlin: assetCarrier. The carrier of a transaction (see THE PASS) in *t, and 1; 0 when none.
-static inline int _BRAssetHoldCarrier(const BRTransaction *tx, _BRAssetHoldTx *t)
+// Kotlin: assetCarrier. The carrier of a transaction (see THE PASS) in *t, its output index in *at
+// (when `at` is not NULL), and 1; 0 when none.
+static inline int _BRAssetHoldCarrier(const BRTransaction *tx, _BRAssetHoldTx *t, size_t *at)
 {
     size_t j, last = _BR_ASSET_HOLD_NONE;
     BRAssetScriptKind kind;
@@ -430,32 +498,43 @@ static inline int _BRAssetHoldCarrier(const BRTransaction *tx, _BRAssetHoldTx *t
         if (! _BRAssetHoldIsOpReturn(&tx->outputs[j])) continue;
         kind = _BRAssetHoldDecode(&tx->outputs[j], t);
 #if (ASSET_HOLD_UNFIXED & ASSET_HOLD_RED_FIRST_CARRIER)
-        if (kind != BR_ASSET_SCRIPT_NOT_ASSET) return 1;
+        if (kind != BR_ASSET_SCRIPT_NOT_ASSET) {
 #else
-        if (kind == BR_ASSET_SCRIPT_UNCLASSIFIABLE) return 1;
-        if (kind == BR_ASSET_SCRIPT_ASSET) last = j;
+        if (kind == BR_ASSET_SCRIPT_UNCLASSIFIABLE) {
 #endif
+            if (at) *at = j;
+            return 1;
+        }
+        if (kind == BR_ASSET_SCRIPT_ASSET) last = j;
     }
 
     if (last == _BR_ASSET_HOLD_NONE) return 0;
     _BRAssetHoldDecode(&tx->outputs[last], t);
+    if (at) *at = last;
     return 1;
 }
 
 // Kotlin: assetTxShape. A funding transaction as the walk reads it: its FIRST OP_RETURN, when that is a
-// carrier, in *t, and 1; 0 (no answer) otherwise.
-static inline int _BRAssetHoldShape(const BRTransaction *tx, _BRAssetHoldTx *t)
+// carrier, in *t, and 1; 0 (no answer) otherwise. In the other reading the first OP_RETURN must also be
+// the carrier THE PASS reads the transaction by; a transaction whose carrier is another has no answer.
+static inline int _BRAssetHoldShape(const _BRAssetHoldState *s, const BRTransaction *tx, _BRAssetHoldTx *t)
 {
-    size_t j;
+    size_t j, first = _BR_ASSET_HOLD_NONE, at = _BR_ASSET_HOLD_NONE;
 
     if (! tx || tx->outCount == 0) return 0;
-    _BRAssetHoldLayout(tx, t);
 
-    for (j = 0; j < tx->outCount; j++) {
-        if (_BRAssetHoldIsOpReturn(&tx->outputs[j])) return (_BRAssetHoldDecode(&tx->outputs[j], t) != BR_ASSET_SCRIPT_NOT_ASSET);
+    for (j = 0; j < tx->outCount && first == _BR_ASSET_HOLD_NONE; j++) {
+        if (_BRAssetHoldIsOpReturn(&tx->outputs[j])) first = j;
     }
 
-    return 0;
+    if (first == _BR_ASSET_HOLD_NONE) return 0;
+#if !(ASSET_HOLD_UNFIXED & ASSET_HOLD_RED_SHAPE_FIRST_ONLY)
+    if (s->classifierInFacts) return (_BRAssetHoldCarrier(tx, t, &at) && at == first) ? 1 : 0;
+#endif
+    (void)s;
+    (void)at;
+    _BRAssetHoldLayout(tx, t);
+    return (_BRAssetHoldDecode(&tx->outputs[first], t) != BR_ASSET_SCRIPT_NOT_ASSET) ? 1 : 0;
 }
 
 static inline int _BRAssetHoldTargets(const _BRAssetHoldTx *t, int32_t vout, _BRAssetHoldUnits units)
@@ -471,7 +550,7 @@ static inline _BRAssetHoldUnits _BRAssetHoldProvenUnits(const _BRAssetHoldState 
 {
     int64_t assigned = 0;
 
-    if (_BRAssetHoldIsProven(s->v, tx->txHash) &&
+    if (_BRAssetHoldIsProven(s, tx->txHash) &&
         BRAssetAssignedUnits(t->h.operation, t->insts, t->h.instructionCount, &assigned)) return _BRAssetHoldSome(assigned);
     return _BRAssetHoldNone();
 }
@@ -597,7 +676,7 @@ static inline BRAssetFact _BRAssetHoldAnswerFromTotals(_BRAssetHoldState *s, UIn
     _BRAssetHoldTx t;
     int p;
 
-    if (_BRAssetHoldShape(tx, &t)) {
+    if (_BRAssetHoldShape(s, tx, &t)) {
         p = _BRAssetHoldFromPayload(&t, (int32_t)vout);
         if (p >= 0) decoder = p ? BR_ASSET_FACT_YES : BR_ASSET_FACT_NO;
         else if (! _BRAssetHoldTotalResolved(s, i)) s->every = 0;
@@ -615,7 +694,7 @@ static inline _BRAssetHoldUnits _BRAssetHoldWalkTotal(_BRAssetHoldState *s, size
     int64_t total = 0, q = 0;
     size_t k;
 
-    if (! _BRAssetHoldShape(tx, &t)) return _BRAssetHoldNone();
+    if (! _BRAssetHoldShape(s, tx, &t)) return _BRAssetHoldNone();
     if (! _BRAssetHoldInputsReadable(tx)) return _BRAssetHoldNone();
 
     for (k = 0; k < tx->inCount; k++) {
@@ -624,7 +703,7 @@ static inline _BRAssetHoldUnits _BRAssetHoldWalkTotal(_BRAssetHoldState *s, size
         BRAssetInputUnits r;
 
         memset(&fact, 0, sizeof(fact));
-        if (_BRAssetHoldRowOf(s->v, in->txHash, in->index, &q)) {
+        if (_BRAssetHoldRowOf(s, in->txHash, in->index, &q)) {
             fact.hasRow = 1;
             fact.quantity = q;
             if (q <= 0) fact.rowIsTargeted = _BRAssetHoldAnswerFromTotals(s, in->txHash, in->index);
@@ -650,9 +729,9 @@ static inline size_t _BRAssetHoldNextBelow(_BRAssetHoldState *s, size_t depth)
         const BRTxInput *in = &tx->inputs[s->w[depth].stackNext++];
         size_t f;
 
-        if (! _BRAssetHoldRowOf(s->v, in->txHash, in->index, &q) || q > 0) continue;
+        if (! _BRAssetHoldRowOf(s, in->txHash, in->index, &q) || q > 0) continue;
         f = _BRAssetHoldFind(s, in->txHash);
-        if (! _BRAssetHoldShape(_BRAssetHoldTxAt(s, f), &t)) continue;
+        if (! _BRAssetHoldShape(s, _BRAssetHoldTxAt(s, f), &t)) continue;
         if (_BRAssetHoldFromPayload(&t, (int32_t)in->index) >= 0) continue;
         return f;
     }
@@ -669,7 +748,7 @@ static inline void _BRAssetHoldPush(_BRAssetHoldState *s, size_t *depth, size_t 
     s->w[*depth].stackTx = i;
     s->w[*depth].stackNext = 0;
     // Kotlin: restsOn is empty for a transaction with no carrier there or inputs it cannot read.
-    if (! _BRAssetHoldShape(s->v->txs[i], &t) || ! _BRAssetHoldInputsReadable(s->v->txs[i]))
+    if (! _BRAssetHoldShape(s, s->v->txs[i], &t) || ! _BRAssetHoldInputsReadable(s->v->txs[i]))
         s->w[*depth].stackNext = s->v->txs[i]->inCount;
     (*depth)++;
 }
@@ -717,7 +796,7 @@ static inline BRAssetFact _BRAssetHoldWalk(_BRAssetHoldState *s, UInt256 txHash,
     _BRAssetHoldTx t;
     int p;
 
-    if (! _BRAssetHoldShape(tx, &t)) return _BRAssetHoldFactOf(s, BR_ASSET_FACT_UNKNOWN, _BRAssetHoldClassifier(s, tx, vout));
+    if (! _BRAssetHoldShape(s, tx, &t)) return _BRAssetHoldFactOf(s, BR_ASSET_FACT_UNKNOWN, _BRAssetHoldClassifier(s, tx, vout));
     p = _BRAssetHoldFromPayload(&t, (int32_t)vout);
     if (p >= 0) return _BRAssetHoldFactOf(s, p ? BR_ASSET_FACT_YES : BR_ASSET_FACT_NO, _BRAssetHoldClassifier(s, tx, vout));
 #if (ASSET_HOLD_UNFIXED & ASSET_HOLD_RED_WALK_STOPS)
@@ -769,7 +848,7 @@ static inline _BRAssetHoldUnits _BRAssetHoldInputUnits(_BRAssetHoldState *s, con
 
         if (in->index > (uint32_t)INT32_MAX) continue;   // reached only when dropUnreadable
         memset(&fact, 0, sizeof(fact));
-        if (_BRAssetHoldRowOf(s->v, in->txHash, in->index, &q)) {
+        if (_BRAssetHoldRowOf(s, in->txHash, in->index, &q)) {
             fact.hasRow = 1;
             fact.quantity = q;
             if (q <= 0) fact.rowIsTargeted = _BRAssetHoldWalk(s, in->txHash, in->index);
@@ -787,15 +866,22 @@ static inline _BRAssetHoldUnits _BRAssetHoldInputUnits(_BRAssetHoldState *s, con
     return zeroRows ? _BRAssetHoldNone() : _BRAssetHoldSome(total);
 }
 
-// Adds an outpoint to `held` once. 0 when it does not fit.
-static inline int _BRAssetHoldAdd(BRUTXO *held, size_t heldCap, size_t *count, UInt256 txHash, uint32_t n)
+// Adds an outpoint to `held` unless held[0, s->heldSorted) has it. 0 when it does not fit. (Within one
+// phase, the pass or the replay, each outpoint is offered once -- the pass reads each transaction once, and
+// rows for one outpoint agree -- so what was added since the last _BRAssetHoldSettle need not be searched;
+// a copy left there by rows that agree goes at the next settle, and the bound counts every row.)
+static inline int _BRAssetHoldAdd(const _BRAssetHoldState *s, BRUTXO *held, size_t heldCap, size_t *count, UInt256 txHash,
+                                  uint32_t n)
 {
-    size_t i;
+    size_t lo = 0, hi = s->heldSorted, mid;
 
-    for (i = 0; i < *count; i++) {
-        if (held[i].n == n && UInt256Eq(held[i].hash, txHash)) return 1;
+    while (lo < hi) {
+        mid = lo + (hi - lo) / 2;
+        if (_BRAssetHoldOutpointCmp(held[mid].hash, held[mid].n, txHash, n) < 0) lo = mid + 1;
+        else hi = mid;
     }
 
+    if (lo < s->heldSorted && held[lo].n == n && UInt256Eq(held[lo].hash, txHash)) return 1;
 #if (ASSET_HOLD_UNFIXED & ASSET_HOLD_RED_CAPACITY_SHORTENS)
     if (*count >= heldCap) return 1;
 #else
@@ -805,6 +891,47 @@ static inline int _BRAssetHoldAdd(BRUTXO *held, size_t heldCap, size_t *count, U
     held[*count].n = n;
     (*count)++;
     return 1;
+}
+
+static inline void _BRAssetHoldHeldSiftDown(BRUTXO *held, size_t root, size_t end)
+{
+    while (2 * root + 1 < end) {
+        size_t child = 2 * root + 1, top = root;
+        BRUTXO t;
+
+        if (_BRAssetHoldOutpointCmp(held[top].hash, held[top].n, held[child].hash, held[child].n) < 0) top = child;
+        if (child + 1 < end && _BRAssetHoldOutpointCmp(held[top].hash, held[top].n, held[child + 1].hash, held[child + 1].n) < 0)
+            top = child + 1;
+        if (top == root) return;
+        t = held[root];
+        held[root] = held[top];
+        held[top] = t;
+        root = top;
+    }
+}
+
+// The end of a phase: held[0, *count) sorted, each outpoint once, and all of it searched from now on.
+static inline void _BRAssetHoldSettle(_BRAssetHoldState *s, BRUTXO *held, size_t *count)
+{
+    size_t i, n = *count, k;
+    BRUTXO t;
+
+    for (i = n / 2; i-- > 0;) _BRAssetHoldHeldSiftDown(held, i, n);
+
+    for (i = n; i-- > 1;) {
+        t = held[0];
+        held[0] = held[i];
+        held[i] = t;
+        _BRAssetHoldHeldSiftDown(held, 0, i);
+    }
+
+    for (i = 0, k = 0; i < n; i++) {
+        if (k > 0 && _BRAssetHoldOutpointCmp(held[k - 1].hash, held[k - 1].n, held[i].hash, held[i].n) == 0) continue;
+        held[k++] = held[i];
+    }
+
+    *count = k;
+    s->heldSorted = k;
 }
 
 // Kotlin: resolveRowTargetsImpl and replayAnswerForAbsentTransaction, with `?: true`: the decoder's
@@ -820,13 +947,13 @@ static inline BRAssetFact _BRAssetHoldReplayAnswer(_BRAssetHoldState *s, const B
 #else
     if (! tx) return BR_ASSET_FACT_NO;   // the wallet is loaded and holds no such transaction
 #endif
-    if (tx->outCount == 0 || ! _BRAssetHoldCarrier(tx, &t) || row->n > (uint32_t)INT32_MAX) return BR_ASSET_FACT_YES;
+    if (tx->outCount == 0 || ! _BRAssetHoldCarrier(tx, &t, NULL) || row->n > (uint32_t)INT32_MAX) return BR_ASSET_FACT_YES;
     units = _BRAssetHoldInputUnits(s, tx, 1);
     if (! units.has) units = _BRAssetHoldProvenUnits(s, tx, &t);
     return _BRAssetHoldTargets(&t, (int32_t)row->n, units) ? BR_ASSET_FACT_YES : BR_ASSET_FACT_NO;
 }
 
-// (internal) A refusal, with nothing written.
+// (internal) A refusal: heldCount 0, whatever `held` was given.
 static inline BRAssetHoldResult _BRAssetHoldRefuse(BRAssetHoldStatus status)
 {
     BRAssetHoldResult r;
@@ -841,8 +968,9 @@ static inline BRAssetHoldResult _BRAssetHoldRefuse(BRAssetHoldStatus status)
 
 // ---- the pass ------------------------------------------------------------------------------------
 
-// What suffices for `view`: one work entry per transaction, and every output of every transaction plus
-// every row in `held` (each saturates at SIZE_MAX). 0 and both 0 when the view cannot be read.
+// What suffices for `view`: as many work entries as it has transactions, rows or proofs, whichever is most;
+// and every output of every transaction plus every row in `held` (saturating at SIZE_MAX). 0 and both 0
+// when the view cannot be read.
 static inline int BRAssetHoldBounds(const BRAssetHoldView *view, size_t *workNeeded, size_t *heldNeeded)
 {
     size_t i, n;
@@ -857,7 +985,11 @@ static inline int BRAssetHoldBounds(const BRAssetHoldView *view, size_t *workNee
         n = (view->txs[i]->outCount > SIZE_MAX - n) ? SIZE_MAX : n + view->txs[i]->outCount;
     }
 
-    if (workNeeded) *workNeeded = view->txCount;
+    if (workNeeded) {
+        *workNeeded = view->txCount;
+        if (view->rowCount > *workNeeded) *workNeeded = view->rowCount;
+        if (view->provenCount > *workNeeded) *workNeeded = view->provenCount;
+    }
     if (heldNeeded) *heldNeeded = n;
     return 1;
 }
@@ -887,7 +1019,7 @@ static inline BRAssetHoldStatus _BRAssetHoldRead(_BRAssetHoldState *s, BRUTXO *h
 
         if (_BRAssetHoldFind(s, tx->txHash) != i) continue;   // listed twice: read once
         s->current = i;
-        carrier = _BRAssetHoldCarrier(tx, &t);
+        carrier = _BRAssetHoldCarrier(tx, &t, NULL);
 
         if (carrier) {
             units = _BRAssetHoldInputUnits(s, tx, 0);
@@ -908,9 +1040,11 @@ static inline BRAssetHoldStatus _BRAssetHoldRead(_BRAssetHoldState *s, BRUTXO *h
             verdict = BRAssetHoldCombine(decoder, _BRAssetHoldClassifier(s, tx, j));
             if (verdict == BR_ASSET_FACT_UNKNOWN) return BR_ASSET_HOLD_REFUSED_UNREADABLE;
             if (verdict == BR_ASSET_FACT_NO) continue;
-            if (! _BRAssetHoldAdd(held, heldCap, count, tx->txHash, (uint32_t)j)) return BR_ASSET_HOLD_REFUSED_CAPACITY;
+            if (! _BRAssetHoldAdd(s, held, heldCap, count, tx->txHash, (uint32_t)j)) return BR_ASSET_HOLD_REFUSED_CAPACITY;
         }
     }
+
+    _BRAssetHoldSettle(s, held, count);
 
     // THE REPLAY, with its own record of totals
     for (i = 0; i < view->txCount; i++) work[i].settled = 0;
@@ -928,8 +1062,10 @@ static inline BRAssetHoldStatus _BRAssetHoldRead(_BRAssetHoldState *s, BRUTXO *h
         verdict = BRAssetHoldCombine(decoder, tx ? _BRAssetHoldClassifier(s, tx, row->n) : BR_ASSET_FACT_NO);
         if (verdict == BR_ASSET_FACT_UNKNOWN) return BR_ASSET_HOLD_REFUSED_UNREADABLE;
         if (verdict == BR_ASSET_FACT_NO) continue;
-        if (! _BRAssetHoldAdd(held, heldCap, count, row->txHash, row->n)) return BR_ASSET_HOLD_REFUSED_CAPACITY;
+        if (! _BRAssetHoldAdd(s, held, heldCap, count, row->txHash, row->n)) return BR_ASSET_HOLD_REFUSED_CAPACITY;
     }
+
+    _BRAssetHoldSettle(s, held, count);
 #else
     (void)k;
 #endif
@@ -937,16 +1073,15 @@ static inline BRAssetHoldStatus _BRAssetHoldRead(_BRAssetHoldState *s, BRUTXO *h
     return BR_ASSET_HOLD_COMPLETE;
 }
 
-// THE PASS and THE REPLAY over `view` (see THE RULES), the decoder's reading and the classifier-informed
-// one: every outpoint to hold, written to held[0, heldCount), once each. `work` has room for workCap
-// entries.
-static inline BRAssetHoldResult BRAssetHoldOutputs(const BRAssetHoldView *view, BRAssetHoldWork *work, size_t workCap,
-                                                   BRUTXO *held, size_t heldCap)
+// (internal) BRAssetHoldOutputs with a choice of readings: bit 1 the decoder's, bit 2 the other. The
+// host KAT reads each alone.
+static inline BRAssetHoldResult _BRAssetHoldOutputsReading(const BRAssetHoldView *view, BRAssetHoldWork *work,
+                                                           size_t workCap, BRUTXO *held, size_t heldCap, int readings)
 {
     BRAssetHoldResult r;
-    BRAssetHoldStatus status;
+    BRAssetHoldStatus status = BR_ASSET_HOLD_COMPLETE;
     _BRAssetHoldState s;
-    size_t i, j, count = 0;
+    size_t i, j, count = 0, workNeeded = 0;
 
     memset(&r, 0, sizeof(r));
     if (! view || (view->txCount > 0 && ! view->txs) || (view->rowCount > 0 && ! view->rows) ||
@@ -964,23 +1099,26 @@ static inline BRAssetHoldResult BRAssetHoldOutputs(const BRAssetHoldView *view, 
         }
     }
 
-    if (workCap < view->txCount) status = BR_ASSET_HOLD_REFUSED_CAPACITY;
+    BRAssetHoldBounds(view, &workNeeded, NULL);
+    if (workCap < workNeeded) status = BR_ASSET_HOLD_REFUSED_CAPACITY;
     else {
         s.v = view;
         s.w = work;
+        s.heldSorted = 0;
         s.epoch = 0;
         s.every = 1;
         s.resolved = _BR_ASSET_HOLD_NONE;
         s.current = _BR_ASSET_HOLD_NONE;
-        _BRAssetHoldSort(view, work, view->txCount);
+        _BRAssetHoldSort(view, work, _BR_ASSET_HOLD_BY_TX, view->txCount);
+        _BRAssetHoldSort(view, work, _BR_ASSET_HOLD_BY_ROW, view->rowCount);
+        _BRAssetHoldSort(view, work, _BR_ASSET_HOLD_BY_PROOF, view->provenCount);
+        if (_BRAssetHoldRowsDisagree(view, work)) return _BRAssetHoldRefuse(BR_ASSET_HOLD_REFUSED_ARGUMENTS);
 
         // the decoder's reading (the Kotlin's), then the one whose facts the classifier informs
         s.classifierInFacts = 0;
-        status = _BRAssetHoldRead(&s, held, heldCap, &count);
-#if !(ASSET_HOLD_UNFIXED & ASSET_HOLD_RED_FACTS_DECODER_ONLY)
+        if (readings & 1) status = _BRAssetHoldRead(&s, held, heldCap, &count);
         s.classifierInFacts = 1;
-        if (status == BR_ASSET_HOLD_COMPLETE) status = _BRAssetHoldRead(&s, held, heldCap, &count);
-#endif
+        if ((readings & 2) && status == BR_ASSET_HOLD_COMPLETE) status = _BRAssetHoldRead(&s, held, heldCap, &count);
     }
 
     if (status != BR_ASSET_HOLD_COMPLETE) {
@@ -992,6 +1130,19 @@ static inline BRAssetHoldResult BRAssetHoldOutputs(const BRAssetHoldView *view, 
     r.status = BR_ASSET_HOLD_COMPLETE;
     r.heldCount = count;
     return r;
+}
+
+// THE PASS and THE REPLAY over `view` (see THE RULES), the decoder's reading and the classifier-informed
+// one: every outpoint to hold, written to held[0, heldCount) once each, in outpoint order. `work` has room
+// for workCap entries.
+static inline BRAssetHoldResult BRAssetHoldOutputs(const BRAssetHoldView *view, BRAssetHoldWork *work, size_t workCap,
+                                                   BRUTXO *held, size_t heldCap)
+{
+#if (ASSET_HOLD_UNFIXED & ASSET_HOLD_RED_FACTS_DECODER_ONLY)
+    return _BRAssetHoldOutputsReading(view, work, workCap, held, heldCap, 1);
+#else
+    return _BRAssetHoldOutputsReading(view, work, workCap, held, heldCap, 3);
+#endif
 }
 
 // ---- the wallet ----------------------------------------------------------------------------------

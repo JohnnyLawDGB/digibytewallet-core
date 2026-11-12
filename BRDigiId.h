@@ -27,7 +27,8 @@
 //      every site, the identity DigiScope logs in with.
 //    - A MESSAGE is signed over SHA256(SHA256("\x19DigiByte Signed Message:\n" || prefix || message)),
 //      where prefix is the message length written as the bridge writes it: one byte below 0xfd; 0xfd
-//      and two little-endian bytes up to 0xffff; above 0xffff one byte, the length's low byte.
+//      and two little-endian bytes up to 0xffff; 0xfe and four up to 0xffffffff; 0xff and eight above
+//      (a full compact size, as a verifier reads it: MSG-LEN).
 //    - THE SIGNATURE is BRKeyCompactSign's 65 bytes (deterministic, RFC 6979) over that hash with the
 //      key marked compressed, written as padded base64. THE ANSWER is "<address>|<base64 signature>",
 //      NUL-terminated, where the address is the key's P2PKH address, or for addressFormat 2 (the shared
@@ -70,7 +71,7 @@
 //    4     DIGIID_RED_SOFT_PATH           A, B, C, D are not hardened.
 //    8     DIGIID_RED_NEGATIVE_INDEX      a negative account index is taken as its uint32 bits.
 //    16    DIGIID_RED_SHARED_ANY_INDEX    the shared identity's address is given for any index.
-//    32    DIGIID_RED_COMPACT_SIZE        a message over 0xffff bytes is prefixed 0xfe and four length bytes.
+//    32    DIGIID_RED_LOW_BYTE_LENGTH     a message over 0xffff bytes is prefixed one byte, its length's low byte.
 //    64    DIGIID_RED_SINGLE_SHA          the message is hashed once.
 //    128   DIGIID_RED_UNCOMPRESSED        the key is not marked compressed before it signs.
 //    256   DIGIID_RED_SEGWIT_IGNORED      address format 2 answers with the P2PKH address.
@@ -109,7 +110,7 @@ extern "C" {
 #define DIGIID_RED_SOFT_PATH           4
 #define DIGIID_RED_NEGATIVE_INDEX      8
 #define DIGIID_RED_SHARED_ANY_INDEX    16
-#define DIGIID_RED_COMPACT_SIZE        32
+#define DIGIID_RED_LOW_BYTE_LENGTH     32
 #define DIGIID_RED_SINGLE_SHA          64
 #define DIGIID_RED_UNCOMPRESSED        128
 #define DIGIID_RED_SEGWIT_IGNORED      256
@@ -137,7 +138,7 @@ typedef enum {
 #define BR_DIGIID_ADDRESS_CAPACITY 75
 // "\x19DigiByte Signed Message:\n": its length, and the most bytes the length prefix takes.
 #define BR_DIGIID_MESSAGE_HEADER_LENGTH 26
-#define BR_DIGIID_MESSAGE_PREFIX_MAX 5
+#define BR_DIGIID_MESSAGE_PREFIX_MAX 9
 
 // ---- the per-site path ----------------------------------------------------------------------------
 
@@ -234,8 +235,8 @@ static inline BRDigiIdStatus BRDigiIdSharedKey(BRKey *key, const void *seed, siz
 
 // ---- the message ----------------------------------------------------------------------------------
 
-// The length prefix the bridge writes for a message of msgLen bytes into out[0, 5): its byte count (1 or
-// 3; see THE RULES for a message over 0xffff bytes).
+// The length prefix the bridge writes for a message of msgLen bytes into out[0, 9): its byte count (1, 3,
+// 5 or 9; the bridge's signed_message.h).
 static inline size_t BRDigiIdMessagePrefix(uint8_t out[BR_DIGIID_MESSAGE_PREFIX_MAX], size_t msgLen)
 {
     uint64_t val = (uint64_t)msgLen;
@@ -250,16 +251,18 @@ static inline size_t BRDigiIdMessagePrefix(uint8_t out[BR_DIGIID_MESSAGE_PREFIX_
         out[2] = (uint8_t)((val >> 8) & 0xff);
         return 3;
     }
-#if (DIGIID_UNFIXED & DIGIID_RED_COMPACT_SIZE)
-    out[0] = 0xfe;
-    out[1] = (uint8_t)(val & 0xff);
-    out[2] = (uint8_t)((val >> 8) & 0xff);
-    out[3] = (uint8_t)((val >> 16) & 0xff);
-    out[4] = (uint8_t)((val >> 24) & 0xff);
-    return 5;
-#else
+#if (DIGIID_UNFIXED & DIGIID_RED_LOW_BYTE_LENGTH)
     out[0] = (uint8_t)val;
     return 1;
+#else
+    if (val <= 0xffffffffULL) {
+        out[0] = 0xfe;
+        for (int i = 0; i < 4; i++) out[1 + i] = (uint8_t)((val >> (8 * i)) & 0xff);
+        return 5;
+    }
+    out[0] = 0xff;
+    for (int i = 0; i < 8; i++) out[1 + i] = (uint8_t)((val >> (8 * i)) & 0xff);
+    return 9;
 #endif
 }
 

@@ -140,12 +140,12 @@ static inline BRServerTxImportResult BRServerTxImport(BRWallet *wallet, BRPeerMa
     tx->timestamp = 0;
 
     UInt256 txHash = tx->txHash;
-    if (! BRWalletRegisterTransactionUnproven(wallet, tx)) {
-        // The wallet keeps an unconfirmed non-wallet tx; it keeps nothing else it refused. Free the tx unless the
-        // wallet's record of the hash is this object.
-        if (BRWalletTransactionForHash(wallet, txHash) != tx) BRTransactionFree(tx);
-        return BR_SERVER_TX_NOT_WALLET;
-    }
+    // Who owns tx is the registration's own answer (REGISTER-RESULT), never a later lookup.
+    BRWalletRegisterOutcome held = BR_WALLET_REGISTER_REFUSED;
+    int ok = BRWalletRegisterTransactionOutcome(wallet, tx, BR_WALLET_REGISTER_UNPROVEN, &held);
+    if (! BRWalletRegisterOutcomeHeld(held)) BRTransactionFree(tx);
+    tx = NULL;
+    if (! ok) return BR_SERVER_TX_NOT_WALLET;
     if (BRServerTxApplyHeight(manager, txHash, blockHeight, blockTimestamp, note, log) == BR_SERVER_HEIGHT_UNPROVABLE) {
         BRWalletRemoveTransaction(wallet, txHash);
         return BR_SERVER_TX_NOT_KEPT_UNPROVABLE;

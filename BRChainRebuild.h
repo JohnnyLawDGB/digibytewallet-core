@@ -112,9 +112,9 @@
 //  progress off). Writing ARM_RERUN and FLOOR_FROM_CACHE in one commit, as Android's one-time
 //  rebuild does (its run() commits in-progress and the floor together), removes the case.
 //
-//  (Android today logs a failed STOP_SYNC, ARM_RERUN or LOWER_FLOOR_TO and continues. Its manual
-//  rebuild has no FLOOR_FROM_CACHE step yet: the only cache whose floor it carries is one written
-//  back after the clear, which the rerun at the next start reads.)
+//  (Android follows this order and these stop rules since digibytewallet-android #248: a failed
+//  STOP_SYNC, ARM_RERUN, FLOOR_FROM_CACHE or LOWER_FLOOR_TO returns before any clear, and a failed
+//  FLOOR_FROM_CACHE disarms the rerun back to its prior state.)
 //
 //  Host KAT: digibytewallet-android native/src/test/host/scan_floor_kat/ (the order checked against
 //  the order of the calls in Android's source). Vectors: vectors/scan-floor/. Header-only, static

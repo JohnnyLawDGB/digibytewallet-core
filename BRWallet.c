@@ -28,6 +28,7 @@
 #include "BRArray.h"
 #include "BRBech32.h"
 #include "BRDigiAsset.h"
+#include "BRAssetHold.h"
 #include "BRDigiDollar.h"
 #include "BRNetwork.h"
 #include <stdlib.h>
@@ -3377,6 +3378,59 @@ int BRWalletRegisterAssetOutpoint(BRWallet *wallet, UInt256 txHash, uint32_t n)
 
     pthread_mutex_unlock(&wallet->lock);
     return added;
+}
+
+// BRAssetHold.h's owned callback for the wallet's own pass: an output paid to an address of the wallet's,
+// the outputs _BRWalletUpdateBalance may put among the plain coins. Called with wallet->lock held.
+static int _BRWalletAssetHoldOwned(void *info, const BRTransaction *tx, size_t vout)
+{
+    BRWallet *wallet = info;
+
+    return (tx->outputs[vout].address[0] != '\0' && BRSetContains(wallet->allAddrs, tx->outputs[vout].address)) ? 1 : 0;
+}
+
+// See BRAssetHold.h. The pass reads one snapshot of the transaction set, and its outpoints are held in the same
+// lock hold, so no transaction can arrive between the reading and the holding. A caller refuses a plain spend
+// unless this answered COMPLETE after the last transaction was added or removed.
+BRAssetHoldResult BRWalletHoldAssetOutputs(BRWallet *wallet, const BRAssetHoldRow *rows, size_t rowCount,
+                                           const UInt256 *proven, size_t provenCount,
+                                           BRAssetHoldWork *work, size_t workCap, BRUTXO *held, size_t heldCap)
+{
+    BRAssetHoldResult r;
+    BRAssetHoldView view;
+    size_t i, added = 0;
+
+    memset(&r, 0, sizeof(r));
+    if (! wallet) {
+        r.status = BR_ASSET_HOLD_REFUSED_ARGUMENTS;
+        return r;
+    }
+
+    pthread_mutex_lock(&wallet->lock);
+    view.txs = (const BRTransaction *const *)wallet->transactions;
+    view.txCount = array_count(wallet->transactions);
+    view.owned = _BRWalletAssetHoldOwned;
+    view.info = wallet;
+    view.rows = rows;
+    view.rowCount = rowCount;
+    view.proven = proven;
+    view.provenCount = provenCount;
+    view.classifier = NULL;   // the core's own, the one behind assetUtxos
+    r = BRAssetHoldOutputs(&view, work, workCap, held, heldCap);
+
+    if (r.status == BR_ASSET_HOLD_COMPLETE) {
+        for (i = 0; i < r.heldCount; i++) {
+            if (_BRWalletIsAssetOverride(wallet, held[i].hash, held[i].n)) continue;
+            array_add(wallet->assetOverrides, held[i]);
+            added++;
+        }
+
+        if (added > 0) _BRWalletUpdateBalance(wallet);   // once, for all of them
+        r.newlyHeld = added;
+    }
+
+    pthread_mutex_unlock(&wallet->lock);
+    return r;
 }
 
 int BRWalletUtxoIsAsset(BRWallet* wallet, BRUTXO* utxo) {

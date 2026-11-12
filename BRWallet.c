@@ -2059,7 +2059,9 @@ BRTransaction *BRWalletCreateDigiDollarTransfer(BRWallet *wallet, const uint8_t 
         if (c <= 0) continue;
         ddsel[m].hash = wallet->ddUtxos[i].hash; ddsel[m].n = n; ddsel[m].c = c;
         ddsel[m].scriptLen = dt->outputs[n].scriptLen;
-        memcpy(ddsel[m].script, dt->outputs[n].script, ddsel[m].scriptLen);
+        // memcpy from NULL is undefined even for 0 bytes, so an empty script is not copied (a coin
+        // with an amount always has its 34-byte script today; the copy must not depend on that)
+        if (ddsel[m].scriptLen > 0) memcpy(ddsel[m].script, dt->outputs[n].script, ddsel[m].scriptLen);
         m++;
     }
     for (size_t i = 1; i < m; i++) { // insertion sort ascending by cents
@@ -2105,7 +2107,8 @@ BRTransaction *BRWalletCreateDigiDollarTransfer(BRWallet *wallet, const uint8_t 
         if (! _BRWalletUtxoSelectableAny(wallet, ut, &budget)) continue;
         feesel[fm].hash = ut->txHash; feesel[fm].n = o->n; feesel[fm].amt = ut->outputs[o->n].amount;
         feesel[fm].scriptLen = ut->outputs[o->n].scriptLen;
-        memcpy(feesel[fm].script, ut->outputs[o->n].script, feesel[fm].scriptLen);
+        // as above: no copy from an empty script (a signable one is never empty today)
+        if (feesel[fm].scriptLen > 0) memcpy(feesel[fm].script, ut->outputs[o->n].script, feesel[fm].scriptLen);
         dgbIn = _BRMoneyAdd(dgbIn, feesel[fm].amt); fm++;
         size_t est = 10 + ddIn*57 + fm*68 + 3*TX_OUTPUT_SIZE + 32; // DD in + fee in + ~3 outs + OP_RETURN
         fee = _txFee(feePerKb, est); if (fee < DD_MIN_FEE) fee = DD_MIN_FEE;

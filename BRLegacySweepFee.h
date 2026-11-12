@@ -24,6 +24,8 @@
 //       408,001 sats                                                                          -> RATIO
 //    6. totalIn <= fee + BR_LEGACY_SWEEP_DUST (546)                                           -> DUST
 //       (implied by 5 today; kept so the bound does not depend on the ratio's constant)
+//    The floor (2) and the dust refusal (6) are masked by 3 and 5 at every rate in range, so no sweep shows them;
+//    legacy_sweep_kat pins both on this header compiled with 3's lower bound and 5 removed (DEVMERGE-KAT-NITS).
 //    otherwise OK, and totalIn - fee is the one output (it does not wrap: 6 leaves fee < totalIn).
 //  Nothing wraps: the product is checked before it is taken; fee is then at most (2^64 - 1) / 1000, so fee * 20 and
 //  fee + 546 fit. estSize and fee (either may be NULL) receive what was computed, as far as the check got.
@@ -38,6 +40,9 @@
 //    BR_LEGACY_SWEEP_RED_FEE_CAP=1              no upper bound on feePerKb (no RATE_TOO_HIGH)
 //    BR_LEGACY_SWEEP_RED_FEE_CEILING=1          no absolute ceiling on the fee (no ABOVE_CEILING)
 //    BR_LEGACY_SWEEP_RED_FEE_OVERFLOW=1         no overflow check on estSize * feePerKb (no WRAPS; the product wraps)
+//    BR_LEGACY_SWEEP_RED_FLOOR=1                no 1000-satoshi fee floor (step 2)
+//    BR_LEGACY_SWEEP_RED_DUST=1                 the dust refusal is not applied (step 6)
+//    BR_LEGACY_SWEEP_RED_DUST_STRICT=1          the dust refusal applies only below the boundary (totalIn < fee + 546)
 //    BR_LEGACY_SWEEP_RED_ABS_CEIL=1             the whole SWEEP-ABS-CEIL guard removed: the rule as it was before it
 //                                               (no lower rate bound, the upper one at MAX_FEE_PER_KB, no ceiling, a
 //                                               lone input exempt from the 5% refusal; BRLegacySweep.h then also
@@ -78,6 +83,15 @@ extern "C" {
 #endif
 #ifndef BR_LEGACY_SWEEP_RED_FEE_OVERFLOW
 #define BR_LEGACY_SWEEP_RED_FEE_OVERFLOW 0
+#endif
+#ifndef BR_LEGACY_SWEEP_RED_FLOOR
+#define BR_LEGACY_SWEEP_RED_FLOOR 0
+#endif
+#ifndef BR_LEGACY_SWEEP_RED_DUST
+#define BR_LEGACY_SWEEP_RED_DUST 0
+#endif
+#ifndef BR_LEGACY_SWEEP_RED_DUST_STRICT
+#define BR_LEGACY_SWEEP_RED_DUST_STRICT 0
 #endif
 #ifndef BR_LEGACY_SWEEP_RED_ABS_CEIL
 #define BR_LEGACY_SWEEP_RED_ABS_CEIL 0
@@ -134,7 +148,9 @@ static inline BRLegacySweepFeeVerdict BRLegacySweepFeeCheck(uint64_t totalIn, si
     if (feePerKb != 0 && (uint64_t)estSize > UINT64_MAX / feePerKb) return BR_LEGACY_SWEEP_FEE_CHECK_WRAPS;
 #endif
     fee = ((uint64_t)estSize * feePerKb) / 1000;
+#if ! BR_LEGACY_SWEEP_RED_FLOOR
     if (fee < BR_LEGACY_SWEEP_MIN_FEE) fee = BR_LEGACY_SWEEP_MIN_FEE;
+#endif
     if (feeOut) *feeOut = fee;
 
 #if BR_LEGACY_SWEEP_RED_ABS_CEIL
@@ -164,7 +180,13 @@ static inline BRLegacySweepFeeVerdict BRLegacySweepFeeCheck(uint64_t totalIn, si
         return BR_LEGACY_SWEEP_FEE_CHECK_RATIO;
 #endif
 #endif
+#if ! BR_LEGACY_SWEEP_RED_DUST
+#if BR_LEGACY_SWEEP_RED_DUST_STRICT
+    if (totalIn < fee + BR_LEGACY_SWEEP_DUST) return BR_LEGACY_SWEEP_FEE_CHECK_DUST;
+#else
     if (totalIn <= fee + BR_LEGACY_SWEEP_DUST) return BR_LEGACY_SWEEP_FEE_CHECK_DUST;
+#endif
+#endif
     return BR_LEGACY_SWEEP_FEE_CHECK_OK;
 }
 

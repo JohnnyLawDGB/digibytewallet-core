@@ -15,7 +15,10 @@
 //    - THE GATE (BRAssetSendGate), before anything else: only an asset whose transfer-rule state is NONE
 //      may be sent (BRAssetRuleAllowsSend, BRAssetRuleGate.h). BOUND is refused as RULE_BOUND, UNKNOWN
 //      (and any value BRSweepRuleState does not define) as RULES_UNKNOWN. BRAssetSendChoose asks it again
-//      first, so no plan is made for an asset the gate refuses.
+//      first, so no plan is made for an asset the gate refuses. BRAssetSendChoose is the only public way
+//      to a plan: the planner itself (_BRAssetPlan, _BRAssetPlanTransfer) asks no gate, carries a leading
+//      underscore, and is called only behind the gate (the host KAT's source gate holds every public
+//      function here that plans, or answers or writes a plan, to asking it first).
 //    - AN OUTPOINT is a row's txid, ASCII letters' case ignored, and its vout (a NULL txid reads as
 //      empty; C only). Scripts are bytes.
 //    - THE FEE (BRAssetFeeEstimate): vsize = 12 + (assetInputs + dgbInputs + 1) * 150 + outputs * 34 + 9
@@ -34,7 +37,7 @@
 //      largest first, equal ones in the order given; taken, when DGB is needed, while their sum is below
 //      it. Not enough: INSUFFICIENT_DGB (needed, that sum). The DGB change is every sat taken less the
 //      fee and the markers.
-//    - THE PLAN (BRAssetPlanTransfer), from asset coins that must all pay one script (the source) and
+//    - THE PLAN (_BRAssetPlanTransfer), from asset coins that must all pay one script (the source) and
 //      fee coins already limited to eligible ones. Refused: no asset coin; coins at more than one script;
 //      a quantity not above 0 (ARGUMENTS; Kotlin: the selector's require throws).
 //      Two markers of BR_ASSET_MARKER_SATS are budgeted on every send. A first selection is made at the
@@ -67,8 +70,10 @@
 //      answer is UNAVAILABLE; anything else (not unspent, another stack) is MISMATCH.
 //    - THE CHOICE (BRAssetSendChoose), in this order: THE GATE; a quantity not above 0 (QUANTITY), a
 //      negative fee rate (FEE_RATE), no asset coin (NO_ASSET_UTXOS), each NOT_PLANNED; no indexer
-//      (UNVERIFIED); the asset coins' sum below the quantity (NOT_PLANNED, NOT_ENOUGH_ASSET). Then up to
-//      (asset coins + 1) rounds, each over the asset coins not set aside and not left out of this send:
+//      (UNVERIFIED); a NULL argument, or an answer whose entries are NULL while its entryCount is above
+//      0, refused before anything is judged or marked (NOT_PLANNED, ARGUMENTS; C only: the Kotlin cannot
+//      write such an answer); the asset coins' sum below the quantity (NOT_PLANNED, NOT_ENOUGH_ASSET).
+//      Then up to (asset coins + 1) rounds, each over the asset coins not set aside and not left out of this send:
 //      none of the source groups covers the quantity -> SPANS_ADDRESSES (the largest single source) when
 //      they do together, UNCONFIRMED when they do not. Else the first group is planned with the fee coins
 //      eligible for its script (a refusal is NOT_PLANNED; when it is NOT_ENOUGH_DGB and the eligibility
@@ -147,6 +152,8 @@
 //    1048576  ASSET_SEND_PLAN_RED_PARSE_COMMA_GROUPS   a lone comma is grouping.
 //    2097152  ASSET_SEND_PLAN_RED_PARSE_UNBOUNDED      the text's length is not bounded.
 //    4194304  ASSET_SEND_PLAN_RED_CONFIRMED_ASKED      an output confirmed earlier is asked again.
+//    8388608  ASSET_SEND_PLAN_RED_NULL_ENTRIES_JUDGED  an answer with entries NULL and a count is judged, and
+//                                                      its coin set aside.
 //
 
 #ifndef BRAssetSendPlan_h
@@ -191,6 +198,7 @@ extern "C" {
 #define ASSET_SEND_PLAN_RED_PARSE_COMMA_GROUPS    1048576
 #define ASSET_SEND_PLAN_RED_PARSE_UNBOUNDED       2097152
 #define ASSET_SEND_PLAN_RED_CONFIRMED_ASKED       4194304
+#define ASSET_SEND_PLAN_RED_NULL_ENTRIES_JUDGED   8388608
 
 // Plain literals, so Swift imports them; the checks below hold them to the rules they come from.
 
@@ -352,7 +360,7 @@ typedef struct {
     int32_t vout;
     BRAssetStackLookup lookup;
     const BRAssetUnits *entries;         // FOUND: the stack, front first; ruleFree is not read
-    size_t entryCount;
+    size_t entryCount;                   //   (entries NULL with entryCount above 0: the choice is ARGUMENTS)
 } BRAssetSendLookup;
 
 #define BR_ASSET_SEND_MARK_VERIFIED  1   // keep it in `verified`
@@ -715,6 +723,8 @@ static inline int _BRAssetPlanSelected(BRAssetSelection s, BRAssetTransferPlan *
 }
 
 // The planner over the rows of two sets (NULL: every row); the caller has checked the buffers.
+// INTERNAL: called only behind THE GATE (by BRAssetSendChoose, after BRAssetSendGate, and by
+// _BRAssetPlanTransfer).
 static inline void _BRAssetPlan(const BRAssetRow *assetRows, const size_t *assetSet, size_t assetCount,
                                 const BRAssetRow *dgbRows, const size_t *dgbSet, size_t dgbCount, int64_t quantity,
                                 int64_t feePerKb, size_t *assetOrder, size_t *dgbOrder, BRAssetTransferPlan *plan)
@@ -830,10 +840,15 @@ static inline void _BRAssetPlan(const BRAssetRow *assetRows, const size_t *asset
     plan->why = BR_ASSET_PLAN_WHY_NONE;
 }
 
+// INTERNAL: called only behind THE GATE. It asks no transfer-rule gate, so it is not a send entry
+// point: a send reaches a plan only through BRAssetSendChoose, which asks BRAssetSendGate first and
+// then plans with _BRAssetPlan, the same planner. Outside the core only the host KAT and
+// vectors/asset-send-plan/generate.c call this, to hold the planner to the Kotlin's (AssetTransferPlanner,
+// which AssetManager.planAssetTransfer calls only after its rule check).
 // Plan a send of `quantity` from assetRows (all paying one script) with the fee and markers paid from
 // dgbRows (already limited to eligible coins) at feePerKb (see THE PLAN). assetOrder needs room for
 // assetCount indices and dgbOrder for dgbCount; the plan's index lists point into them.
-static inline BRAssetTransferPlan BRAssetPlanTransfer(const BRAssetRow *assetRows, size_t assetCount,
+static inline BRAssetTransferPlan _BRAssetPlanTransfer(const BRAssetRow *assetRows, size_t assetCount,
                                                       const BRAssetRow *dgbRows, size_t dgbCount, int64_t quantity,
                                                       int64_t feePerKb, size_t *assetOrder, size_t assetOrderCap,
                                                       size_t *dgbOrder, size_t dgbOrderCap)
@@ -1107,6 +1122,22 @@ static inline int _BRAssetSendConfirmed(const BRAssetRow *rows, size_t count, co
     return 0;
 }
 
+// Is any answer one whose entries are NULL while its entryCount is above 0 (C only)?
+static inline int _BRAssetSendAnswersMalformed(const BRAssetSendLookup *answers, size_t answerCount)
+{
+    size_t j;
+
+#if (ASSET_SEND_PLAN_UNFIXED & ASSET_SEND_PLAN_RED_NULL_ENTRIES_JUDGED)
+    (void)answers; (void)answerCount; (void)j;
+    return 0;
+#else
+    for (j = 0; j < answerCount; j++) {
+        if (answers[j].entryCount > 0 && ! answers[j].entries) return 1;
+    }
+    return 0;
+#endif
+}
+
 // The answer given for asset row i (its txid as written, and its vout), or NULL.
 static inline const BRAssetSendLookup *_BRAssetSendAnswerFor(const BRAssetRow *row, const BRAssetSendLookup *answers,
                                                              size_t answerCount)
@@ -1151,8 +1182,9 @@ static inline BRAssetSendOutcome BRAssetSendChoose(BRSweepRuleState ruleState, i
     if (assetCount == 0) return _BRAssetSendNotPlanned(BR_ASSET_PLAN_WHY_NO_ASSET_UTXOS);
     if (! hasStackSource) return _BRAssetSendAnswer(BR_ASSET_SEND_UNVERIFIED);
     if (! assetId || ! assetRows || (dgbCount > 0 && (! dgbRows || ! dgbParentHasData)) ||
-        (verifiedCount > 0 && ! verified) || (setAsideCount > 0 && ! setAside) || (answerCount > 0 && ! answers))
-        return _BRAssetSendNotPlanned(BR_ASSET_PLAN_WHY_ARGUMENTS);
+        (verifiedCount > 0 && ! verified) || (setAsideCount > 0 && ! setAside) || (answerCount > 0 && ! answers) ||
+        _BRAssetSendAnswersMalformed(answers, answerCount))
+        return _BRAssetSendNotPlanned(BR_ASSET_PLAN_WHY_ARGUMENTS);   // marks were cleared above: nothing is kept
     if (! marks || marksCap < assetCount || ! work || workCap < BRAssetSendWorkLength(assetCount, dgbCount))
         return _BRAssetSendAnswer(BR_ASSET_SEND_CAPACITY);
 

@@ -36,7 +36,7 @@
 //     `overflow`.
 //
 //   plan <assetRows> <dgbRows> <quantity> <feePerKb> <answer>
-//     BRAssetPlanTransfer. <answer>: `ready <asset> <dgb> <outputs> <opReturn> <estimatedFee> <paidFee>`,
+//     _BRAssetPlanTransfer. <answer>: `ready <asset> <dgb> <outputs> <opReturn> <estimatedFee> <paidFee>`,
 //     the inputs as in select, the outputs <role>:<sats> joined by ',' (role r recipient marker, d data,
 //     c DGB change, m last marker), the carrier in hex; or `refused <why>` (BRAssetPlanWhy in lower case,
 //     BR_ASSET_PLAN_WHY_ dropped, '_' as '-'), followed by <required> <available> for not-enough-asset
@@ -297,7 +297,7 @@ static void planLine(const BRAssetRow *a, size_t na, const BRAssetRow *d, size_t
     put(&b, " ");
     putRows(&b, d, nd, NULL);
     put(&b, " %lld %lld ", (long long)qty, (long long)rate);
-    p = BRAssetPlanTransfer(a, na, d, nd, qty, rate, AO, N(AO), DO_, N(DO_));
+    p = _BRAssetPlanTransfer(a, na, d, nd, qty, rate, AO, N(AO), DO_, N(DO_));
     if (p.status == BR_ASSET_PLAN_READY) {
         put(&b, "ready ");
         putIdx(&b, p.assetInputs, p.assetInputCount);
@@ -349,6 +349,15 @@ static void groupsLine(const BRAssetRow *r, size_t n, int64_t qty)
     for (i = 0; i < count; i++) put(&b, "%s%zu:%zu:%lld", i ? "," : "", g[i].first, g[i].rowCount, (long long)g[i].total);
     put(&b, " %lld", (long long)BRAssetLargestSingleSource(r, n));
     emit(b.s);
+}
+
+// c as UTF-8 into out (room for 4 bytes): its length.
+static size_t utf8Of(uint32_t c, char *out)
+{
+    if (c < 0x80) { out[0] = (char)c; return 1; }
+    if (c < 0x800) { out[0] = (char)(0xc0 | (c >> 6)); out[1] = (char)(0x80 | (c & 0x3f)); return 2; }
+    out[0] = (char)(0xe0 | (c >> 12)); out[1] = (char)(0x80 | ((c >> 6) & 0x3f)); out[2] = (char)(0x80 | (c & 0x3f));
+    return 3;
 }
 
 static void parseLine(const char *t, size_t len, int32_t div)
@@ -676,7 +685,28 @@ int main(void)
             { "1", 18 }, { "\xc2\xa0" "5\xe3\x80\x80", 0 }, { "\xd9\xa5", 0 }, { "1,000", 3 }, { "1.", 2 },
         };
 
+        // Every code point the trim takes (Kotlin's isWhitespace), before and after a digit; then three it
+        // does not take; then the length limit counted after many grouping commas are dropped.
+        static const uint32_t spaces[] = { 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x1c, 0x1d, 0x1e, 0x1f, 0x20, 0xa0, 0x1680, 0x2000,
+                                           0x2001, 0x2002, 0x2003, 0x2004, 0x2005, 0x2006, 0x2007, 0x2008, 0x2009, 0x200a,
+                                           0x2028, 0x2029, 0x202f, 0x205f, 0x3000, 0x180e, 0x200b, 0xfeff };
+        static const struct { const char *t; int d; } grouped[] = {
+            { "00,000,000,000,000,000,000,000,000,001.50", 2 }, { "000,000,000,000,000,000,000,000,000,001.50", 2 },
+            { "00,000,000,000,000,000,000,001.50000000", 8 }, { "000,000,000,000,000,000,000,001.50000000", 8 },
+        };
+        char w[8];
+        size_t wn;
+
         for (i = 0; i < N(texts); i++) parseLine(texts[i].t, strlen(texts[i].t), texts[i].d);
+        for (i = 0; i < N(spaces); i++) {
+            wn = utf8Of(spaces[i], w);
+            w[wn] = '5';
+            parseLine(w, wn + 1, 0);
+            w[0] = '5';
+            wn = 1 + utf8Of(spaces[i], w + 1);
+            parseLine(w, wn, 0);
+        }
+        for (i = 0; i < N(grouped); i++) parseLine(grouped[i].t, strlen(grouped[i].t), grouped[i].d);
         formatLine(5, 0); formatLine(100, 0); formatLine(1000000, 0); formatLine(150, 2); formatLine(100, 2); formatLine(100000, 2);
         formatLine(1, 2); formatLine(123456, 2); formatLine(1, 8); formatLine(100000000, 8); formatLine(INT64_MAX, 8); formatLine(INT64_MAX, 0);
         formatLine(-150, 2); formatLine(INT64_MIN, 0); formatLine(0, 5); formatLine(1, 20);

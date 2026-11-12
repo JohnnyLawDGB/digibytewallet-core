@@ -16,15 +16,13 @@
 //      the wallet's assetUtxos) says which outputs an instruction names, and fails closed on a carrier it
 //      cannot classify. Each answers YES, NO or UNKNOWN (BRAssetFact).
 //    - THE UNION (BRAssetHoldCombine). YES when either reader says YES; NO only when both say NO;
-//      otherwise UNKNOWN. Never weaker than either reader. The pass is read twice. The DECODER'S
-//      READING is the Kotlin's, exactly: every fact the walk reads is the decoder's. The OTHER READING
-//      puts the questions the Kotlin puts to its decoder alone -- does this funding transaction carry a
-//      payload, may this funding output carry units -- to both readers, and reads the union; and it reads
-//      a funding transaction only by the carrier the pass reads that transaction by. In both,
-//      each output's verdict is the decoder's united with the classifier's, and an output either
-//      reading holds is held. (Two readings, not one: a remainder proof turns an unknown total into a
-//      known one, so a reading with more unknowns can hold less; the decoder's reading keeps the pass
-//      never weaker than the Kotlin.) Everywhere else the move is exact.
+//      otherwise UNKNOWN. Never weaker than either reader. The pass is read twice. In the DECODER'S
+//      READING every fact the walk reads is the decoder's; it is the move of Android's pass. In the
+//      OTHER READING each fact about a funding transaction -- does it carry a payload, may this output
+//      carry units -- is the union of both readers, and a funding transaction is read only by the
+//      carrier the pass reads it by. In both, each output's verdict is the decoder's united with the
+//      classifier's, and an output either reading holds is held. (Two readings, not one: a remainder
+//      proof turns an unknown total into a known one, so a reading with more unknowns can hold less.)
 //    - THE PASS (BRAssetHoldOutputs), in the wallet's order, each transaction once:
 //        * its carrier: among its OP_RETURN outputs (a script whose first byte is 0x6a) that are DigiAsset
 //          carriers, the first one that cannot be classified, otherwise the last one (BRDigiAsset.c's
@@ -32,7 +30,7 @@
 //        * what its inputs carried, input by input: a row with a positive quantity carries it; a row
 //          storing zero or less carries nothing only when its funding output is NOT targeted (the walk
 //          below); no row carries nothing only when the funding transaction carries no payload (the
-//          decoder reads its FIRST OP_RETURN; in the other reading the classifier reads any output too).
+//          decoder's reading asks its first OP_RETURN; the other reading asks both readers).
 //          A no-row input whose funding transaction may carry a payload, a sum past INT64_MAX, or an
 //          input whose outpoint index is past INT32_MAX makes the total unknown; so does a stored-zero
 //          row that may be targeted, though the inputs after it are still read. Unknown, and the
@@ -45,8 +43,8 @@
 //      remainder of zero: YES. Otherwise the remainder of the funding transaction decides, and its input
 //      total is resolved the same way, one transaction further back, as far back as the run goes (each
 //      transaction once, on an explicit stack held in the caller's work buffer, so a long run of sends costs
-//      no call depth). The walk reads the funding transaction's FIRST OP_RETURN as its carrier; in the other
-//      reading only when that is also the carrier THE PASS reads it by. A transaction the wallet does not
+//      no call depth). In the decoder's reading the walk reads a funding transaction by its first OP_RETURN; in
+//      the other reading only by the carrier THE PASS reads it by. A transaction the wallet does not
 //      hold, one with no carrier there (in the other reading: one whose carrier is another output), and one
 //      whose inputs cannot all be read (an index past INT32_MAX) have no answer. A total taken before
 //      everything under it was resolved (a cycle) has no answer, and that walk records nothing for later
@@ -615,7 +613,7 @@ static inline BRAssetFact _BRAssetHoldFactOf(const _BRAssetHoldState *s, BRAsset
     return s->classifierInFacts ? BRAssetHoldCombine(decoder, classifier) : _BRAssetHoldFact(decoder);
 }
 
-// Kotlin: isAssetTx (hasAssetPayload over the FIRST OP_RETURN), with the classifier (any carrier).
+// Kotlin: isAssetTx (hasAssetPayload). In the other reading, united with the classifier.
 // The pass answers NO for a transaction it has already read and found to carry no carrier (Kotlin: the
 // pass's plainTxs); that differs from hasAssetPayload only for a transaction with no outputs.
 static inline BRAssetFact _BRAssetHoldIsAssetTx(const _BRAssetHoldState *s, UInt256 txHash)

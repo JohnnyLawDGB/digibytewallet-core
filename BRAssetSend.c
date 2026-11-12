@@ -35,6 +35,7 @@
 #define BR_ASSET_TRANSFER_RED_PRESPENT       8192
 #define BR_ASSET_TRANSFER_RED_GATE           16384
 #define BR_ASSET_TRANSFER_RED_DUPLICATE      32768
+#define BR_ASSET_TRANSFER_RED_RULES          65536
 
 #define _RED(bit) (BR_ASSET_TRANSFER_UNFIXED & (bit))
 
@@ -157,7 +158,7 @@ static int _carrierReads(const BRAssetTransferPlan *plan, BRAssetHeader *h, BRAs
 // on the last output, nothing anywhere else, nothing voided. -1 when the working space cannot be allocated.
 static int _unitsLandOk(const BRAssetHeader *h, const BRAssetTransferInstruction *insts, size_t instCount,
                         const _BRAssetTransferInput *inputs, size_t inCount, size_t assetInputCount,
-                        int32_t outputCount, const char *assetId, int64_t quantity, int64_t change)
+                        int32_t outputCount, const char *assetId, int64_t quantity, int64_t change, int ruleFree)
 {
     BRAssetInputStack *stacks = calloc(inCount, sizeof(*stacks));
     BRAssetUnits *units = calloc(assetInputCount, sizeof(*units));
@@ -173,7 +174,7 @@ static int _unitsLandOk(const BRAssetHeader *h, const BRAssetTransferInstruction
         if (i < assetInputCount) {
             units[i].assetId = assetId;
             units[i].count = inputs[i].row->assetQuantity;
-            units[i].ruleFree = 1;   // the plan's choice asked the gate: its rule state is NONE
+            units[i].ruleFree = ruleFree;   // the allocator refuses units that may carry rules (WHY_RULES)
             stacks[i].units = &units[i];
             stacks[i].unitCount = 1;
         }
@@ -233,14 +234,29 @@ static int _inHeld(const BRUTXO *held, size_t heldCount, UInt256 txHash, uint32_
     return 0;
 }
 
+// Whether the transaction has a data output (a script that starts with OP_RETURN), as the planner's fee-coin
+// rule reads it (BRAssetFeeCoinEligible). tx is a funding transaction with the input's output, so it has one.
+static BRAssetFact _hasDataOutput(const BRTransaction *tx)
+{
+    size_t i;
+
+    for (i = 0; i < tx->outCount; i++) {
+        if (tx->outputs[i].script && tx->outputs[i].scriptLen > 0 && tx->outputs[i].script[0] == 0x6a)
+            return BR_ASSET_FACT_YES;
+    }
+    return BR_ASSET_FACT_NO;
+}
+
 // Check 15 for one input; BR_ASSET_TRANSFER_SIGNED when it passes. plain[0, plainCount) the wallet's plain
 // spendable coins.
 static BRAssetTransferStatus _walletHoldsInput(BRWallet *wallet, const _BRAssetTransferInput *in,
+                                               const BRAssetTransferPlan *plan,
                                                const BRUTXO *held, size_t heldCount,
                                                const BRUTXO *plain, size_t plainCount)
 {
     uint32_t n = (uint32_t)in->row->vout;
     BRTransaction *funding;
+    BRAssetFact parentHasData = BR_ASSET_FACT_UNKNOWN;
     int state = BRWalletOutpointAssetState(wallet, in->txHash, n), ok;
     size_t i;
 
@@ -265,6 +281,7 @@ static BRAssetTransferStatus _walletHoldsInput(BRWallet *wallet, const _BRAssetT
     if (funding) {
         ok = funding->outputs[n].amount == (uint64_t)in->row->satoshis &&
              _sameBytes(funding->outputs[n].script, funding->outputs[n].scriptLen, in->row->script, in->row->scriptLen);
+        parentHasData = _hasDataOutput(funding);
         BRTransactionFree(funding);
 #if ! _RED(BR_ASSET_TRANSFER_RED_RECORD)
         if (! ok) return BR_ASSET_TRANSFER_INPUT_MISMATCH;
@@ -284,14 +301,18 @@ static BRAssetTransferStatus _walletHoldsInput(BRWallet *wallet, const _BRAssetT
         if (plain[i].n == n && UInt256Eq(plain[i].hash, in->txHash)) break;
     }
     if (i == plainCount) return BR_ASSET_TRANSFER_FEE_COIN_NOT_PLAIN;
+    // The planner's own rule for a fee coin (BRAssetFeeCoinEligible), read from the funding transaction itself
+    // rather than taken from the caller: a second line behind the held list and the plain coins.
+    if (! BRAssetFeeCoinEligible(in->row->script, in->row->scriptLen, plan->sourceScript, plan->sourceScriptLen,
+                                 parentHasData)) return BR_ASSET_TRANSFER_FEE_COIN_NOT_PLAIN;
 #else
-    (void)i; (void)plain; (void)plainCount;
+    (void)i; (void)plain; (void)plainCount; (void)plan; (void)parentHasData;
 #endif
     return BR_ASSET_TRANSFER_SIGNED;
 }
 
 BRAssetTransferStatus BRWalletBuildAssetTransfer(BRTransaction **txOut, BRWallet *wallet,
-                                                 const BRAssetSendOutcome *outcome,
+                                                 BRSweepRuleState ruleState, const BRAssetSendOutcome *outcome,
                                                  const BRAssetRow *assetRows, size_t assetCount,
                                                  const BRAssetRow *dgbRows, size_t dgbCount,
                                                  const char *assetId, int64_t quantity,
@@ -311,6 +332,11 @@ BRAssetTransferStatus BRWalletBuildAssetTransfer(BRTransaction **txOut, BRWallet
     uint8_t recipientScript[BR_ASSET_TRANSFER_SCRIPT_MAX];
     size_t recipientLen, inCount, instCount = 0, plainCount = 0, i, j;
     int64_t assetTotal = 0, change, totalIn = 0, totalOut = 0;
+#if _RED(BR_ASSET_TRANSFER_RED_RULES)
+    int ruleFree = 1;
+#else
+    int ruleFree = BRAssetRuleAllowsSend(ruleState);
+#endif
 
     if (txOut) *txOut = NULL;
     memset(&h, 0, sizeof(h));
@@ -319,6 +345,12 @@ BRAssetTransferStatus BRWalletBuildAssetTransfer(BRTransaction **txOut, BRWallet
         r = BR_ASSET_TRANSFER_BAD_ARGUMENT;
         goto out;
     }
+    // 2. The rule state, asked again: an outcome is the caller's struct, not proof the gate was asked.
+#if ! _RED(BR_ASSET_TRANSFER_RED_RULES)
+    if (! ruleFree) { r = BR_ASSET_TRANSFER_RULE_STATE; goto out; }
+#else
+    (void)ruleState;
+#endif
     plan = &outcome->plan;
     if (outcome->kind != BR_ASSET_SEND_PLANNED || plan->status != BR_ASSET_PLAN_READY) {
         r = BR_ASSET_TRANSFER_NOT_PLANNED;
@@ -418,7 +450,7 @@ BRAssetTransferStatus BRWalletBuildAssetTransfer(BRTransaction **txOut, BRWallet
 #if ! _RED(BR_ASSET_TRANSFER_RED_UNITS)
     {
         int landed = _unitsLandOk(&h, insts, instCount, inputs, inCount, plan->assetInputCount,
-                                  (int32_t)plan->outputCount, assetId, quantity, change);
+                                  (int32_t)plan->outputCount, assetId, quantity, change, ruleFree);
 
         if (landed < 0) { r = BR_ASSET_TRANSFER_NO_MEMORY; goto out; }
         if (! landed) { r = BR_ASSET_TRANSFER_UNITS_MISPLACED; goto out; }
@@ -432,6 +464,9 @@ BRAssetTransferStatus BRWalletBuildAssetTransfer(BRTransaction **txOut, BRWallet
     rep.paidFeeSats = (int64_t)((uint64_t)totalIn - (uint64_t)totalOut);
 #if ! _RED(BR_ASSET_TRANSFER_RED_FEE)
     if (rep.paidFeeSats != plan->paidFeeSats) { r = BR_ASSET_TRANSFER_FEE_MISMATCH; goto out; }
+    // The planner's fee rule: the estimate plus 0..dust. Change above the dust line is an output, never fee.
+    if (plan->estimatedFeeSats <= 0 || plan->estimatedFeeSats > rep.paidFeeSats ||
+        rep.paidFeeSats - plan->estimatedFeeSats > BR_ASSET_CHANGE_DUST_SATS) { r = BR_ASSET_TRANSFER_FEE_MISMATCH; goto out; }
 #endif
 #if ! _RED(BR_ASSET_TRANSFER_RED_APPROVAL)
     if (! BRAssetFeeWithinApproval(rep.paidFeeSats, approvedFeeSats)) { r = BR_ASSET_TRANSFER_FEE_NOT_APPROVED; goto out; }
@@ -447,7 +482,7 @@ BRAssetTransferStatus BRWalletBuildAssetTransfer(BRTransaction **txOut, BRWallet
         plainCount = BRWalletSelectableUTXOs(wallet, plain, plainCount);
     }
     for (i = 0; i < inCount; i++) {
-        r = _walletHoldsInput(wallet, &inputs[i], held, heldCount, plain, plainCount);
+        r = _walletHoldsInput(wallet, &inputs[i], plan, held, heldCount, plain, plainCount);
         if (r != BR_ASSET_TRANSFER_SIGNED) { rep.input = i; goto out; }
     }
 

@@ -10,9 +10,9 @@
 //  so does the serialization. The core does not take its caller's word for the plan: it re-checks what it
 //  signs (THE CHECKS below), and each refusal is a status, never a transaction with something changed.
 //
-//  BRWalletBuildAssetTransfer(&tx, wallet, outcome, assetRows, assetCount, dgbRows, dgbCount, assetId,
-//                             quantity, recipientAddress, approvedFeeSats, held, heldCount, seed, seedLen,
-//                             now, &report)
+//  BRWalletBuildAssetTransfer(&tx, wallet, ruleState, outcome, assetRows, assetCount, dgbRows, dgbCount,
+//                             assetId, quantity, recipientAddress, approvedFeeSats, held, heldCount, seed,
+//                             seedLen, now, &report)
 //
 //  THE TRANSACTION, in the bridge's order, for a plan that passes every check:
 //    inputs   plan.assetInputs (assetRows) in order, then plan.dgbInputs (dgbRows) in order; each its
@@ -31,8 +31,15 @@
 //  and nothing is left allocated:
 //    1. txOut, wallet, outcome, assetId, recipientAddress or seed NULL; assetRows NULL with assetCount
 //       above 0, dgbRows with dgbCount, held with heldCount                              -> BAD_ARGUMENT
-//    2. the outcome is not BR_ASSET_SEND_PLANNED, or its plan is not BR_ASSET_PLAN_READY  -> NOT_PLANNED
-//       (only BRAssetSendChoose makes a PLANNED outcome, and only for an asset whose rule state is NONE)
+//    2. ruleState does not allow a send (BRAssetRuleAllowsSend: only NONE; BOUND, UNKNOWN and any value
+//       BRSweepRuleState does not define do not)                                         -> RULE_STATE
+//       the outcome is not BR_ASSET_SEND_PLANNED, or its plan is not BR_ASSET_PLAN_READY  -> NOT_PLANNED
+//       BRAssetSendOutcome is a plain struct: a caller can fill one in, keep a stale one, or keep one made
+//       for another rule state, so a PLANNED kind and a READY status say nothing of where the plan came
+//       from. Everything below is checked again here, and the rule state is asked again, as
+//       BRAssetSendChoose asks it itself: ruleState is the asset's state read at this call (the same
+//       BRAssetRuleStateForAsset reading the choice is given). A transfer that breaks an asset's rules
+//       loses the whole input holding (BRAssetRuleGate.h), so a wrong NONE is the costly answer.
 //    3. seedLen 0 or above BR_ASSET_TRANSFER_SEED_MAX (64)                                -> BAD_SEED
 //    4. THE PLAN'S SHAPE: no asset input; an index list NULL where it has entries; an index outside
 //       its rows; outputs other than [recipient marker, carrier, (DGB change), last marker]; a marker
@@ -52,14 +59,18 @@
 //   10. THE CARRIER (BRAssetDecode.h): it is not a version-3 TRANSFER this reader classifies, or it does
 //       not read exactly (BRAssetPayloadReadsExactly over the list it decodes to)       -> CARRIER_MISMATCH
 //   11. WHERE THE UNITS LAND (BRAssetAllocate over the decoded list, the asset inputs each carrying its
-//       row's units of assetId and every fee input nothing, and the transaction's output count): not
+//       row's units of assetId, rule-free only as BRAssetRuleAllowsSend(ruleState) says, and every fee
+//       input nothing, and the transaction's output count): not
 //       ALLOCATED, instructions voided, or anything but exactly `quantity` of assetId on output 0 and,
 //       when the asset inputs hold more, exactly the rest on the LAST output (the implicit change; no
 //       entry there when they hold exactly `quantity`)                                   -> UNITS_MISPLACED
 //   12. THE PLAN'S INSTRUCTIONS: the carrier does not read exactly as the instructions the plan's rule
 //       gives for these asset inputs, `quantity` and that change (BRAssetSendPlan.h, THE INSTRUCTIONS,
 //       the change to the last output), or its bytes are not that list's encoding           -> CARRIER_MISMATCH
-//   13. every input's sats less every output's is not plan.paidFeeSats                   -> FEE_MISMATCH
+//   13. every input's sats less every output's is not plan.paidFeeSats; or the plan's own fee rule does
+//       not hold of it: plan.estimatedFeeSats not above 0, or paidFeeSats not the estimate plus
+//       0..BR_ASSET_CHANGE_DUST_SATS (BRAssetSendPlan.h, THE PLAN: change above the dust line is an output,
+//       never fee)                                                                          -> FEE_MISMATCH
 //   14. BRAssetFeeWithinApproval(paid, approvedFeeSats) is 0 (above what the person saw)   -> FEE_NOT_APPROVED
 //   15. per input, in signing order (report->input), by the wallet (asset inputs and fee inputs alike): the outpoint is spent
 //       (BRWalletOutpointAssetState 0)                                                    -> INPUT_SPENT
@@ -68,7 +79,9 @@
 //       the output's amount or script is not the row's                                    -> INPUT_MISMATCH
 //       a fee input in held[0, heldCount)                                                 -> INPUT_HELD
 //       a fee input that is not one of the wallet's plain spendable coins
-//       (BRWalletSelectableUTXOs)                                                         -> FEE_COIN_NOT_PLAIN
+//       (BRWalletSelectableUTXOs), or that the planner's fee-coin rule does not admit
+//       (BRAssetFeeCoinEligible against plan.sourceScript, the funding transaction's data output read
+//       here: an output whose script starts with OP_RETURN, 0x6a)                         -> FEE_COIN_NOT_PLAIN
 //   16. BRSpendGuardInputsUnspent is 0 (a send registered since 15)                       -> INPUT_SPENT
 //   17. BRWalletSignTransaction fails, or an input is left unsigned                       -> SIGN_FAILED
 //   18. BRSignedSpendGate refuses (a coin spent meanwhile, or claimed for another send)    -> GATE_REFUSED
@@ -81,7 +94,10 @@
 //
 //  quantity, assetId, recipientAddress and approvedFeeSats are the approval the person confirmed: the
 //  units sent, the asset, the address (already without surrounding whitespace) and the highest fee they
-//  saw. A plan for anything else is refused (5, 8, 11, 14), so what is signed is what was approved.
+//  saw. A plan for anything else is refused (5, 8, 11, 14), so what is signed is what was approved. The
+//  approval is the caller's to give as the figure the person saw: an approval of INT64_MAX limits
+//  nothing beyond check 13's fee rule, which a plan filled in by hand can still satisfy at a high rate
+//  (the outcome does not carry the rate it was planned at, so the rate is not checked here).
 //
 //  KEYS. seed is read, never written or copied. The keys are derived and wiped inside
 //  BRWalletSignTransaction (BRKeyClean, every path). Nothing here draws a random number or reads a
@@ -115,6 +131,8 @@
 //    8192   BR_ASSET_TRANSFER_RED_PRESPENT     a spent input is not refused before signing (15, 16).
 //    16384  BR_ASSET_TRANSFER_RED_GATE         the signed transaction does not pass the spend gate (18).
 //    32768  BR_ASSET_TRANSFER_RED_DUPLICATE    two inputs naming one outpoint are not refused (7).
+//    65536  BR_ASSET_TRANSFER_RED_RULES        the rule state is not asked (2), and the allocator is told
+//                                              the units are rule-free whatever it is (11).
 //
 //  Permission is hereby granted, free of charge, to any person obtaining a copy
 //  of this software and associated documentation files (the "Software"), to deal
@@ -137,7 +155,7 @@
 #ifndef BRAssetSend_h
 #define BRAssetSend_h
 
-#include "BRAssetSendPlan.h"   // BRAssetSendOutcome, BRAssetTransferPlan, BRAssetRow
+#include "BRAssetSendPlan.h"   // BRAssetSendOutcome, BRAssetTransferPlan, BRAssetRow; BRSweepRuleState
 #include "BRTransaction.h"     // BRTransaction
 #include "BRWallet.h"          // BRWallet, BRUTXO
 #include <stddef.h>
@@ -170,9 +188,11 @@ typedef enum {
     BR_ASSET_TRANSFER_INPUT_UNKNOWN = 16,      // an input the wallet holds no transaction or output for
     BR_ASSET_TRANSFER_INPUT_MISMATCH = 17,     // an input whose amount or script is not the wallet's record
     BR_ASSET_TRANSFER_INPUT_HELD = 18,         // a fee input the hold holds
-    BR_ASSET_TRANSFER_FEE_COIN_NOT_PLAIN = 19, // a fee input that is not one of the wallet's plain spendable coins
+    BR_ASSET_TRANSFER_FEE_COIN_NOT_PLAIN = 19, // a fee input not among the wallet's plain spendable coins, or not
+                                               // a fee coin by the planner's rule (BRAssetFeeCoinEligible)
     BR_ASSET_TRANSFER_SIGN_FAILED = 20,        // an input was not signed
-    BR_ASSET_TRANSFER_GATE_REFUSED = 21        // the spend gate refused the signed transaction
+    BR_ASSET_TRANSFER_GATE_REFUSED = 21,       // the spend gate refused the signed transaction
+    BR_ASSET_TRANSFER_RULE_STATE = 22          // the asset's transfer-rule state does not allow a send
 } BRAssetTransferStatus;
 
 typedef struct {
@@ -184,7 +204,7 @@ typedef struct {
 // the rows the outcome's choice was given, and the `work` buffer that choice wrote must still hold the plan's
 // index lists; the rows' txid, script and asset id strings stay the caller's.
 BRAssetTransferStatus BRWalletBuildAssetTransfer(BRTransaction **txOut, BRWallet *wallet,
-                                                 const BRAssetSendOutcome *outcome,
+                                                 BRSweepRuleState ruleState, const BRAssetSendOutcome *outcome,
                                                  const BRAssetRow *assetRows, size_t assetCount,
                                                  const BRAssetRow *dgbRows, size_t dgbCount,
                                                  const char *assetId, int64_t quantity,

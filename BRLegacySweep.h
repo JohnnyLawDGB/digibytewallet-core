@@ -4,7 +4,8 @@
 //  The Recover-funds sweep: one transaction spending a derivation profile's coins, each signed with the key
 //  derived from the recovery seed at the profile's prefix + (chain, index), into one output paying the
 //  destination everything less the fee. Moved from the Android JNI bridge (jni_derive.c,
-//  NativeBridge_buildAndSignLegacySweep), unchanged: for the same inputs it signs the same bytes. The bridge's
+//  NativeBridge_buildAndSignLegacySweep), unchanged except for three refusals the bridge does not make (BAD_AMOUNT,
+//  FEE_RATE_TOO_HIGH, FEE_OVERFLOW): for every other input it signs the same bytes. The bridge's
 //  JNI handling (arrays, strings, the hex decoding of txids and scripts, logging), the signed-spend gate and the
 //  serialization stay on the platform side.
 //
@@ -43,8 +44,8 @@
 //  are refused before they do: the sum totalIn (each amount and the running total at most MAX_MONEY, so the sum is
 //  at most MAX_MONEY: BAD_AMOUNT), and the product estSize * feePerKb (FEE_OVERFLOW). Then fee is at most
 //  (2^64 - 1) / 1000 or the 1000 floor, so fee * 20 and fee + 546 fit; and the dust rule leaves fee < totalIn, so
-//  the output totalIn - fee never wraps. (The bridge, jni_derive.c, still wraps both; the core no longer agrees with
-//  it there, and only there.) A jlong amount that was negative reads as above MAX_MONEY.
+//  the output totalIn - fee never wraps. (The bridge, jni_derive.c, still wraps both; the core differs from it
+//  only on those wraps and on rates above BR_LEGACY_SWEEP_MAX_FEE_PER_KB.) A jlong amount that was negative reads as above MAX_MONEY.
 //  FEE RATE. A lone input is exempt from the 5% rule, so without a bound on feePerKb a large rate would burn most of
 //  a one-coin sweep (one 10 DGB coin at 4.9e9 sat/kB would sign with a fee of 9.996 DGB). The bound is the core's
 //  existing ceiling on a fee rate, MAX_FEE_PER_KB (BRWallet.h): the highest rate BRPeerManager will raise the

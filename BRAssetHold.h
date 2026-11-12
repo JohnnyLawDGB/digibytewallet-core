@@ -10,6 +10,14 @@
 //  refusals, and one deliberate difference, THE UNION below.
 //
 //  THE RULES:
+//    - ONE CARRIER RULE (ASSET-HOLD-ONE-RULE). Which output of a transaction carries its DigiAsset, and
+//      whether it carries one at all, is BRTxAssetCarrier's answer (BRDigiAsset.c, DA-014-REF; Kotlin:
+//      DigiAssetCarrierRule), and nothing in this header reads it any other way: DA_TX_NONE, no carrier;
+//      DA_TX_CARRIER, that output, decoded; DA_TX_UNDECIDED, a carrier that cannot be classified, so
+//      every output may carry units. A DA_TX_CARRIER output the decoder cannot classify is read as
+//      unclassifiable too (the hold direction). The pass, the walk, the replay and "does the funding
+//      transaction carry a payload" all ask it; so does the classifier half, whose BRTxOutputIsAsset and
+//      BRContainsAsset rest on the same answer.
 //    - TWO READERS. The decoder (BRAssetDecode.h, with BRAssetTargetsOutput in BRAssetQuantity.h) says
 //      which outputs a carrier may put units on, implicit change and unclassifiable carriers included.
 //      The core's classifier (BRTxOutputIsAsset and BRContainsAsset in BRDigiAsset.c, the test behind
@@ -19,22 +27,26 @@
 //      otherwise UNKNOWN. Never weaker than either reader. The pass is read twice. In the DECODER'S
 //      READING every fact the walk reads is the decoder's; it is the move of Android's pass. In the
 //      OTHER READING each fact about a funding transaction -- does it carry a payload, may this output
-//      carry units -- is the union of both readers, and a funding transaction is read only by the
-//      carrier the pass reads it by. In both, each output's verdict is the decoder's united with the
+//      carry units -- is the union of both readers. In both, each output's verdict is the decoder's united with the
 //      classifier's, and an output either reading holds is held. (Two readings, not one: a remainder
 //      proof turns an unknown total into a known one, so a reading with more unknowns can hold less.)
+//      The union is kept although both readers now take the carrier from the one rule: they still read
+//      that carrier's INSTRUCTIONS with two different decoders (BRAssetTargetsOutput, with implicit change
+//      and the remainder, against BRDigiAsset.c's _BRCarrierNames), and nothing proves either holds every
+//      output the other does. It joins two readings of the instructions, not two carrier rules.
 //    - THE PASS (BRAssetHoldOutputs), in the wallet's order, each transaction once:
-//        * its carrier: among its OP_RETURN outputs (a script whose first byte is 0x6a) that are DigiAsset
-//          carriers, the first one that cannot be classified, otherwise the last one (BRDigiAsset.c's
-//          choice). None: the decoder says NO for every output.
+//        * its carrier: ONE CARRIER RULE. None: the decoder says NO for every output. Undecided: the
+//          decoder says YES for every output.
 //        * what its inputs carried, input by input: a row with a positive quantity carries it; a row
 //          storing zero or less carries nothing only when its funding output is NOT targeted (the walk
-//          below); no row carries nothing only when the funding transaction carries no payload (the
-//          decoder's reading asks its first OP_RETURN; the other reading asks both readers).
+//          below); no row carries nothing only when the funding transaction carries no payload (the one
+//          rule answers DA_TX_NONE; the other reading asks both readers).
 //          A no-row input whose funding transaction may carry a payload, a sum past INT64_MAX, or an
 //          input whose outpoint index is past INT32_MAX makes the total unknown; so does a stored-zero
 //          row that may be targeted, though the inputs after it are still read. Unknown, and the
-//          transaction's remainder proven zero: what its instructions assign (BRAssetAssignedUnits).
+//          transaction's remainder proven zero: what its instructions assign (BRAssetAssignedUnits) --
+//          in the other reading only when THE PROOF GUARD (_BRAssetHoldProvenUnits) lets the proof be read:
+//          the inputs' rows storing more than zero sum to none or to exactly what is assigned.
 //        * every output that is not OP_RETURN and is the wallet's own (owned == NULL: every output):
 //          decoder BRAssetTargetsOutput(carrier, vout, first non-OP_RETURN output, input units, output
 //          count); classifier BRTxOutputIsAsset. YES held, NO not held, UNKNOWN refuses.
@@ -43,9 +55,8 @@
 //      remainder of zero: YES. Otherwise the remainder of the funding transaction decides, and its input
 //      total is resolved the same way, one transaction further back, as far back as the run goes (each
 //      transaction once, on an explicit stack held in the caller's work buffer, so a long run of sends costs
-//      no call depth). In the decoder's reading the walk reads a funding transaction by its first OP_RETURN; in
-//      the other reading only by the carrier THE PASS reads it by. A transaction the wallet does not
-//      hold, one with no carrier there (in the other reading: one whose carrier is another output), and one
+//      no call depth). In both readings the walk reads a funding transaction by its carrier under the one
+//      rule, as THE PASS does. A transaction the wallet does not hold, one with no carrier, and one
 //      whose inputs cannot all be read (an index past INT32_MAX) have no answer. A total taken before
 //      everything under it was resolved (a cycle) has no answer, and that walk records nothing for later
 //      walks; every other total a walk resolves is recorded for the rest of the phase, and the pass records
@@ -114,13 +125,16 @@
 //    32    ASSET_HOLD_RED_ABSENT_HELD         a row whose transaction the wallet does not hold is held.
 //    64    ASSET_HOLD_RED_OWNERSHIP_IGNORED   an output that is not the wallet's own is held like one that is.
 //    128   ASSET_HOLD_RED_PROOF_IGNORED       a remainder proof is not read.
-//    256   ASSET_HOLD_RED_FIRST_CARRIER       a transaction's carrier is its first carrier output.
+//    256   ASSET_HOLD_RED_SECOND_RULE         the header's own carrier reading, the rule before the one rule: the
+//                                             first unclassifiable OP_RETURN carrier, else the last carrier, a
+//                                             plain OP_RETURN beside it ignored; the walk and the payload test by
+//                                             the first OP_RETURN (the other reading: only when that is the carrier).
 //    512   ASSET_HOLD_RED_INPUT_DROPPED       an input the pass cannot read is passed over.
 //    1024  ASSET_HOLD_RED_SETTLED_UNGATED     a walk records totals taken before everything under them was resolved.
 //    2048  ASSET_HOLD_RED_CAPACITY_SHORTENS   a held list the buffer cannot hold is shortened.
 //    4096  ASSET_HOLD_RED_REFUSAL_EMPTY       a pass that cannot complete answers "complete, nothing held".
 //    8192  ASSET_HOLD_RED_FACTS_DECODER_ONLY  only the decoder's reading is made.
-//    16384 ASSET_HOLD_RED_SHAPE_FIRST_ONLY    the other reading too reads a funding transaction by its first OP_RETURN.
+//    16384 ASSET_HOLD_RED_PROOF_UNGUARDED     the other reading reads a remainder proof without THE PROOF GUARD.
 //    32768 ASSET_HOLD_RED_DUPLICATE_ROWS      two rows for one outpoint that differ are read, one of them winning.
 //    65536 ASSET_HOLD_RED_SEAMS_OPEN          a build without ASSET_HOLD_TEST_SEAMS honours the test seams.
 //
@@ -177,13 +191,13 @@ extern "C" {
 #define ASSET_HOLD_RED_ABSENT_HELD         32
 #define ASSET_HOLD_RED_OWNERSHIP_IGNORED   64
 #define ASSET_HOLD_RED_PROOF_IGNORED       128
-#define ASSET_HOLD_RED_FIRST_CARRIER       256
+#define ASSET_HOLD_RED_SECOND_RULE         256
 #define ASSET_HOLD_RED_INPUT_DROPPED       512
 #define ASSET_HOLD_RED_SETTLED_UNGATED     1024
 #define ASSET_HOLD_RED_CAPACITY_SHORTENS   2048
 #define ASSET_HOLD_RED_REFUSAL_EMPTY       4096
 #define ASSET_HOLD_RED_FACTS_DECODER_ONLY  8192
-#define ASSET_HOLD_RED_SHAPE_FIRST_ONLY    16384
+#define ASSET_HOLD_RED_PROOF_UNGUARDED     16384
 #define ASSET_HOLD_RED_DUPLICATE_ROWS      32768
 #define ASSET_HOLD_RED_SEAMS_OPEN          65536
 
@@ -513,8 +527,8 @@ static inline void _BRAssetHoldLayout(const BRTransaction *tx, _BRAssetHoldTx *t
     }
 }
 
-// Kotlin: assetCarrier. The carrier of a transaction (see THE PASS) in *t, its output index in *at
-// (when `at` is not NULL), and 1; 0 when none.
+#if (ASSET_HOLD_UNFIXED & ASSET_HOLD_RED_SECOND_RULE)
+// COMPARISON ARM ONLY: the header's own carrier reading as it was before the one rule. Never shipped.
 static inline int _BRAssetHoldCarrier(const BRTransaction *tx, _BRAssetHoldTx *t, size_t *at)
 {
     size_t j, last = _BR_ASSET_HOLD_NONE;
@@ -525,11 +539,7 @@ static inline int _BRAssetHoldCarrier(const BRTransaction *tx, _BRAssetHoldTx *t
     for (j = 0; j < tx->outCount; j++) {
         if (! _BRAssetHoldIsOpReturn(&tx->outputs[j])) continue;
         kind = _BRAssetHoldDecode(&tx->outputs[j], t);
-#if (ASSET_HOLD_UNFIXED & ASSET_HOLD_RED_FIRST_CARRIER)
-        if (kind != BR_ASSET_SCRIPT_NOT_ASSET) {
-#else
         if (kind == BR_ASSET_SCRIPT_UNCLASSIFIABLE) {
-#endif
             if (at) *at = j;
             return 1;
         }
@@ -542,9 +552,6 @@ static inline int _BRAssetHoldCarrier(const BRTransaction *tx, _BRAssetHoldTx *t
     return 1;
 }
 
-// Kotlin: assetTxShape. A funding transaction as the walk reads it: its FIRST OP_RETURN, when that is a
-// carrier, in *t, and 1; 0 (no answer) otherwise. In the other reading the first OP_RETURN must also be
-// the carrier THE PASS reads the transaction by; a transaction whose carrier is another has no answer.
 static inline int _BRAssetHoldShape(const _BRAssetHoldState *s, const BRTransaction *tx, _BRAssetHoldTx *t)
 {
     size_t j, first = _BR_ASSET_HOLD_NONE, at = _BR_ASSET_HOLD_NONE;
@@ -556,14 +563,68 @@ static inline int _BRAssetHoldShape(const _BRAssetHoldState *s, const BRTransact
     }
 
     if (first == _BR_ASSET_HOLD_NONE) return 0;
-#if !(ASSET_HOLD_UNFIXED & ASSET_HOLD_RED_SHAPE_FIRST_ONLY)
     if (s->classifierInFacts) return (_BRAssetHoldCarrier(tx, t, &at) && at == first) ? 1 : 0;
-#endif
-    (void)s;
-    (void)at;
     _BRAssetHoldLayout(tx, t);
     return (_BRAssetHoldDecode(&tx->outputs[first], t) != BR_ASSET_SCRIPT_NOT_ASSET) ? 1 : 0;
 }
+
+static inline BRAssetFact _BRAssetHoldPayloadOf(const BRTransaction *tx)
+{
+    size_t j;
+
+    for (j = 0; j < tx->outCount; j++) {
+        if (! _BRAssetHoldIsOpReturn(&tx->outputs[j])) continue;
+        return (BRAssetDecodeHeader(tx->outputs[j].script, tx->outputs[j].scriptLen, NULL) != BR_ASSET_SCRIPT_NOT_ASSET)
+            ? BR_ASSET_FACT_YES : BR_ASSET_FACT_NO;
+    }
+
+    return BR_ASSET_FACT_NO;
+}
+#else
+// Kotlin: assetCarrier (DigiAssetCarrierRule.verdict). The carrier of a transaction by the ONE CARRIER
+// RULE, BRTxAssetCarrier (THE RULES); this header has no reading of its own of which output carries the
+// asset. DA_TX_NONE: 0. DA_TX_CARRIER: that output decoded in *t, its index in *at (when `at` is not
+// NULL), and 1. DA_TX_UNDECIDED, or a carrier the decoder does not classify: *t unclassifiable, so that
+// BRAssetTargetsOutput targets every output (Kotlin: Undecided reads as an UNCLASSIFIABLE header), *at
+// _BR_ASSET_HOLD_NONE, and 1.
+static inline int _BRAssetHoldCarrier(const BRTransaction *tx, _BRAssetHoldTx *t, size_t *at)
+{
+    size_t idx = _BR_ASSET_HOLD_NONE;
+    int verdict;
+
+    _BRAssetHoldLayout(tx, t);
+    if (at) *at = _BR_ASSET_HOLD_NONE;
+    verdict = BRTxAssetCarrier(tx, &idx);
+    if (verdict == DA_TX_NONE) return 0;
+
+    if (verdict == DA_TX_CARRIER && idx < tx->outCount &&
+        _BRAssetHoldDecode(&tx->outputs[idx], t) == BR_ASSET_SCRIPT_ASSET) {
+        if (at) *at = idx;
+        return 1;
+    }
+
+    memset(&t->h, 0, sizeof(t->h));
+    t->h.kind = BR_ASSET_SCRIPT_UNCLASSIFIABLE;
+    return 1;
+}
+
+// Kotlin: assetTxShape. A funding transaction as the walk reads it, in both readings: its carrier under
+// the one rule in *t, and 1; 0 (no answer) for a transaction the wallet does not hold, one with no
+// outputs, and one with no carrier.
+static inline int _BRAssetHoldShape(const _BRAssetHoldState *s, const BRTransaction *tx, _BRAssetHoldTx *t)
+{
+    (void)s;
+    if (! tx || tx->outCount == 0) return 0;
+    return _BRAssetHoldCarrier(tx, t, NULL);
+}
+
+// Kotlin: hasAssetPayload. Does the one rule find a carrier (DA_TX_CARRIER or DA_TX_UNDECIDED) among tx's
+// outputs?
+static inline BRAssetFact _BRAssetHoldPayloadOf(const BRTransaction *tx)
+{
+    return (BRTxAssetCarrier(tx, NULL) != DA_TX_NONE) ? BR_ASSET_FACT_YES : BR_ASSET_FACT_NO;
+}
+#endif
 
 static inline int _BRAssetHoldTargets(const _BRAssetHoldTx *t, int32_t vout, _BRAssetHoldUnits units)
 {
@@ -572,15 +633,42 @@ static inline int _BRAssetHoldTargets(const _BRAssetHoldTx *t, int32_t vout, _BR
                                 t->insts, t->h.instructionCount);
 }
 
+// The units tx's inputs are KNOWN to carry, in *units: the sum of their rows storing more than zero. 0 when
+// that sum does not fit.
+static inline int _BRAssetHoldKnownUnits(const _BRAssetHoldState *s, const BRTransaction *tx, int64_t *units)
+{
+    int64_t total = 0, q = 0;
+    size_t k;
+
+    for (k = 0; k < tx->inCount; k++) {
+        if (_BRAssetHoldRowOf(s, tx->inputs[k].txHash, tx->inputs[k].index, &q) && q > 0 &&
+            ! _BRAssetAddUnits(total, q, &total)) return 0;
+    }
+
+    *units = total;
+    return 1;
+}
+
 // Kotlin: provenInputUnits. What the instructions assign, when the transaction's remainder is proven zero.
+// THE PROOF GUARD, in the other reading only (the decoder's is the Kotlin's): the proof is read only when
+// the units the inputs are known to carry are none or exactly what the instructions assign. Known units
+// the instructions leave over, or fall short of, put a remainder on the last output whatever the proof
+// says; unread, the remainder is unknown and the last output stays held. (ASSET-HOLD-ONE-RULE: reading
+// a funding transaction by the one rule can turn a total the earlier reading knew into an unknown one,
+// and a proof read then would release an output that reading held.)
 static inline _BRAssetHoldUnits _BRAssetHoldProvenUnits(const _BRAssetHoldState *s, const BRTransaction *tx,
                                                         const _BRAssetHoldTx *t)
 {
-    int64_t assigned = 0;
+    int64_t assigned = 0, known = 0;
 
-    if (_BRAssetHoldIsProven(s, tx->txHash) &&
-        BRAssetAssignedUnits(t->h.operation, t->insts, t->h.instructionCount, &assigned)) return _BRAssetHoldSome(assigned);
-    return _BRAssetHoldNone();
+    if (! _BRAssetHoldIsProven(s, tx->txHash) ||
+        ! BRAssetAssignedUnits(t->h.operation, t->insts, t->h.instructionCount, &assigned)) return _BRAssetHoldNone();
+#if !(ASSET_HOLD_UNFIXED & ASSET_HOLD_RED_PROOF_UNGUARDED)
+    if (s->classifierInFacts && (! _BRAssetHoldKnownUnits(s, tx, &known) || (known != 0 && known != assigned)))
+        return _BRAssetHoldNone();
+#endif
+    (void)known;
+    return _BRAssetHoldSome(assigned);
 }
 
 // The classifier's verdict for output `vout` of `tx`: UNKNOWN for a transaction the wallet does not
@@ -618,21 +706,12 @@ static inline BRAssetFact _BRAssetHoldFactOf(const _BRAssetHoldState *s, BRAsset
 // pass's plainTxs); that differs from hasAssetPayload only for a transaction with no outputs.
 static inline BRAssetFact _BRAssetHoldIsAssetTx(const _BRAssetHoldState *s, UInt256 txHash)
 {
-    size_t i = _BRAssetHoldFind(s, txHash), j;
+    size_t i = _BRAssetHoldFind(s, txHash);
     const BRTransaction *tx = _BRAssetHoldTxAt(s, i);
     BRAssetFact decoder = BR_ASSET_FACT_UNKNOWN;
 
     if (tx && tx->outCount == 0 && s->current != _BR_ASSET_HOLD_NONE && i < s->current) decoder = BR_ASSET_FACT_NO;
-    if (tx && tx->outCount > 0) {
-        decoder = BR_ASSET_FACT_NO;
-
-        for (j = 0; j < tx->outCount; j++) {
-            if (! _BRAssetHoldIsOpReturn(&tx->outputs[j])) continue;
-            if (BRAssetDecodeHeader(tx->outputs[j].script, tx->outputs[j].scriptLen, NULL) != BR_ASSET_SCRIPT_NOT_ASSET)
-                decoder = BR_ASSET_FACT_YES;
-            break;
-        }
-    }
+    if (tx && tx->outCount > 0) decoder = _BRAssetHoldPayloadOf(tx);
 
     return _BRAssetHoldFactOf(s, decoder, _BRAssetHoldClassifierContains(s, tx));
 }

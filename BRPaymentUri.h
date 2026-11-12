@@ -17,8 +17,10 @@
 //    - the query after the first '?' is split on '&'; each key and value is percent-decoded
 //      ('+' is a space). The FIRST occurrence of a key wins: a repeated key is how a second
 //      value is smuggled past a display that shows only the first;
-//    - amount: DGB text through BRAmountParseDGB (exact; no floating point). An amount that is
-//      not one is DROPPED (hasAmount 0), never rounded and never a rejection;
+//    - amount: DGB text through BRAmountParseDGB (exact; no floating point), as decoded: no
+//      digit mapping, so only ASCII digits. An amount that is not one -- nine decimals, or an
+//      ambiguous comma such as "1,000" or "0,123" -- is DROPPED (hasAmount 0), never rounded and
+//      never a rejection: the address stands and the amount is left to the person;
 //    - assetId and assetAmount (the asset's RAW units, never scaled like DGB) come together or
 //      not at all. Either one alone, an assetAmount that is not an integer, or one <= 0 REJECTS
 //      the whole URI: a malformed asset request must never degrade into a plain DGB payment

@@ -709,7 +709,9 @@ struct BRPeerManagerStruct {
     UInt256  cfBackfillTipHash;         // last header accepted into the backfill run
     uint32_t cfBackfillTipHeight;       // its height; 0 = run not started
     uint32_t cfBackfillTarget;          // the abandonedBelow value this run is chasing
-    uint32_t cfBackfillQuietBelow;      // highest target a run ever chased: a late reply below it is backfill, not a fork
+    uint32_t cfBackfillQuietBelow;      // highest target the current backfill chased: a late reply below it is
+                                        // backfill, not a fork. Zeroed on every run reset, ledger re-Init/restore
+                                        // and rescan, so a real fork below an old target logs again.
     // When only ONE filter peer is connected the K-distinct-disagreers threshold
     // can never be met (the active probe reaches no other filter peer), so
     // cfDisagreedCount wedges at 1/K forever and cfheaders never advance. Count
@@ -3075,6 +3077,9 @@ static void _BRPeerManagerReinitCFLedgerLocked(BRPeerManager *manager, uint32_t 
     uint32_t band = manager->cfLedger.abandonedBelow;
     uint32_t frontier = manager->cfLedger.scannedThrough + 1;
     BRCFScanLedgerInit(&manager->cfLedger, start);
+    // A new scan state: forget what earlier backfill runs chased, so a real fork below an old
+    // target logs again (see cfBackfillQuietBelow).
+    manager->cfBackfillQuietBelow = 0;
     // The reorg suite's own red arm restores the shape before ANY carry, so it disables this too.
 #if !defined(CF_BAND_KEPT_UNFIXED) && !defined(CF_REORG_BAND_KEPT_UNFIXED)
     if (band > 0 && band <= start) manager->cfLedger.abandonedBelow = band;
@@ -3175,6 +3180,7 @@ uint32_t BRPeerManagerBackfillAbandonedBandStep(BRPeerManager *manager)
     if (abandoned == 0) {                       // nothing to do; forget any stale run
         manager->cfBackfillTarget   = 0;
         manager->cfBackfillTipHeight = 0;
+        manager->cfBackfillQuietBelow = 0;      // no band left: a block below the old target is a real fork
         MGR_UNLOCK(manager);
         return 0;
     }
@@ -3186,6 +3192,7 @@ uint32_t BRPeerManagerBackfillAbandonedBandStep(BRPeerManager *manager)
     if (abandoned == 0) {
         manager->cfBackfillTarget = 0;
         manager->cfBackfillTipHeight = 0;
+        manager->cfBackfillQuietBelow = 0;
         MGR_UNLOCK(manager);
         return retired;
     }
@@ -3201,6 +3208,7 @@ uint32_t BRPeerManagerBackfillAbandonedBandStep(BRPeerManager *manager)
     if (abandoned <= BRCFScanLedgerStartHeight(&manager->cfLedger)) {
         manager->cfBackfillTarget    = 0;
         manager->cfBackfillTipHeight = 0;
+        manager->cfBackfillQuietBelow = 0;
         MGR_UNLOCK(manager);
         return retired;
     }
@@ -9597,6 +9605,7 @@ void BRPeerManagerRescan(BRPeerManager *manager)
 {
     assert(manager != NULL);
     MGR_LOCK(manager);
+    manager->cfBackfillQuietBelow = 0;   // a rescan ends every backfill run; real forks log again
     
     if (manager->isConnected) {
         // start the chain download from the most recent checkpoint that's at least a week older than earliestKeyTime
@@ -10749,6 +10758,7 @@ int BRPeerManagerCFLedgerRestore(BRPeerManager *manager, const uint8_t *buf, siz
     assert(manager != NULL);
     MGR_LOCK(manager);
     int ok = BRCFScanLedgerParse(&manager->cfLedger, buf, buflen);
+    manager->cfBackfillQuietBelow = 0;   // a different scan state; see _BRPeerManagerReinitCFLedgerLocked
     // C1: the restored ledger is a different scan state than whatever this manager had in
     // flight — a solicitation recorded against the old one must not complete a hole in it.
     _BRPeerManagerClearSolicitedBlocksLocked(manager);

@@ -3176,6 +3176,22 @@ uint32_t BRPeerManagerBackfillAbandonedBandStep(BRPeerManager *manager)
         return retired;
     }
 
+#ifndef CF_ABANDONED_AT_START_UNFIXED
+    // CF-ABANDONED-AT-START. Invariant: the backfill asks for headers only for a band this ledger
+    // can retire. A band carried at or below the ledger's start (abandonedBelow <= start: a re-Init
+    // at or inside the band kept it, _BRPeerManagerReinitCFLedgerLocked) lies wholly below the
+    // start; a ledger never scans below its start, and BRCFScanLedgerRetireAbandonedTo refuses any
+    // floor under it, so no header can ever retire it. Only a re-Init below the band (the rescan)
+    // clears it, and then abandonedBelow is 0 here. The band stays recorded, untouched: its heights
+    // were never scanned. Without this the step sent a getheaders on every tick, for nothing.
+    if (abandoned <= BRCFScanLedgerStartHeight(&manager->cfLedger)) {
+        manager->cfBackfillTarget    = 0;
+        manager->cfBackfillTipHeight = 0;
+        MGR_UNLOCK(manager);
+        return retired;
+    }
+#endif
+
     // (Re)start the run whenever the target moves — a band raised again while a backfill
     // was in flight must not be chased with a locator derived from the old one.
     if (manager->cfBackfillTarget != abandoned) {

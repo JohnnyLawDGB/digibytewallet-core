@@ -932,7 +932,9 @@ uint32_t BRPeerManagerRetireAbandonedBand(BRPeerManager *manager);
 
    Safe on any tick and safe to call forever — it re-derives everything from the ledger and
    the block set, so a missed tick, a dropped peer or a process restart costs time, never
-   correctness. Does nothing when there is no band or no connected peer. */
+   correctness. Does nothing when there is no band or no connected peer, and requests nothing
+   for a band at or below the scan ledger's start (CF-ABANDONED-AT-START): that band lies below
+   anything this ledger scans, so no header can retire it; only a rescan clears it. */
 uint32_t BRPeerManagerBackfillAbandonedBandStep(BRPeerManager *manager);
 
 // SPAN below the watermark: heights in [start .. abandonedBelow-1], i.e.

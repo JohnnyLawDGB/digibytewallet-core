@@ -656,6 +656,10 @@ static inline int _BRAssetHoldKnownUnits(const _BRAssetHoldState *s, const BRTra
 // says; unread, the remainder is unknown and the last output stays held. (ASSET-HOLD-ONE-RULE: reading
 // a funding transaction by the one rule can turn a total the earlier reading knew into an unknown one,
 // and a proof read then would release an output that reading held.)
+// The decoder's reading still reads proofs unguarded. That is safe only because the other reading, with
+// this guard, holds everything the old union held -- a property asset_hold_kat's one_rule_holds_no_less
+// shows over pseudo-random wallets, not one anything proves. Do not drop the guard on the belief that the
+// decoder's reading covers it: it does not.
 static inline _BRAssetHoldUnits _BRAssetHoldProvenUnits(const _BRAssetHoldState *s, const BRTransaction *tx,
                                                         const _BRAssetHoldTx *t)
 {

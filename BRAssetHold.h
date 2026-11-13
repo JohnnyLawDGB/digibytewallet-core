@@ -45,8 +45,9 @@
 //          input whose outpoint index is past INT32_MAX makes the total unknown; so does a stored-zero
 //          row that may be targeted, though the inputs after it are still read. Unknown, and the
 //          transaction's remainder proven zero: what its instructions assign (BRAssetAssignedUnits) --
-//          in the other reading only when THE PROOF GUARD (_BRAssetHoldProvenUnits) lets the proof be read:
-//          the inputs' rows storing more than zero sum to none or to exactly what is assigned.
+//          only when THE PROOF GUARD (_BRAssetHoldProvenUnits, both readings, as the Kotlin's
+//          inputUnitsOrRemainderProof) lets the proof be read: every input was read, and the inputs' rows
+//          storing more than zero sum to none or to exactly what is assigned.
 //        * every output that is not OP_RETURN and is the wallet's own (owned == NULL: every output):
 //          decoder BRAssetTargetsOutput(carrier, vout, first non-OP_RETURN output, input units, output
 //          count); classifier BRTxOutputIsAsset. YES held, NO not held, UNKNOWN refuses.
@@ -134,7 +135,8 @@
 //    2048  ASSET_HOLD_RED_CAPACITY_SHORTENS   a held list the buffer cannot hold is shortened.
 //    4096  ASSET_HOLD_RED_REFUSAL_EMPTY       a pass that cannot complete answers "complete, nothing held".
 //    8192  ASSET_HOLD_RED_FACTS_DECODER_ONLY  only the decoder's reading is made.
-//    16384 ASSET_HOLD_RED_PROOF_UNGUARDED     the other reading reads a remainder proof without THE PROOF GUARD.
+//    16384 ASSET_HOLD_RED_PROOF_UNGUARDED     a remainder proof is read whatever the inputs' rows sum to.
+//    131072 ASSET_HOLD_RED_PROOF_UNREAD_INPUT a remainder proof is read although an input could not be read.
 //    32768 ASSET_HOLD_RED_DUPLICATE_ROWS      two rows for one outpoint that differ are read, one of them winning.
 //    65536 ASSET_HOLD_RED_SEAMS_OPEN          a build without ASSET_HOLD_TEST_SEAMS honours the test seams.
 //
@@ -200,6 +202,7 @@ extern "C" {
 #define ASSET_HOLD_RED_PROOF_UNGUARDED     16384
 #define ASSET_HOLD_RED_DUPLICATE_ROWS      32768
 #define ASSET_HOLD_RED_SEAMS_OPEN          65536
+#define ASSET_HOLD_RED_PROOF_UNREAD_INPUT  131072
 
 // ---- the types -----------------------------------------------------------------------------------
 
@@ -633,6 +636,18 @@ static inline int _BRAssetHoldTargets(const _BRAssetHoldTx *t, int32_t vout, _BR
                                 t->insts, t->h.instructionCount);
 }
 
+// Are all of tx's inputs readable as the Kotlin reads them (an index it can hold in an Int)?
+static inline int _BRAssetHoldInputsReadable(const BRTransaction *tx)
+{
+    size_t k;
+
+    for (k = 0; k < tx->inCount; k++) {
+        if (tx->inputs[k].index > (uint32_t)INT32_MAX) return 0;
+    }
+
+    return 1;
+}
+
 // The units tx's inputs are KNOWN to carry, in *units: the sum of their rows storing more than zero. 0 when
 // that sum does not fit.
 static inline int _BRAssetHoldKnownUnits(const _BRAssetHoldState *s, const BRTransaction *tx, int64_t *units)
@@ -649,17 +664,17 @@ static inline int _BRAssetHoldKnownUnits(const _BRAssetHoldState *s, const BRTra
     return 1;
 }
 
-// Kotlin: provenInputUnits. What the instructions assign, when the transaction's remainder is proven zero.
-// THE PROOF GUARD, in the other reading only (the decoder's is the Kotlin's): the proof is read only when
-// the units the inputs are known to carry are none or exactly what the instructions assign. Known units
-// the instructions leave over, or fall short of, put a remainder on the last output whatever the proof
-// says; unread, the remainder is unknown and the last output stays held. (ASSET-HOLD-ONE-RULE: reading
-// a funding transaction by the one rule can turn a total the earlier reading knew into an unknown one,
-// and a proof read then would release an output that reading held.)
-// The decoder's reading still reads proofs unguarded. That is safe only because the other reading, with
-// this guard, holds everything the old union held -- a property asset_hold_kat's one_rule_holds_no_less
-// shows over pseudo-random wallets, not one anything proves. Do not drop the guard on the belief that the
-// decoder's reading covers it: it does not.
+// Kotlin: inputUnitsOrRemainderProof's proof branch (AssetManager.kt, ASSET-PROOF-GUARD-KT) over
+// provenInputUnits. What the instructions assign, when the transaction's remainder is proven zero, read
+// through THE PROOF GUARD in BOTH readings, as the Kotlin reads it at every site: the proof is read only
+// when every input was read (no outpoint index past INT32_MAX: the Kotlin's null input list, and its
+// replay's dropped line) and the units the inputs are known to carry (their rows storing more than zero)
+// sum to none or exactly what the instructions assign. Known units the instructions leave over, or fall
+// short of, put a remainder on the last output whatever the proof says; unread, the remainder is unknown
+// and the last output stays held. (ASSET-HOLD-ONE-RULE: reading a funding transaction by the one rule can
+// turn a total the earlier reading knew into an unknown one, and an unguarded proof read then would
+// release an output that reading held.) The guard only ever leaves a total unknown, so it never makes the
+// pass hold fewer outputs; asset_hold_kat's one_rule_holds_no_less compares the pass with the one before.
 static inline _BRAssetHoldUnits _BRAssetHoldProvenUnits(const _BRAssetHoldState *s, const BRTransaction *tx,
                                                         const _BRAssetHoldTx *t)
 {
@@ -667,10 +682,13 @@ static inline _BRAssetHoldUnits _BRAssetHoldProvenUnits(const _BRAssetHoldState 
 
     if (! _BRAssetHoldIsProven(s, tx->txHash) ||
         ! BRAssetAssignedUnits(t->h.operation, t->insts, t->h.instructionCount, &assigned)) return _BRAssetHoldNone();
-#if !(ASSET_HOLD_UNFIXED & ASSET_HOLD_RED_PROOF_UNGUARDED)
-    if (s->classifierInFacts && (! _BRAssetHoldKnownUnits(s, tx, &known) || (known != 0 && known != assigned)))
-        return _BRAssetHoldNone();
+#if !(ASSET_HOLD_UNFIXED & ASSET_HOLD_RED_PROOF_UNREAD_INPUT)
+    if (! _BRAssetHoldInputsReadable(tx)) return _BRAssetHoldNone();
 #endif
+#if !(ASSET_HOLD_UNFIXED & ASSET_HOLD_RED_PROOF_UNGUARDED)
+    if (! _BRAssetHoldKnownUnits(s, tx, &known) || (known != 0 && known != assigned)) return _BRAssetHoldNone();
+#endif
+    (void)s;
     (void)known;
     return _BRAssetHoldSome(assigned);
 }
@@ -763,18 +781,6 @@ static inline _BRAssetHoldUnits _BRAssetHoldTotalOf(const _BRAssetHoldState *s, 
     }
 
     return u;
-}
-
-// Are all of tx's inputs readable as the Kotlin reads them (an index it can hold in an Int)?
-static inline int _BRAssetHoldInputsReadable(const BRTransaction *tx)
-{
-    size_t k;
-
-    for (k = 0; k < tx->inCount; k++) {
-        if (tx->inputs[k].index > (uint32_t)INT32_MAX) return 0;
-    }
-
-    return 1;
 }
 
 // Kotlin: TargetingWalk.answerFromTotals, united with the classifier: from the payload and the totals

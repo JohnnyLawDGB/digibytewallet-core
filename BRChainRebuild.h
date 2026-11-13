@@ -113,8 +113,9 @@
 //  rebuild does (its run() commits in-progress and the floor together), removes the case.
 //
 //  (Android follows this order and these stop rules since digibytewallet-android #248: a failed
-//  STOP_SYNC, ARM_RERUN, FLOOR_FROM_CACHE or LOWER_FLOOR_TO returns before any clear, and a failed
-//  FLOOR_FROM_CACHE disarms the rerun back to its prior state.)
+//  LOWER_FLOOR_TO, STOP_SYNC, ARM_RERUN or FLOOR_FROM_CACHE returns before any clear. A failed
+//  ARM_RERUN or FLOOR_FROM_CACHE then puts done and in-progress back as they were; if that write
+//  fails too, the rerun stays armed, which defers the rebuild to the next launch.)
 //
 //  Host KAT: digibytewallet-android native/src/test/host/scan_floor_kat/ (the order checked against
 //  the order of the calls in Android's source). Vectors: vectors/scan-floor/. Header-only, static

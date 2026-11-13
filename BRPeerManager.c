@@ -709,6 +709,9 @@ struct BRPeerManagerStruct {
     UInt256  cfBackfillTipHash;         // last header accepted into the backfill run
     uint32_t cfBackfillTipHeight;       // its height; 0 = run not started
     uint32_t cfBackfillTarget;          // the abandonedBelow value this run is chasing
+    uint32_t cfBackfillQuietBelow;      // highest target the current backfill chased: a late reply below it is
+                                        // backfill, not a fork. Zeroed on every run reset, ledger re-Init/restore
+                                        // and rescan, so a real fork below an old target logs again.
     // When only ONE filter peer is connected the K-distinct-disagreers threshold
     // can never be met (the active probe reaches no other filter peer), so
     // cfDisagreedCount wedges at 1/K forever and cfheaders never advance. Count
@@ -3074,6 +3077,9 @@ static void _BRPeerManagerReinitCFLedgerLocked(BRPeerManager *manager, uint32_t 
     uint32_t band = manager->cfLedger.abandonedBelow;
     uint32_t frontier = manager->cfLedger.scannedThrough + 1;
     BRCFScanLedgerInit(&manager->cfLedger, start);
+    // A new scan state: forget what earlier backfill runs chased, so a real fork below an old
+    // target logs again (see cfBackfillQuietBelow).
+    manager->cfBackfillQuietBelow = 0;
     // The reorg suite's own red arm restores the shape before ANY carry, so it disables this too.
 #if !defined(CF_BAND_KEPT_UNFIXED) && !defined(CF_REORG_BAND_KEPT_UNFIXED)
     if (band > 0 && band <= start) manager->cfLedger.abandonedBelow = band;
@@ -3108,6 +3114,19 @@ static uint32_t _BRPeerManagerRetireAbandonedToResidentLocked(BRPeerManager *man
 
     uint32_t floor = _BRPeerManagerBlockFloor(manager);
     if (floor == 0 || floor >= abandoned) return 0;    // no headers below the floor to help
+#ifndef CF_RETIRE_FLOOR_CLAMP_UNFIXED
+    // CF-ABANDONED-AT-START. Invariant: a band is retired only down to a height whose header is
+    // resident AND that the ledger can scan. The ledger never scans below its start, and
+    // BRCFScanLedgerRetireAbandonedTo refuses a floor under it; passing a resident floor that sits
+    // below the start (a backfill locator checkpoint under the start) was refused on every tick,
+    // and the backfill re-sent getheaders for ever. Clamp to the start: every header in
+    // [floor .. tip] is resident (the floor is the walk's bottom), so [start .. abandoned-1] is,
+    // and those heights become requestable again, to be scanned, not assumed. The band then sits
+    // at abandonedBelow == start, which the backfill step idles on.
+    uint32_t ledgerStart = BRCFScanLedgerStartHeight(&manager->cfLedger);
+    if (floor < ledgerStart) floor = ledgerStart;
+    if (floor >= abandoned) return 0;                  // nothing between the start and the band
+#endif
 
     uint32_t retired = BRCFScanLedgerRetireAbandonedTo(&manager->cfLedger, floor);
     if (retired > 0) {
@@ -3161,6 +3180,7 @@ uint32_t BRPeerManagerBackfillAbandonedBandStep(BRPeerManager *manager)
     if (abandoned == 0) {                       // nothing to do; forget any stale run
         manager->cfBackfillTarget   = 0;
         manager->cfBackfillTipHeight = 0;
+        manager->cfBackfillQuietBelow = 0;      // no band left: a block below the old target is a real fork
         MGR_UNLOCK(manager);
         return 0;
     }
@@ -3172,14 +3192,33 @@ uint32_t BRPeerManagerBackfillAbandonedBandStep(BRPeerManager *manager)
     if (abandoned == 0) {
         manager->cfBackfillTarget = 0;
         manager->cfBackfillTipHeight = 0;
+        manager->cfBackfillQuietBelow = 0;
         MGR_UNLOCK(manager);
         return retired;
     }
+
+#ifndef CF_ABANDONED_AT_START_UNFIXED
+    // CF-ABANDONED-AT-START. Invariant: the backfill asks for headers only for a band this ledger
+    // can retire. A band carried at or below the ledger's start (abandonedBelow <= start: a re-Init
+    // at or inside the band kept it, _BRPeerManagerReinitCFLedgerLocked) lies wholly below the
+    // start; a ledger never scans below its start, and BRCFScanLedgerRetireAbandonedTo refuses any
+    // floor under it, so no header can ever retire it. Only a re-Init below the band (the rescan)
+    // clears it, and then abandonedBelow is 0 here. The band stays recorded, untouched: its heights
+    // were never scanned. Without this the step sent a getheaders on every tick, for nothing.
+    if (abandoned <= BRCFScanLedgerStartHeight(&manager->cfLedger)) {
+        manager->cfBackfillTarget    = 0;
+        manager->cfBackfillTipHeight = 0;
+        manager->cfBackfillQuietBelow = 0;
+        MGR_UNLOCK(manager);
+        return retired;
+    }
+#endif
 
     // (Re)start the run whenever the target moves — a band raised again while a backfill
     // was in flight must not be chased with a locator derived from the old one.
     if (manager->cfBackfillTarget != abandoned) {
         manager->cfBackfillTarget    = abandoned;
+        if (abandoned > manager->cfBackfillQuietBelow) manager->cfBackfillQuietBelow = abandoned;
         manager->cfBackfillTipHeight = 0;
     }
 
@@ -4581,7 +4620,10 @@ static BRMerkleBlock *_peerRelayedBlockOnce(void *info, BRMerkleBlock *block)
         // would otherwise emit 20k "chain fork" lines.
         int isBackfill = (manager->cfBackfillTarget != 0 &&
                           block->height < manager->cfBackfillTarget);
-        if (!isBackfill) peer_log(peer, "chain fork reached height %"PRIu32, block->height);
+        // A reply to a getheaders sent before the run was reset (band retired, cleared, or
+        // idled) still lands below the old target: it is a late backfill reply, not a fork.
+        if (!isBackfill && block->height >= manager->cfBackfillQuietBelow)
+            peer_log(peer, "chain fork reached height %"PRIu32, block->height);
         BRSetAdd(manager->blocks, block);
         if (isBackfill) _BRPeerManagerNoteBackfillHeaderLocked(manager, block);
 
@@ -9563,6 +9605,7 @@ void BRPeerManagerRescan(BRPeerManager *manager)
 {
     assert(manager != NULL);
     MGR_LOCK(manager);
+    manager->cfBackfillQuietBelow = 0;   // a rescan ends every backfill run; real forks log again
     
     if (manager->isConnected) {
         // start the chain download from the most recent checkpoint that's at least a week older than earliestKeyTime
@@ -10715,6 +10758,7 @@ int BRPeerManagerCFLedgerRestore(BRPeerManager *manager, const uint8_t *buf, siz
     assert(manager != NULL);
     MGR_LOCK(manager);
     int ok = BRCFScanLedgerParse(&manager->cfLedger, buf, buflen);
+    manager->cfBackfillQuietBelow = 0;   // a different scan state; see _BRPeerManagerReinitCFLedgerLocked
     // C1: the restored ledger is a different scan state than whatever this manager had in
     // flight — a solicitation recorded against the old one must not complete a hole in it.
     _BRPeerManagerClearSolicitedBlocksLocked(manager);

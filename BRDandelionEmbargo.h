@@ -31,7 +31,9 @@
 //  clock can jump; BRDandelionEmbargoRemainingMs never waits longer than
 //  BR_DANDELION_EMBARGO_MAX_MS, so a clock set back cannot hold an embargo, and the sweep's spare
 //  of it, for longer than the window (Android's timer is a monotonic coroutine delay and never
-//  waits past the delay it drew). A deadline already passed at re-arm runs its step at once.
+//  waits past the delay it drew). That holds only if the platform runs the deadline step when the
+//  wait it was given ends, without asking RemainingMs again: asking again after a set-back clock
+//  would wait another window. A deadline already passed at re-arm runs its step at once.
 //
 //  The manager torn down before the deadline (iOS frees the peer manager on every trip to the
 //  background; Android rebuilds it in-process on forceReconnect -> startSync). Android's timer
@@ -56,7 +58,8 @@
 //  must do the same: an embargo armed by an earlier process is not pending, and its deadline
 //  step is not run (BRDandelionEmbargoIsPending).
 //
-//  Android references (tag v4.1.3, unchanged on develop as of 2026-11-13):
+//  Android references (line numbers at tag v4.1.3; the behaviour is unchanged on develop as of
+//  2026-11-13, where some of these lines have moved):
 //    core/.../core/dandelion/DandelionBroadcastPolicy.kt:6-7 (window), :11-12 (stem), :16
 //    (fluff), :28 (sweep), :32-35 (delay); Broadcaster.kt:52-62 (broadcast), :64-79 (embargo
 //    timer; :65 the draw, SecureRandom.nextDouble), :71 (a relay count it cannot read counts as
@@ -178,18 +181,21 @@ static inline int64_t BRDandelionEmbargoDelayMs(uint64_t draw)
     return BR_DANDELION_EMBARGO_MIN_MS + (int64_t)(n >> 48);
 }
 
-// The embargo's deadline, wall-clock ms: the time the stem returned 1, plus the delay.
-// Saturates at INT64_MAX.
+// The embargo's deadline, wall-clock ms: the time the stem returned 1, plus the delay
+// (BRDandelionEmbargoDelayMs, so within the window). Saturates at INT64_MAX and INT64_MIN, so no
+// input overflows.
 static inline int64_t BRDandelionEmbargoDeadlineMs(int64_t stemmedAtMs, int64_t delayMs)
 {
     if (delayMs > 0 && stemmedAtMs > INT64_MAX - delayMs) return INT64_MAX;
+    if (delayMs < 0 && stemmedAtMs < INT64_MIN - delayMs) return INT64_MIN;
     return stemmedAtMs + delayMs;
 }
 
 // How long to wait, ms, from nowMs (wall clock) for an embargo due at deadlineMs: at arming and
 // at every re-arm (iOS: on foreground, after the trip to the background suspended its timer).
 // 0 when the deadline has passed or is now: run the deadline step at once. Never more than
-// BR_DANDELION_EMBARGO_MAX_MS, so a clock set back cannot stretch the embargo.
+// BR_DANDELION_EMBARGO_MAX_MS, so a clock set back cannot stretch the embargo, provided the
+// platform runs the deadline step when this wait ends rather than asking again.
 static inline int64_t BRDandelionEmbargoRemainingMs(int64_t nowMs, int64_t deadlineMs)
 {
     uint64_t left;

@@ -709,6 +709,7 @@ struct BRPeerManagerStruct {
     UInt256  cfBackfillTipHash;         // last header accepted into the backfill run
     uint32_t cfBackfillTipHeight;       // its height; 0 = run not started
     uint32_t cfBackfillTarget;          // the abandonedBelow value this run is chasing
+    uint32_t cfBackfillQuietBelow;      // highest target a run ever chased: a late reply below it is backfill, not a fork
     // When only ONE filter peer is connected the K-distinct-disagreers threshold
     // can never be met (the active probe reaches no other filter peer), so
     // cfDisagreedCount wedges at 1/K forever and cfheaders never advance. Count
@@ -3108,6 +3109,19 @@ static uint32_t _BRPeerManagerRetireAbandonedToResidentLocked(BRPeerManager *man
 
     uint32_t floor = _BRPeerManagerBlockFloor(manager);
     if (floor == 0 || floor >= abandoned) return 0;    // no headers below the floor to help
+#ifndef CF_RETIRE_FLOOR_CLAMP_UNFIXED
+    // CF-ABANDONED-AT-START. Invariant: a band is retired only down to a height whose header is
+    // resident AND that the ledger can scan. The ledger never scans below its start, and
+    // BRCFScanLedgerRetireAbandonedTo refuses a floor under it; passing a resident floor that sits
+    // below the start (a backfill locator checkpoint under the start) was refused on every tick,
+    // and the backfill re-sent getheaders for ever. Clamp to the start: every header in
+    // [floor .. tip] is resident (the floor is the walk's bottom), so [start .. abandoned-1] is,
+    // and those heights become requestable again, to be scanned, not assumed. The band then sits
+    // at abandonedBelow == start, which the backfill step idles on.
+    uint32_t ledgerStart = BRCFScanLedgerStartHeight(&manager->cfLedger);
+    if (floor < ledgerStart) floor = ledgerStart;
+    if (floor >= abandoned) return 0;                  // nothing between the start and the band
+#endif
 
     uint32_t retired = BRCFScanLedgerRetireAbandonedTo(&manager->cfLedger, floor);
     if (retired > 0) {
@@ -3196,6 +3210,7 @@ uint32_t BRPeerManagerBackfillAbandonedBandStep(BRPeerManager *manager)
     // was in flight must not be chased with a locator derived from the old one.
     if (manager->cfBackfillTarget != abandoned) {
         manager->cfBackfillTarget    = abandoned;
+        if (abandoned > manager->cfBackfillQuietBelow) manager->cfBackfillQuietBelow = abandoned;
         manager->cfBackfillTipHeight = 0;
     }
 
@@ -4597,7 +4612,10 @@ static BRMerkleBlock *_peerRelayedBlockOnce(void *info, BRMerkleBlock *block)
         // would otherwise emit 20k "chain fork" lines.
         int isBackfill = (manager->cfBackfillTarget != 0 &&
                           block->height < manager->cfBackfillTarget);
-        if (!isBackfill) peer_log(peer, "chain fork reached height %"PRIu32, block->height);
+        // A reply to a getheaders sent before the run was reset (band retired, cleared, or
+        // idled) still lands below the old target: it is a late backfill reply, not a fork.
+        if (!isBackfill && block->height >= manager->cfBackfillQuietBelow)
+            peer_log(peer, "chain fork reached height %"PRIu32, block->height);
         BRSetAdd(manager->blocks, block);
         if (isBackfill) _BRPeerManagerNoteBackfillHeaderLocked(manager, block);
 

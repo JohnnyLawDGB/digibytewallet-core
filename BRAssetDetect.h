@@ -3,10 +3,9 @@
 //
 //  DigiAsset DETECTION: what the wallet writes about its own outputs of one transaction that carries a
 //  DigiAsset payload. Until 2026-11 this lived only in Android's Kotlin (core/.../asset/AssetManager.kt:
-//  processIncomingAssetTx up to its writes and the decisions after them, persistDetectedAssetOutput as it
-//  calls it, walkFactsForCreditedAssets' choice of what to walk, the issuance walk's rename by
-//  utxoDao.replaceAssetId, transferRuleState as transferOutputCredits asks it; AssetTxQuantity.kt:
-//  forOutput, implicitChange, forOutputTotal). THE RULES below are its answers.
+//  processIncomingAssetTx up to its writes, persistDetectedAssetOutput as it calls it,
+//  walkFactsForCreditedAssets' choice of what to walk, transferRuleState as transferOutputCredits asks it;
+//  AssetTxQuantity.kt: forOutput, implicitChange, forOutputTotal). THE RULES below are taken from it.
 //
 //  A STEP FUNCTION OVER DATA. The platform passes the transaction, the wallet's other transactions, the
 //  scripts it owns, its stored rows (BRAssetRow, BRAssetHoldings.h), its remainder proofs and, when the
@@ -50,18 +49,17 @@
 //    - THE INDEXER is asked about an output (askIndexer) when its credit is UNKNOWN, the transaction is
 //      not our own unconfirmed send, and the owned set is not empty (the indexer is told nothing about an
 //      output that may be someone else's). Its answer is held to `bound` (BRAssetMaxDeliverable).
-//    - THE ISSUANCE WALK is due (issuanceWalkDue) for an issuance when a write left a row unresolved and
-//      the placeholder is an "unresolved:" id, or when the walk has not answered for this transaction in
-//      this process (walkedInSession 0): the walk also brings the issuance's facts, which the rule gate reads.
+//    - THE ISSUANCE WALK is due (issuanceWalkDue) for an issuance when the walk has not answered for this
+//      transaction in this process (walkedInSession 0): the walk also brings the issuance's facts, which
+//      the rule gate reads. After it has answered, it is due again only while a write left a row unresolved
+//      that THE RENAME can rename (an "unresolved:" placeholder and a carrier that is the first OP_RETURN).
 //    - `targeted`: BRAssetTargetsOutput with what the inputs carried (Kotlin: protectTargetedOutputs).
 //      The hold itself is BRAssetHold.h's pass, which is never weaker than this.
 //
-//  THE RENAME (BRAssetDetectRename; Kotlin: utxoDao.replaceAssetId after the issuance walk): every row
-//  whose asset id is the placeholder, byte for byte, is renamed to the id the walk named, when that id
-//  differs from it. Only an "unresolved:" placeholder is renamed, and only when the transaction's carrier
-//  is its FIRST OP_RETURN output (carrierIsFirstOpReturn): the walk reads a transaction by its first
-//  OP_RETURN (BRAssetProvenance.h, ONE HOP), and its answer names this transaction's asset only when that
-//  is the carrier detection read it by. A derived id is never renamed.
+//  THE RENAME (BRAssetDetectRename; the step utxoDao.replaceAssetId performs): every row whose asset id is
+//  the placeholder, byte for byte, is renamed to the id the walk named, when that id differs from it. Only
+//  an "unresolved:" placeholder is renamed, never a derived id, and only when the carrier is the
+//  transaction's first OP_RETURN output (carrierIsFirstOpReturn).
 //
 //  THE FACTS WALK (BRAssetDetectFactsWalk; Kotlin: walkFactsForCreditedAssets), for a transfer or burn,
 //  over the rows after the writes and the indexer's answers: the assets the transaction's own rows name
@@ -121,6 +119,7 @@
 //    8192   ASSET_DETECT_RED_CLAIM_EARLIER_RULE  the claim is BRAssetQuantityForOutputTotal's.
 //    16384  ASSET_DETECT_RED_DUPLICATE_ROWS      two rows for one outpoint that differ in credit or id are read.
 //    32768  ASSET_DETECT_RED_UNCLASSIFIABLE_ROWS a carrier that cannot be classified writes UNCHECKED rows.
+//    65536  ASSET_DETECT_RED_WALK_UNRENAMABLE    the issuance walk is due again for rows the rename cannot rename.
 //
 //  Permission is hereby granted, free of charge, to any person obtaining a copy
 //  of this software and associated documentation files (the "Software"), to deal
@@ -181,6 +180,7 @@ extern "C" {
 #define ASSET_DETECT_RED_CLAIM_EARLIER_RULE  8192
 #define ASSET_DETECT_RED_DUPLICATE_ROWS      16384
 #define ASSET_DETECT_RED_UNCLASSIFIABLE_ROWS 32768
+#define ASSET_DETECT_RED_WALK_UNRENAMABLE    65536
 
 // "unresolved:" and a 64-character txid, and the NUL after it. It also holds a derived id.
 #define BR_ASSET_PLACEHOLDER_BUFFER 76
@@ -808,11 +808,18 @@ static inline BRAssetDetectStatus BRAssetDetect(const BRAssetDetectView *view, c
         o->bound = BRAssetMaxDeliverable(&out->header, out->insts, out->header.instructionCount, o->vout, out->txOutputCount);
     }
 
-#if (ASSET_DETECT_UNFIXED & ASSET_DETECT_RED_WALK_ONCE_DROPPED)
-    out->issuanceWalkDue = isIssuance && out->anyUnresolved && BRAssetIdIsUnresolved(out->placeholder);
-#else
-    out->issuanceWalkDue = isIssuance && ((out->anyUnresolved && BRAssetIdIsUnresolved(out->placeholder)) || ! view->walkedInSession);
+    {
+        int renamable = out->anyUnresolved && BRAssetIdIsUnresolved(out->placeholder) && ! out->placeholderDerived;
+
+#if !(ASSET_DETECT_UNFIXED & ASSET_DETECT_RED_WALK_UNRENAMABLE)
+        renamable = renamable && out->carrierIsFirstOpReturn;
 #endif
+#if (ASSET_DETECT_UNFIXED & ASSET_DETECT_RED_WALK_ONCE_DROPPED)
+        out->issuanceWalkDue = isIssuance && renamable;
+#else
+        out->issuanceWalkDue = isIssuance && (renamable || ! view->walkedInSession);
+#endif
+    }
     return _BRAssetDetectEnd(out, BR_ASSET_DETECT_DONE);
 }
 

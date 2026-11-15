@@ -1291,15 +1291,18 @@ static inline BRAssetHoldResult BRAssetHoldOutputs(const BRAssetHoldView *view, 
 typedef enum {
     BR_ASSET_CARRIER_UNREADABLE = 0,   // the transaction cannot be read (a NULL transaction, outputs, inputs or
                                        // script where the counts say there are some, or more than INT32_MAX outputs)
-    BR_ASSET_CARRIER_NONE = 1,         // no OP_RETURN output of it is a DigiAsset carrier
-    BR_ASSET_CARRIER_FOUND = 2         // *at, *header and insts say which output it is and what it says
+    BR_ASSET_CARRIER_NONE = 1,         // the one carrier rule finds no output tagged "DA" (DA_TX_NONE)
+    BR_ASSET_CARRIER_FOUND = 2         // a carrier, decided or not: *at, *header and insts say what it is
 } BRAssetCarrierStatus;
 
-// The carrier THE PASS reads `tx` by: among its OP_RETURN outputs that are DigiAsset carriers, the first one
-// that cannot be classified, otherwise the last one (Kotlin: assetCarrier). On FOUND, *at is its output
-// index and *header its header (kind BR_ASSET_SCRIPT_UNCLASSIFIABLE, every other field zero, for one that
-// cannot be classified); insts, when not NULL, has room for BR_ASSET_MAX_INSTRUCTIONS and receives the
-// header->instructionCount instructions. `at` and `header` may be NULL. Nothing is written otherwise.
+// The carrier THE PASS reads `tx` by: the ONE CARRIER RULE, BRTxAssetCarrier (THE RULES; Kotlin:
+// assetCarrier, DigiAssetCarrierRule.verdict). FOUND for DA_TX_CARRIER and DA_TX_UNDECIDED alike. A decided
+// carrier the decoder classifies: *at is its output index and *header its header. DA_TX_UNDECIDED, or a
+// decided carrier the decoder does not classify: *at is (size_t)-1 -- no output index, never to be used as
+// one -- and *header has kind BR_ASSET_SCRIPT_UNCLASSIFIABLE, every other field zero (so BRAssetTargetsOutput
+// targets every output). insts, when not NULL, has room for BR_ASSET_MAX_INSTRUCTIONS and receives the
+// header->instructionCount instructions (none for an unclassifiable header). `at` and `header` may be NULL.
+// Nothing is written on UNREADABLE or NONE.
 static inline BRAssetCarrierStatus BRAssetHoldCarrierOf(const BRTransaction *tx, size_t *at, BRAssetHeader *header,
                                                         BRAssetTransferInstruction *insts)
 {
@@ -1347,13 +1350,13 @@ typedef struct {
 // facts[k], for input k (facts has room for inputCap >= tx->inCount entries; NULL only when tx has no
 // inputs): hasRow and quantity from the view's row for the outpoint; for a row storing zero or less,
 // rowIsTargeted (THE WALK: does the funding transaction direct units to that output?); with no row,
-// fundingIsAssetTx (Kotlin: hasAssetPayload, its first OP_RETURN decoded) and fundingHasDataOutput (an
-// OP_RETURN output at all), each UNKNOWN for a transaction the wallet does not hold. Every other fact is
-// UNKNOWN, credit is UNCHECKED and assetId NULL (the view's rows carry neither). An input whose outpoint
-// index is past INT32_MAX has no row and every fact UNKNOWN. rowIndex, when not NULL (inputCap entries),
-// receives each input's row as its place in view->rows (the first, when the view lists the outpoint
-// twice), or (size_t)-1. outputRow, when not NULL (outputCap >= tx->outCount entries), receives the same
-// for each of tx's own outputs.
+// fundingIsAssetTx (Kotlin: hasAssetPayload: the one carrier rule finds a carrier, decided or not) and
+// fundingHasDataOutput (an OP_RETURN output at all), each UNKNOWN for a transaction the wallet does not
+// hold. Every other fact is UNKNOWN, credit is UNCHECKED and assetId NULL (the view's rows carry neither).
+// An input whose outpoint index is past INT32_MAX has no row and every fact UNKNOWN. rowIndex, when not
+// NULL (inputCap entries), receives each input's row as its place in view->rows (the first, when the view
+// lists the outpoint twice), or (size_t)-1. outputRow, when not NULL (outputCap >= tx->outCount entries),
+// receives the same for each of tx's own outputs.
 //
 // hasUnits and units: what tx's inputs carried in all (Kotlin: resolveInputAssetUnits with `unresolved`
 // given, the inputs it cannot read passed over, then provenInputUnits): an input past INT32_MAX is passed

@@ -13,9 +13,14 @@
 //  It never calls out, fetches, stores or reads a clock; the platform schedules, fetches and stores.
 //
 //  THE RULES (BRAssetDetect):
-//    - THE CARRIER is THE PASS's (BRAssetHoldCarrierOf, BRAssetHold.h): among the OP_RETURN outputs that
-//      are DigiAsset carriers, the first one that cannot be classified, otherwise the last one. A
-//      transaction with no outputs, or no carrier, is NOT_ASSET: nothing is written.
+//    - THE CARRIER is THE PASS's (BRAssetHoldCarrierOf, BRAssetHold.h), which is the ONE CARRIER RULE
+//      (BRTxAssetCarrier, BRDigiAsset.c, DA-014-REF; Kotlin: DigiAssetCarrierRule): this header has no
+//      reading of its own of which output carries the asset. DA_TX_NONE (no output tagged "DA"), or a
+//      transaction with no outputs: NOT_ASSET, nothing is written. DA_TX_CARRIER: that output, the only
+//      nulldata output and the only tagged one, decoded. DA_TX_UNDECIDED (anything else with a tagged
+//      output: two tagged outputs, a tagged output beside a second nulldata output or one that is not
+//      nulldata, an unclassifiable carrier, the encrypted-key shape), or a carrier the decoder does not
+//      classify: UNCLASSIFIABLE (below), and carrierAt is _BR_ASSET_DETECT_NONE.
 //    - THE PLACEHOLDER, the asset id the transaction's rows carry until the asset is named: a LOCKED
 //      ISSUANCE is named at once by its first input (BRAssetIdForIssuance: that input's txid in display
 //      order, lower case, and its index, which must be within INT32_MAX; the header's aggregation and
@@ -27,8 +32,9 @@
 //    - THE OUTPUTS THAT GET A ROW: every output that is not OP_RETURN (a script whose first byte is 0x6a)
 //      and whose script is one of `owned`; with no owned scripts (ownedCount 0: the platform could not
 //      build the set) every output that is not OP_RETURN.
-//    - A CARRIER THAT CANNOT BE CLASSIFIED (UNCLASSIFIABLE): nothing is written; every output that would
-//      get a row is `targeted` (hold it), credited nothing, and not asked about.
+//    - A CARRIER THAT CANNOT BE CLASSIFIED (UNCLASSIFIABLE), which includes every transaction the one rule
+//      leaves undecided: nothing is written; every output that would get a row is `targeted` (hold it),
+//      credited nothing, and not asked about.
 //    - ALL SETTLED. When every output that gets a row already has a row whose credit is settled
 //      (BRAssetCreditIsSettled), nothing is allocated again: every credit is UNKNOWN, which leaves those
 //      rows as they are (BRAssetPersistDetectedOutput re-tags them NATIVE and nothing else).
@@ -53,13 +59,16 @@
 //      transaction in this process (walkedInSession 0): the walk also brings the issuance's facts, which
 //      the rule gate reads. After it has answered, it is due again only while a write left a row unresolved
 //      that THE RENAME can rename (an "unresolved:" placeholder and a carrier that is the first OP_RETURN).
+//      (Under the one rule a decided carrier is the transaction's only nulldata output, so it is the first
+//      OP_RETURN unless an OP_RETURN output that is not nulldata comes before it.)
 //    - `targeted`: BRAssetTargetsOutput with what the inputs carried (Kotlin: protectTargetedOutputs).
 //      The hold itself is BRAssetHold.h's pass, which is never weaker than this.
 //
 //  THE RENAME (BRAssetDetectRename; the step utxoDao.replaceAssetId performs): every row whose asset id is
 //  the placeholder, byte for byte, is renamed to the id the walk named, when that id differs from it. Only
 //  an "unresolved:" placeholder is renamed, never a derived id, and only when the carrier is the
-//  transaction's first OP_RETURN output (carrierIsFirstOpReturn).
+//  transaction's first OP_RETURN output (carrierIsFirstOpReturn; never for an undecided carrier, which has
+//  no output index).
 //
 //  THE FACTS WALK (BRAssetDetectFactsWalk; Kotlin: walkFactsForCreditedAssets), for a transfer or burn,
 //  over the rows after the writes and the indexer's answers: the assets the transaction's own rows name
@@ -381,8 +390,9 @@ typedef struct {
     char txid[BR_ASSET_TXID_BUFFER];         // display order, lower case
     char placeholder[BR_ASSET_PLACEHOLDER_BUFFER];
     int placeholderDerived;                  // the placeholder is the id derived from the first input
-    size_t carrierAt;                        // the carrier's output index
-    int carrierIsFirstOpReturn;              // it is the transaction's first OP_RETURN output
+    size_t carrierAt;                        // the carrier's output index; _BR_ASSET_DETECT_NONE ((size_t)-1) when
+                                             // UNCLASSIFIABLE (no carrier is decided), 0 when NOT_ASSET
+    int carrierIsFirstOpReturn;              // it is the transaction's first OP_RETURN output (never when undecided)
     BRAssetHeader header;                    // the carrier's header
     BRAssetTransferInstruction insts[BR_ASSET_MAX_INSTRUCTIONS];   // header.instructionCount of them
     int payloadExact;                        // BRAssetPayloadReadsExactly of the carrier
@@ -626,7 +636,8 @@ static inline BRAssetDetectStatus BRAssetDetect(const BRAssetDetectView *view, c
             out->firstNonOpReturn = (int32_t)j;
         }
     }
-    out->carrierIsFirstOpReturn = (firstOpReturn == out->carrierAt) ? 1 : 0;
+    // an undecided carrier has no output index (carrierAt _BR_ASSET_DETECT_NONE), so it is never the first OP_RETURN
+    out->carrierIsFirstOpReturn = (out->carrierAt != _BR_ASSET_DETECT_NONE && firstOpReturn == out->carrierAt) ? 1 : 0;
     isIssuance = (out->header.kind == BR_ASSET_SCRIPT_ASSET && out->header.operation == DA_ISSUANCE) ? 1 : 0;
 
 #if !(ASSET_DETECT_UNFIXED & ASSET_DETECT_RED_PLACEHOLDER_ALWAYS)
@@ -659,7 +670,8 @@ static inline BRAssetDetectStatus BRAssetDetect(const BRAssetDetectView *view, c
     }
     out->outputCount = n;
 
-    if (out->header.kind != BR_ASSET_SCRIPT_ASSET) {   // a carrier that cannot be classified
+    // a carrier that cannot be classified, or none decided (carrierAt is then no output, and is never indexed)
+    if (out->header.kind != BR_ASSET_SCRIPT_ASSET || out->carrierAt >= tx->outCount) {
 #if (ASSET_DETECT_UNFIXED & ASSET_DETECT_RED_UNCLASSIFIABLE_ROWS)
         for (i = 0; i < n; i++) {
             BRAssetDetectOutput *o = &buf->outputs[i];

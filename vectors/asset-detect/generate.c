@@ -7,9 +7,10 @@
 // The corpus, in the order it is written:
 //   1. claims: hand-built instruction lists and seeded ones, through BRAssetClaimForOutputTotal and
 //      BRAssetClaimRemainder;
-//   2. worlds: a few written by hand, then seeded ones. A world is the wallet's transactions, its rows, its
-//      remainder proofs and owned scripts; each of its transactions is detected twice, first with no rules
-//      answer (the detection may ask), then with every id answered by the world's rule lines.
+//   2. worlds: a few written by hand (world 5 holds the one carrier rule's cases, BRTxAssetCarrier), then
+//      seeded ones. A world is the wallet's transactions, its rows, its remainder proofs and owned scripts;
+//      each of its transactions is detected twice, first with no rules answer (the detection may ask), then
+//      with every id answered by the world's rule lines.
 //
 // THE FILE. Text, one record a line, fields separated by one space, numbers in decimal, scripts and txids in
 // hex (txids in display order, lower case). A line that starts with '#' is a comment. `-` is "none".
@@ -118,7 +119,8 @@ static size_t hx(const char *hex, uint8_t *out, size_t cap)
 #define OURS   "0014111111111111111111111111111111111111111111"
 #define OURS2  "0014333333333333333333333333333333333333333333"
 #define THEIRS "0014222222222222222222222222222222222222222222"
-#define NOTE   "6a0568656c6c6f"
+#define NOTE   "6a0568656c6c6f"                 // a plain nulldata OP_RETURN, tagged nothing
+#define BARE   "6aff"                           // an OP_RETURN output that is not nulldata, tagged nothing
 #define PD2    "6a4d060044410215000a"
 #define X "Laxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
 #define Y "Layyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy"
@@ -221,12 +223,14 @@ static void outScript(Tx *t, const uint8_t *s, size_t n, uint64_t sats)
     t->tx.outCount++;
 }
 
-static void out(Tx *t, const char *hex)
+static void outSats(Tx *t, const char *hex, uint64_t sats)
 {
     uint8_t b[120];
 
-    outScript(t, b, hx(hex, b, sizeof(b)), 600);
+    outScript(t, b, hx(hex, b, sizeof(b)), sats);
 }
+
+static void out(Tx *t, const char *hex) { outSats(t, hex, 600); }
 
 typedef struct { uint8_t b[120]; size_t bits; } Bits;
 
@@ -616,7 +620,8 @@ static void handWorlds(void)
     t = tx(11); in(t, tid(5), 0); out(t, OURS); out(t, PD2); out(t, OURS);
     detectWorld(3);
 
-    // no owned set; a settled transaction; a plain OP_RETURN before the carrier; a proof
+    // no owned set; a settled transaction; a plain OP_RETURN before the carrier (two nulldata outputs: the one
+    // carrier rule leaves it undecided); a proof
     reset();
     OWNEDN = 0;
     t = tx(12); in(t, tid(13), 0); out(t, OURS); out(t, NOTE); out(t, "6a0644410115000a"); out(t, THEIRS);
@@ -625,6 +630,21 @@ static void handWorlds(void)
     row(tid(14), 2, &t->outs[2], BR_ASSET_CREDIT_MIXED, 0, "unresolved:z", 0);
     PROOFS[PROOFN++] = tid(12);
     detectWorld(4);
+
+    // the one carrier rule (BRTxAssetCarrier): an OP_RETURN that is not nulldata before the carrier (decided,
+    // not the first OP_RETURN); two carriers; the encrypted-key shape and the same with output 0 at 600; an
+    // unlocked issuance after an OP_RETURN that is not nulldata (walked: the rename cannot rename its rows);
+    // a lone carrier that is not nulldata; the same unlocked issuance as the only OP_RETURN (walked: due)
+    reset();
+    p = tx(15); out(p, THEIRS);
+    t = tx(16); in(t, tid(15), 0); out(t, OURS); out(t, BARE); out(t, "6a06444103150005"); out(t, OURS);
+    t = tx(17); in(t, tid(15), 0); out(t, OURS); out(t, "6a0644410315000a"); out(t, "6a06444103150105"); out(t, OURS);
+    t = tx(18); in(t, tid(15), 0); outSats(t, OURS, 650); out(t, "6a06444103150005"); out(t, OURS);
+    t = tx(19); in(t, tid(15), 0); out(t, OURS); out(t, "6a06444103150005"); out(t, OURS);
+    t = tx(21); in(t, tid(15), 0); out(t, OURS); out(t, BARE); out(t, "6a0a44410305201600201600"); out(t, OURS);
+    t = tx(20); in(t, tid(15), 0); out(t, OURS); out(t, "6a06444103150005ff"); out(t, OURS);
+    t = tx(22); in(t, tid(15), 0); out(t, OURS); out(t, "6a0a44410305201600201600"); out(t, OURS);
+    detectWorld(5);
 }
 
 static void seededWorlds(void)

@@ -283,18 +283,72 @@ row 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a000e 0 001411111
 row 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a000e 2 0014111111111111111111111111111111111111111111 600 1 0 native mixed 0 unresolved:z
 proof 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a000c
 owned -
-detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a000c 0 0 0 0 done unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a000c 0 1 -
-out 0 1 10 unknown insert:unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a000c:10:unchecked:native 0 10
-out 3 0 0 unknown insert:unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a000c:0:unchecked:native 0 none
-detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a000c 0 0 0 1 done unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a000c 0 1 -
-out 0 1 10 unknown insert:unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a000c:10:unchecked:native 0 10
-out 3 0 0 unknown insert:unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a000c:0:unchecked:native 0 none
+detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a000c 0 0 0 0 unclassifiable - 0 0 -
+out 0 1 0 unknown nothing 0 0
+out 3 1 0 unknown nothing 0 0
+detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a000c 0 0 0 1 unclassifiable - 0 0 -
+out 0 1 0 unknown nothing 0 0
+out 3 1 0 unknown nothing 0 0
 detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a000e 100 0 1 0 done unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a000e 0 1 -
 out 0 1 5 unknown update:Laxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx:5:verified:native 0 5
 out 2 1 0 unknown update:unresolved:z:0:mixed:native 0 none
 detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a000e 100 0 1 1 done unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a000e 0 1 -
 out 0 1 5 unknown update:Laxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx:5:verified:native 0 5
 out 2 1 0 unknown update:unresolved:z:0:mixed:native 0 none
+world 5
+tx 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a000f - 600:0014222222222222222222222222222222222222222222
+tx 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0010 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a000f:0 600:0014111111111111111111111111111111111111111111,600:6aff,600:6a06444103150005,600:0014111111111111111111111111111111111111111111
+tx 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0011 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a000f:0 600:0014111111111111111111111111111111111111111111,600:6a0644410315000a,600:6a06444103150105,600:0014111111111111111111111111111111111111111111
+tx 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0012 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a000f:0 650:0014111111111111111111111111111111111111111111,600:6a06444103150005,600:0014111111111111111111111111111111111111111111
+tx 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0013 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a000f:0 600:0014111111111111111111111111111111111111111111,600:6a06444103150005,600:0014111111111111111111111111111111111111111111
+tx 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0015 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a000f:0 600:0014111111111111111111111111111111111111111111,600:6aff,600:6a0a44410305201600201600,600:0014111111111111111111111111111111111111111111
+tx 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0014 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a000f:0 600:0014111111111111111111111111111111111111111111,600:6a06444103150005ff,600:0014111111111111111111111111111111111111111111
+tx 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0016 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a000f:0 600:0014111111111111111111111111111111111111111111,600:6a0a44410305201600201600,600:0014111111111111111111111111111111111111111111
+owned 0014111111111111111111111111111111111111111111,0014333333333333333333333333333333333333333333
+detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a000f 0 0 0 0 not-asset - 0 0 -
+detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a000f 0 0 0 1 not-asset - 0 0 -
+detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0010 100 0 1 0 done unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0010 0 1 -
+out 0 1 5 holds:-:- insert:unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0010:0:backed:native 0 5
+out 3 0 0 holds:-:- insert:unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0010:0:backed:native 0 none
+detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0010 100 0 1 1 done unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0010 0 1 -
+out 0 1 5 holds:-:- insert:unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0010:0:backed:native 0 5
+out 3 0 0 holds:-:- insert:unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0010:0:backed:native 0 none
+detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0011 0 0 0 0 unclassifiable - 0 0 -
+out 0 1 0 unknown nothing 0 0
+out 3 1 0 unknown nothing 0 0
+detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0011 0 0 0 1 unclassifiable - 0 0 -
+out 0 1 0 unknown nothing 0 0
+out 3 1 0 unknown nothing 0 0
+detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0012 100 1 1 0 unclassifiable - 0 0 -
+out 0 1 0 unknown nothing 0 0
+out 2 1 0 unknown nothing 0 0
+detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0012 100 1 1 1 unclassifiable - 0 0 -
+out 0 1 0 unknown nothing 0 0
+out 2 1 0 unknown nothing 0 0
+detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0013 0 0 0 0 done unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0013 0 1 -
+out 0 1 5 holds:-:- insert:unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0013:0:backed:native 0 5
+out 2 0 0 holds:-:- insert:unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0013:0:backed:native 0 none
+detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0013 0 0 0 1 done unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0013 0 1 -
+out 0 1 5 holds:-:- insert:unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0013:0:backed:native 0 5
+out 2 0 0 holds:-:- insert:unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0013:0:backed:native 0 none
+detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0015 100 0 1 0 done unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0015 0 1 -
+out 0 1 1000000 holds:unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0015:1000000 insert:unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0015:1000000:backed:native 0 1000000
+out 3 0 0 holds:-:unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0015 insert:unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0015:0:backed:native 0 none
+detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0015 100 0 1 1 done unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0015 0 1 -
+out 0 1 1000000 holds:unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0015:1000000 insert:unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0015:1000000:backed:native 0 1000000
+out 3 0 0 holds:-:unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0015 insert:unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0015:0:backed:native 0 none
+detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0014 0 0 0 0 unclassifiable - 0 0 -
+out 0 1 0 unknown nothing 0 0
+out 2 1 0 unknown nothing 0 0
+detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0014 0 0 0 1 unclassifiable - 0 0 -
+out 0 1 0 unknown nothing 0 0
+out 2 1 0 unknown nothing 0 0
+detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0016 100 0 1 0 done unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0016 1 1 -
+out 0 1 1000000 holds:unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0016:1000000 insert:unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0016:1000000:backed:native 0 1000000
+out 2 0 0 holds:-:unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0016 insert:unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0016:0:backed:native 0 none
+detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0016 100 0 1 1 done unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0016 1 1 -
+out 0 1 1000000 holds:unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0016:1000000 insert:unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0016:1000000:backed:native 0 1000000
+out 2 0 0 holds:-:unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0016 insert:unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0016:0:backed:native 0 none
 world 100
 tx 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0100 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0900:2,5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0902:1 0:6a09444103050704224020,600:0014111111111111111111111111111111111111111111,0:6a09444102154003001f1f,600:6a4d060044410215000a
 tx 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0101 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0100:1 600:0014333333333333333333333333333333333333333333,600:0014111111111111111111111111111111111111111111
@@ -398,12 +452,12 @@ out 3 1 38 unknown insert:unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5
 detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0102 0 0 0 1 done unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0102 0 1 -
 out 0 1 34 unknown insert:unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0102:34:unchecked:native 1 34
 out 3 1 38 unknown insert:unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0102:38:unchecked:native 1 none
-detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0103 100 1 1 0 done unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0103 0 0 -
-out 0 0 0 holds:-:- nothing 0 0
-out 3 1 0 unknown nothing 0 none
-detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0103 100 1 1 1 done unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0103 0 0 -
-out 0 0 0 holds:-:- nothing 0 0
-out 3 1 0 unknown nothing 0 none
+detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0103 100 1 1 0 unclassifiable - 0 0 -
+out 0 1 0 unknown nothing 0 0
+out 3 1 0 unknown nothing 0 0
+detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0103 100 1 1 1 unclassifiable - 0 0 -
+out 0 1 0 unknown nothing 0 0
+out 3 1 0 unknown nothing 0 0
 world 104
 tx 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0100 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0902:0,5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0902:1,5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0900:0 0:6a0c444103050002161f00020020,600:0014111111111111111111111111111111111111111111,600:0014111111111111111111111111111111111111111111,0:6a06444103050048
 tx 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0101 - 600:0014111111111111111111111111111111111111111111,600:0014111111111111111111111111111111111111111111,0:6a0a44410305232040020c04,600:0014111111111111111111111111111111111111111111
@@ -420,12 +474,12 @@ owned 0014111111111111111111111111111111111111111111,001433333333333333333333333
 rule Laxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx - -
 rule unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0100 - -
 rule unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0103 - -
-detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0100 0 0 0 0 done unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0100 1 1 -
-out 1 1 0 holds:-:- insert:unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0100:0:backed:native 0 0
-out 2 0 0 holds:-:- update:Laxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx:21:mixed:native 0 0
-detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0100 0 0 0 1 done unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0100 1 1 -
-out 1 1 0 holds:-:- insert:unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0100:0:backed:native 0 0
-out 2 0 0 holds:-:- update:Laxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx:21:mixed:native 0 0
+detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0100 0 0 0 0 unclassifiable - 0 0 -
+out 1 1 0 unknown nothing 0 0
+out 2 1 0 unknown nothing 0 0
+detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0100 0 0 0 1 unclassifiable - 0 0 -
+out 1 1 0 unknown nothing 0 0
+out 2 1 0 unknown nothing 0 0
 detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0101 100 0 1 0 done unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0101 1 1 -
 out 0 1 50 holds:unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0101:12 insert:unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0101:12:backed:native 0 12
 out 1 1 0 holds:unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0101:12 insert:unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0101:12:backed:native 0 12
@@ -470,8 +524,8 @@ detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0101 100 0 1 
 out 1 1 10 holds:unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0101:10 insert:unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0101:10:backed:native 0 none
 detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0101 100 0 1 1 done unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0101 1 1 -
 out 1 1 10 holds:unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0101:10 insert:unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0101:10:backed:native 0 none
-detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0102 0 0 0 0 done unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0102 0 0 -
-detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0102 0 0 0 1 done unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0102 0 0 -
+detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0102 0 0 0 0 unclassifiable - 0 0 -
+detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0102 0 0 0 1 unclassifiable - 0 0 -
 detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0103 100 1 1 0 unclassifiable - 0 0 -
 out 0 1 0 unknown nothing 0 0
 out 2 1 0 unknown nothing 0 0
@@ -514,10 +568,12 @@ out 1 0 0 holds:-:- insert:unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a
 out 2 1 4 unknown insert:unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0102:4:unchecked:native 1 4
 detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0103 100 1 1 0 done unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0103 0 0 -
 detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0103 100 1 1 1 done unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0103 0 0 -
-detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0104 0 0 0 0 needs-rules unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0104 0 0 Layyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy
-detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0104 0 0 0 1 done unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0104 0 1 -
-out 0 1 23 unknown insert:unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0104:23:unchecked:native 1 23
-out 2 1 23 unknown insert:unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0104:23:unchecked:native 1 23
+detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0104 0 0 0 0 unclassifiable - 0 0 -
+out 0 1 0 unknown nothing 0 0
+out 2 1 0 unknown nothing 0 0
+detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0104 0 0 0 1 unclassifiable - 0 0 -
+out 0 1 0 unknown nothing 0 0
+out 2 1 0 unknown nothing 0 0
 detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0105 100 0 1 0 not-asset - 0 0 -
 detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0105 100 0 1 1 not-asset - 0 0 -
 world 107
@@ -534,14 +590,14 @@ row 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0102 3 001411111
 owned 0014111111111111111111111111111111111111111111,0014333333333333333333333333333333333333333333
 rule Laxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx - -
 rule unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0101 - -
-detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0100 0 0 0 0 done unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0100 0 1 -
-out 3 0 0 holds:-:- insert:unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0100:0:backed:native 0 0
-detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0100 0 0 0 1 done unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0100 0 1 -
-out 3 0 0 holds:-:- insert:unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0100:0:backed:native 0 0
-detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0101 100 0 1 0 done unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0101 0 1 -
-out 2 0 0 holds:-:- insert:unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0101:0:backed:native 0 0
-detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0101 100 0 1 1 done unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0101 0 1 -
-out 2 0 0 holds:-:- insert:unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0101:0:backed:native 0 0
+detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0100 0 0 0 0 unclassifiable - 0 0 -
+out 3 1 0 unknown nothing 0 0
+detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0100 0 0 0 1 unclassifiable - 0 0 -
+out 3 1 0 unknown nothing 0 0
+detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0101 100 0 1 0 unclassifiable - 0 0 -
+out 2 1 0 unknown nothing 0 0
+detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0101 100 0 1 1 unclassifiable - 0 0 -
+out 2 1 0 unknown nothing 0 0
 detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0102 0 0 0 0 unclassifiable - 0 0 -
 out 1 1 0 unknown nothing 0 0
 out 3 1 0 unknown nothing 0 0
@@ -696,12 +752,12 @@ owned 0014111111111111111111111111111111111111111111,001433333333333333333333333
 rule Laxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx Laxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx:5:1 0
 rule Layyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy Layyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy:1:0 0
 rule unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0100 - -
-detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0100 0 0 0 0 done unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0100 0 1 -
-out 2 0 0 holds:-:- insert:unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0100:0:backed:native 0 0
-detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0100 0 0 0 1 done unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0100 0 1 -
-out 2 0 0 holds:-:- insert:unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0100:0:backed:native 0 0
-detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0101 100 0 1 0 done unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0101 0 0 -
-detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0101 100 0 1 1 done unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0101 0 0 -
+detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0100 0 0 0 0 unclassifiable - 0 0 -
+out 2 1 0 unknown nothing 0 0
+detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0100 0 0 0 1 unclassifiable - 0 0 -
+out 2 1 0 unknown nothing 0 0
+detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0101 100 0 1 0 unclassifiable - 0 0 -
+detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0101 100 0 1 1 unclassifiable - 0 0 -
 detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0102 0 0 0 0 done unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0102 0 1 -
 out 0 1 36 unknown insert:unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0102:36:unchecked:native 1 36
 out 1 1 36 unknown insert:unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0102:36:unchecked:native 1 36
@@ -777,12 +833,12 @@ rule Layyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy Layyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy
 rule unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0101 - -
 detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0100 0 0 0 0 unclassifiable - 0 0 -
 detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0100 0 0 0 1 unclassifiable - 0 0 -
-detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0101 100 0 1 0 done unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0101 0 1 -
-out 1 1 0 holds:-:- insert:unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0101:0:backed:native 0 none
-out 3 1 0 holds:-:- update:-:17:backed:native 0 none
-detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0101 100 0 1 1 done unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0101 0 1 -
-out 1 1 0 holds:-:- insert:unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0101:0:backed:native 0 none
-out 3 1 0 holds:-:- update:-:17:backed:native 0 none
+detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0101 100 0 1 0 unclassifiable - 0 0 -
+out 1 1 0 unknown nothing 0 0
+out 3 1 0 unknown nothing 0 0
+detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0101 100 0 1 1 unclassifiable - 0 0 -
+out 1 1 0 unknown nothing 0 0
+out 3 1 0 unknown nothing 0 0
 detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0102 0 0 0 0 done Lh53LcEMvTrERSFerjGWiGGLTVXJVzv1G4QxY6 1 0 -
 detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0102 0 0 0 1 done Lh53LcEMvTrERSFerjGWiGGLTVXJVzv1G4QxY6 1 0 -
 detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0103 100 1 1 0 done unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0103 0 0 -
@@ -807,12 +863,12 @@ detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0100 0 0 0 1 
 out 1 1 3 holds:-:unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0100 insert:unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0100:0:backed:native 0 25
 out 2 1 0 holds:-:unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0100 update:-:13:verified:native 0 25
 out 3 1 0 holds:-:unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0100 update:Layyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy:0:mixed:native 0 25
-detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0101 100 0 1 0 done unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0101 0 1 -
-out 1 1 18 holds:-:unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0101 insert:unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0101:0:backed:native 0 0
-out 2 0 0 holds:-:unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0101 insert:unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0101:0:backed:native 0 0
-detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0101 100 0 1 1 done unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0101 0 1 -
-out 1 1 18 holds:-:unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0101 insert:unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0101:0:backed:native 0 0
-out 2 0 0 holds:-:unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0101 insert:unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0101:0:backed:native 0 0
+detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0101 100 0 1 0 unclassifiable - 0 0 -
+out 1 1 0 unknown nothing 0 0
+out 2 1 0 unknown nothing 0 0
+detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0101 100 0 1 1 unclassifiable - 0 0 -
+out 1 1 0 unknown nothing 0 0
+out 2 1 0 unknown nothing 0 0
 world 116
 tx 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0100 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0900:1,5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0902:0 600:0014333333333333333333333333333333333333333333,600:0014111111111111111111111111111111111111111111,0:6a0a44410315401f1124255a,600:0014111111111111111111111111111111111111111111
 tx 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0101 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0100:4,5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0900:1 600:0014111111111111111111111111111111111111111111,600:0014222222222222222222222222222222222222222222,600:0014111111111111111111111111111111111111111111,600:6a4d060044410215000a,0:6a0744410215600100
@@ -929,12 +985,12 @@ row 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0104 4 6a0444410
 owned 0014111111111111111111111111111111111111111111,0014333333333333333333333333333333333333333333
 rule Laxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx Laxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx:1:0 0
 rule Layyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy - -
-detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0100 0 0 0 0 done unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0100 0 1 -
-out 2 0 0 holds:-:- insert:unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0100:0:backed:native 0 0
-out 4 1 0 unknown insert:unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0100:0:unchecked:native 1 none
-detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0100 0 0 0 1 done unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0100 0 1 -
-out 2 0 0 holds:-:- insert:unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0100:0:backed:native 0 0
-out 4 1 0 unknown insert:unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0100:0:unchecked:native 1 none
+detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0100 0 0 0 0 unclassifiable - 0 0 -
+out 2 1 0 unknown nothing 0 0
+out 4 1 0 unknown nothing 0 0
+detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0100 0 0 0 1 unclassifiable - 0 0 -
+out 2 1 0 unknown nothing 0 0
+out 4 1 0 unknown nothing 0 0
 detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0101 100 0 1 0 unclassifiable - 0 0 -
 out 0 1 0 unknown nothing 0 0
 out 2 1 0 unknown nothing 0 0
@@ -945,14 +1001,14 @@ detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0102 0 0 0 0 
 out 2 1 0 unknown nothing 0 0
 detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0102 0 0 0 1 unclassifiable - 0 0 -
 out 2 1 0 unknown nothing 0 0
-detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0103 100 1 1 0 done unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0103 0 0 -
-out 0 1 11 unknown nothing 0 11
-out 2 0 0 holds:-:- nothing 0 0
-out 3 0 0 holds:-:- nothing 0 0
-detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0103 100 1 1 1 done unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0103 0 0 -
-out 0 1 11 unknown nothing 0 11
-out 2 0 0 holds:-:- nothing 0 0
-out 3 0 0 holds:-:- nothing 0 0
+detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0103 100 1 1 0 unclassifiable - 0 0 -
+out 0 1 0 unknown nothing 0 0
+out 2 1 0 unknown nothing 0 0
+out 3 1 0 unknown nothing 0 0
+detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0103 100 1 1 1 unclassifiable - 0 0 -
+out 0 1 0 unknown nothing 0 0
+out 2 1 0 unknown nothing 0 0
+out 3 1 0 unknown nothing 0 0
 detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0104 0 0 0 0 done unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0104 0 0 -
 out 1 0 0 unknown update:Laxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx:20:backed:native 1 0
 detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0104 0 0 0 1 done unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0104 0 0 -
@@ -972,10 +1028,10 @@ detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0100 0 0 0 0 
 detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0100 0 0 0 1 unclassifiable - 0 0 -
 detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0101 100 0 1 0 done unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0101 0 0 -
 detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0101 100 0 1 1 done unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0101 0 0 -
-detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0102 0 0 0 0 done Lh53LcEMvTrERSFerjGWiGGLTVXJVzv1G4QxY6 1 1 -
-out 3 1 47 unknown update:-:5:verified:native 1 none
-detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0102 0 0 0 1 done Lh53LcEMvTrERSFerjGWiGGLTVXJVzv1G4QxY6 1 1 -
-out 3 1 47 unknown update:-:5:verified:native 1 none
+detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0102 0 0 0 0 unclassifiable - 0 0 -
+out 3 1 0 unknown nothing 0 0
+detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0102 0 0 0 1 unclassifiable - 0 0 -
+out 3 1 0 unknown nothing 0 0
 world 121
 tx 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0100 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0900:1,5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0902:1,5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0902:2 600:0014333333333333333333333333333333333333333333,600:0014222222222222222222222222222222222222222222,600:0014111111111111111111111111111111111111111111,600:0014333333333333333333333333333333333333333333
 tx 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0101 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0902:0,5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0100:1 0:6a0844410305001f0928,0:6a08444102250322105a,600:0014222222222222222222222222222222222222222222
@@ -994,10 +1050,10 @@ detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0100 0 0 0 0 
 detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0100 0 0 0 1 not-asset - 0 0 -
 detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0101 100 0 1 0 unclassifiable - 0 0 -
 detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0101 100 0 1 1 unclassifiable - 0 0 -
-detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0102 0 0 0 0 done unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0102 0 1 -
-out 0 1 41 unknown update:-:13:backed:native 1 41
-detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0102 0 0 0 1 done unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0102 0 1 -
-out 0 1 41 unknown update:-:13:backed:native 1 41
+detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0102 0 0 0 0 unclassifiable - 0 0 -
+out 0 1 0 unknown nothing 0 0
+detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0102 0 0 0 1 unclassifiable - 0 0 -
+out 0 1 0 unknown nothing 0 0
 detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0103 100 1 1 0 unclassifiable - 0 0 -
 out 0 1 0 unknown nothing 0 0
 out 2 1 0 unknown nothing 0 0
@@ -1105,12 +1161,12 @@ out 3 1 0 unknown nothing 0 0
 detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0101 100 0 1 1 unclassifiable - 0 0 -
 out 0 1 0 unknown nothing 0 0
 out 3 1 0 unknown nothing 0 0
-detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0102 0 0 0 0 done unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0102 0 0 -
-detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0102 0 0 0 1 done unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0102 0 0 -
+detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0102 0 0 0 0 unclassifiable - 0 0 -
+detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0102 0 0 0 1 unclassifiable - 0 0 -
 detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0103 100 1 1 0 done unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0103 0 0 -
 detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0103 100 1 1 1 done unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0103 0 0 -
-detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0104 0 0 0 0 done unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0104 0 0 -
-detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0104 0 0 0 1 done unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0104 0 0 -
+detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0104 0 0 0 0 unclassifiable - 0 0 -
+detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0104 0 0 0 1 unclassifiable - 0 0 -
 world 126
 tx 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0100 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0900:2,5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0901:0 0:6a0944410325020040011b,0:6a0d44410305238000223081227044
 tx 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0101 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0100:1 600:0014222222222222222222222222222222222222222222,600:0014111111111111111111111111111111111111111111,0:6a0444410315,600:0014111111111111111111111111111111111111111111
@@ -1127,16 +1183,16 @@ proof 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0102
 owned 0014111111111111111111111111111111111111111111,0014333333333333333333333333333333333333333333
 rule Laxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx Laxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx:3:1 0
 rule unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0103 - -
-detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0100 0 0 0 0 done unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0100 1 0 -
-detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0100 0 0 0 1 done unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0100 1 0 -
+detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0100 0 0 0 0 unclassifiable - 0 0 -
+detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0100 0 0 0 1 unclassifiable - 0 0 -
 detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0101 100 0 1 0 done unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0101 0 1 -
 out 1 0 0 holds:-:- insert:unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0101:0:backed:native 0 0
 out 3 1 19 unknown update:"":0:backed:native 1 none
 detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0101 100 0 1 1 done unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0101 0 1 -
 out 1 0 0 holds:-:- insert:unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0101:0:backed:native 0 0
 out 3 1 19 unknown update:"":0:backed:native 1 none
-detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0102 0 0 0 0 done unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0102 0 0 -
-detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0102 0 0 0 1 done unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0102 0 0 -
+detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0102 0 0 0 0 unclassifiable - 0 0 -
+detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0102 0 0 0 1 unclassifiable - 0 0 -
 detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0103 100 1 1 0 done Lh53LcEMvTrERSFerjGWiGGLTVXJVzv18ceVoH 0 0 -
 out 0 1 58 unknown nothing 0 22
 detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0103 100 1 1 1 done Lh53LcEMvTrERSFerjGWiGGLTVXJVzv18ceVoH 0 0 -
@@ -1243,10 +1299,10 @@ detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0101 100 0 1 
 detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0101 100 0 1 1 not-asset - 0 0 -
 detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0102 0 0 0 0 not-asset - 0 0 -
 detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0102 0 0 0 1 not-asset - 0 0 -
-detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0103 100 1 1 0 done unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0103 0 0 -
-out 0 1 15 unknown nothing 0 15
-detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0103 100 1 1 1 done unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0103 0 0 -
-out 0 1 15 unknown nothing 0 15
+detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0103 100 1 1 0 unclassifiable - 0 0 -
+out 0 1 0 unknown nothing 0 0
+detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0103 100 1 1 1 unclassifiable - 0 0 -
+out 0 1 0 unknown nothing 0 0
 world 130
 tx 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0100 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0902:1,5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0902:1,5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0900:1 0:6a0b444103250122700022405a,600:0014111111111111111111111111111111111111111111
 tx 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0101 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0902:1,5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0100:1 0:6a0c44410225831e400222503f04,600:0014333333333333333333333333333333333333333333,600:0014222222222222222222222222222222222222222222
@@ -1346,14 +1402,14 @@ out 1 1 57 holds:-:La39rMzHSmkou1y5Xp6xsSDEcpSpLXwmavLiVe insert:La39rMzHSmkou1y
 out 2 1 0 holds:La39rMzHSmkou1y5Xp6xsSDEcpSpLXwmavLiVe:57 insert:La39rMzHSmkou1y5Xp6xsSDEcpSpLXwmavLiVe:57:backed:native 0 none
 detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0101 100 0 1 0 done unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0101 0 0 -
 detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0101 100 0 1 1 done unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0101 0 0 -
-detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0102 0 0 0 0 done unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0102 0 1 -
-out 0 0 0 holds:-:- insert:unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0102:0:backed:native 0 0
-out 1 0 0 holds:-:- update:Laxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx:0:verified:native 0 0
-out 2 1 28 unknown update:Laxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx:7:backed:native 1 28
-detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0102 0 0 0 1 done unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0102 0 1 -
-out 0 0 0 holds:-:- insert:unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0102:0:backed:native 0 0
-out 1 0 0 holds:-:- update:Laxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx:0:verified:native 0 0
-out 2 1 28 unknown update:Laxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx:7:backed:native 1 28
+detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0102 0 0 0 0 unclassifiable - 0 0 -
+out 0 1 0 unknown nothing 0 0
+out 1 1 0 unknown nothing 0 0
+out 2 1 0 unknown nothing 0 0
+detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0102 0 0 0 1 unclassifiable - 0 0 -
+out 0 1 0 unknown nothing 0 0
+out 1 1 0 unknown nothing 0 0
+out 2 1 0 unknown nothing 0 0
 detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0103 100 1 1 0 unclassifiable - 0 0 -
 out 2 1 0 unknown nothing 0 0
 detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0103 100 1 1 1 unclassifiable - 0 0 -
@@ -1432,10 +1488,10 @@ out 3 1 0 unknown update:"":0:verified:native 1 none
 detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0100 0 0 0 1 done unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0100 0 1 -
 out 0 1 7 unknown insert:unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0100:7:unchecked:native 1 7
 out 3 1 0 unknown update:"":0:verified:native 1 none
-detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0101 100 0 1 0 done unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0101 0 1 -
-out 2 0 0 holds:-:- insert:unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0101:0:backed:native 0 0
-detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0101 100 0 1 1 done unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0101 0 1 -
-out 2 0 0 holds:-:- insert:unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0101:0:backed:native 0 0
+detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0101 100 0 1 0 unclassifiable - 0 0 -
+out 2 1 0 unknown nothing 0 0
+detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0101 100 0 1 1 unclassifiable - 0 0 -
+out 2 1 0 unknown nothing 0 0
 detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0102 0 0 0 0 done unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0102 1 0 -
 detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0102 0 0 0 1 done unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0102 1 0 -
 world 135
@@ -1502,12 +1558,12 @@ detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0104 0 0 0 0 
 out 4 1 0 unknown nothing 0 0
 detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0104 0 0 0 1 unclassifiable - 0 0 -
 out 4 1 0 unknown nothing 0 0
-detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0105 100 0 1 0 done unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0105 0 1 -
-out 1 1 20 holds:-:unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0105 insert:unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0105:0:backed:native 0 0
-out 3 1 0 holds:unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0105:9 insert:unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0105:9:backed:native 0 none
-detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0105 100 0 1 1 done unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0105 0 1 -
-out 1 1 20 holds:-:unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0105 insert:unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0105:0:backed:native 0 0
-out 3 1 0 holds:unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0105:9 insert:unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0105:9:backed:native 0 none
+detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0105 100 0 1 0 unclassifiable - 0 0 -
+out 1 1 0 unknown nothing 0 0
+out 3 1 0 unknown nothing 0 0
+detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0105 100 0 1 1 unclassifiable - 0 0 -
+out 1 1 0 unknown nothing 0 0
+out 3 1 0 unknown nothing 0 0
 world 137
 tx 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0100 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0902:1,5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0900:0,5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0901:0 0:6a0b444102251f00c005001f09,600:0014111111111111111111111111111111111111111111,600:0014222222222222222222222222222222222222222222,600:0014333333333333333333333333333333333333333333,600:0014222222222222222222222222222222222222222222
 tx 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0101 - 600:0014111111111111111111111111111111111111111111,0:6a0444410325
@@ -1571,8 +1627,8 @@ detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0100 0 0 0 1 
 out 0 1 22 unknown insert:unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0100:22:unchecked:native 1 none
 out 1 1 0 unknown insert:unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0100:0:unchecked:native 1 none
 out 3 1 0 unknown update:"":27:verified:native 1 none
-detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0101 100 0 1 0 done unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0101 0 0 -
-detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0101 100 0 1 1 done unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0101 0 0 -
+detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0101 100 0 1 0 unclassifiable - 0 0 -
+detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0101 100 0 1 1 unclassifiable - 0 0 -
 world 139
 tx 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0100 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0901:1,5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0902:1,5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0902:2 600:0014333333333333333333333333333333333333333333,600:0014222222222222222222222222222222222222222222,600:0014333333333333333333333333333333333333333333,0:6a06444103151f02,0:6a0644410215841e
 tx 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0101 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0902:1 600:0014111111111111111111111111111111111111111111,0:6a0a44410325000622158011
@@ -1584,12 +1640,12 @@ owned 0014111111111111111111111111111111111111111111,001433333333333333333333333
 rule Laxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx Laxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx:5:1 0
 rule Layyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy Layyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy:5:1 0
 rule unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0100 - -
-detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0100 0 0 0 0 done unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0100 0 1 -
-out 0 0 0 holds:-:- insert:unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0100:0:backed:native 0 0
-out 2 0 0 holds:-:- insert:unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0100:0:backed:native 0 0
-detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0100 0 0 0 1 done unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0100 0 1 -
-out 0 0 0 holds:-:- insert:unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0100:0:backed:native 0 0
-out 2 0 0 holds:-:- insert:unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0100:0:backed:native 0 0
+detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0100 0 0 0 0 unclassifiable - 0 0 -
+out 0 1 0 unknown nothing 0 0
+out 2 1 0 unknown nothing 0 0
+detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0100 0 0 0 1 unclassifiable - 0 0 -
+out 0 1 0 unknown nothing 0 0
+out 2 1 0 unknown nothing 0 0
 detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0101 100 0 1 0 done unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0101 0 1 -
 out 0 1 23 unknown update:-:4:verified:native 1 23
 detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0101 100 0 1 1 done unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0101 0 1 -
@@ -1612,14 +1668,14 @@ rule Layyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy Layyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy
 rule unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0103 - -
 detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0100 0 0 0 0 not-asset - 0 0 -
 detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0100 0 0 0 1 not-asset - 0 0 -
-detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0101 100 0 1 0 done unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0101 0 1 -
-out 0 1 39 holds:-:- insert:unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0101:0:backed:native 0 0
-out 1 0 0 holds:-:- update:Laxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx:27:backed:native 0 0
-out 4 1 0 unknown insert:unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0101:0:unchecked:native 1 none
-detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0101 100 0 1 1 done unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0101 0 1 -
-out 0 1 39 holds:-:- insert:unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0101:0:backed:native 0 0
-out 1 0 0 holds:-:- update:Laxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx:27:backed:native 0 0
-out 4 1 0 unknown insert:unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0101:0:unchecked:native 1 none
+detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0101 100 0 1 0 unclassifiable - 0 0 -
+out 0 1 0 unknown nothing 0 0
+out 1 1 0 unknown nothing 0 0
+out 4 1 0 unknown nothing 0 0
+detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0101 100 0 1 1 unclassifiable - 0 0 -
+out 0 1 0 unknown nothing 0 0
+out 1 1 0 unknown nothing 0 0
+out 4 1 0 unknown nothing 0 0
 detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0102 0 0 0 0 done unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0102 0 0 -
 detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0102 0 0 0 1 done unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0102 0 0 -
 detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0103 100 1 1 0 not-asset - 0 0 -
@@ -1693,24 +1749,24 @@ owned 0014111111111111111111111111111111111111111111,001433333333333333333333333
 rule Laxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx Laxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx:3:1 0
 rule unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0104 - -
 rule Layyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy - -
-detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0100 0 0 0 0 done unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0100 0 0 -
-detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0100 0 0 0 1 done unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0100 0 0 -
-detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0101 100 0 1 0 needs-rules unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0101 0 0 Laxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
-detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0101 100 0 1 1 done unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0101 0 0 -
-detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0102 0 0 0 0 done unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0102 0 1 -
-out 0 1 0 unknown insert:unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0102:0:unchecked:native 1 0
-out 1 1 0 unknown update:Laxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx:12:verified:native 1 0
-out 3 1 31 unknown insert:unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0102:31:unchecked:native 1 31
-detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0102 0 0 0 1 done unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0102 0 1 -
-out 0 1 0 unknown insert:unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0102:0:unchecked:native 1 0
-out 1 1 0 unknown update:Laxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx:12:verified:native 1 0
-out 3 1 31 unknown insert:unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0102:31:unchecked:native 1 31
+detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0100 0 0 0 0 unclassifiable - 0 0 -
+detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0100 0 0 0 1 unclassifiable - 0 0 -
+detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0101 100 0 1 0 unclassifiable - 0 0 -
+detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0101 100 0 1 1 unclassifiable - 0 0 -
+detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0102 0 0 0 0 unclassifiable - 0 0 -
+out 0 1 0 unknown nothing 0 0
+out 1 1 0 unknown nothing 0 0
+out 3 1 0 unknown nothing 0 0
+detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0102 0 0 0 1 unclassifiable - 0 0 -
+out 0 1 0 unknown nothing 0 0
+out 1 1 0 unknown nothing 0 0
+out 3 1 0 unknown nothing 0 0
 detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0103 100 1 1 0 done unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0103 0 0 -
 detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0103 100 1 1 1 done unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0103 0 0 -
-detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0104 0 0 0 0 done unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0104 0 1 -
-out 0 1 0 unknown insert:unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0104:0:unchecked:native 1 none
-detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0104 0 0 0 1 done unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0104 0 1 -
-out 0 1 0 unknown insert:unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0104:0:unchecked:native 1 none
+detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0104 0 0 0 0 unclassifiable - 0 0 -
+out 0 1 0 unknown nothing 0 0
+detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0104 0 0 0 1 unclassifiable - 0 0 -
+out 0 1 0 unknown nothing 0 0
 detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0105 100 0 1 0 unclassifiable - 0 0 -
 out 0 1 0 unknown nothing 0 0
 out 2 1 0 unknown nothing 0 0
@@ -1731,8 +1787,8 @@ row 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0105 2 001422222
 owned 0014111111111111111111111111111111111111111111,0014333333333333333333333333333333333333333333
 rule Layyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy Layyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy:3:1 0
 rule unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0100 - -
-detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0100 0 0 0 0 done unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0100 0 0 -
-detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0100 0 0 0 1 done unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0100 0 0 -
+detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0100 0 0 0 0 unclassifiable - 0 0 -
+detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0100 0 0 0 1 unclassifiable - 0 0 -
 detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0101 100 0 1 0 done unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0101 0 0 -
 detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0101 100 0 1 1 done unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0101 0 0 -
 detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0102 0 0 0 0 done unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0102 1 0 -
@@ -1772,8 +1828,8 @@ rule unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0102
 rule unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0100 - -
 detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0100 0 0 0 0 not-asset - 0 0 -
 detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0100 0 0 0 1 not-asset - 0 0 -
-detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0101 100 0 1 0 done unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0101 0 0 -
-detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0101 100 0 1 1 done unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0101 0 0 -
+detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0101 100 0 1 0 unclassifiable - 0 0 -
+detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0101 100 0 1 1 unclassifiable - 0 0 -
 detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0102 0 0 0 0 done unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0102 0 1 -
 out 0 1 13 unknown insert:unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0102:13:unchecked:native 1 13
 out 2 1 18 unknown insert:unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0102:18:unchecked:native 1 18
@@ -1790,8 +1846,8 @@ out 0 0 0 holds:-:- nothing 0 0
 out 1 0 0 holds:-:- nothing 0 0
 out 2 0 0 holds:-:- nothing 0 0
 out 3 0 0 holds:-:- nothing 0 0
-detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0104 0 0 0 0 done unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0104 1 0 -
-detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0104 0 0 0 1 done unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0104 1 0 -
+detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0104 0 0 0 0 unclassifiable - 0 0 -
+detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0104 0 0 0 1 unclassifiable - 0 0 -
 world 146
 tx 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0100 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0900:2,5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0901:0,5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0902:1 600:0014333333333333333333333333333333333333333333,0:6a06444103050728
 tx 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0101 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0902:1,5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0900:1 600:0014222222222222222222222222222222222222222222,600:0014222222222222222222222222222222222222222222,600:0014222222222222222222222222222222222222222222,600:0014222222222222222222222222222222222222222222,0:6a0f4441030523701f12401f1340001904
@@ -1810,10 +1866,10 @@ detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0100 0 0 0 1 
 out 0 1 7 unknown update:unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0100:9:verified:native 1 0
 detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0101 100 0 1 0 done unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0101 0 0 -
 detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0101 100 0 1 1 done unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0101 0 0 -
-detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0102 0 0 0 0 done unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0102 0 1 -
-out 2 0 0 holds:-:- insert:unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0102:0:backed:native 0 0
-detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0102 0 0 0 1 done unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0102 0 1 -
-out 2 0 0 holds:-:- insert:unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0102:0:backed:native 0 0
+detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0102 0 0 0 0 unclassifiable - 0 0 -
+out 2 1 0 unknown nothing 0 0
+detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0102 0 0 0 1 unclassifiable - 0 0 -
+out 2 1 0 unknown nothing 0 0
 world 147
 tx 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0100 - 600:0014111111111111111111111111111111111111111111,600:0014111111111111111111111111111111111111111111,0:6a0b4441031560021a40032260
 tx 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0101 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0950:2147483648 600:0014111111111111111111111111111111111111111111,0:6a094441030522c0030d48,600:0014333333333333333333333333333333333333333333
@@ -1840,12 +1896,12 @@ out 2 1 0 holds:unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5
 detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0101 100 0 1 1 done unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0101 1 1 -
 out 0 1 44 holds:-:unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0101 insert:unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0101:0:backed:native 0 0
 out 2 1 0 holds:unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0101:44 update:-:0:backed:native 0 none
-detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0102 0 0 0 0 done unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0102 0 1 -
-out 0 0 0 unknown update:Layyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy:23:mixed:native 1 0
-out 4 0 0 unknown update:unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0102:0:mixed:native 1 none
-detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0102 0 0 0 1 done unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0102 0 1 -
-out 0 0 0 unknown update:Layyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy:23:mixed:native 1 0
-out 4 0 0 unknown update:unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0102:0:mixed:native 1 none
+detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0102 0 0 0 0 unclassifiable - 0 0 -
+out 0 1 0 unknown nothing 0 0
+out 4 1 0 unknown nothing 0 0
+detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0102 0 0 0 1 unclassifiable - 0 0 -
+out 0 1 0 unknown nothing 0 0
+out 4 1 0 unknown nothing 0 0
 detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0103 100 1 1 0 done unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0103 0 0 -
 detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0103 100 1 1 1 done unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0103 0 0 -
 world 148
@@ -1858,10 +1914,10 @@ owned 0014111111111111111111111111111111111111111111,001433333333333333333333333
 rule Laxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx - -
 rule Layyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy Layyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy:3:1 0
 rule unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0101 - -
-detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0100 0 0 0 0 done La5qA5rVZP2mdxT7y581DQC9DTbFi21urCfYnt 1 0 -
-out 1 1 17 holds:-:La5qA5rVZP2mdxT7y581DQC9DTbFi21urCfYnt insert:La5qA5rVZP2mdxT7y581DQC9DTbFi21urCfYnt:0:backed:native 0 0
-detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0100 0 0 0 1 done La5qA5rVZP2mdxT7y581DQC9DTbFi21urCfYnt 1 0 -
-out 1 1 17 holds:-:La5qA5rVZP2mdxT7y581DQC9DTbFi21urCfYnt insert:La5qA5rVZP2mdxT7y581DQC9DTbFi21urCfYnt:0:backed:native 0 0
+detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0100 0 0 0 0 unclassifiable - 0 0 -
+out 1 1 0 unknown nothing 0 0
+detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0100 0 0 0 1 unclassifiable - 0 0 -
+out 1 1 0 unknown nothing 0 0
 detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0101 100 0 1 0 done unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0101 0 0 -
 detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0101 100 0 1 1 done unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0101 0 0 -
 detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0102 0 0 0 0 done unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0102 1 0 -
@@ -1926,8 +1982,8 @@ detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0100 0 0 0 0 
 out 1 1 0 unknown update:"":28:verified:native 1 none
 detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0100 0 0 0 1 done unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0100 0 0 -
 out 1 1 0 unknown update:"":28:verified:native 1 none
-detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0101 100 0 1 0 done unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0101 0 0 -
-detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0101 100 0 1 1 done unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0101 0 0 -
+detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0101 100 0 1 0 unclassifiable - 0 0 -
+detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0101 100 0 1 1 unclassifiable - 0 0 -
 detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0102 0 0 0 0 unclassifiable - 0 0 -
 out 0 1 0 unknown nothing 0 0
 detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0102 0 0 0 1 unclassifiable - 0 0 -
@@ -1995,12 +2051,12 @@ owned 0014111111111111111111111111111111111111111111,001433333333333333333333333
 rule Laxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx Laxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx:3:1 0
 rule Layyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy - -
 rule unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0102 - -
-detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0100 0 0 0 0 done unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0100 0 1 -
-out 2 0 0 holds:-:- update:"":19:backed:native 0 0
-out 3 0 0 holds:-:- insert:unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0100:0:backed:native 0 0
-detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0100 0 0 0 1 done unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0100 0 1 -
-out 2 0 0 holds:-:- update:"":19:backed:native 0 0
-out 3 0 0 holds:-:- insert:unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0100:0:backed:native 0 0
+detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0100 0 0 0 0 unclassifiable - 0 0 -
+out 2 1 0 unknown nothing 0 0
+out 3 1 0 unknown nothing 0 0
+detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0100 0 0 0 1 unclassifiable - 0 0 -
+out 2 1 0 unknown nothing 0 0
+out 3 1 0 unknown nothing 0 0
 detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0101 100 0 1 0 done Lh6iXMXqSyq5YQBhT7RiRcp6ppCFVA86iAuays 0 0 -
 detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0101 100 0 1 1 done Lh6iXMXqSyq5YQBhT7RiRcp6ppCFVA86iAuays 0 0 -
 detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0102 0 0 0 0 done unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0102 0 1 -
@@ -2051,14 +2107,14 @@ detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0103 100 1 1 
 out 1 1 0 unknown nothing 0 0
 out 2 1 0 unknown nothing 0 0
 out 3 1 0 unknown nothing 0 0
-detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0104 0 0 0 0 done unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0104 0 1 -
-out 0 0 0 holds:-:- update:Layyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy:0:backed:native 0 0
-out 1 0 0 holds:-:- insert:unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0104:0:backed:native 0 0
-out 2 0 0 holds:-:- insert:unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0104:0:backed:native 0 0
-detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0104 0 0 0 1 done unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0104 0 1 -
-out 0 0 0 holds:-:- update:Layyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy:0:backed:native 0 0
-out 1 0 0 holds:-:- insert:unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0104:0:backed:native 0 0
-out 2 0 0 holds:-:- insert:unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0104:0:backed:native 0 0
+detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0104 0 0 0 0 unclassifiable - 0 0 -
+out 0 1 0 unknown nothing 0 0
+out 1 1 0 unknown nothing 0 0
+out 2 1 0 unknown nothing 0 0
+detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0104 0 0 0 1 unclassifiable - 0 0 -
+out 0 1 0 unknown nothing 0 0
+out 1 1 0 unknown nothing 0 0
+out 2 1 0 unknown nothing 0 0
 detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0105 100 0 1 0 done unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0105 0 1 -
 out 1 1 21 unknown insert:unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0105:21:unchecked:native 1 none
 detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0105 100 0 1 1 done unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0105 0 1 -
@@ -2119,10 +2175,10 @@ detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0101 100 0 1 
 out 0 1 19 unknown update:unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0103:0:backed:native 1 19
 detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0101 100 0 1 1 done unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0101 0 1 -
 out 0 1 19 unknown update:unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0103:0:backed:native 1 19
-detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0102 0 0 0 0 done unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0102 0 1 -
-out 0 0 0 holds:-:- insert:unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0102:0:backed:native 0 0
-detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0102 0 0 0 1 done unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0102 0 1 -
-out 0 0 0 holds:-:- insert:unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0102:0:backed:native 0 0
+detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0102 0 0 0 0 unclassifiable - 0 0 -
+out 0 1 0 unknown nothing 0 0
+detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0102 0 0 0 1 unclassifiable - 0 0 -
+out 0 1 0 unknown nothing 0 0
 detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0103 100 1 1 0 unclassifiable - 0 0 -
 detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0103 100 1 1 1 unclassifiable - 0 0 -
 world 157
@@ -2151,8 +2207,8 @@ rule unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0102
 rule Layyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy - -
 rule Laxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx - -
 rule unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0101 - -
-detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0100 0 0 0 0 done unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0100 0 0 -
-detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0100 0 0 0 1 done unresolved:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0100 0 0 -
+detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0100 0 0 0 0 unclassifiable - 0 0 -
+detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0100 0 0 0 1 unclassifiable - 0 0 -
 detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0101 100 0 1 0 unclassifiable - 0 0 -
 detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0101 100 0 1 1 unclassifiable - 0 0 -
 detect 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0102 0 0 0 0 unclassifiable - 0 0 -

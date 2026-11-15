@@ -7,7 +7,8 @@
 //  transactions the wallet no longer has, the write made when an asset output is detected, and the
 //  acceptance of a DigiAsset indexer's answer for one output. Until 2026-11 this lived only in
 //  Android's Kotlin (core/.../asset/AssetManager.kt: isHeldForDisplay, computeHeldAssetBalancesImpl,
-//  decideAssetSpent, reconcileAssetRowsLocallyImpl, clearDeadAssetSend, pruneRemovedNativeAssetRowsImpl,
+//  carrierCreditRefusal, rowCountRefusal, firstCountedRow, displayHeldBalances, decideAssetSpent,
+//  reconcileAssetRowsLocallyImpl, clearDeadAssetSend, pruneRemovedNativeAssetRowsImpl,
 //  pruneDeadBroadcastRowsImpl, persistDetectedAssetOutput, settledRow, settleFromIndexer and
 //  isOutgoingUnconfirmedRow; AssetSums.add; AssetMaintenanceGate.kt; and the reply rules of
 //  network/DigiScopeAssetParsing.kt). It moves here unchanged: every input the Kotlin answers gets the
@@ -20,19 +21,43 @@
 //      function below sees only the rows marked as asset rows; any other row is not there.
 //    - NATIVE STATE is BRWalletOutpointAssetState's answer for the row's outpoint: SPENT 0, HELD 1,
 //      UNDETECTED -1 (the wallet has no record of the funding transaction), CONFLICTED -2 (the funding
-//      transaction is known and invalid), or PROBE_ERROR -99 (the platform could not ask). Any other
-//      value is an answer of none of these.
+//      transaction is known and invalid), OTHER_FAMILY -3 (ONE-FAMILY: a DigiDollar output, or an output
+//      of a transaction marked both DigiDollar and DigiAsset), or PROBE_ERROR -99 (the platform could not
+//      ask). Any other value is an answer of none of these.
 //    - HELD (BRAssetHeldForDisplay): the row's script is not empty and is one of the wallet's own, and
 //      the native state is HELD. Nothing else is held, whatever the row's provenance: a CONFLICTED
-//      output never exists on chain, and an outpoint the wallet has no record of may be a phantom.
+//      output never exists on chain, an OTHER_FAMILY output is never an asset holding, and an outpoint
+//      the wallet has no record of may be a phantom.
+//    - THE CARRIER (BRAssetRowCarrierOf): what the row's funding transaction, the one the platform got
+//      from the wallet for the row's txid, says of the row's output, by THE ONE CARRIER RULE
+//      (BRTxAssetCarrier, BRDigiAsset.c; Kotlin: DigiAssetCarrierRule) and the decoder (BRAssetDecode.h).
+//      CREDITS only when, in this order: the transaction can be read (it is there, it has outputs, every
+//      script with a length has bytes); it is the row's (its hash is the row's txid); the rule's answer
+//      is DA_TX_CARRIER and the decoder classifies that carrier; the transaction carries no DigiDollar
+//      marking (BRDigiDollarTxMarked; ONE-FAMILY); the row's vout is one of its outputs; that output is
+//      not OP_RETURN (a script whose first byte is 0x6a); and the carrier's instructions can deliver
+//      there (BRAssetTargetsOutput, with the units that came in unknown: an instruction names the output,
+//      it is an issuance's first non-OP_RETURN output, or it is the last output, where a remainder goes).
+//      Each other answer names the first step that failed. The answer is computed on every recompute
+//      and never stored with the row: a row counts only while the rule credits its output, and a row the
+//      rule does not credit is kept, not deleted. (Kotlin reads the DigiDollar marking from the scripts
+//      alone; the nVersion marker read here beside them is one the native wallet already answers
+//      OTHER_FAMILY for whenever the transaction carries a DigiAsset tag, so the row counts in neither.)
 //    - A ROW COUNTS (BRAssetRowCounts) when it is an asset row, not flagged spent, names an asset, its
-//      credit counts (BACKED or VERIFIED: BRAssetCreditCounts) and it is held.
+//      credit counts (BACKED or VERIFIED: BRAssetCreditCounts), it is held, and its carrier answer is
+//      CREDITS. Kotlin: rowCountRefusal.
 //    - THE BALANCE (BRAssetHeldBalances), per asset id, over the rows that count: the quantities
 //      summed, a sum past the int64 range stopping at its end (INT64_MAX, or INT64_MIN for negative
 //      quantities) and never wrapping; and the number of those rows whose quantity is above zero. An
 //      asset whose counted rows sum to zero is still listed, at zero: the platform shows only a
 //      quantity above zero. An empty owned set is NO_OWNERSHIP, not an empty balance: the wallet could
 //      not say which scripts are its own.
+//    - THE FIRST COUNTED ROW (BRAssetFirstCountedRow): of one asset's rows, the first that counts. The
+//      transfer-rule check for an asset walks from it, never from a row the balance does not count.
+//    - WHAT IS SHOWN (BRAssetHeldBalancesShow): a balance answered OK is shown, and becomes the last good
+//      answer; any other answer shows the last good answer, or nothing before there has been one. Never
+//      the sum of the rows as stored: that sum counts every row the rules above leave out. The platform
+//      keeps the last good answer.
 //    - THE SPENT FLAG (BRAssetRowSpentDecide): SPENT sets it, HELD clears it, every other state leaves
 //      it as it is (a mid-sync wallet never hides a holding, and nothing spent a CONFLICTED output).
 //    - THE RECONCILE (BRAssetReconcileRows): when the prune is allowed and the owned set is not empty,
@@ -95,7 +120,10 @@
 //  (the platform passes the times), no I/O. Header-only, static inline; its includes are libc,
 //  BRAssetAllocate.h (BRAssetCredit, BRAssetUnits, BRAssetOutputCredit, BRAssetStackLookup,
 //  BRAssetDeliverable, BRAssetCreditFromIndexer and the credit states, which this header uses and does
-//  not redefine) and BRSyncFrontier.h (BR_CF_BEHIND_THRESHOLD). Nothing in the core calls it yet.
+//  not redefine), BRAssetDecode.h (BRAssetDecodeInstructions), BRAssetQuantity.h (BRAssetTargetsOutput),
+//  BRDigiAsset.h (BRTxAssetCarrier, the one carrier rule), BRDigiDollar.h (BRDigiDollarTxMarked),
+//  BRTransaction.h (BRTransaction, read only) and BRSyncFrontier.h (BR_CF_BEHIND_THRESHOLD); a program
+//  that calls BRAssetRowCarrierOf links BRDigiAsset.c and BRDigiDollar.c. Nothing in the core calls it yet.
 //
 //  Test seams (host KAT asset_holdings_kat in the Android repo): ASSET_HOLDINGS_UNFIXED, tested by VALUE
 //  as a set of bits; each comparison arm sets one bit and fails only its own cases. Unset or =0 is what
@@ -123,13 +151,26 @@
 //    1048576  ASSET_HOLDINGS_RED_WIRE_TRAILING        a stored row with bytes after it is read.
 //    2097152  ASSET_HOLDINGS_RED_GATE_IGNORES_SCAN    the prune gate opens whatever the scan frontier.
 //    4194304  ASSET_HOLDINGS_RED_QUANTITY_LOWERED     re-detection lowers an unsettled quantity.
+//    8388608  ASSET_HOLDINGS_RED_CARRIER_IGNORED      a row counts whatever its carrier answer.
+//    16777216 ASSET_HOLDINGS_RED_OTHER_FAMILY_HELD    an OTHER_FAMILY outpoint is held.
+//    33554432 ASSET_HOLDINGS_RED_DIGIDOLLAR_CREDITED  a carrier credits in a transaction marked DigiDollar.
+//    67108864 ASSET_HOLDINGS_RED_UNTARGETED_CREDITED  a carrier credits an output its instructions do not reach.
+//    134217728 ASSET_HOLDINGS_RED_DATA_OUTPUT_CREDITED a carrier credits an OP_RETURN output.
+//    268435456 ASSET_HOLDINGS_RED_ANY_FUNDING         a transaction that is not the row's answers for it.
+//    536870912 ASSET_HOLDINGS_RED_FIRST_ROW_ANY       the first counted row is the asset's first row, counted or not.
+//    1073741824 ASSET_HOLDINGS_RED_LAST_GOOD_DROPPED  an answer that is not OK shows nothing after a good one.
 //
 
 #ifndef BRAssetHoldings_h
 #define BRAssetHoldings_h
 
 #include "BRAssetAllocate.h"   // BRAssetCredit, BRAssetUnits, BRAssetOutputCredit, BRAssetStackLookup, BRAssetDeliverable
+#include "BRAssetDecode.h"     // BRAssetDecodeInstructions, BRAssetHeaderHasRules, BR_ASSET_MAX_INSTRUCTIONS
+#include "BRAssetQuantity.h"   // BRAssetTargetsOutput
+#include "BRDigiAsset.h"       // BRTxAssetCarrier, DA_TX_CARRIER (the one carrier rule)
+#include "BRDigiDollar.h"      // BRDigiDollarTxMarked (ONE-FAMILY)
 #include "BRSyncFrontier.h"    // BR_CF_BEHIND_THRESHOLD
+#include "BRTransaction.h"     // BRTransaction, BRTxOutput (read only)
 #include <stddef.h>
 #include <stdint.h>
 #include <string.h>
@@ -165,12 +206,21 @@ extern "C" {
 #define ASSET_HOLDINGS_RED_WIRE_TRAILING         1048576
 #define ASSET_HOLDINGS_RED_GATE_IGNORES_SCAN     2097152
 #define ASSET_HOLDINGS_RED_QUANTITY_LOWERED      4194304
+#define ASSET_HOLDINGS_RED_CARRIER_IGNORED       8388608
+#define ASSET_HOLDINGS_RED_OTHER_FAMILY_HELD     16777216
+#define ASSET_HOLDINGS_RED_DIGIDOLLAR_CREDITED   33554432
+#define ASSET_HOLDINGS_RED_UNTARGETED_CREDITED   67108864
+#define ASSET_HOLDINGS_RED_DATA_OUTPUT_CREDITED  134217728
+#define ASSET_HOLDINGS_RED_ANY_FUNDING           268435456
+#define ASSET_HOLDINGS_RED_FIRST_ROW_ANY         536870912
+#define ASSET_HOLDINGS_RED_LAST_GOOD_DROPPED     1073741824
 
 // BRWalletOutpointAssetState's answers, and the platform's own for a probe that failed.
 #define BR_ASSET_STATE_SPENT         0
 #define BR_ASSET_STATE_HELD          1
 #define BR_ASSET_STATE_UNDETECTED    (-1)
 #define BR_ASSET_STATE_CONFLICTED    (-2)
+#define BR_ASSET_STATE_OTHER_FAMILY  (-3)
 #define BR_ASSET_STATE_PROBE_ERROR   (-99)
 
 // Consecutive passes that must find a row's transaction absent before a prune deletes the row.
@@ -234,6 +284,28 @@ typedef struct {
     int64_t quantity;
     size_t utxoCount;              // counted rows whose quantity is above zero
 } BRAssetHeldBalance;
+
+// What a row's funding transaction says of the row's output (BRAssetRowCarrierOf; Kotlin:
+// carrierCreditRefusal, whose reason each names). UNREADABLE is 0; only CREDITS counts, and any value
+// this header does not define is no CREDITS.
+typedef enum {
+    BR_ASSET_ROW_CARRIER_UNREADABLE = 0,     // no transaction, no outputs, or a script it cannot read (carrier:unreadable)
+    BR_ASSET_ROW_CARRIER_CREDITS = 1,        // the carrier can deliver units to the output (Kotlin: null)
+    BR_ASSET_ROW_CARRIER_NONE = 2,           // no output is tagged "DA" (carrier:none)
+    BR_ASSET_ROW_CARRIER_UNDECIDED = 3,      // tagged, with no carrier to credit from (carrier:undecided)
+    BR_ASSET_ROW_CARRIER_DIGIDOLLAR = 4,     // the transaction carries a DigiDollar marking (carrier:onefamily-digidollar)
+    BR_ASSET_ROW_CARRIER_NO_SUCH_OUTPUT = 5, // the row's vout is not one of its outputs (carrier:no-such-output)
+    BR_ASSET_ROW_CARRIER_DATA_OUTPUT = 6,    // the row's output is OP_RETURN (carrier:data-output)
+    BR_ASSET_ROW_CARRIER_NOT_TARGETED = 7,   // no instruction can deliver there (carrier:not-targeted)
+    BR_ASSET_ROW_CARRIER_NOT_FUNDING = 8     // the transaction is not the row's: its hash is not the row's txid
+} BRAssetRowCarrier;
+
+// What the platform shows for one recompute of the balance (BRAssetHeldBalancesShow). NOTHING is 0.
+typedef enum {
+    BR_ASSET_SHOW_NOTHING = 0,               // no balance at all, never the rows' stored sum
+    BR_ASSET_SHOW_LAST_GOOD = 1,             // the last balance answered OK
+    BR_ASSET_SHOW_COMPUTED = 2               // this balance; keep it as the last good one
+} BRAssetHeldShow;
 
 // What to do with one row. KEEP is 0.
 typedef enum {
@@ -437,6 +509,83 @@ static inline int _BRAssetHoldOwns(const BRAssetScript *owned, size_t ownedCount
     return 0;
 }
 
+// ---- the carrier ----------------------------------------------------------------------------------
+
+// Is the script OP_RETURN, as the Kotlin tells a data output: not empty, first byte 0x6a?
+static inline int _BRAssetHoldIsData(const BRTxOutput *o)
+{
+    return o->scriptLen > 0 && o->script[0] == 0x6a;
+}
+
+// Is `txid` tx's hash in display order, as lower- or upper-case hex?
+static inline int _BRAssetHoldTxidIs(const char *txid, const BRTransaction *tx)
+{
+    static const char digits[] = "0123456789abcdef";
+    size_t i;
+
+    if (strlen(txid) != BR_ASSET_TXID_LENGTH) return 0;
+    for (i = 0; i < BR_ASSET_TXID_LENGTH; i++) {
+        uint8_t b = tx->txHash.u8[31 - i / 2];
+        int c = (unsigned char)txid[i];
+
+        if (c >= 'A' && c <= 'F') c += 'a' - 'A';
+        if (c != digits[(i % 2) ? (b & 0x0f) : (b >> 4)]) return 0;
+    }
+    return 1;
+}
+
+// What `funding`, the wallet's transaction for row->txid (NULL when the platform could not get it), says
+// of the row's output: THE CARRIER. Kotlin: carrierCreditRefusal.
+static inline BRAssetRowCarrier BRAssetRowCarrierOf(const BRAssetRow *row, const BRTransaction *funding)
+{
+    BRAssetHeader h;
+    BRAssetTransferInstruction insts[BR_ASSET_MAX_INSTRUCTIONS];
+    size_t j, at = 0;
+    int32_t first = 0;
+    int hasFirst = 0, verdict;
+
+    if (! row || ! row->txid || ! funding) return BR_ASSET_ROW_CARRIER_UNREADABLE;
+    if (funding->outCount == 0 || ! funding->outputs || funding->outCount > (size_t)INT32_MAX) {
+        return BR_ASSET_ROW_CARRIER_UNREADABLE;
+    }
+    for (j = 0; j < funding->outCount; j++) {
+        if (funding->outputs[j].scriptLen > 0 && ! funding->outputs[j].script) return BR_ASSET_ROW_CARRIER_UNREADABLE;
+    }
+#if !(ASSET_HOLDINGS_UNFIXED & ASSET_HOLDINGS_RED_ANY_FUNDING)
+    if (! _BRAssetHoldTxidIs(row->txid, funding)) return BR_ASSET_ROW_CARRIER_NOT_FUNDING;
+#endif
+
+    verdict = BRTxAssetCarrier(funding, &at);
+    if (verdict == DA_TX_NONE) return BR_ASSET_ROW_CARRIER_NONE;
+    if (verdict != DA_TX_CARRIER || at >= funding->outCount) return BR_ASSET_ROW_CARRIER_UNDECIDED;
+    if (BRAssetDecodeInstructions(funding->outputs[at].script, funding->outputs[at].scriptLen, &h, insts,
+                                  BR_ASSET_MAX_INSTRUCTIONS) != BR_ASSET_SCRIPT_ASSET) return BR_ASSET_ROW_CARRIER_UNDECIDED;
+#if !(ASSET_HOLDINGS_UNFIXED & ASSET_HOLDINGS_RED_DIGIDOLLAR_CREDITED)
+    if (BRDigiDollarTxMarked(funding)) return BR_ASSET_ROW_CARRIER_DIGIDOLLAR;
+#endif
+    if (row->vout < 0 || (size_t)row->vout >= funding->outCount) return BR_ASSET_ROW_CARRIER_NO_SUCH_OUTPUT;
+#if !(ASSET_HOLDINGS_UNFIXED & ASSET_HOLDINGS_RED_DATA_OUTPUT_CREDITED)
+    if (_BRAssetHoldIsData(&funding->outputs[row->vout])) return BR_ASSET_ROW_CARRIER_DATA_OUTPUT;
+#endif
+
+    for (j = 0; j < funding->outCount; j++) {
+        if (! _BRAssetHoldIsData(&funding->outputs[j])) {
+            hasFirst = 1;
+            first = (int32_t)j;
+            break;
+        }
+    }
+#if (ASSET_HOLDINGS_UNFIXED & ASSET_HOLDINGS_RED_UNTARGETED_CREDITED)
+    (void)hasFirst;
+    (void)first;
+    return BR_ASSET_ROW_CARRIER_CREDITS;
+#else
+    return BRAssetTargetsOutput(h.operation, h.version, BRAssetHeaderHasRules(&h), h.hasTotalQuantity, h.totalQuantity,
+                                row->vout, hasFirst, first, 0, 0, (int32_t)funding->outCount, insts, h.instructionCount)
+        ? BR_ASSET_ROW_CARRIER_CREDITS : BR_ASSET_ROW_CARRIER_NOT_TARGETED;
+#endif
+}
+
 // ---- holding and counting -------------------------------------------------------------------------
 
 // Does the wallet hold this output? Kotlin: isHeldForDisplay (its everConfirmed is not read there).
@@ -455,6 +604,9 @@ static inline int BRAssetHeldForDisplay(const uint8_t *script, size_t scriptLen,
 #if (ASSET_HOLDINGS_UNFIXED & ASSET_HOLDINGS_RED_CONFLICTED_HELD)
     if (nativeState == BR_ASSET_STATE_CONFLICTED) return 1;
 #endif
+#if (ASSET_HOLDINGS_UNFIXED & ASSET_HOLDINGS_RED_OTHER_FAMILY_HELD)
+    if (nativeState == BR_ASSET_STATE_OTHER_FAMILY) return 1;
+#endif
 #if (ASSET_HOLDINGS_UNFIXED & ASSET_HOLDINGS_RED_BACKEND_RESCUES)
     if (source == BR_ASSET_SOURCE_BACKEND &&
         (nativeState == BR_ASSET_STATE_UNDETECTED || nativeState == BR_ASSET_STATE_PROBE_ERROR)) return 1;
@@ -464,8 +616,10 @@ static inline int BRAssetHeldForDisplay(const uint8_t *script, size_t scriptLen,
     return 0;
 }
 
-// Does this row count toward its asset's balance?
-static inline int BRAssetRowCounts(const BRAssetRow *row, const BRAssetScript *owned, size_t ownedCount, int nativeState)
+// Does this row count toward its asset's balance? `carrier` is BRAssetRowCarrierOf(row, its funding
+// transaction). Kotlin: rowCountRefusal is null.
+static inline int BRAssetRowCounts(const BRAssetRow *row, const BRAssetScript *owned, size_t ownedCount, int nativeState,
+                                   BRAssetRowCarrier carrier)
 {
     if (! row || ! row->isAsset || ! row->assetId) return 0;
 #if !(ASSET_HOLDINGS_UNFIXED & ASSET_HOLDINGS_RED_SPENT_COUNTS)
@@ -474,16 +628,23 @@ static inline int BRAssetRowCounts(const BRAssetRow *row, const BRAssetScript *o
 #if !(ASSET_HOLDINGS_UNFIXED & ASSET_HOLDINGS_RED_UNBACKED_COUNTS)
     if (! BRAssetCreditCounts(row->credit)) return 0;
 #endif
-    return BRAssetHeldForDisplay(row->script, row->scriptLen, owned, ownedCount, row->source, nativeState);
+    if (! BRAssetHeldForDisplay(row->script, row->scriptLen, owned, ownedCount, row->source, nativeState)) return 0;
+#if (ASSET_HOLDINGS_UNFIXED & ASSET_HOLDINGS_RED_CARRIER_IGNORED)
+    (void)carrier;
+    return 1;
+#else
+    return carrier == BR_ASSET_ROW_CARRIER_CREDITS;
+#endif
 }
 
-// The balance of every asset the rows hold. nativeStates[i] is row i's native state, one per row; only
-// an unspent asset row that names an asset depends on it. OK with *count balances in out[0, *count), in the order
-// their assets first count; NO_OWNERSHIP when ownedCount is 0; CAPACITY when more assets count than
-// `cap` holds. Kotlin: computeHeldAssetBalancesImpl.
+// The balance of every asset the rows hold. nativeStates[i] is row i's native state and carriers[i] its
+// carrier answer (BRAssetRowCarrierOf), one each per row; only an unspent asset row that names an asset
+// depends on them. OK with *count balances in out[0, *count), in the order their assets first count;
+// NO_OWNERSHIP when ownedCount is 0; CAPACITY when more assets count than `cap` holds. Kotlin:
+// computeHeldAssetBalancesImpl.
 static inline BRAssetHoldingsStatus BRAssetHeldBalances(const BRAssetRow *rows, size_t rowCount, const int *nativeStates,
-                                                        const BRAssetScript *owned, size_t ownedCount,
-                                                        BRAssetHeldBalance *out, size_t cap, size_t *count)
+                                                        const BRAssetRowCarrier *carriers, const BRAssetScript *owned,
+                                                        size_t ownedCount, BRAssetHeldBalance *out, size_t cap, size_t *count)
 {
     size_t i, j, n = 0;
 
@@ -495,15 +656,15 @@ static inline BRAssetHoldingsStatus BRAssetHeldBalances(const BRAssetRow *rows, 
 #else
     if (ownedCount == 0) return BR_ASSET_HOLDINGS_NO_OWNERSHIP;
 #endif
-    if (rowCount > 0 && (! rows || ! nativeStates)) return BR_ASSET_HOLDINGS_REFUSED;
+    if (rowCount > 0 && (! rows || ! nativeStates || ! carriers)) return BR_ASSET_HOLDINGS_REFUSED;
     if (cap > 0 && ! out) return BR_ASSET_HOLDINGS_REFUSED;
 
     // First how many assets count, so that a balance `out` cannot hold writes nothing.
     for (i = 0; i < rowCount; i++) {
-        if (! rows[i].isAsset || ! rows[i].assetId || ! BRAssetRowCounts(&rows[i], owned, ownedCount, nativeStates[i])) continue;
+        if (! BRAssetRowCounts(&rows[i], owned, ownedCount, nativeStates[i], carriers[i])) continue;
         for (j = 0; j < i; j++) {
             if (rows[j].isAsset && rows[j].assetId && strcmp(rows[j].assetId, rows[i].assetId) == 0 &&
-                BRAssetRowCounts(&rows[j], owned, ownedCount, nativeStates[j])) break;
+                BRAssetRowCounts(&rows[j], owned, ownedCount, nativeStates[j], carriers[j])) break;
         }
         if (j == i) n++;
     }
@@ -511,7 +672,7 @@ static inline BRAssetHoldingsStatus BRAssetHeldBalances(const BRAssetRow *rows, 
 
     n = 0;
     for (i = 0; i < rowCount; i++) {
-        if (! rows[i].isAsset || ! rows[i].assetId || ! BRAssetRowCounts(&rows[i], owned, ownedCount, nativeStates[i])) continue;
+        if (! BRAssetRowCounts(&rows[i], owned, ownedCount, nativeStates[i], carriers[i])) continue;
         for (j = 0; j < n && strcmp(out[j].assetId, rows[i].assetId) != 0; j++) {}
         if (j == n) {
             out[n].assetId = rows[i].assetId;
@@ -528,6 +689,40 @@ static inline BRAssetHoldingsStatus BRAssetHeldBalances(const BRAssetRow *rows, 
     }
     *count = n;
     return BR_ASSET_HOLDINGS_OK;
+}
+
+// The first of `assetId`'s rows that counts (rows[i] with that asset id, compared byte for byte), with
+// nativeStates and carriers as BRAssetHeldBalances reads them: its index, or rowCount when none counts,
+// the owned set is empty or an argument is missing. Kotlin: firstCountedRow.
+static inline size_t BRAssetFirstCountedRow(const BRAssetRow *rows, size_t rowCount, const char *assetId,
+                                            const int *nativeStates, const BRAssetRowCarrier *carriers,
+                                            const BRAssetScript *owned, size_t ownedCount)
+{
+    size_t i;
+
+    if (! rows || ! assetId || ! nativeStates || ! carriers || ! owned || ownedCount == 0) return rowCount;
+    for (i = 0; i < rowCount; i++) {
+        if (! rows[i].isAsset || ! rows[i].assetId || strcmp(rows[i].assetId, assetId) != 0) continue;
+#if (ASSET_HOLDINGS_UNFIXED & ASSET_HOLDINGS_RED_FIRST_ROW_ANY)
+        if (! rows[i].spent && BRAssetCreditCounts(rows[i].credit)) return i;
+#else
+        if (BRAssetRowCounts(&rows[i], owned, ownedCount, nativeStates[i], carriers[i])) return i;
+#endif
+    }
+    return rowCount;
+}
+
+// What to show for a recompute of the balance that answered `status`, given whether there has been an OK
+// answer before (the platform keeps it). Kotlin: displayHeldBalances.
+static inline BRAssetHeldShow BRAssetHeldBalancesShow(BRAssetHoldingsStatus status, int hasLastGood)
+{
+    if (status == BR_ASSET_HOLDINGS_OK) return BR_ASSET_SHOW_COMPUTED;
+#if (ASSET_HOLDINGS_UNFIXED & ASSET_HOLDINGS_RED_LAST_GOOD_DROPPED)
+    (void)hasLastGood;
+    return BR_ASSET_SHOW_NOTHING;
+#else
+    return hasLastGood ? BR_ASSET_SHOW_LAST_GOOD : BR_ASSET_SHOW_NOTHING;
+#endif
 }
 
 // ---- reconcile and prunes -------------------------------------------------------------------------

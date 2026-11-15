@@ -29,7 +29,8 @@
 //  same way, or a relaunch restores a different wallet on iOS than on Android.
 //
 //  Host KAT: digibytewallet-android native/src/test/host/saved_transactions_core_kat/ (the reader);
-//  scan_floor_kat (BRSavedTransactionsFloorMinima, the floor a discarded blob leaves).
+//  scan_floor_kat (BRSavedTransactionsFloorMinima, the floor a discarded blob leaves);
+//  tx_ckpt_short_restore_kat (BRSavedTransactionsDeclaredCount, BRSavedTransactionsRestoreCheck).
 //  Header-only, static inline; no locking or I/O.
 //
 
@@ -186,6 +187,154 @@ static inline void BRSavedTransactionsFloorMinima(const uint8_t *buf, size_t len
         }
         if (height >= 1 && height <= (uint32_t)TX_UNCONFIRMED && time > 0 &&
             (out->minRecordTime == 0 || time < out->minRecordTime)) out->minRecordTime = time;
+    }
+}
+
+// ---- the short restore (TX-CKPT-CAP) ------------------------------------------------------------
+//
+// The checkpoint is a cache of the wallet's history, and the compact-filter scan resumes from a
+// frontier that assumes the cache restored. So at the restore, before the wallet is built from the
+// records, the count the checkpoint DECLARES is compared with what the reader loaded. A restore
+// short of it is recorded, and the next sync start rebuilds the headers, filters and scan ledger
+// from the wallet's birth floor instead of resuming near the tip without that history. Until
+// 2026-11 the rule lived only in Android's Kotlin (SavedTransactionsCheckpoint.declaredCount,
+// isShort and recordRestore; WalletManager.restoreFromDisk; CfRestorePreflight.kt's
+// TRANSACTION_CHECKPOINT_SHORT), and iOS opened the short wallet and resumed near the tip.
+//
+// The verdict (BRSavedTransactionsRestoreCheck), Android's outcomes value for value:
+//   the file is there but could not be read, or holds fewer than 4 bytes  -> SHORT_UNREADABLE,
+//                                                                           record -1;
+//   the file is there: the reader loaded fewer records than it declares   -> SHORT_LOADED,
+//                                                                           record the declared count;
+//                      otherwise (a declared count of 0 included)         -> COMPLETE;
+//   no file, while "transactions checkpointed" is set with a stored
+//   record count above 0 (the file was lost)                              -> SHORT_FILE_LOST,
+//                                                                           record that count;
+//   no file otherwise (never checkpointed, or an empty wallet's count 0)  -> COMPLETE (no checkpoint
+//                                                                           is the preflight's
+//                                                                           MISSING_TRANSACTION_CHECKPOINT).
+//   "Loaded" is the READER's count (BRSavedTransactionsDeserialize's return; Android's
+//   loadSerializedTransactions), not what the wallet then kept: a repeated, unsigned or out-of-range
+//   record the wallet declines is not history the frontier assumed. With a file present the stored
+//   count is not read: the file is judged by what it declares.
+//
+// What the platform does with it (Android's, which iOS takes as is):
+//   - the stored count is the declared count of the checkpoint last written (0 for none), committed
+//     with the "transactions checkpointed" flag; a platform that stores no count cannot tell a lost
+//     file from an empty wallet, and must store it;
+//   - a SHORT verdict is recorded (the record value) before the wallet is built, and the record is
+//     STICKY: a COMPLETE verdict later never clears it (a checkpoint written from the short wallet
+//     declares the short count and would hide the shortfall). Only the rebuild clears it, in the same
+//     commit that clears "has synced";
+//   - at the sync start a recorded short restore is a reset decided BEFORE BRCFRestorePreflight,
+//     whatever else the stored state says, named BR_SAVED_TRANSACTIONS_SHORT_RESET_NAME, and carried
+//     out as BRCFRestorePreflight.h's reset (window, filter headers, ledger and abandonment record
+//     deleted, "has synced" cleared, the birth checkpoint stored as the scan floor);
+//   - a load the platform deliberately skipped (Android: a history rebuild in progress, which reads
+//     no file) is not judged at all.
+//
+// MACRO CONVENTION: SAVED_TRANSACTIONS_SHORT_RESTORE_UNFIXED is tested by VALUE (#if), a set of bits,
+// each one comparison arm of tx_ckpt_short_restore_kat; unset or =0 ships. Never defined in a
+// production build.
+//   1   no verdict: every restore is COMPLETE (the iOS port before 2026-11, Android 4.1.3).
+//   2   a lost file is COMPLETE: only a file that is there is judged.
+//   4   a lost file is short on the flag alone, the stored count not read (an empty wallet's
+//       checkpoint of 0 records with no file rebuilds).
+//   8   an unreadable file is COMPLETE.
+//   16  the declared count read as BRSavedTransactionsFloorMinima reads it: a blob of 4 bytes or
+//       fewer declares 0 (a 4-byte blob that declares records and holds none reads as complete).
+#ifndef SAVED_TRANSACTIONS_SHORT_RESTORE_UNFIXED
+#define SAVED_TRANSACTIONS_SHORT_RESTORE_UNFIXED 0
+#endif
+#define SAVED_TRANSACTIONS_SHORT_RED_NO_VERDICT     1
+#define SAVED_TRANSACTIONS_SHORT_RED_LOST_IGNORED   2
+#define SAVED_TRANSACTIONS_SHORT_RED_FLAG_ALONE     4
+#define SAVED_TRANSACTIONS_SHORT_RED_UNREADABLE_OK  8
+#define SAVED_TRANSACTIONS_SHORT_RED_FLOOR_COUNT    16
+
+// The declared count of a checkpoint whose count cannot be read (Kotlin: UNREADABLE).
+#define BR_SAVED_TRANSACTIONS_UNREADABLE (-1)
+
+// The name a platform records for the sync-start reset (Android's CfRestoreResetReason).
+#define BR_SAVED_TRANSACTIONS_SHORT_RESET_NAME "TRANSACTION_CHECKPOINT_SHORT"
+
+typedef enum {
+    BR_SAVED_TX_RESTORE_COMPLETE = 0,           // resume as BRCFRestorePreflight decides
+    BR_SAVED_TX_RESTORE_SHORT_LOADED = 1,       // the reader loaded fewer records than the file declares
+    BR_SAVED_TX_RESTORE_SHORT_UNREADABLE = 2,   // the file is there and its count cannot be read
+    BR_SAVED_TX_RESTORE_SHORT_FILE_LOST = 3      // no file, after a checkpoint of records landed
+} BRSavedTransactionsRestore;
+
+// The record count a stored checkpoint declares, its leading u32 little-endian (Kotlin:
+// SavedTransactionsCheckpoint.declaredCount): 0 to 4,294,967,295, or BR_SAVED_TRANSACTIONS_UNREADABLE
+// when it holds fewer than 4 bytes (NULL too). Unlike BRSavedTransactionsFloorMinima's declaredCount,
+// a blob of exactly 4 bytes declares its count.
+static inline int64_t BRSavedTransactionsDeclaredCount(const uint8_t *buf, size_t len)
+{
+#if (SAVED_TRANSACTIONS_SHORT_RESTORE_UNFIXED & SAVED_TRANSACTIONS_SHORT_RED_FLOOR_COUNT)
+    // RED ARM SEAM (tx_ckpt_short_restore_kat): BRSavedTransactionsFloorMinima's reading.
+    if (! buf || len < 4) return BR_SAVED_TRANSACTIONS_UNREADABLE;
+    if (len == 4) return 0;
+#else
+    if (! buf || len < 4) return BR_SAVED_TRANSACTIONS_UNREADABLE;
+#endif
+    return (int64_t)UInt32GetLE(buf);
+}
+
+// Whether a restore is short (see the banner). fileExists: a checkpoint file is there. fileRead: its
+// bytes were read (read only when fileExists). declaredCount: BRSavedTransactionsDeclaredCount of those
+// bytes (read only when the file was read). readerLoaded: what BRSavedTransactionsDeserialize returned
+// for them (0 when it was not called). checkpointed: the stored "transactions checkpointed" flag.
+// checkpointedCount: the record count stored beside it (read only when the flag is set; 0 or less is
+// none). On a SHORT verdict *recordOut (when not NULL) is set to the value to record: the declared or
+// stored count, or BR_SAVED_TRANSACTIONS_UNREADABLE; on COMPLETE it is left as it was.
+static inline BRSavedTransactionsRestore BRSavedTransactionsRestoreCheck(int fileExists, int fileRead,
+                                                                         int64_t declaredCount, uint64_t readerLoaded,
+                                                                         int checkpointed, int64_t checkpointedCount,
+                                                                         int64_t *recordOut)
+{
+    BRSavedTransactionsRestore verdict = BR_SAVED_TX_RESTORE_COMPLETE;
+    int64_t record = 0;
+
+    if (! fileExists) {
+        int64_t stored = checkpointed ? checkpointedCount : 0;
+#if (SAVED_TRANSACTIONS_SHORT_RESTORE_UNFIXED & SAVED_TRANSACTIONS_SHORT_RED_FLAG_ALONE)
+        // RED ARM SEAM (tx_ckpt_short_restore_kat): the flag alone.
+        if (checkpointed) { verdict = BR_SAVED_TX_RESTORE_SHORT_FILE_LOST; record = stored; }
+#else
+        if (stored > 0) { verdict = BR_SAVED_TX_RESTORE_SHORT_FILE_LOST; record = stored; }
+#endif
+#if (SAVED_TRANSACTIONS_SHORT_RESTORE_UNFIXED & SAVED_TRANSACTIONS_SHORT_RED_LOST_IGNORED)
+        // RED ARM SEAM (tx_ckpt_short_restore_kat): only a file that is there is judged.
+        verdict = BR_SAVED_TX_RESTORE_COMPLETE;
+#endif
+    }
+    else if (! fileRead || declaredCount < 0) {
+#if ! (SAVED_TRANSACTIONS_SHORT_RESTORE_UNFIXED & SAVED_TRANSACTIONS_SHORT_RED_UNREADABLE_OK)
+        verdict = BR_SAVED_TX_RESTORE_SHORT_UNREADABLE;
+        record = BR_SAVED_TRANSACTIONS_UNREADABLE;
+#endif
+    }
+    else if (readerLoaded < (uint64_t)declaredCount) {
+        verdict = BR_SAVED_TX_RESTORE_SHORT_LOADED;
+        record = declaredCount;
+    }
+#if (SAVED_TRANSACTIONS_SHORT_RESTORE_UNFIXED & SAVED_TRANSACTIONS_SHORT_RED_NO_VERDICT)
+    // RED ARM SEAM (tx_ckpt_short_restore_kat): no verdict at all.
+    verdict = BR_SAVED_TX_RESTORE_COMPLETE;
+#endif
+    if (verdict != BR_SAVED_TX_RESTORE_COMPLETE && recordOut) *recordOut = record;
+    return verdict;
+}
+
+// The verdict's name in logs ("" for COMPLETE).
+static inline const char *BRSavedTransactionsRestoreName(BRSavedTransactionsRestore verdict)
+{
+    switch (verdict) {
+        case BR_SAVED_TX_RESTORE_SHORT_LOADED:     return "SHORT_LOADED";
+        case BR_SAVED_TX_RESTORE_SHORT_UNREADABLE: return "SHORT_UNREADABLE";
+        case BR_SAVED_TX_RESTORE_SHORT_FILE_LOST:  return "SHORT_FILE_LOST";
+        default:                                   return "";
     }
 }
 

@@ -427,6 +427,10 @@ typedef struct {
     void *volatile mempoolInfo;
     void (*volatile mempoolCallback)(void *info, int success);
     volatile uint8_t viaSocks;   // this connection was opened through the SOCKS proxy (Tor)
+    // Set by BRPeerConnect when it starts this peer's thread and never cleared after a start: a
+    // peer gets one peer thread for its life. Only BRPeerConnect reads or writes it (the manager
+    // calls it under manager->lock); the peer thread never touches it.
+    int threadStarted;
     pthread_t thread;
 } BRPeerContext;
 
@@ -2638,6 +2642,14 @@ int BRPeerConnect(BRPeer *peer)
     int error = 0;
     pthread_attr_t attr;
 
+#ifndef PEER_CONNECT_ONCE_UNFIXED
+    // One thread per peer. The status cannot answer "is a thread running": the peer thread marks
+    // the peer disconnected before its teardown (the callback drain, then the disconnected
+    // callback, which ends the peer's life in BRPeerManager), so it reads disconnected while that
+    // thread still runs. A peer whose thread has started is in that thread's hands.
+    if (ctx->threadStarted) return 1;
+#endif
+
     if (ctx->status == BRPeerStatusDisconnected || ctx->waitingForNetwork) {
         ctx->status = BRPeerStatusConnecting;
     
@@ -2650,9 +2662,14 @@ int BRPeerConnect(BRPeer *peer)
             ctx->waitingForNetwork = 0;
             gettimeofday(&tv, NULL);
             ctx->disconnectTime = tv.tv_sec + (double)tv.tv_usec/1000000 + CONNECT_TIMEOUT;
+            // Before pthread_create, not after: the thread can run to its end before
+            // pthread_create returns. The peer stays allocated meanwhile only because the caller
+            // holds manager->lock, which the thread's disconnected callback needs before it frees it.
+            ctx->threadStarted = 1;
 
             if (pthread_attr_init(&attr) != 0) {
                 error = ENOMEM;
+                ctx->threadStarted = 0;
                 peer_log(peer, "error creating thread");
                 ctx->status = BRPeerStatusDisconnected;
                 //if (ctx->disconnected) ctx->disconnected(ctx->info, error);
@@ -2660,6 +2677,7 @@ int BRPeerConnect(BRPeer *peer)
             else if (pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED) != 0 ||
                      pthread_create(&ctx->thread, &attr, _peerThreadRoutine, peer) != 0) {
                 error = EAGAIN;
+                ctx->threadStarted = 0;
                 peer_log(peer, "error creating thread");
                 pthread_attr_destroy(&attr);
                 ctx->status = BRPeerStatusDisconnected;

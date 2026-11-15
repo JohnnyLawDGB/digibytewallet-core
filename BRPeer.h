@@ -324,6 +324,9 @@ int      BRPeerCompletedHandshake(BRPeer *peer); // got verack — separates "ne
 // or the connect waits for the network): that thread runs the disconnected callback when it ends.
 // Returns 0 when no thread could be started: the peer is left disconnected, the disconnected callback
 // will not run, and the caller runs its disconnect path itself.
+// A peer gets one peer thread for its life: once a thread has started, BRPeerConnect returns 1
+// and starts nothing, even after that thread has ended. To dial the address again, make a new
+// peer with BRPeerNew (BRPeerManager frees a peer when its thread ends and redials with a new one).
 int BRPeerConnect(BRPeer *peer);
 
 // close connection to peer

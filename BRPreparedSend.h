@@ -9,9 +9,9 @@
 //
 //  Not everything the signer checks. Since Android 4.1.2 its signer also refuses a coin another
 //  signed-but-unregistered send has claimed (bridge coin_reservation.h; released as BRWalletSend.h
-//  step 1b describes) and re-checks the inputs are unspent (spend_guard.h). BRPreparedSendCheck reads
-//  BRWalletUTXOs, which already leaves out coins a pending send spends, but it cannot see two
-//  prepared sends signed before either is registered. A platform that can sign two sends at once
+//  step 1b describes) and re-checks the inputs are unspent (spend_guard.h). BRPreparedSendCheck asks
+//  BRWalletOutpointSelectable, which already leaves out coins a pending send spends, but it cannot
+//  see two prepared sends signed before either is registered. A platform that can sign two sends at once
 //  needs the reservation too (a push-down candidate).
 //
 //  The flow. A send is built (BRWalletCreateTransactionAtFeePerKb) and quoted at review, before
@@ -29,7 +29,9 @@
 //    BRPreparedSendCheck   only what was approved is signed: the outputs are exactly the approved
 //                          payment (that amount to that script) plus at most one change output to
 //                          an address of this wallet, they pay exactly the approved fee, and every
-//                          coin they spend is still one of the wallet's spendable plain coins.
+//                          coin they spend is still one the wallet's own selection would spend
+//                          (SEND-GATE-SET, BRPreparedSendCoinOK): never an unconfirmed coin someone
+//                          else sent, an asset-held, ONE-FAMILY-held or unsignable output.
 //                          Call it twice: on the parsed bytes BEFORE signing (sign only on
 //                          BRPreparedSendOK), and on the signed transaction AFTER signing (hand the
 //                          signed bytes back to be broadcast only on BRPreparedSendOK). Signing
@@ -39,10 +41,17 @@
 //  The approved fee is the quote shown at review, carried with the bytes; never a figure computed
 //  again after the prompt.
 //
+//  SEND-GATE-SET (Android 4.1.4, bridge prepared_send.h, the same rule): the coins a prepared send
+//  may spend are the coins the wallet's own selection would spend (BRWalletSelectableUTXOs), not the
+//  raw set its balance sums (BRWalletUTXOs, which also holds an unconfirmed coin someone else sent
+//  and an output the wallet cannot sign). Each input is asked alone (BRWalletOutpointSelectable, its
+//  own walk budget), so a wallet with many unconfirmed coins cannot use up one shared budget before
+//  the check reaches a coin selection already took.
+//
 //  Ownership: nothing here keeps a pointer past the call or takes ownership of anything. The
-//  wallet, transaction and payment script stay the caller's. BRPreparedSendCheck takes one copy of
-//  the wallet's spendable coins (BRWalletUTXOs, under the wallet's own lock) and frees it before
-//  returning; the caller must not hold the wallet's lock.
+//  wallet, transaction and payment script stay the caller's. BRPreparedSendCheck asks the wallet
+//  once per input (under the wallet's own lock each time); the caller must not hold the wallet's
+//  lock.
 //
 //  MACRO CONVENTION: PREPARED_SEND_UNFIXED is tested by VALUE (#if). =1 is the host KATs'
 //  comparison arm, the behaviour before these rules: the typical-send figure every confirmation
@@ -50,8 +59,19 @@
 //  checked before signing. Unset or =0 is what ships; =0 never builds the comparison arm. Never
 //  defined in a production build.
 //
-//  Host KATs: digibytewallet-android native/src/test/host/prepared_send_kat/ (the header's edges)
-//  and fee_quote_kat/ (the rules against wallets the core builds and signs).
+//  SEND_GATE_SET_UNFIXED, also tested by VALUE, the SEND-GATE-SET comparison arms (the bridge copy's
+//  values): =1 is the membership set before that item (BRWalletUTXOs, the raw set the balance sums);
+//  =2 is the selectable set enumerated whole (BRWalletSelectableUTXOs), whose one walk budget can run
+//  out before the check reaches a coin selection took. Unset or =0 ships: each input asked alone
+//  (BRWalletOutpointSelectable). Never defined in a production build.
+//
+//  The rules are the bridge copy's (digibytewallet-android native/src/main/jni/bridge/prepared_send.h)
+//  name for name: prepared_send_quote, prepared_send_check, prepared_send_coin_ok and PREPARED_SEND_*
+//  are BRPreparedSendQuote, BRPreparedSendCheck, BRPreparedSendCoinOK and BRPreparedSend*, with the
+//  same verdict values and the same seams, so the bridge can include this header in its place.
+//
+//  Host KATs: digibytewallet-android native/src/test/host/prepared_send_core_kat/ (this header
+//  against fee_quote_kat's cases, every arm) and fee_quote_kat/ (the bridge copy).
 //  Header-only, static inline; no I/O.
 //
 
@@ -75,11 +95,15 @@ extern "C" {
 #define PREPARED_SEND_UNFIXED 0
 #endif
 
+#ifndef SEND_GATE_SET_UNFIXED
+#define SEND_GATE_SET_UNFIXED 0
+#endif
+
 typedef enum {
     BRPreparedSendOK = 0,
     BRPreparedSendFeeUnknown = 1,        // an input is not a transaction the wallet holds: the fee cannot be told
     BRPreparedSendFeeChanged = 2,        // the transaction does not pay exactly the approved fee
-    BRPreparedSendCoinUnavailable = 3,   // a coin it spends is no longer one of the wallet's spendable plain coins
+    BRPreparedSendCoinUnavailable = 3,   // a coin it spends is not one the wallet's own selection would spend
     BRPreparedSendNotApproved = 4        // its outputs are not the approved payment plus change to a wallet address
 } BRPreparedSendVerdict;
 
@@ -142,11 +166,45 @@ static inline int BRPreparedSendHasCoin(const BRUTXO *utxos, size_t count, UInt2
     return 0;
 }
 
+// SEND-GATE-SET: 1 when the coin (hash, n) is one a prepared send may spend -- one the wallet's own
+// selection would spend -- else 0 (also for a NULL wallet, and when a comparison arm cannot copy its
+// list). Asked of that outpoint alone (BRWalletOutpointSelectable, its own walk budget).
+static inline int BRPreparedSendCoinOK(BRWallet *wallet, UInt256 hash, uint32_t n)
+{
+#if SEND_GATE_SET_UNFIXED == 1 || SEND_GATE_SET_UNFIXED == 2
+    // RED ARM SEAM (prepared_send_core_kat): =1 the raw set the balance sums; =2 the whole selectable
+    // set enumerated under one walk budget.
+    size_t count;
+    BRUTXO *u;
+    int r;
+
+    if (! wallet) return 0;
+#if SEND_GATE_SET_UNFIXED == 1
+    count = BRWalletUTXOs(wallet, NULL, 0);
+#else
+    count = BRWalletSelectableUTXOs(wallet, NULL, 0);
+#endif
+    u = calloc(count ? count : 1, sizeof(*u));
+    if (! u) return 0;
+#if SEND_GATE_SET_UNFIXED == 1
+    count = BRWalletUTXOs(wallet, u, count);
+#else
+    count = BRWalletSelectableUTXOs(wallet, u, count);
+#endif
+    r = BRPreparedSendHasCoin(u, count, hash, n);
+    free(u);
+    return r;
+#else
+    if (! wallet) return 0;
+    return BRWalletOutpointSelectable(wallet, hash, n) ? 1 : 0;
+#endif
+}
+
 // Whether tx may be signed -- or, once signed, handed back to be broadcast -- as the approved
 // send: payAmount to payScript (plus change to the wallet), at approvedFee, from coins still the
 // wallet's. Anything but BRPreparedSendOK refuses. The first failing rule is reported, in this
 // order: fee unknown (also a NULL wallet or tx), fee changed, outputs not approved, coin
-// unavailable (also when the coin list cannot be copied: unable to tell, so do not sign).
+// unavailable (the first input BRPreparedSendCoinOK refuses; no input at all is unavailable too).
 static inline BRPreparedSendVerdict BRPreparedSendCheck(BRWallet *wallet, const BRTransaction *tx,
                                                         const uint8_t *payScript, size_t payScriptLen,
                                                         uint64_t payAmount, uint64_t approvedFee)
@@ -157,8 +215,6 @@ static inline BRPreparedSendVerdict BRPreparedSendCheck(BRWallet *wallet, const 
     return BRPreparedSendOK;
 #else
     uint64_t fee;
-    size_t count;
-    BRUTXO *coins;
     BRPreparedSendVerdict verdict = BRPreparedSendOK;
 
     if (! wallet || ! tx) return BRPreparedSendFeeUnknown;
@@ -168,18 +224,14 @@ static inline BRPreparedSendVerdict BRPreparedSendCheck(BRWallet *wallet, const 
     if (! BRPreparedSendPaysAsApproved(wallet, tx, payScript, payScriptLen, payAmount)) return BRPreparedSendNotApproved;
     if (tx->inCount == 0) return BRPreparedSendCoinUnavailable;
 
-    // The wallet's spendable plain coins now: spent coins, asset carriers and DigiDollar outputs
-    // are not among them. One copy, taken under the wallet's lock. A coin that arrived between the
-    // two calls is not in it, which can only refuse -- and reviewing again builds afresh.
-    count = BRWalletUTXOs(wallet, NULL, 0);
-    coins = calloc(count ? count : 1, sizeof(*coins));
-    if (! coins) return BRPreparedSendCoinUnavailable;   // cannot tell, so do not sign
-    count = BRWalletUTXOs(wallet, coins, count);
+    // Each coin must be one the wallet's own selection would spend now (SEND-GATE-SET): spent coins,
+    // asset carriers, DigiDollar and ONE-FAMILY-held outputs, unsignable outputs and unconfirmed coins
+    // someone else sent are not. Each is asked alone, under the wallet's lock. A coin that changed
+    // between the two calls can only refuse -- and reviewing again builds afresh.
     for (size_t i = 0; i < tx->inCount && verdict == BRPreparedSendOK; i++) {
-        if (! BRPreparedSendHasCoin(coins, count, tx->inputs[i].txHash, tx->inputs[i].index))
+        if (! BRPreparedSendCoinOK(wallet, tx->inputs[i].txHash, tx->inputs[i].index))
             verdict = BRPreparedSendCoinUnavailable;
     }
-    free(coins);
     return verdict;
 #endif
 }

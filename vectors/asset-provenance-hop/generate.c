@@ -37,6 +37,7 @@
 // cannot be read.
 //
 
+#define _DEFAULT_SOURCE  // strtok_r is POSIX: glibc declares it under -std=c99 only with this
 #include "BRAssetProvenance.h"
 #include <stdio.h>
 #include <stdlib.h>

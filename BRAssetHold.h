@@ -91,6 +91,12 @@
 //  removed, and immediately before building any spend from the plain-coin set; refuse the spend when it
 //  answers anything but COMPLETE. (Nothing in the core enforces that order yet.)
 //
+//  FOR DETECTION (BRAssetDetect.h, Kotlin: processIncomingAssetTx). BRAssetHoldCarrierOf is THE PASS's
+//  carrier choice, and BRAssetHoldInputFacts what the wallet knows about each input of one transaction
+//  (its row, THE WALK's answer for a row storing zero, the funding transaction's payload and data output)
+//  and what those inputs carried in all, in the decoder's reading. Neither holds anything: what is held
+//  is still the pass's answer.
+//
 //  No allocation, no network, no clock, no I/O in the pass: the caller's `work` buffer (BRAssetHoldBounds)
 //  holds the walk's state, its stack and the sorted indexes of transactions, rows and proofs, and the
 //  caller's `held` buffer the answer, never shortened. Every lookup (a transaction, a row, a proof, a
@@ -682,6 +688,21 @@ static inline _BRAssetHoldUnits _BRAssetHoldTotalOf(const _BRAssetHoldState *s, 
     return u;
 }
 
+// Can the pass read `tx` at all: a transaction, outputs, inputs and scripts wherever the counts say there are
+// some, and no more than INT32_MAX outputs?
+static inline int _BRAssetHoldTxReadable(const BRTransaction *tx)
+{
+    size_t j;
+
+    if (! tx || (tx->outCount > 0 && ! tx->outputs) || (tx->inCount > 0 && ! tx->inputs) ||
+        tx->outCount > (size_t)INT32_MAX) return 0;
+    for (j = 0; j < tx->outCount; j++) {
+        if (tx->outputs[j].scriptLen > 0 && ! tx->outputs[j].script) return 0;
+    }
+
+    return 1;
+}
+
 // Are all of tx's inputs readable as the Kotlin reads them (an index it can hold in an Int)?
 static inline int _BRAssetHoldInputsReadable(const BRTransaction *tx)
 {
@@ -1113,7 +1134,7 @@ static inline BRAssetHoldResult _BRAssetHoldOutputsReading(const BRAssetHoldView
     BRAssetHoldResult r;
     BRAssetHoldStatus status = BR_ASSET_HOLD_COMPLETE;
     _BRAssetHoldState s;
-    size_t i, j, count = 0, workNeeded = 0;
+    size_t i, count = 0, workNeeded = 0;
 
     memset(&r, 0, sizeof(r));
     if (! view || (view->txCount > 0 && ! view->txs) || (view->rowCount > 0 && ! view->rows) ||
@@ -1126,14 +1147,7 @@ static inline BRAssetHoldResult _BRAssetHoldOutputsReading(const BRAssetHoldView
 #endif
 
     for (i = 0; i < view->txCount; i++) {   // every transaction must be readable before any is read
-        const BRTransaction *tx = view->txs[i];
-
-        if (! tx || (tx->outCount > 0 && ! tx->outputs) || (tx->inCount > 0 && ! tx->inputs) ||
-            tx->outCount > (size_t)INT32_MAX) return _BRAssetHoldRefuse(BR_ASSET_HOLD_REFUSED_UNREADABLE);
-        for (j = 0; j < tx->outCount; j++) {
-            if (tx->outputs[j].scriptLen > 0 && ! tx->outputs[j].script)
-                return _BRAssetHoldRefuse(BR_ASSET_HOLD_REFUSED_UNREADABLE);
-        }
+        if (! _BRAssetHoldTxReadable(view->txs[i])) return _BRAssetHoldRefuse(BR_ASSET_HOLD_REFUSED_UNREADABLE);
     }
 
     BRAssetHoldBounds(view, &workNeeded, NULL);
@@ -1180,6 +1194,187 @@ static inline BRAssetHoldResult BRAssetHoldOutputs(const BRAssetHoldView *view, 
 #else
     return _BRAssetHoldOutputsReading(view, work, workCap, held, heldCap, 3);
 #endif
+}
+
+// ---- for detection: the carrier and one transaction's inputs (BRAssetDetect.h) -------------------
+
+// What BRAssetHoldCarrierOf found. UNREADABLE is 0.
+typedef enum {
+    BR_ASSET_CARRIER_UNREADABLE = 0,   // the transaction cannot be read (a NULL transaction, outputs, inputs or
+                                       // script where the counts say there are some, or more than INT32_MAX outputs)
+    BR_ASSET_CARRIER_NONE = 1,         // no OP_RETURN output of it is a DigiAsset carrier
+    BR_ASSET_CARRIER_FOUND = 2         // *at, *header and insts say which output it is and what it says
+} BRAssetCarrierStatus;
+
+// The carrier THE PASS reads `tx` by: among its OP_RETURN outputs that are DigiAsset carriers, the first one
+// that cannot be classified, otherwise the last one (Kotlin: assetCarrier). On FOUND, *at is its output
+// index and *header its header (kind BR_ASSET_SCRIPT_UNCLASSIFIABLE, every other field zero, for one that
+// cannot be classified); insts, when not NULL, has room for BR_ASSET_MAX_INSTRUCTIONS and receives the
+// header->instructionCount instructions. `at` and `header` may be NULL. Nothing is written otherwise.
+static inline BRAssetCarrierStatus BRAssetHoldCarrierOf(const BRTransaction *tx, size_t *at, BRAssetHeader *header,
+                                                        BRAssetTransferInstruction *insts)
+{
+    _BRAssetHoldTx t;
+    size_t j = 0, n;
+
+    if (! _BRAssetHoldTxReadable(tx)) return BR_ASSET_CARRIER_UNREADABLE;
+    if (! _BRAssetHoldCarrier(tx, &t, &j)) return BR_ASSET_CARRIER_NONE;
+    n = (t.h.instructionCount < BR_ASSET_MAX_INSTRUCTIONS) ? t.h.instructionCount : BR_ASSET_MAX_INSTRUCTIONS;
+    if (at) *at = j;
+    if (header) *header = t.h;
+    if (insts && n > 0) memcpy(insts, t.insts, n * sizeof(t.insts[0]));
+    return BR_ASSET_CARRIER_FOUND;
+}
+
+// Kotlin: nativeParentHasDataOutput. Does the wallet's transaction txHash have an OP_RETURN output? UNKNOWN
+// for a transaction the wallet does not hold, or holds with no outputs.
+static inline BRAssetFact _BRAssetHoldHasDataOutput(const _BRAssetHoldState *s, UInt256 txHash)
+{
+    const BRTransaction *tx = _BRAssetHoldTxAt(s, _BRAssetHoldFind(s, txHash));
+    size_t j;
+
+    if (! tx || tx->outCount == 0) return BR_ASSET_FACT_UNKNOWN;
+    for (j = 0; j < tx->outCount; j++) {
+        if (_BRAssetHoldIsOpReturn(&tx->outputs[j])) return BR_ASSET_FACT_YES;
+    }
+
+    return BR_ASSET_FACT_NO;
+}
+
+// What BRAssetHoldInputFacts answers.
+typedef struct {
+    BRAssetHoldStatus status;        // COMPLETE, or why not (as BRAssetHoldOutputs refuses)
+    int hasUnits;                    // COMPLETE: what tx's inputs carried in all is known
+    int64_t units;                   //   and is this
+    size_t workNeeded;               // CAPACITY: work entries that suffice (BRAssetHoldBounds)
+} BRAssetHoldInputs;
+
+// What the wallet knows about each input of `tx`, read as Android's processIncomingAssetTx reads it: THE
+// WALK in the decoder's reading (the Kotlin's; the view's classifier is never asked, and a production
+// build refuses a view that names one, as BRAssetHoldOutputs does), each total resolved once for the call.
+// `view` is the wallet as THE PASS reads it (its `owned` is not read); `tx` need not be one of its
+// transactions, and is read whether or not it is.
+//
+// facts[k], for input k (facts has room for inputCap >= tx->inCount entries; NULL only when tx has no
+// inputs): hasRow and quantity from the view's row for the outpoint; for a row storing zero or less,
+// rowIsTargeted (THE WALK: does the funding transaction direct units to that output?); with no row,
+// fundingIsAssetTx (Kotlin: hasAssetPayload, its first OP_RETURN decoded) and fundingHasDataOutput (an
+// OP_RETURN output at all), each UNKNOWN for a transaction the wallet does not hold. Every other fact is
+// UNKNOWN, credit is UNCHECKED and assetId NULL (the view's rows carry neither). An input whose outpoint
+// index is past INT32_MAX has no row and every fact UNKNOWN. rowIndex, when not NULL (inputCap entries),
+// receives each input's row as its place in view->rows (the first, when the view lists the outpoint
+// twice), or (size_t)-1. outputRow, when not NULL (outputCap >= tx->outCount entries), receives the same
+// for each of tx's own outputs.
+//
+// hasUnits and units: what tx's inputs carried in all (Kotlin: resolveInputAssetUnits with `unresolved`
+// given, the inputs it cannot read passed over, then provenInputUnits): an input past INT32_MAX is passed
+// over, a stored-zero row that may be targeted makes the total unknown though the inputs after it are still
+// read, and when the total is unknown and tx's remainder is proven zero, what its carrier's instructions
+// assign.
+//
+// The refusals are BRAssetHoldOutputs': ARGUMENTS (a NULL where a value is needed, or a test seam this build
+// does not offer), UNREADABLE (tx or a transaction of the view), ROWS, CAPACITY (work, inputCap or
+// outputCap too small). On COMPLETE, work[0, view->rowCount).row lists the view's rows in outpoint order,
+// then view order; BRAssetDetect.h reads it.
+static inline BRAssetHoldInputs BRAssetHoldInputFacts(const BRAssetHoldView *view, BRAssetHoldWork *work, size_t workCap,
+                                                      const BRTransaction *tx, BRAssetInputFacts *facts, size_t *rowIndex,
+                                                      size_t inputCap, size_t *outputRow, size_t outputCap)
+{
+    BRAssetHoldInputs r;
+    _BRAssetHoldState s;
+    _BRAssetHoldUnits units;
+    _BRAssetHoldTx t;
+    const BRAssetHoldRow *row;
+    size_t i, k, lo, workNeeded = 0;
+
+    memset(&r, 0, sizeof(r));
+    if (! view || (view->txCount > 0 && ! view->txs) || (view->rowCount > 0 && ! view->rows) ||
+        (view->provenCount > 0 && ! view->proven) || (workCap > 0 && ! work) || ! tx ||
+        (tx->inCount > 0 && ! facts)) {
+        r.status = _BRAssetHoldRefuse(BR_ASSET_HOLD_REFUSED_ARGUMENTS).status;
+        return r;
+    }
+#if !ASSET_HOLD_TEST_SEAMS && !(ASSET_HOLD_UNFIXED & ASSET_HOLD_RED_SEAMS_OPEN)
+    if (view->classifier != NULL) {
+        r.status = _BRAssetHoldRefuse(BR_ASSET_HOLD_REFUSED_ARGUMENTS).status;
+        return r;
+    }
+#endif
+    if (! _BRAssetHoldTxReadable(tx)) {
+        r.status = _BRAssetHoldRefuse(BR_ASSET_HOLD_REFUSED_UNREADABLE).status;
+        return r;
+    }
+    for (i = 0; i < view->txCount; i++) {
+        if (! _BRAssetHoldTxReadable(view->txs[i])) {
+            r.status = _BRAssetHoldRefuse(BR_ASSET_HOLD_REFUSED_UNREADABLE).status;
+            return r;
+        }
+    }
+
+    BRAssetHoldBounds(view, &workNeeded, NULL);
+    if (workCap < workNeeded || inputCap < tx->inCount || (outputRow && outputCap < tx->outCount)) {
+        r.status = _BRAssetHoldRefuse(BR_ASSET_HOLD_REFUSED_CAPACITY).status;
+        r.workNeeded = workNeeded;
+        return r;
+    }
+
+    s.v = view;
+    s.w = work;
+    s.heldSorted = 0;
+    s.epoch = 0;
+    s.every = 1;
+    s.resolved = _BR_ASSET_HOLD_NONE;
+    s.classifierInFacts = 0;
+    s.current = _BR_ASSET_HOLD_NONE;
+    _BRAssetHoldSort(view, work, _BR_ASSET_HOLD_BY_TX, view->txCount);
+    _BRAssetHoldSort(view, work, _BR_ASSET_HOLD_BY_ROW, view->rowCount);
+    _BRAssetHoldSort(view, work, _BR_ASSET_HOLD_BY_PROOF, view->provenCount);
+    if (_BRAssetHoldRowsDisagree(view, work)) {
+        r.status = _BRAssetHoldRefuse(BR_ASSET_HOLD_REFUSED_ROWS).status;
+        return r;
+    }
+
+    for (i = 0; i < view->txCount; i++) {
+        work[i].epoch = 0;
+        work[i].state = 0;
+        work[i].settled = 0;
+        work[i].link = _BR_ASSET_HOLD_NONE;
+    }
+
+    units = _BRAssetHoldInputUnits(&s, tx, 1);
+    if (! units.has && _BRAssetHoldCarrier(tx, &t, NULL)) units = _BRAssetHoldProvenUnits(&s, tx, &t);
+
+    for (k = 0; k < tx->inCount; k++) {
+        const BRTxInput *in = &tx->inputs[k];
+
+        memset(&facts[k], 0, sizeof(facts[k]));
+        if (rowIndex) rowIndex[k] = _BR_ASSET_HOLD_NONE;
+        if (in->index > (uint32_t)INT32_MAX) continue;
+        lo = _BRAssetHoldRowLowerBound(&s, in->txHash, in->index);
+        row = (lo < view->rowCount) ? &view->rows[work[lo].row] : NULL;
+
+        if (row && row->n == in->index && UInt256Eq(row->txHash, in->txHash)) {
+            facts[k].hasRow = 1;
+            facts[k].quantity = row->quantity;
+            if (rowIndex) rowIndex[k] = work[lo].row;
+            if (row->quantity <= 0) facts[k].rowIsTargeted = _BRAssetHoldWalk(&s, in->txHash, in->index);
+        }
+        else {
+            facts[k].fundingIsAssetTx = _BRAssetHoldIsAssetTx(&s, in->txHash);
+            facts[k].fundingHasDataOutput = _BRAssetHoldHasDataOutput(&s, in->txHash);
+        }
+    }
+
+    for (k = 0; outputRow && k < tx->outCount; k++) {
+        lo = _BRAssetHoldRowLowerBound(&s, tx->txHash, (uint32_t)k);
+        row = (lo < view->rowCount) ? &view->rows[work[lo].row] : NULL;
+        outputRow[k] = (row && row->n == (uint32_t)k && UInt256Eq(row->txHash, tx->txHash)) ? work[lo].row : _BR_ASSET_HOLD_NONE;
+    }
+
+    r.status = BR_ASSET_HOLD_COMPLETE;
+    r.hasUnits = units.has;
+    r.units = units.v;
+    return r;
 }
 
 // ---- the wallet ----------------------------------------------------------------------------------

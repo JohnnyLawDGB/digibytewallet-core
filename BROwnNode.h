@@ -33,10 +33,13 @@
 //  a host name is refused, never looked up (the device's resolver would send the query beside Tor,
 //  naming the user's node to whoever watches the network); otherwise the platform looks it up
 //  and dials the first IPv4 address.
-//  BROwnNodeHealthFor (refreshOwnNodeHealth): BRPeerManagerCompactFilterPeerStatus 3 (connected
-//  and answering cfheaders) is serving, 1 (in the pool, not yet connected) is connecting, and
-//  anything else is dark: 2 (connected but serving no filters, a node without
-//  peerblockfilters=1) is exactly the misconfiguration this status exists to show. It has no
+//  BROwnNodeHealthFor (refreshOwnNodeHealth): BRPeerManagerCompactFilterPeerStatus 3 (connected,
+//  has answered, and no cfheaders/cfilters request of ours to it has stalled) is serving, 1 (in the
+//  pool, not yet connected) is connecting, and anything else is dark. 2 means connected but not
+//  serving filters now: either it never answered (a node without peerblockfilters=1, the
+//  misconfiguration this status was first built to show) or -- OWNNODE-LIVE -- a request of ours to
+//  it stalled. A caught-up wallet asks nothing between blocks, so a node that stops relaying blocks
+//  reaches 2 only through the tip-stall watchdog's rebuild (see BRCFServedClock). It has no
 //  memory, so a platform's health poll calls BROwnNodeHealthObserve, which adds the time limit.
 //  BROwnNodeHealthObserve (refreshOwnNodeHealth, each health poll): BROwnNodeHealthFor with a
 //  time limit on "connecting". Status 1 alone cannot tell a dial in progress from a node that

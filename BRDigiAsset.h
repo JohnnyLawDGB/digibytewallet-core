@@ -46,8 +46,11 @@ uint8_t BROutpointIsAsset(const BRTxOutput* output);
 
 uint8_t BRTxOutputIsAsset(const BRTransaction* transaction, const BRTxOutput* output);
 
-uint8_t BROutpointIsAsset(const BRTxOutput* output);
+/* DA-014-REF: what BRTxAssetCarrier answers (see BRDigiAsset.c). */
+#define DA_TX_NONE      0
+#define DA_TX_CARRIER   1
+#define DA_TX_UNDECIDED 2
 
-uint8_t BRTxOutputIsAsset(const BRTransaction* transaction, const BRTxOutput* output);
+int BRTxAssetCarrier(const BRTransaction *transaction, size_t *carrierIdx);
 
 #endif /* BRDigiAsset_h */

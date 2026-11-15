@@ -13,18 +13,38 @@ The legacy tree is breadwallet's, with a NON-STANDARD master key ("DigiByte seed
 why no standard tool can produce its vectors: this script implements BIP39, BIP32, secp256k1,
 Base58Check, Bech32/Bech32m and the BIP86 tweak from their specifications, in the Python
 standard library only, sharing no code with the core. The core is checked AGAINST this file
-(host KAT derivation_vectors_kat; the iOS test target reads the same file).
+(host KAT derivation_vectors_kat, every .txt here). No iOS test target exists yet; when one
+does, it must read these same files.
 
-Usage:   python3 -I generate.py > abandon-about.txt
-         python3 -I generate.py TREZOR > abandon-about-trezor.txt
+Usage:   python3 -I generate.py [--mnemonic "<phrase>"] [passphrase] > <file>
 
-The optional argument is a BIP39 passphrase (NFKD-normalized, as BIP39 specifies), so the
-passphrase path is held to the same independent vectors. "TREZOR" is the passphrase of the
-published BIP39 test vectors.
+  python3 -I generate.py > abandon-about.txt
+  python3 -I generate.py TREZOR > abandon-about-trezor.txt
+  python3 -I generate.py --mnemonic "$ART24" > abandon-art.txt
+  python3 -I generate.py --mnemonic "$ART24" TREZOR > abandon-art-trezor.txt
+  python3 -I generate.py --mnemonic "$ART24" "Correct Horse 25th!" > abandon-art-correct-horse.txt
+
+  where ART24="abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon
+  abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon
+  abandon art" (on one line: "abandon" x23 then "art").
+
+--mnemonic picks the BIP39 phrase, which must be one a BIP39 wallet could produce: every word
+on the published English list (bip39-english.wordlist, pinned by its SHA-256) and the checksum
+matching the entropy; without it the phrase is the 12-word "abandon" x11 "about".
+Both are the published BIP39 test vectors (128-bit and 256-bit entropy, all zero), so the
+24-word path is held to the same independent vectors as the 12-word one (DERIV-24).
+
+The optional positional argument is a BIP39 passphrase (NFKD-normalized, as BIP39 specifies),
+so the passphrase path is held to the same independent vectors. "TREZOR" is the passphrase of
+the published BIP39 test vectors; "Correct Horse 25th!" adds spaces, mixed case, digits and
+punctuation, which must reach PBKDF2 unchanged. A passphrase the file header cannot carry
+unambiguously is refused: leading or trailing whitespace, a line break, or the literal "(empty)"
+(the no-passphrase marker).
 """
 
 import hashlib
 import hmac
+import os
 import sys
 import unicodedata
 
@@ -72,6 +92,46 @@ def ser_p(pt):  # compressed SEC1
 
 
 # --- BIP39 / BIP32 ------------------------------------------------------------------------------
+# The BIP39 English wordlist, as published (bitcoin/bips bip-0039/english.txt), pinned by the
+# SHA-256 of that file. It is data, not code: the pin is what makes it the published list rather
+# than whatever copy sits beside this script.
+WORDLIST = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bip39-english.wordlist")
+WORDLIST_SHA256 = "2f5eed53a4727b4bf8880d8f3f199efc90e58503646d9ff8eff3a2ed3b24dbda"
+
+
+def bip39_words():
+    with open(WORDLIST, "rb") as f:
+        raw = f.read()
+    if hashlib.sha256(raw).hexdigest() != WORDLIST_SHA256:
+        sys.exit("generate.py: bip39-english.wordlist is not the published BIP39 English list")
+    words = raw.decode().split("\n")[:-1]
+    assert len(words) == 2048 and len(set(words)) == 2048
+    return words
+
+
+def bip39_check(mnemonic):
+    """Refuse a phrase no BIP39 wallet could produce: a word off the list, or a bad checksum.
+
+    BIP39: 11 bits per word; ENT = 32 * words / 3 bits of entropy, then CS = ENT / 32 bits of
+    checksum, which must equal the first CS bits of SHA-256(entropy).
+    """
+    words = mnemonic.split(" ")
+    if len(words) not in (12, 15, 18, 21, 24):
+        sys.exit("generate.py: a BIP39 mnemonic has 12, 15, 18, 21 or 24 words")
+    index = {w: i for i, w in enumerate(bip39_words())}
+    bits = 0
+    for w in words:
+        if w not in index:
+            sys.exit("generate.py: %r is not a BIP39 English word" % w)
+        bits = (bits << 11) | index[w]
+    cs = len(words) * 11 // 33
+    ent = len(words) * 11 - cs
+    entropy = (bits >> cs).to_bytes(ent // 8, "big")
+    if bits & ((1 << cs) - 1) != hashlib.sha256(entropy).digest()[0] >> (8 - cs):
+        sys.exit("generate.py: the mnemonic's BIP39 checksum does not match its entropy")
+    return entropy
+
+
 def bip39_seed(mnemonic, passphrase):
     m = unicodedata.normalize("NFKD", mnemonic).encode()
     s = unicodedata.normalize("NFKD", "mnemonic" + passphrase).encode()
@@ -178,11 +238,27 @@ def taproot_output_x(k):
 
 # --- the vectors ----------------------------------------------------------------------------------
 def main():
-    passphrase = sys.argv[1] if len(sys.argv) > 1 else PASSPHRASE
-    seed = bip39_seed(MNEMONIC, passphrase)
+    args = sys.argv[1:]
+    mnemonic = MNEMONIC
+    if args[:1] == ["--mnemonic"]:
+        if len(args) < 2:
+            sys.exit("usage: generate.py [--mnemonic \"<phrase>\"] [passphrase]")
+        mnemonic = " ".join(args[1].split())   # one space between words, as BIP39 joins them
+        args = args[2:]
+    if len(args) > 1 or (args and args[0].startswith("--")):
+        sys.exit("usage: generate.py [--mnemonic \"<phrase>\"] [passphrase]")
+    bip39_check(mnemonic)
+    passphrase = args[0] if args else PASSPHRASE
+    # The header line "# passphrase: <text>" must read back as exactly <text>: a reader that
+    # skips the space after the colon also skips leading whitespace, a line reader drops what
+    # follows a newline, and "(empty)" is the no-passphrase marker.
+    if passphrase != passphrase.strip() or "\n" in passphrase or "\r" in passphrase or passphrase == "(empty)":
+        sys.exit("generate.py: this passphrase cannot be written to the file header unambiguously "
+                 "(leading or trailing whitespace, a line break, or the literal \"(empty)\")")
+    seed = bip39_seed(mnemonic, passphrase)
     print("# DigiByte wallet derivation vectors. Generated by vectors/derivation/generate.py, an")
     print("# implementation independent of the core (Python standard library only). Do not edit.")
-    print("# mnemonic: " + MNEMONIC)
+    print("# mnemonic: " + mnemonic)
     print("# passphrase: " + (passphrase if passphrase else "(empty)"))
     print("# bip39 seed: " + seed.hex())
     print("# columns: derivation format chain index address")

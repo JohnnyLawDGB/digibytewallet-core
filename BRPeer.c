@@ -2790,6 +2790,7 @@ const char *BRPeerDisconnectTagName(BRPeerDisconnectTag tag)
         case BR_DISC_TAG_DOWNLOAD_SWAP:return "download-swap";
         case BR_DISC_TAG_CF_STALL:     return "cf-stall";
         case BR_DISC_TAG_HEADER_POW:   return "header-pow";
+        case BR_DISC_TAG_FILTER_SLOT:  return "filter-slot";
         default:                       return "none";
     }
 }

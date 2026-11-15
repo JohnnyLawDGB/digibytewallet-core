@@ -296,6 +296,8 @@ typedef enum {
     BR_DISC_TAG_HEADER_POW,     // a header refused for its proof of work (DGB_HEADER_POW_CHECK >= 2): its hash does
                                 // not meet its own target (or the target is out of range), or its algorithm is
                                 // not allowed at its height
+    BR_DISC_TAG_FILTER_SLOT,    // a peer serving no compact filters, dropped to free its slot for a filter peer
+                                // (G5-QUORUM lone-peer stall): says nothing against the peer
     BR_DISC_TAG_COUNT
 } BRPeerDisconnectTag;
 

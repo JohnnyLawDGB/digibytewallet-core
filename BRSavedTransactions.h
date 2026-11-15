@@ -45,7 +45,39 @@
 extern "C" {
 #endif
 
+// TX-CKPT-CAP: the ONE limit on how many records a saved-transactions blob may hold. The
+// writer (BRWalletSerializeTransactions) refuses to write a blob above it and both readers
+// (this one and the Android bridge's saved_transactions_deserialize.h) refuse to read one,
+// so the wallet never writes a checkpoint its own reader drops. Until 2026-11 only the
+// readers had a limit (10,000) and the writer wrote any count: a wallet past 10,000
+// transactions saved a checkpoint that loaded as nothing on the next launch.
+//
+// The limit bounds the record-pointer array the reader allocates before it has parsed
+// anything (8 bytes a record, under 1 MB here), whatever count a corrupt blob claims; the
+// records themselves are bounded by the blob, which ends the walk. It is set well above any
+// wallet the SPV core can hold usably: the balance pass is quadratic in the unspent set.
+//
+// What happens above it (the writer emits nothing):
+//  - a wallet that grows past it keeps its last checkpoint and scan ledger (the app writes
+//    the ledger and "has synced" only after a checkpoint lands), and sync never reports
+//    complete. Launches resume from that frozen ledger only while the saved near-tip header
+//    window still reaches down to it; once the window has moved past it, the next launch
+//    finds the frontier below the window (HEADER_WINDOW_MISSING) and rebuilds from the
+//    birth floor, and so does every launch after it while the wallet stays above the limit;
+//  - a stored checkpoint that is itself above the limit (written before the writer had one)
+//    is refused by the reader, so the app records a short restore and rebuilds from the
+//    birth floor; the rebuilt wallet passes the limit again, nothing replaces that
+//    checkpoint, and so EVERY launch rebuilds from the birth floor.
+// Funds are never hidden (the scan finds them each time); the cost is the rescan. The app
+// leaves a breadcrumb in dgb_diag when the refusal starts. The Kotlin mirror
+// (SavedTransactionsCheckpoint.MAX_RECORDS) is held to this value by a source gate.
+#ifdef TX_CKPT_CAP_UNFIXED
+// RED-gate shape only: the reader limit as it was, with no writer limit. Never defined in
+// a production build.
 #define BR_SAVED_TRANSACTIONS_MAX_COUNT     10000u
+#else
+#define BR_SAVED_TRANSACTIONS_MAX_COUNT     100000u
+#endif
 #define BR_SAVED_TRANSACTIONS_RECORD_HEADER 12u
 
 // Parses a saved-transactions blob. On a sane count, allocates *outTxs and returns the

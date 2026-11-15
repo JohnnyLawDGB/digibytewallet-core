@@ -148,6 +148,43 @@ static int _BRAssetPayloadSpan(const BRTxOutput *output, size_t *hdrOff, const u
 #endif
 }
 
+/* (internal)
+ * DigiByte Core's `nulldata` output type (script/standard.cpp Solver): OP_RETURN followed only by
+ * complete push opcodes (CScript::IsPushOnly -- every opcode <= OP_16, every push's data present).
+ * An OP_RETURN followed by anything else is `nonstandard`, and DigiAsset Core does not read it.
+ */
+static int _BRScriptIsNullData(const uint8_t *s, size_t n)
+{
+    size_t pc = 1;
+
+    if (!s || n < 1 || s[0] != OP_RETURN) return 0;
+    while (pc < n) {
+        uint8_t op = s[pc++];
+        uint64_t size = 0;
+
+        if (op > OP_16) return 0;
+        if (op < OP_PUSHDATA1) {
+            size = op;
+        } else if (op == OP_PUSHDATA1) {
+            if (n - pc < 1) return 0;
+            size = s[pc];
+            pc += 1;
+        } else if (op == OP_PUSHDATA2) {
+            if (n - pc < 2) return 0;
+            size = (uint64_t)s[pc] | ((uint64_t)s[pc + 1] << 8);
+            pc += 2;
+        } else if (op == OP_PUSHDATA4) {
+            if (n - pc < 4) return 0;
+            size = (uint64_t)s[pc] | ((uint64_t)s[pc + 1] << 8) | ((uint64_t)s[pc + 2] << 16) |
+                   ((uint64_t)s[pc + 3] << 24);
+            pc += 4;
+        }
+        if ((uint64_t)(n - pc) < size) return 0;
+        pc += (size_t)size;
+    }
+    return 1;
+}
+
 /*
  * Returns zero if an output is no DigiAsset carrier; otherwise nonzero: the length of the
  * carrier's declared payload (from the "DA" tag on, always >= 4), or DA_UNCLASSIFIED_ANSWER for
@@ -210,64 +247,30 @@ static size_t _BRAssetAmountSpan(const uint8_t *ptr, const uint8_t *end)
 }
 #endif
 
-/*
- * Returns 1 if an asset was sent to the output -- or, fail closed, if the transaction carries a
- * DigiAsset carrier this reader cannot classify (DA_UNCLASSIFIED_ANSWER): then every output of
- * the transaction is held, whichever one is asked about.
- *
- * Unclassifiable: a tagged carrier _BRAssetPayloadSpan cannot frame; a version of 0 or an opcode
+/* (internal)
+ * What the carrier `or_output` (its payload at hdrOff..payloadEnd, as _BRAssetPayloadSpan framed it)
+ * says about output `idx`: 1 when an instruction names it, 0 when none does, and
+ * DA_NAMES_UNCLASSIFIED when the payload cannot be classified -- a version of 0 or an opcode
  * other than the issuance opcodes 0x01-0x05, transfer 0x15 and burn 0x25; metadata, an issuance
  * amount or an issuance flags byte the payload is too short to hold or that is invalid
  * (aggregation 3); and a transfer or burn instruction the payload ends inside. Those are the
  * payloads the Kotlin DigiAssetDecoder reports as UNCLASSIFIABLE. An issuance's instruction
  * stream follows a rules block neither reader parses (opcodes 3 and 4), so it is read only as far
- * as it goes.
+ * as it goes. idx == (size_t)-1 names no output and so classifies the whole payload.
  */
-uint8_t BRTxOutputIsAsset(const BRTransaction* transaction, const BRTxOutput* output) {
-    size_t idx = (size_t)-1;
-
-    BRTxOutput* or_output = NULL;
-    size_t hdrOff = 0;
-    const uint8_t *payloadEnd = NULL;
-    int unclassified = 0;
-
+#define DA_NAMES_UNCLASSIFIED (-1)
+static int _BRCarrierNames(const BRTxOutput *or_output, size_t hdrOff, const uint8_t *payloadEnd, size_t idx)
+{
     uint8_t* ptr;
     uint8_t type;
     uint8_t version;
     int issuance;
 
-    // 1) find `output`'s index in the transaction
-    // 2) find the asset OP_RETURN and the span it declares
-    for (size_t i = 0; i < transaction->outCount; ++i) {
-        size_t ho;
-        const uint8_t *pe;
-
-        if (&transaction->outputs[i] == output)
-            idx = i;
-
-        switch (_BRAssetPayloadSpan(&transaction->outputs[i], &ho, &pe)) {
-            case DA_CARRIER_FOUND:
-                or_output = &transaction->outputs[i];
-                hdrOff = ho;
-                payloadEnd = pe;
-                break;
-            case DA_CARRIER_UNCLASSIFIED:
-                unclassified = 1;
-                break;
-            default:
-                break;
-        }
-    }
-
-    if (idx == (size_t)-1) return 0;
-    if (unclassified) return DA_UNCLASSIFIED_ANSWER;
-    if (or_output == NULL) return 0;
-
     /* Every read below is bounded by the DECLARED payload, not the whole script. */
     const uint8_t *end = payloadEnd;
 
     ptr = or_output->script + hdrOff; /* first byte after the "DA" tag, for either framing */
-    if ((size_t)(end - ptr) < 2) return DA_UNCLASSIFIED_ANSWER; /* no room for version + type */
+    if ((size_t)(end - ptr) < 2) return DA_NAMES_UNCLASSIFIED; /* no room for version + type */
     version = *ptr;
     ptr++;
 
@@ -275,7 +278,7 @@ uint8_t BRTxOutputIsAsset(const BRTransaction* transaction, const BRTxOutput* ou
     ptr++;
 
     issuance = (type >= DA_TYPE_SHA1_META_SHA256 && type <= DA_TYPE_SHA1_NO_META_LOCKED);
-    if (version == 0 || (!issuance && type != 0x15 && type != 0x25)) return DA_UNCLASSIFIED_ANSWER;
+    if (version == 0 || (!issuance && type != 0x15 && type != 0x25)) return DA_NAMES_UNCLASSIFIED;
 
     {
         // Metadata: v1/v2 issuance opcodes 1 and 2 carry a 20-byte SHA1 torrent hash, and opcodes
@@ -286,7 +289,7 @@ uint8_t BRTxOutputIsAsset(const BRTransaction* transaction, const BRTxOutput* ou
         if (version < 3 && type < 3) meta += 20 /* SHA1 Torrent Hash */;
         if (type == 1 || type == 3 || type == 4) meta += 32 /* SHA256 of metadata */;
 #ifndef ASSET_SCRIPT_BOUNDS_UNFIXED
-        if ((size_t)(end - ptr) < meta) return DA_UNCLASSIFIED_ANSWER;
+        if ((size_t)(end - ptr) < meta) return DA_NAMES_UNCLASSIFIED;
 #endif
         ptr += meta;
     }
@@ -303,12 +306,12 @@ uint8_t BRTxOutputIsAsset(const BRTransaction* transaction, const BRTxOutput* ou
         ptr += data->byteSize;
 #else
         size_t width;
-        if (ptr >= end) return DA_UNCLASSIFIED_ANSWER;
+        if (ptr >= end) return DA_NAMES_UNCLASSIFIED;
         width = _BRAssetAmountSpan(ptr, end);
-        if (width == 0) return DA_UNCLASSIFIED_ANSWER;
+        if (width == 0) return DA_NAMES_UNCLASSIFIED;
         ptr += width;
         // The issuance flags are the payload's last byte; aggregation 3 is not a valid type.
-        if (((end[-1] & 0x0C) >> 2) == 3) return DA_UNCLASSIFIED_ANSWER;
+        if (((end[-1] & 0x0C) >> 2) == 3) return DA_NAMES_UNCLASSIFIED;
 #endif
     }
 
@@ -385,8 +388,100 @@ uint8_t BRTxOutputIsAsset(const BRTransaction* transaction, const BRTxOutput* ou
             }
         }
 
-        if (truncated && !issuance) return DA_UNCLASSIFIED_ANSWER;
+        if (truncated && !issuance) return DA_NAMES_UNCLASSIFIED;
     }
 
     return 0;
+}
+
+/*
+ * DA-014-REF: the ONE carrier rule, shared with the Kotlin DigiAssetCarrierRule and held to the
+ * same vectors (vectors/da-carrier/vectors.txt, host KAT asset_carrier_reference_kat).
+ *
+ * It follows DigiAsset Core, the reference indexer. Its decodeAssetTxHeader reads the LAST nulldata
+ * output (DigiByte Core's Solver: OP_RETURN followed only by complete pushes). Before that, its
+ * transaction reader (DigiByteTransaction constructor, dataIndex) offers the FIRST nulldata output
+ * to the KYC, exchange-rate and encrypted-key readers, and a match there ends the reading. Those
+ * matches depend on more than the scripts, so the wallet credits only a transaction whose single
+ * nulldata output is its single tagged output -- the reference's first and last nulldata output
+ * at once. The encrypted-key reader (decodeEncryptedKeyTx) can still take such a lone carrier: it
+ * reads no content, only one input, two or three outputs, output 0 worth exactly
+ * DA_ENCRYPTED_KEY_SATS and the nulldata output at index 1. That shape is UNDECIDED too. (The
+ * exchange-rate reader also needs the indexer's own watch list, which the wallet does not have.)
+ *
+ *   DA_TX_NONE       no output is tagged "DA": a plain transaction.
+ *   DA_TX_CARRIER    exactly one output is nulldata, exactly one is tagged, they are the same
+ *                    output, its payload classifies, and the transaction is not in the
+ *                    encrypted-key shape; *carrierIdx is that output.
+ *   DA_TX_UNDECIDED  anything else with a tagged output: nothing may be credited, and every
+ *                    output is held.
+ */
+#define DA_ENCRYPTED_KEY_SATS 650   /* output 0 of a DigiAsset Core encrypted-key transaction */
+
+int BRTxAssetCarrier(const BRTransaction *transaction, size_t *carrierIdx)
+{
+    size_t tagged = 0, nullData = 0, carrier = (size_t)-1, ho = 0;
+    const uint8_t *pe = NULL;
+    int carrierFramed = 0;
+
+    if (!transaction) return DA_TX_NONE;
+    for (size_t i = 0; i < transaction->outCount; ++i) {
+        const BRTxOutput *o = &transaction->outputs[i];
+        size_t h;
+        const uint8_t *e;
+        int r = _BRAssetPayloadSpan(o, &h, &e);
+#ifdef ASSET_CARRIER_REF_UNFIXED
+        /* UNFIXED arm, built only by the reference-carrier KAT: the earlier rule -- the last output
+         * that frames as a carrier, whatever OP_RETURN follows it; unclassifiable framing anywhere
+         * holds everything. */
+        if (r == DA_CARRIER_UNCLASSIFIED) return DA_TX_UNDECIDED;
+        if (r == DA_CARRIER_FOUND) { tagged = 1; nullData = 1; carrier = i; ho = h; pe = e; carrierFramed = 1; }
+#else
+        int isNull = (o->script && _BRScriptIsNullData(o->script, o->scriptLen));
+
+        if (isNull) nullData++;
+        if (r != DA_CARRIER_NONE) {
+            tagged++;
+            if (isNull) { carrier = i; carrierFramed = (r == DA_CARRIER_FOUND); ho = h; pe = e; }
+        }
+#endif
+    }
+    if (tagged == 0) return DA_TX_NONE;
+    if (tagged != 1 || nullData != 1 || !carrierFramed) return DA_TX_UNDECIDED;
+#ifndef ASSET_CARRIER_REF_UNFIXED
+    if (_BRCarrierNames(&transaction->outputs[carrier], ho, pe, (size_t)-1) == DA_NAMES_UNCLASSIFIED)
+        return DA_TX_UNDECIDED;
+    if (carrier == 1 && transaction->inCount == 1 && transaction->outCount >= 2 && transaction->outCount <= 3 &&
+        transaction->outputs[0].amount == DA_ENCRYPTED_KEY_SATS)
+        return DA_TX_UNDECIDED;   /* DigiAsset Core reads it as an encrypted-key transaction */
+#endif
+    if (carrierIdx) *carrierIdx = carrier;
+    return DA_TX_CARRIER;
+}
+
+/*
+ * Returns 1 if an asset was sent to the output -- or, fail closed, if BRTxAssetCarrier cannot
+ * decide the transaction or its carrier cannot be classified (DA_UNCLASSIFIED_ANSWER): then every
+ * output of the transaction is held, whichever one is asked about.
+ */
+uint8_t BRTxOutputIsAsset(const BRTransaction* transaction, const BRTxOutput* output) {
+    size_t idx = (size_t)-1, carrier = 0, hdrOff = 0;
+    const uint8_t *payloadEnd = NULL;
+    const BRTxOutput *or_output;
+    int verdict, named;
+
+    for (size_t i = 0; i < transaction->outCount; ++i) {
+        if (&transaction->outputs[i] == output)
+            idx = i;
+    }
+    if (idx == (size_t)-1) return 0;
+
+    verdict = BRTxAssetCarrier(transaction, &carrier);
+    if (verdict == DA_TX_NONE) return 0;
+    if (verdict == DA_TX_UNDECIDED) return DA_UNCLASSIFIED_ANSWER;
+    or_output = &transaction->outputs[carrier];
+    if (_BRAssetPayloadSpan(or_output, &hdrOff, &payloadEnd) != DA_CARRIER_FOUND) return DA_UNCLASSIFIED_ANSWER;
+    named = _BRCarrierNames(or_output, hdrOff, payloadEnd, idx);
+    if (named == DA_NAMES_UNCLASSIFIED) return DA_UNCLASSIFIED_ANSWER;
+    return (uint8_t)named;
 }

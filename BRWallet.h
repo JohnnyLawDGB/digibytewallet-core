@@ -95,6 +95,13 @@ inline static int BRUTXOEq(const void *utxo, const void *otherUtxo)
 typedef struct BRWalletStruct BRWallet;
     
 // allocates and populates a BRWallet struct that must be freed by calling BRWalletFree()
+// OWNERSHIP of transactions[] (REGISTER-RESULT): the wallet takes each record it keeps; it skips a
+// repeated hash, an unsigned record and one outside the money range WITHOUT freeing it or saying so, and
+// a skipped record stays the caller's. The caller tells them apart with
+// BRWalletTransactionForHash(wallet, tx->txHash) != tx, which is valid ONLY before the wallet is shared
+// with another thread (a peer manager, a JNI call): once it is, that lookup races with registration and
+// release, and records must be added with BRWalletRegisterTransactionOutcome instead. The same holds for
+// BRWalletNewDual and BRWalletOpenWithKeys (BRWalletOpen.h). The array itself stays the caller's.
 BRWallet *BRWalletNew(BRTransaction *transactions[], size_t txCount, BRMasterPubKey mpk);
 
 // allocates a wallet with dual master key support: mpkBIP84 is the primary BIP84 key (m/84'/20'/0'),
@@ -256,6 +263,9 @@ BRTransaction *BRWalletCopyTransactionForHash(BRWallet *wallet, UInt256 txHash);
 //   [4] tx count, then per tx: [4] serialized len, [4] blockHeight, [4] timestamp, [N] tx bytes.
 // If buf == NULL or bufLen is too small, nothing is written and the REQUIRED size is returned;
 // otherwise the blob is written and the number of bytes WRITTEN (== required size) is returned.
+// A wallet holding more than BR_SAVED_TRANSACTIONS_MAX_COUNT transactions (BRSavedTransactions.h,
+// the readers' limit) gets 0 and nothing is written: the wallet never writes a blob its reader
+// refuses (TX-CKPT-CAP).
 size_t BRWalletSerializeTransactions(BRWallet *wallet, uint8_t *buf, size_t bufLen);
 
 // writes transactions registered in the wallet, and that were unconfirmed before blockHeight, to the transactions array
@@ -288,8 +298,17 @@ size_t BRWalletUTXOs(BRWallet *wallet, BRUTXO utxos[], size_t utxosCount);
 // else. Returns the number written, or the total when utxos is NULL.
 size_t BRWalletSelectableUTXOs(BRWallet *wallet, BRUTXO utxos[], size_t utxosCount);
 
+// SEND-GATE-SET: 1 when the outpoint is among the coins BRWalletSelectableUTXOs lists (the same predicate,
+// asked of one outpoint with its own walk budget); 0 otherwise.
+int BRWalletOutpointSelectable(BRWallet *wallet, UInt256 txHash, uint32_t n);
+
 // wallet's unspent DigiDollar token UTXOs (SEND coin-selection input)
 size_t BRWalletDigiDollarUTXOs(BRWallet *wallet, BRUTXO utxos[], size_t utxosCount);
+
+// ASSET-SIGN-GATE: the outputs the wallet holds as DigiAsset holdings (assetUtxos), copied under the
+// wallet's lock. Not pruned of spends: pair each with BRWalletOutpointAssetState. Returns the number
+// written, or the total when utxos is NULL.
+size_t BRWalletAssetUTXOs(BRWallet *wallet, BRUTXO utxos[], size_t utxosCount);
 
 // true if the outpoint (txHash, n) has been spent by a registered tx. Reads the
 // authoritative spentOutputs set (rebuilt every balance update from every
@@ -331,19 +350,71 @@ int BRWalletSignTransaction(BRWallet *wallet, BRTransaction *tx, int forkId, con
 // true if the given transaction is associated with the wallet (even if it hasn't been registered)
 int BRWalletContainsTransaction(BRWallet *wallet, const BRTransaction *tx);
 
-// adds a transaction to the wallet, or returns false if it isn't associated with the wallet
+// Who holds tx once a registration returns (REGISTER-RESULT). Every register entry point below
+// reports one of these, decided under the wallet's lock in the same critical section that took or
+// refused tx, so a caller never has to infer ownership from a later lookup.
+typedef enum {
+    BR_WALLET_REGISTER_REFUSED = 0,   // the wallet does not hold tx: it was refused (money range, an unsigned
+                                      // spend of a wallet coin), or it is a non-wallet tx the wallet does not
+                                      // keep (confirmed, or past the kept set's bounds). The CALLER still owns
+                                      // tx and releases it.
+    BR_WALLET_REGISTER_KEPT,          // the wallet holds tx itself as one of its transactions (newly, or tx is
+                                      // the wallet's own record passed back). The WALLET owns tx: the caller
+                                      // must not release it.
+    BR_WALLET_REGISTER_KEPT_FOREIGN,  // the wallet holds tx itself as an unconfirmed non-wallet tx (for the
+                                      // validity and pending checks of its own). The WALLET owns tx: the caller
+                                      // must not release it.
+    BR_WALLET_REGISTER_DUPLICATE,     // the wallet already held a different record of tx's hash and did not
+                                      // take tx (it may have moved its own record into its transactions). The
+                                      // CALLER still owns tx and releases it.
+} BRWalletRegisterOutcome;
+
+// True when the outcome leaves tx with the wallet (KEPT or KEPT_FOREIGN): the caller must not release tx.
+static inline int BRWalletRegisterOutcomeHeld(BRWalletRegisterOutcome outcome)
+{
+    return outcome == BR_WALLET_REGISTER_KEPT || outcome == BR_WALLET_REGISTER_KEPT_FOREIGN;
+}
+
+// How a registration checks an unconfirmed tx's signatures on wallet coins (see the three forms below).
+typedef enum {
+    BR_WALLET_REGISTER_TRUSTED = 0,   // as BRWalletRegisterTransactionTrusted
+    BR_WALLET_REGISTER_CHECKED = 1,   // as BRWalletRegisterTransaction
+    BR_WALLET_REGISTER_UNPROVEN = 2,  // as BRWalletRegisterTransactionUnproven
+} BRWalletRegisterCheck;
+
+// Registers tx with the given check. Returns what the three forms below return, and writes to *outcome
+// who holds tx now. outcome must not be NULL (asserted): a caller that does not read the outcome cannot
+// know whether it may release tx. Ownership follows *outcome and nothing else:
+// BRWalletRegisterOutcomeHeld(*outcome) -> the wallet owns tx; otherwise the caller still does.
+// Production callers use this form, pass &<their outcome> and read it with BRWalletRegisterOutcomeHeld
+// (register_result_kat checks both, and that none uses the three below).
+int BRWalletRegisterTransactionOutcome(BRWallet *wallet, BRTransaction *tx, BRWalletRegisterCheck check,
+                                       BRWalletRegisterOutcome *outcome);
+
+// adds a transaction to the wallet. The return value is the legacy answer, and it says NOTHING about who
+// owns tx, nor whether tx is a wallet tx:
+//   1 -- tx was newly added as a wallet tx (KEPT), or the wallet already held a record of tx's hash and
+//        this call did not refuse it at the money-range or signature check: tx itself (KEPT, or
+//        KEPT_FOREIGN for the wallet's own non-wallet record passed back) or a different object
+//        (DUPLICATE, wallet and non-wallet records alike: the caller still owns tx).
+//   0 -- tx was refused at the money-range or signature check (a hash the wallet did not hold: REFUSED;
+//        a held non-wallet record the call would have moved into the wallet's transactions: KEPT_FOREIGN
+//        when tx is that record, DUPLICATE when tx is another object of its hash), or tx is a hash the
+//        wallet did not hold and a non-wallet tx, whether newly kept as foreign (KEPT_FOREIGN, the wallet
+//        owns it) or not kept (confirmed, or past the kept set's bounds: REFUSED, the caller owns it).
+// OWNERSHIP: read it from BRWalletRegisterTransactionOutcome's *outcome, never from this value.
 int BRWalletRegisterTransaction(BRWallet *wallet, BRTransaction *tx);
 
 // The same, accepting an unconfirmed tx's signatures on the wallet's outputs as they stand now, without
 // checking them. Only for a tx that needs no check: one this wallet signed itself, or one delivered inside
 // a block whose transaction list hashes to its header. The acceptance is not permanent: it is checked
 // again when the tx's wallet-owned inputs change, or when a reorg takes it back to unconfirmed. Every
-// other caller uses BRWalletRegisterTransaction.
+// other caller uses BRWalletRegisterTransaction. OWNERSHIP: as BRWalletRegisterTransaction.
 int BRWalletRegisterTransactionTrusted(BRWallet *wallet, BRTransaction *tx);
 
 // The same as BRWalletRegisterTransaction for a tx whose height the wallet has not proven itself (a
 // server reported it): its signatures on wallet coins are checked at any height, at registration and at
-// every balance rebuild, as an unconfirmed tx's are.
+// every balance rebuild, as an unconfirmed tx's are. OWNERSHIP: as BRWalletRegisterTransaction.
 int BRWalletRegisterTransactionUnproven(BRWallet *wallet, BRTransaction *tx);
 
 // BRWalletUpdateTransactions for heights a server reported: the records stay checked as above.
@@ -442,8 +513,16 @@ BRUTXO * BRGetUTXO(BRWallet *wallet);
 //   0 SPENT, 1 HELD, -1 UNDETECTED (funding tx unknown), -2 CONFLICTED (funding tx known
 // but invalid -- another transaction spent its inputs, i.e. a stuck send that was re-sent).
 // CONFLICTED cannot be derived from spent-ness: nothing ever spends the abandoned attempt's
-// own change output.
+// own change output. -3 OTHER_FAMILY (ONE-FAMILY): the output is a DigiDollar output, or its
+// transaction carries both a DigiDollar marking and a DigiAsset tag; it is never an asset holding.
 int BRWalletOutpointAssetState(BRWallet *wallet, UInt256 txHash, uint32_t n);
+
+// ONE-FAMILY: 1 when the wallet holds txHash and output n of it may be spent by no asset send, no plain
+// send and no sweep -- a DigiDollar output (spent only by BRWalletCreateDigiDollarTransfer), or an output
+// of a transaction marked both DigiDollar and DigiAsset (spent by nothing). 0 when it may be spent.
+// -1 when the wallet does not hold txHash or it has no output n: it cannot be judged, and a caller
+// that gates a spend must refuse it.
+int BRWalletOutpointIsOneFamilyHeld(BRWallet *wallet, UInt256 txHash, uint32_t n);
 
 int BRWalletRegisterAssetOutpoint(BRWallet *wallet, UInt256 txHash, uint32_t n);
 

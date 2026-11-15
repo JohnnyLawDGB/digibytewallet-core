@@ -316,7 +316,9 @@ Remarks:
    persistently-divergent peer can't loop forever.
 
    CF_CONTINUITY_REANCHOR_K is now consulted ONLY by the single-peer escape
-   hatch (CF_SINGLE_PEER_REANCHOR_ROUNDS' companion, one connected filter peer)
+   hatch (CF_SINGLE_PEER_REANCHOR_ROUNDS' companion, one connected filter peer:
+   since G5-QUORUM, above the top compiled checkpoint and outside own-node exclusive
+   mode, that hatch needs this many distinct peers claiming the same prevFilterHeader)
    and by the -DCF_QUORUM_UNFIXED fallback below. The multi-peer quorum re-anchor
    decision itself was widened past raw K (see CF_CONTINUITY_REANCHOR_FLOOR). */
 #define CF_CONTINUITY_REANCHOR_K   2
@@ -386,6 +388,21 @@ Remarks:
 #ifndef CF_DISAGREED_CAP
 #define CF_DISAGREED_CAP PEER_MAX_CONNECTIONS
 #endif
+
+/* G5-QUORUM. The cfcheckpt rebuild decision counts only peers that ANSWERED: its
+   denominator is the distinct (address, port) peers, none at the cfheaders source's
+   address and all still connected, whose cfcheckpt reply compared at least one height
+   above the compiled table in the current window. Our chain is the outlier only when at
+   least CF_CKPT_QUORUM_MIN of those repliers, on at least CF_CKPT_QUORUM_MIN DISTINCT
+   addresses, report the SAME value at the SAME height and they are a strict majority of
+   the repliers. Silent and departed peers and the source are neither for nor against;
+   one replier, or one host on many ports, can never rebuild.
+
+   CF_CKPT_PEER_CAP bounds the replier set and the per-peer re-check cursors. Twice the
+   connection cap, so a slot held by a peer that has since disconnected can always be
+   reused for a connected one (at most PEER_MAX_CONNECTIONS are connected at once). */
+#define CF_CKPT_QUORUM_MIN 2
+#define CF_CKPT_PEER_CAP   (2 * PEER_MAX_CONNECTIONS)
 
 /* Floor of connected filter peers below which the cfheaders stall-recovery must
    NOT disconnect a peer. A batch no peer can serve (e.g. a contested range during
@@ -640,7 +657,8 @@ void BRPeerManagerClearPinnedPeer(BRPeerManager *manager);
 
 // Compact-filter status of the peer at addr:port, for the own-node connectivity UI:
 // one of BR_CF_PEER_{UNKNOWN,CONNECTING,CONNECTED_NOT_SERVING,SERVING} (see
-// BRPeerCFStatus.h). SERVING means it has answered a cfheaders/cfilter this session.
+// BRPeerCFStatus.h). SERVING means it has answered a cfheaders/cfilter this session and no
+// request of ours to it has stalled since (OWNNODE-LIVE: a stalled request reads not-serving).
 int BRPeerManagerCompactFilterPeerStatus(BRPeerManager *manager, UInt128 addr, uint16_t port);
 
 // connect to bitcoin peer-to-peer network (also call this whenever networkIsReachable() status changes)
@@ -914,7 +932,14 @@ uint32_t BRPeerManagerRetireAbandonedBand(BRPeerManager *manager);
 
    Safe on any tick and safe to call forever — it re-derives everything from the ledger and
    the block set, so a missed tick, a dropped peer or a process restart costs time, never
-   correctness. Does nothing when there is no band or no connected peer. */
+   correctness. Does nothing when there is no band or no connected peer, and requests nothing
+   for a band at or below the scan ledger's start (CF-ABANDONED-AT-START): that band lies below
+   anything this ledger scans, so no header can retire it; only a rescan clears it.
+
+   Retirement only RE-OPENS scanning: it lowers abandonedBelow, never below the ledger's start,
+   so abandonedBelow never returns to 0 through this path. Both the app's poll (WalletViewModel)
+   and BRCFAbandonmentPoll clear the history-gap banner only on abandonedBelow == 0, so a retired
+   band never clears the banner; only a rescan (a re-Init below the band) does. */
 uint32_t BRPeerManagerBackfillAbandonedBandStep(BRPeerManager *manager);
 
 // SPAN below the watermark: heights in [start .. abandonedBelow-1], i.e.

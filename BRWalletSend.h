@@ -103,8 +103,10 @@ static inline void BRWalletRegisterOwnSend(BRWallet *wallet, BRTransaction *tx)
     walletCopy = BRTransactionCopy(tx);
 #endif
     if (! walletCopy) return;                                       // the peer relay-back re-registers
-    BRWalletRegisterTransactionTrusted(wallet, walletCopy);
-    if (walletCopy != tx && BRWalletTransactionForHash(wallet, tx->txHash) != walletCopy) BRTransactionFree(walletCopy);
+    BRWalletRegisterOutcome held = BR_WALLET_REGISTER_REFUSED;
+    BRWalletRegisterTransactionOutcome(wallet, walletCopy, BR_WALLET_REGISTER_TRUSTED, &held);
+    // The copy is the wallet's only when the registration says the wallet took it (REGISTER-RESULT).
+    if (walletCopy != tx && ! BRWalletRegisterOutcomeHeld(held)) BRTransactionFree(walletCopy);
 }
 
 // ---- 2. the publish verdict ring -----------------------------------------------------------

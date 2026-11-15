@@ -90,8 +90,8 @@ static void minimaCorpus(void)
     n = blob(b, 2, unconf, 2); minimaLine(b, n);
     n = blob(b, 3, below, 3); minimaLine(b, n);
     n = blob(b, 2, past, 2); minimaLine(b, n);
-    n = blob(b, 10001, capped, 1); minimaLine(b, n);
-    n = blob(b, 10000, capped, 1); minimaLine(b, n);
+    n = blob(b, BR_SAVED_TRANSACTIONS_MAX_COUNT + 1, capped, 1); minimaLine(b, n);
+    n = blob(b, BR_SAVED_TRANSACTIONS_MAX_COUNT, capped, 1); minimaLine(b, n);
     n = blob(b, 3, two, 2); minimaLine(b, n);     // a count above the records present
     n = blob(b, 1, two, 2); minimaLine(b, n);     // a count below them
     n = blob(b, 2, two, 2);

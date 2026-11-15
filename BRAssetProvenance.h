@@ -22,9 +22,14 @@
 //      accepted only when they hash to the id asked for (BRRawTxId, BRRawTxBinding.h), and are otherwise
 //      no bytes.
 //        no bytes                                                     -> UNAVAILABLE (weather: retry);
-//        then the transaction's FIRST output whose script begins OP_RETURN (0x6a) is decoded
-//        (BRAssetDecodeHeader); no such output, bytes that do not parse, a script that is not a
-//        carrier, and a tagged carrier that cannot be classified     -> DEAD END;
+//        then the transaction's carrier is read by the ONE CARRIER RULE, BRTxAssetCarrier
+//        (BRDigiAsset.c, DA-014-REF; Kotlin: DigiAssetCarrierRule.verdict, the hop since Android
+//        4.1.4), and only a DA_TX_CARRIER answer is decoded (BRAssetDecodeHeader, the output it
+//        names). Bytes that do not parse, a transaction with no output array, DA_TX_NONE (no output
+//        tagged "DA"), DA_TX_UNDECIDED (a second nulldata or tagged output of any kind, a tagged
+//        output that is not nulldata, a carrier that cannot be classified, the encrypted-key
+//        shape), and a carrier the decoder cannot classify            -> DEAD END: nothing is named
+//                                                                        or recorded from it;
 //        an ISSUANCE that is not locked                               -> DEAD END (its id is computed
 //                                                                        from a script this is not given);
 //        an ISSUANCE with no first input, or whose id is refused
@@ -83,9 +88,10 @@
 //
 //  No allocation, no wallet, no network, no clock, no I/O. Header-only, static inline; its includes are
 //  libc, BRTransaction.h (BRTransaction, read only, no function of it called), BRAssetDecode.h
-//  (BRAssetDecodeHeader, BRAssetMetadataCid) and BRAssetId.h (BRAssetIdForIssuance, so a program that
-//  calls BRAssetHopClassify links BRCrypto.c and BRBase58.c), which this header uses and does not
-//  redefine. It reads no build-time policy macro. Nothing in the core calls it yet.
+//  (BRAssetDecodeHeader, BRAssetMetadataCid), BRAssetId.h (BRAssetIdForIssuance) and BRDigiAsset.h
+//  (BRTxAssetCarrier), which this header uses and does not redefine; a program that calls
+//  BRAssetHopClassify links BRDigiAsset.c, BRCrypto.c and BRBase58.c. It reads no build-time policy
+//  macro. Nothing in the core calls it yet.
 //
 //  Test seams (host KAT asset_provenance_rules_kat in the Android repo): ASSET_PROVENANCE_UNFIXED, tested
 //  by VALUE as a set of bits; each comparison arm sets one bit and fails only its own cases. Unset or =0
@@ -106,6 +112,8 @@
 //    8192   ASSET_PROVENANCE_RED_PARENTS_REPEATED   a repeated parent, and the start txid, are walked again.
 //    16384  ASSET_PROVENANCE_RED_ISSUANCE_ANY_ROW   a row without the issuance opcode answers for the issuance.
 //    32768  ASSET_PROVENANCE_RED_KNOWN_UNCHECKED    the store's issuance facts are taken without the id check.
+//    65536  ASSET_PROVENANCE_RED_FIRST_OP_RETURN    the hop decodes the first script that begins 0x6a, not the
+//                                                   carrier the one carrier rule names (the hop before 2026-11).
 //
 
 #ifndef BRAssetProvenance_h
@@ -114,6 +122,7 @@
 #include "BRTransaction.h"   // BRTransaction, BRTxInput, BRTxOutput (read only)
 #include "BRAssetDecode.h"   // BRAssetDecodeHeader, BRAssetMetadataCid, BRAssetHeader
 #include "BRAssetId.h"       // BRAssetIdForIssuance, BR_ASSET_ID_BUFFER
+#include "BRDigiAsset.h"     // BRTxAssetCarrier, DA_TX_CARRIER (the one carrier rule)
 #include <stddef.h>
 #include <stdint.h>
 #include <string.h>
@@ -142,6 +151,7 @@ extern "C" {
 #define ASSET_PROVENANCE_RED_PARENTS_REPEATED   8192
 #define ASSET_PROVENANCE_RED_ISSUANCE_ANY_ROW   16384
 #define ASSET_PROVENANCE_RED_KNOWN_UNCHECKED    32768
+#define ASSET_PROVENANCE_RED_FIRST_OP_RETURN    65536
 
 // A txid's length in characters (display-order hex), and the bytes that hold it with the NUL after it.
 #define BR_ASSET_TXID_LENGTH 64
@@ -374,6 +384,7 @@ static inline BRAssetHop BRAssetHopClassify(int fetched, const BRTransaction *tx
     }
     if (! tx) return _BRAssetHopOf(BR_ASSET_HOP_DEAD_END);
 
+#if (ASSET_PROVENANCE_UNFIXED & ASSET_PROVENANCE_RED_FIRST_OP_RETURN)
     for (i = 0; tx->outputs && i < tx->outCount; i++) {
         const BRTxOutput *out = &tx->outputs[i];
 
@@ -383,6 +394,13 @@ static inline BRAssetHop BRAssetHopClassify(int fetched, const BRTransaction *tx
             break;
         }
     }
+#else
+    // The one carrier rule: only a transaction it decides names an asset, by the output it names.
+    if (tx->outputs && BRTxAssetCarrier(tx, &i) == DA_TX_CARRIER && i < tx->outCount) {
+        script = tx->outputs[i].script;
+        scriptLen = tx->outputs[i].scriptLen;
+    }
+#endif
     if (! script) return _BRAssetHopOf(BR_ASSET_HOP_DEAD_END);
     if (BRAssetDecodeHeader(script, scriptLen, &header) != BR_ASSET_SCRIPT_ASSET) return _BRAssetHopOf(BR_ASSET_HOP_DEAD_END);
 

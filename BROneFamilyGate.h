@@ -21,7 +21,8 @@
 //  Defined, it is the comparison arm: every input accepted. Never defined in a production build.
 //
 //  Host KATs: digibytewallet-android native/src/test/host/asset_sign_gate_core_kat/ (this header against
-//  one_family_kat's cases) and asset_send_kat/ (BRWalletBuildAssetTransfer).
+//  one_family_kat's cases, and called directly: no wallet, no transaction, a refused input first or last) and
+//  asset_send_kat/ (BRWalletBuildAssetTransfer).
 //  Header-only, static inline; no I/O. The wallet is asked once per input, under its own lock each time.
 //
 

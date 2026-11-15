@@ -64,7 +64,9 @@
 //  ships. Never defined in a production build.
 //
 //  Host KATs: digibytewallet-android native/src/test/host/asset_sign_gate_core_kat/ (this header against
-//  asset_sign_gate_kat's cases, every arm) and asset_send_kat/ (BRWalletBuildAssetTransfer).
+//  asset_sign_gate_kat's cases, every arm, and called directly on hand-built transactions and wallet state for
+//  the guards BRWalletBuildAssetTransfer's checks keep the sign path from reaching) and asset_send_kat/
+//  (BRWalletBuildAssetTransfer).
 //  Header-only, static inline; no I/O.
 //
 

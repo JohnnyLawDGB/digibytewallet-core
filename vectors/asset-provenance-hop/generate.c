@@ -37,7 +37,6 @@
 // cannot be read.
 //
 
-#define _DEFAULT_SOURCE  // strtok_r is POSIX: glibc declares it under -std=c99 only with this
 #include "BRAssetProvenance.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -54,6 +53,21 @@ static int BAD = 0;
 
 static void emit(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 #include <stdarg.h>
+
+// strtok_r is POSIX, not C99, and a -std=c99 build on glibc does not declare it: a C99 one.
+static char *_tok(char *s, const char *delim, char **save)
+{
+    char *end;
+
+    if (! s) s = *save;
+    s += strspn(s, delim);
+    if (*s == '\0') { *save = s; return NULL; }
+    end = s + strcspn(s, delim);
+    if (*end != '\0') *end++ = '\0';
+    *save = end;
+    return s;
+}
+
 static void emit(const char *fmt, ...)
 {
     va_list ap;
@@ -268,18 +282,18 @@ static void daCarrierCases(const char *path)
 
         if (strncmp(line, "v ", 2) != 0) continue;
         line[strcspn(line, "\r\n")] = '\0';
-        tok = strtok_r(line + 2, " ", &save);
+        tok = _tok(line + 2, " ", &save);
         if (! tok || strlen(tok) >= sizeof(name)) { fail(path, "a case without a name"); break; }
         strcpy(name, tok);
-        tok = strtok_r(NULL, " ", &save);
+        tok = _tok(NULL, " ", &save);
         if (! tok || strlen(tok) >= sizeof(expected)) { fail(name, "no expected verdict"); break; }
         strcpy(expected, tok);
-        while ((tok = strtok_r(NULL, " ", &save))) {
+        while ((tok = _tok(NULL, " ", &save))) {
             if (strncmp(tok, "in=", 3) == 0) { nIn = (size_t)strtoul(tok + 3, NULL, 10); continue; }
             if (strncmp(tok, "amt=", 4) == 0) {
                 char *a = tok + 4, *s2 = NULL, *x;
                 hasAmt = 1;
-                for (x = strtok_r(a, ",", &s2); x && nAmt < OMAX; x = strtok_r(NULL, ",", &s2)) amts[nAmt++] = strtoull(x, NULL, 10);
+                for (x = _tok(a, ",", &s2); x && nAmt < OMAX; x = _tok(NULL, ",", &s2)) amts[nAmt++] = strtoull(x, NULL, 10);
                 continue;
             }
             if (nOut >= OMAX || ! outOf(&outs[nOut], tok, 700)) { fail(name, "an output that does not fit"); goto done; }

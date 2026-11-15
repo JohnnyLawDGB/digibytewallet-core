@@ -87,7 +87,10 @@
 //  15a. ONE-FAMILY (BROneFamilyGate.h): an input, asset or fee, that the wallet holds as DigiDollar or
 //       that is an output of a transaction marked both DigiDollar and DigiAsset, or that it cannot judge
 //       (BRWalletOutpointIsOneFamilyHeld not 0)                                         -> OTHER_FAMILY
-//  15b. ASSET-SIGN-GATE (BRAssetSignGate.h): BRAssetSignCheck(wallet, tx, the recipient's script,
+//  15b. ASSET-SIGN-GATE (BRAssetSignGate.h): plan.paidFeeSats or approvedFeeSats at or below 0, refused before
+//       the gate is asked, since it takes both as uint64_t (the bridge's refusal of an approval of no fee;
+//       checks 13 and 14 refuse such a fee first; report->signVerdict stays BR_ASSET_SIGN_OK) -> NOT_APPROVED
+//       BRAssetSignCheck(wallet, tx, the recipient's script,
 //       BR_ASSET_MARKER_SATS, plan.paidFeeSats, approvedFeeSats) on the transaction about to be signed is
 //       not BR_ASSET_SIGN_OK: an input that is neither a coin the wallet's selection would spend nor a
 //       DigiAsset holding the wallet holds in state 1 (BRWalletAssetUTXOs), or that pays no address of the
@@ -122,13 +125,15 @@
 //
 //  report (optional), written on every path: the input refused, in signing order (checks 6 and 15;
 //  SIZE_MAX otherwise), the fee the transaction would pay (from check 13 on; 0 before), and
-//  BRAssetSignCheck's verdict (checks 15b and 18a; BR_ASSET_SIGN_OK otherwise).
+//  BRAssetSignCheck's verdict (checks 15b and 18a; BR_ASSET_SIGN_OK otherwise, and for 15b's refusal of a fee
+//  at or below 0, which does not ask it).
 //
 //  NETWORK. BRAddressScriptPubKey follows BRNetworkIsTestnet() at the call.
 //
 //  Comparison arms for the host KAT only (asset_send_kat in the Android repo): BR_ASSET_TRANSFER_UNFIXED,
 //  tested by VALUE as a set of bits, read in BRAssetSend.c; each arm sets one bit and fails only its own
-//  cases. Unset or =0 is what ships.
+//  cases, except 524288, whose refusal checks 13 and 14 make first: it is run with 64 and with 128, and each
+//  pair fails that bit's cases and its partner's. Unset or =0 is what ships.
 //    1      BR_ASSET_TRANSFER_RED_SHAPE        the plan's outputs and source script are not checked (4).
 //    2      BR_ASSET_TRANSFER_RED_ASSET        the asset inputs' asset and units are not checked (5).
 //    4      BR_ASSET_TRANSFER_RED_BOUNDS       a negative vout and out-of-range sats are cast, unchecked (6).
@@ -148,7 +153,9 @@
 //    65536  BR_ASSET_TRANSFER_RED_RULES        the rule state is not asked (2), and the allocator is told
 //                                              the units are rule-free whatever it is (11).
 //    131072 BR_ASSET_TRANSFER_RED_ONE_FAMILY   ONE-FAMILY is not asked (15a).
-//    262144 BR_ASSET_TRANSFER_RED_SIGN_GATE    BRAssetSignCheck is not asked, before or after signing (15b, 18a).
+//    262144 BR_ASSET_TRANSFER_RED_SIGN_GATE    BRAssetSignCheck is not asked, before or after signing, and 15b's fee
+//                                              refusal is not made (15b, 18a).
+//    524288 BR_ASSET_TRANSFER_RED_SIGN_FEE     a fee at or below 0 is handed to BRAssetSignCheck, cast (15b).
 //
 //  Permission is hereby granted, free of charge, to any person obtaining a copy
 //  of this software and associated documentation files (the "Software"), to deal
@@ -221,7 +228,8 @@ typedef enum {
 typedef struct {
     size_t input;              // BAD_INPUT and the wallet's checks: the input refused, in signing order; else SIZE_MAX
     int64_t paidFeeSats;       // from the fee check on: every input's sats less every output's; else 0
-    BRAssetSignVerdict signVerdict;   // NOT_APPROVED and SIGNED_NOT_APPROVED: BRAssetSignCheck's verdict; else OK
+    BRAssetSignVerdict signVerdict;   // NOT_APPROVED and SIGNED_NOT_APPROVED: BRAssetSignCheck's verdict (OK when
+                                      // 15b refused a fee at or below 0 without asking it); else OK
 } BRAssetTransferReport;
 
 // Builds and signs the transfer `outcome` plans (see THE TRANSACTION and THE CHECKS). assetRows and dgbRows are

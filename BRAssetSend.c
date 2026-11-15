@@ -40,6 +40,7 @@
 #define BR_ASSET_TRANSFER_RED_RULES          65536
 #define BR_ASSET_TRANSFER_RED_ONE_FAMILY     131072
 #define BR_ASSET_TRANSFER_RED_SIGN_GATE      262144
+#define BR_ASSET_TRANSFER_RED_SIGN_FEE       524288
 
 #define _RED(bit) (BR_ASSET_TRANSFER_UNFIXED & (bit))
 
@@ -495,8 +496,13 @@ BRAssetTransferStatus BRWalletBuildAssetTransfer(BRTransaction **txOut, BRWallet
     if (! BRWalletTxInputsOneFamilyOK(wallet, tx)) { r = BR_ASSET_TRANSFER_OTHER_FAMILY; goto out; }
 #endif
     // 15b. ASSET-SIGN-GATE on the transaction about to be signed (BRAssetSignGate.h): the approved marker to the
-    // approved recipient, the plan's fee within the approval. Checks 13 and 14 put both fees above 0.
+    // approved recipient, the plan's fee within the approval. The gate takes both fees as uint64_t, so a fee at
+    // or below 0 is refused here before either is cast, as the bridge refuses one before asset_sign_check;
+    // checks 13 and 14 refuse such a fee first, and this does not lean on them.
 #if ! _RED(BR_ASSET_TRANSFER_RED_SIGN_GATE)
+#if ! _RED(BR_ASSET_TRANSFER_RED_SIGN_FEE)
+    if (plan->paidFeeSats <= 0 || approvedFeeSats <= 0) { r = BR_ASSET_TRANSFER_NOT_APPROVED; goto out; }
+#endif
     rep.signVerdict = BRAssetSignCheck(wallet, tx, recipientScript, recipientLen, BR_ASSET_MARKER_SATS,
                                        (uint64_t)plan->paidFeeSats, (uint64_t)approvedFeeSats);
     if (rep.signVerdict != BR_ASSET_SIGN_OK) { r = BR_ASSET_TRANSFER_NOT_APPROVED; goto out; }

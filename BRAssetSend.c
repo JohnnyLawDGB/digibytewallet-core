@@ -11,6 +11,8 @@
 #include "BRAssetDecode.h"     // BRAssetDecodeInstructions, BRAssetPayloadReadsExactly
 #include "BRAddress.h"         // BRAddressScriptPubKey
 #include "BRSpendGate.h"       // BRSpendGuardInputsUnspent, BRSignedSpendGate
+#include "BRCoinReservation.h" // BRCoinReservationRelease
+#include "BROneFamilyGate.h"   // BRWalletTxInputsOneFamilyOK
 
 #include <stdlib.h>
 #include <string.h>
@@ -36,6 +38,8 @@
 #define BR_ASSET_TRANSFER_RED_GATE           16384
 #define BR_ASSET_TRANSFER_RED_DUPLICATE      32768
 #define BR_ASSET_TRANSFER_RED_RULES          65536
+#define BR_ASSET_TRANSFER_RED_ONE_FAMILY     131072
+#define BR_ASSET_TRANSFER_RED_SIGN_GATE      262144
 
 #define _RED(bit) (BR_ASSET_TRANSFER_UNFIXED & (bit))
 
@@ -321,7 +325,7 @@ BRAssetTransferStatus BRWalletBuildAssetTransfer(BRTransaction **txOut, BRWallet
                                                  const void *seed, size_t seedLen, double now,
                                                  BRAssetTransferReport *report)
 {
-    BRAssetTransferReport rep = { SIZE_MAX, 0 };
+    BRAssetTransferReport rep = { SIZE_MAX, 0, BR_ASSET_SIGN_OK };
     BRAssetTransferStatus r = BR_ASSET_TRANSFER_SIGNED;
     const BRAssetTransferPlan *plan;
     _BRAssetTransferInput *inputs = NULL;
@@ -486,6 +490,18 @@ BRAssetTransferStatus BRWalletBuildAssetTransfer(BRTransaction **txOut, BRWallet
         if (r != BR_ASSET_TRANSFER_SIGNED) { rep.input = i; goto out; }
     }
 
+    // 15a. ONE-FAMILY, every input (BROneFamilyGate.h).
+#if ! _RED(BR_ASSET_TRANSFER_RED_ONE_FAMILY)
+    if (! BRWalletTxInputsOneFamilyOK(wallet, tx)) { r = BR_ASSET_TRANSFER_OTHER_FAMILY; goto out; }
+#endif
+    // 15b. ASSET-SIGN-GATE on the transaction about to be signed (BRAssetSignGate.h): the approved marker to the
+    // approved recipient, the plan's fee within the approval. Checks 13 and 14 put both fees above 0.
+#if ! _RED(BR_ASSET_TRANSFER_RED_SIGN_GATE)
+    rep.signVerdict = BRAssetSignCheck(wallet, tx, recipientScript, recipientLen, BR_ASSET_MARKER_SATS,
+                                       (uint64_t)plan->paidFeeSats, (uint64_t)approvedFeeSats);
+    if (rep.signVerdict != BR_ASSET_SIGN_OK) { r = BR_ASSET_TRANSFER_NOT_APPROVED; goto out; }
+#endif
+
     // 16, 17, 18: the DGB send's order (spent check, sign, claim, spent check again).
 #if ! _RED(BR_ASSET_TRANSFER_RED_PRESPENT)
     if (! BRSpendGuardInputsUnspent(wallet, tx)) { r = BR_ASSET_TRANSFER_INPUT_SPENT; goto out; }
@@ -498,6 +514,16 @@ BRAssetTransferStatus BRWalletBuildAssetTransfer(BRTransaction **txOut, BRWallet
     if (! BRSignedSpendGate(wallet, tx, now)) { r = BR_ASSET_TRANSFER_GATE_REFUSED; goto out; }
 #else
     (void)now;
+#endif
+    // 18a. ASSET-SIGN-GATE again, on the signed transaction; refused, the claim 18 took is released.
+#if ! _RED(BR_ASSET_TRANSFER_RED_SIGN_GATE)
+    rep.signVerdict = BRAssetSignCheck(wallet, tx, recipientScript, recipientLen, BR_ASSET_MARKER_SATS,
+                                       (uint64_t)plan->paidFeeSats, (uint64_t)approvedFeeSats);
+    if (rep.signVerdict != BR_ASSET_SIGN_OK) {
+        BRCoinReservationRelease(tx->txHash);
+        r = BR_ASSET_TRANSFER_SIGNED_NOT_APPROVED;
+        goto out;
+    }
 #endif
 
     *txOut = tx;

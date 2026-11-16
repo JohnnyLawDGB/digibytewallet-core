@@ -21,11 +21,13 @@
 //    outputs  plan.outputs in order: the recipient marker pays BRAddressScriptPubKey(recipientAddress);
 //             the carrier pays plan.opReturnScript; the DGB change and the last marker pay
 //             plan.sourceScript; each at its plan sats.
-//    signing  BRSpendGuardInputsUnspent, BRWalletSignTransaction(wallet, tx, 0, seed, seedLen) with every
-//             input signed (BRTransactionIsSigned), then BRSignedSpendGate(wallet, tx, now): the order
-//             of the bridge's seed_sign_transaction, the signer every Android DGB send goes through
-//             (spent check, sign, claim, spent check again). On SIGNED the claim is held for tx->txHash
-//             until the publish releases it (BRWalletSend.h step 1b).
+//    signing  BRWalletTxInputsOneFamilyOK and BRAssetSignCheck, BRSpendGuardInputsUnspent,
+//             BRWalletSignTransaction(wallet, tx, 0, seed, seedLen) with every input signed
+//             (BRTransactionIsSigned), then BRSignedSpendGate(wallet, tx, now), then BRAssetSignCheck on the
+//             signed transaction: the order of the bridge's NativeBridge_buildAndSignAssetTransferTx around
+//             seed_sign_transaction, the signer every Android DGB send goes through (spent check, sign, claim,
+//             spent check again). On SIGNED the claim is held for tx->txHash until the publish releases it
+//             (BRWalletSend.h step 1b).
 //
 //  THE CHECKS, in this order; the first that fails is the status, *txOut is NULL, nothing is claimed
 //  and nothing is left allocated:
@@ -82,9 +84,23 @@
 //       (BRWalletSelectableUTXOs), or that the planner's fee-coin rule does not admit
 //       (BRAssetFeeCoinEligible against plan.sourceScript, the funding transaction's data output read
 //       here: an output whose script starts with OP_RETURN, 0x6a)                         -> FEE_COIN_NOT_PLAIN
+//  15a. ONE-FAMILY (BROneFamilyGate.h): an input, asset or fee, that the wallet holds as DigiDollar or
+//       that is an output of a transaction marked both DigiDollar and DigiAsset, or that it cannot judge
+//       (BRWalletOutpointIsOneFamilyHeld not 0)                                         -> OTHER_FAMILY
+//  15b. ASSET-SIGN-GATE (BRAssetSignGate.h): plan.paidFeeSats or approvedFeeSats at or below 0, refused before
+//       the gate is asked, since it takes both as uint64_t (the bridge's refusal of an approval of no fee;
+//       checks 13 and 14 refuse such a fee first; report->signVerdict stays BR_ASSET_SIGN_OK) -> NOT_APPROVED
+//       BRAssetSignCheck(wallet, tx, the recipient's script,
+//       BR_ASSET_MARKER_SATS, plan.paidFeeSats, approvedFeeSats) on the transaction about to be signed is
+//       not BR_ASSET_SIGN_OK: an input that is neither a coin the wallet's selection would spend nor a
+//       DigiAsset holding the wallet holds in state 1 (BRWalletAssetUTXOs), or that pays no address of the
+//       wallet's; an output that is neither the recipient's marker, the wallet's nor the one data output;
+//       the recipient paid other than once at the marker; another fee (report->signVerdict) -> NOT_APPROVED
 //   16. BRSpendGuardInputsUnspent is 0 (a send registered since 15)                       -> INPUT_SPENT
 //   17. BRWalletSignTransaction fails, or an input is left unsigned                       -> SIGN_FAILED
 //   18. BRSignedSpendGate refuses (a coin spent meanwhile, or claimed for another send)    -> GATE_REFUSED
+//  18a. BRAssetSignCheck, as in 15b, on the signed transaction is not BR_ASSET_SIGN_OK; the claim 18 took
+//       is released (report->signVerdict)                                               -> SIGNED_NOT_APPROVED
 //   19. SIGNED: *txOut is the signed transaction; the caller frees it (BRTransactionFree).
 //
 //  HELD. held[0, heldCount) is what a COMPLETE BRWalletHoldAssetOutputs (or BRAssetHoldOutputs over the
@@ -108,13 +124,16 @@
 //  is. A vout below 0 or an amount out of that range is refused rather than cast.
 //
 //  report (optional), written on every path: the input refused, in signing order (checks 6 and 15;
-//  SIZE_MAX otherwise), and the fee the transaction would pay (from check 13 on; 0 before).
+//  SIZE_MAX otherwise), the fee the transaction would pay (from check 13 on; 0 before), and
+//  BRAssetSignCheck's verdict (checks 15b and 18a; BR_ASSET_SIGN_OK otherwise, and for 15b's refusal of a fee
+//  at or below 0, which does not ask it).
 //
 //  NETWORK. BRAddressScriptPubKey follows BRNetworkIsTestnet() at the call.
 //
 //  Comparison arms for the host KAT only (asset_send_kat in the Android repo): BR_ASSET_TRANSFER_UNFIXED,
 //  tested by VALUE as a set of bits, read in BRAssetSend.c; each arm sets one bit and fails only its own
-//  cases. Unset or =0 is what ships.
+//  cases, except 524288, whose refusal checks 13 and 14 make first: it is run with 64 and with 128, and each
+//  pair fails that bit's cases and its partner's. Unset or =0 is what ships.
 //    1      BR_ASSET_TRANSFER_RED_SHAPE        the plan's outputs and source script are not checked (4).
 //    2      BR_ASSET_TRANSFER_RED_ASSET        the asset inputs' asset and units are not checked (5).
 //    4      BR_ASSET_TRANSFER_RED_BOUNDS       a negative vout and out-of-range sats are cast, unchecked (6).
@@ -133,6 +152,10 @@
 //    32768  BR_ASSET_TRANSFER_RED_DUPLICATE    two inputs naming one outpoint are not refused (7).
 //    65536  BR_ASSET_TRANSFER_RED_RULES        the rule state is not asked (2), and the allocator is told
 //                                              the units are rule-free whatever it is (11).
+//    131072 BR_ASSET_TRANSFER_RED_ONE_FAMILY   ONE-FAMILY is not asked (15a).
+//    262144 BR_ASSET_TRANSFER_RED_SIGN_GATE    BRAssetSignCheck is not asked, before or after signing, and 15b's fee
+//                                              refusal is not made (15b, 18a).
+//    524288 BR_ASSET_TRANSFER_RED_SIGN_FEE     a fee at or below 0 is handed to BRAssetSignCheck, cast (15b).
 //
 //  Permission is hereby granted, free of charge, to any person obtaining a copy
 //  of this software and associated documentation files (the "Software"), to deal
@@ -156,6 +179,7 @@
 #define BRAssetSend_h
 
 #include "BRAssetSendPlan.h"   // BRAssetSendOutcome, BRAssetTransferPlan, BRAssetRow; BRSweepRuleState
+#include "BRAssetSignGate.h"   // BRAssetSignVerdict
 #include "BRTransaction.h"     // BRTransaction
 #include "BRWallet.h"          // BRWallet, BRUTXO
 #include <stddef.h>
@@ -192,12 +216,20 @@ typedef enum {
                                                // a fee coin by the planner's rule (BRAssetFeeCoinEligible)
     BR_ASSET_TRANSFER_SIGN_FAILED = 20,        // an input was not signed
     BR_ASSET_TRANSFER_GATE_REFUSED = 21,       // the spend gate refused the signed transaction
-    BR_ASSET_TRANSFER_RULE_STATE = 22          // the asset's transfer-rule state does not allow a send
+    BR_ASSET_TRANSFER_RULE_STATE = 22,         // the asset's transfer-rule state does not allow a send
+    BR_ASSET_TRANSFER_OTHER_FAMILY = 23,       // an input the wallet holds as DigiDollar or of a dual-family
+                                               // transaction, or one it cannot judge (ONE-FAMILY)
+    BR_ASSET_TRANSFER_NOT_APPROVED = 24,       // the transaction about to be signed is not the approved send
+                                               // (ASSET-SIGN-GATE; report->signVerdict)
+    BR_ASSET_TRANSFER_SIGNED_NOT_APPROVED = 25 // the signed transaction is not the approved send; its claim is
+                                               // released (ASSET-SIGN-GATE; report->signVerdict)
 } BRAssetTransferStatus;
 
 typedef struct {
     size_t input;              // BAD_INPUT and the wallet's checks: the input refused, in signing order; else SIZE_MAX
     int64_t paidFeeSats;       // from the fee check on: every input's sats less every output's; else 0
+    BRAssetSignVerdict signVerdict;   // NOT_APPROVED and SIGNED_NOT_APPROVED: BRAssetSignCheck's verdict (OK when
+                                      // 15b refused a fee at or below 0 without asking it); else OK
 } BRAssetTransferReport;
 
 // Builds and signs the transfer `outcome` plans (see THE TRANSACTION and THE CHECKS). assetRows and dgbRows are

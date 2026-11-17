@@ -24,7 +24,11 @@
 //    - THE ROOT is an argument of every per-site call (BRDigiIdSiteKey, BRDigiIdSignSite, BRDigiIdAddress),
 //      and this header has no default: the caller passes the root of the wallet it signs for, which is
 //      that wallet's setting, not this header's. 0 is no root (BR_DIGIID_ROOT_NONE), so a zeroed or unset
-//      value derives nothing; it is REFUSED, as is every value but DIGIBYTE and STANDARD.
+//      value derives nothing; it is REFUSED, as is every value but DIGIBYTE and STANDARD. In
+//      BRDigiIdAddress the root sits beside hasUri, and C passes an int where the enum goes, and the enum
+//      where an int goes, without a word; so hasUri is 0 or 1, and every other value is REFUSED. A call
+//      with the two swapped is then refused, or, for DIGIBYTE with a URI, is the same call: it never
+//      answers another root's identity.
 //    - THE URI is hashed as the bytes given, with no normalisation. The Android app passes the
 //      callback URL DigiIdRequest keeps verbatim ("https://host/path", no query), and the bridge
 //      reads it with GetStringUTFChars, so the bytes Android hashes are what ART writes for the
@@ -53,11 +57,11 @@
 //      encoders write it.
 //    - REFUSED (BR_DIGIID_REFUSED, and no key, address or answer): no seed (the wallet is locked); no
 //      message; no URI where one is needed; an account index below zero; an unknown root (THE ROOT) on
-//      any call that takes one, even where `work` is too small as well; the shared identity's address
-//      asked for any index but 0. A NULL pointer is "no value": an empty URI or message is a non-NULL
-//      pointer with length 0. The bridge signs an empty message, so a caller with one passes a
-//      non-NULL pointer: Swift does not promise a non-nil baseAddress for an empty buffer (an
-//      UnsafeRawBufferPointer's may be nil), and nil here is REFUSED.
+//      any call that takes one, and a hasUri that is neither 0 nor 1 (THE ROOT), even where `work` is
+//      too small as well; the shared identity's address asked for any index but 0. A NULL pointer is "no
+//      value": an empty URI or message is a non-NULL pointer with length 0. The bridge signs an empty
+//      message, so a caller with one passes a non-NULL pointer: Swift does not promise a non-nil
+//      baseAddress for an empty buffer (an UnsafeRawBufferPointer's may be nil), and nil here is REFUSED.
 //    - THE CALLER'S OWN REFUSAL: the bridge also refuses all three calls while there is no wallet
 //      (g_wallet NULL, read under WALLET_READ_GUARD). That check is not here; a caller makes it, and
 //      passes no seed when it fails.
@@ -109,6 +113,9 @@
 //                                         swapped in place, which moves every existing identity).
 //    524288 DIGIID_RED_ANY_ROOT           a root that is neither DIGIBYTE nor STANDARD is not refused: it
 //                                         derives with "DigiByte seed" and answers BR_DIGIID_OK.
+//    1048576 DIGIID_RED_ANY_HASURI        BRDigiIdAddress takes any nonzero hasUri as 1, so a root swapped
+//                                         with hasUri is not refused (STANDARD, 1 swapped answers DIGIBYTE's
+//                                         per-site address).
 //
 
 #ifndef BRDigiId_h
@@ -150,11 +157,12 @@ extern "C" {
 #define DIGIID_RED_ROOT_IGNORED        131072
 #define DIGIID_RED_ROOT_ALWAYS_STANDARD 262144
 #define DIGIID_RED_ANY_ROOT            524288
+#define DIGIID_RED_ANY_HASURI          1048576
 
 typedef enum {
     BR_DIGIID_OK = 0,
-    BR_DIGIID_REFUSED = 1,      // no seed, message or URI; an index below zero; an unknown root; the shared identity at
-                                // index != 0
+    BR_DIGIID_REFUSED = 1,      // no seed, message or URI; an index below zero; an unknown root; a hasUri but 0 or 1;
+                                // the shared identity at index != 0
     BR_DIGIID_CAPACITY = 2,     // `work` or `out` is too small
     BR_DIGIID_NO_ADDRESS = 3,   // the key gives no address
     BR_DIGIID_NOT_SIGNED = 4    // BRKeyCompactSign gave no signature
@@ -676,11 +684,12 @@ static inline BRDigiIdStatus BRDigiIdSignSite(char *out, size_t outCap, const vo
 
 // The P2PKH address a login would sign with, without signing (the bridge's identityAddress, for
 // BR_DIGIID_ROOT_DIGIBYTE): the per-site identity of uri[0, uriLen) at account `index` under `root` when
-// hasUri, the shared identity otherwise (index must then be 0, and both roots give the one shared
+// hasUri is 1, the shared identity when it is 0 (index must then be 0, and both roots give the one shared
 // address). NUL-terminated into out[0, outCap). Refused: no seed, no out, index < 0, a root that is
-// neither BR_DIGIID_ROOT_DIGIBYTE nor BR_DIGIID_ROOT_STANDARD (with or without hasUri), hasUri with no
-// uri, no hasUri with index != 0. CAPACITY: work cannot hold BRDigiIdIndexesWorkSize(uriLen) bytes (when
-// hasUri), or out the address (BR_DIGIID_ADDRESS_CAPACITY always suffices).
+// neither BR_DIGIID_ROOT_DIGIBYTE nor BR_DIGIID_ROOT_STANDARD (with or without hasUri), a hasUri that is
+// neither 0 nor 1 (so a root swapped with it is refused: THE ROOT), hasUri with no uri, no hasUri with
+// index != 0. CAPACITY: work cannot hold BRDigiIdIndexesWorkSize(uriLen) bytes (when hasUri), or out the
+// address (BR_DIGIID_ADDRESS_CAPACITY always suffices).
 static inline BRDigiIdStatus BRDigiIdAddress(char *out, size_t outCap, const void *seed, size_t seedLen,
                                              BRDigiIdRoot root, int hasUri, const char *uri, size_t uriLen,
                                              int32_t index, uint8_t *work, size_t workCap)
@@ -696,6 +705,9 @@ static inline BRDigiIdStatus BRDigiIdAddress(char *out, size_t outCap, const voi
 #endif
 #if ! (DIGIID_UNFIXED & DIGIID_RED_ANY_ROOT)
     if (root != BR_DIGIID_ROOT_DIGIBYTE && root != BR_DIGIID_ROOT_STANDARD) return BR_DIGIID_REFUSED;
+#endif
+#if ! (DIGIID_UNFIXED & DIGIID_RED_ANY_HASURI)
+    if (hasUri != 0 && hasUri != 1) return BR_DIGIID_REFUSED;   // a root swapped into hasUri's place is refused here (THE ROOT)
 #endif
 
     if (hasUri) status = BRDigiIdSiteKey(&key, seed, seedLen, root, uri, uriLen, index, work, workCap);

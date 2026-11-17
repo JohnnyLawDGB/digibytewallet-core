@@ -628,8 +628,15 @@ void BRHMAC(void *mac, void (*hash)(void *, const void *, size_t), size_t hashLe
     hash(mac, kopad, blockLen + hashLen);
     
     mem_clean(k, sizeof(k));
+#ifndef HMAC_PAD_RESIDUE_UNFIXED
+    // The whole of both pads: after the key's block, kipad holds the data (a BIP32 master key's seed, a hardened
+    // step's parent key) and kopad the inner hash, which with a known key such as "Bitcoin seed" gives the MAC.
+    mem_clean(kipad, sizeof(kipad));
+    mem_clean(kopad, sizeof(kopad));
+#else
     mem_clean(kipad, blockLen);
     mem_clean(kopad, blockLen);
+#endif
 }
 
 // hmac-drbg with no prediction resistance or additional input

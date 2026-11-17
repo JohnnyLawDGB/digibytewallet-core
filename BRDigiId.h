@@ -5,13 +5,26 @@
 //  this lived only in the Android bridge (native/src/main/jni/bridge/slip13.c, seed_derive_identity_key
 //  in jni_wallet.c, and jni_wallet_sign.c: sign_with_key, base64_encode, write_varint, message_utf8 and
 //  the entry points signMessage, signIdentityMessage and identityAddress). It moves here unchanged: for
-//  the same seed, URI bytes, index and message bytes, every key, address and signature here is
-//  byte-identical to the bridge's, and every input the bridge refuses is refused here.
+//  the same seed, URI bytes, index and message bytes, every key, address and signature here under the
+//  root BR_DIGIID_ROOT_DIGIBYTE is byte-identical to the bridge's, and every input the bridge refuses is
+//  refused here. The bridge takes no root: its per-site master key is always DIGIBYTE's, so it has no
+//  answer for BR_DIGIID_ROOT_STANDARD to match.
 //
 //  THE RULES:
-//    - THE PER-SITE IDENTITY of a site's URI and an account index i is the key at m/13'/A'/B'/C'/D',
-//      every step hardened, where h = SHA256(LE32(i) || uri) and A, B, C, D are h's first 16 bytes read
-//      as four little-endian uint32 (SLIP-0013, the derivation of BitID's BIP draft).
+//    - THE PER-SITE IDENTITY of a site's URI and an account index i under a root is the key at
+//      m/13'/A'/B'/C'/D', every step hardened, where h = SHA256(LE32(i) || uri) and A, B, C, D are h's
+//      first 16 bytes read as four little-endian uint32 (SLIP-0013, the derivation of BitID's BIP draft),
+//      and m is the BIP32 master key the root names, HMAC-SHA512(key, seed) with key:
+//        BR_DIGIID_ROOT_DIGIBYTE  "DigiByte seed", BRBIP32PrivKeyPath's (the bread-wallet tree): every
+//                                 per-site identity the bridge and this header gave before the root was
+//                                 an argument;
+//        BR_DIGIID_ROOT_STANDARD  "Bitcoin seed", BIP32's own (BR_DERIVATION_HMAC_STANDARD): the one
+//                                 SLIP-0013 specifies, and the one Coinomi signs with.
+//      The same URI and index give a different identity under each root.
+//    - THE ROOT is an argument of every per-site call (BRDigiIdSiteKey, BRDigiIdSignSite, BRDigiIdAddress),
+//      and this header has no default: the caller passes the root of the wallet it signs for, which is
+//      that wallet's setting, not this header's. 0 is no root (BR_DIGIID_ROOT_NONE), so a zeroed or unset
+//      value derives nothing; it is REFUSED, as is every value but DIGIBYTE and STANDARD.
 //    - THE URI is hashed as the bytes given, with no normalisation. The Android app passes the
 //      callback URL DigiIdRequest keeps verbatim ("https://host/path", no query), and the bridge
 //      reads it with GetStringUTFChars, so the bytes Android hashes are what ART writes for the
@@ -24,7 +37,9 @@
 //      String never holds a lone surrogate; but a URI that may hold U+0000 must go through
 //      BRDigiIdUriBytesFromUtf16, or its site gets another identity than on Android.
 //    - THE SHARED IDENTITY is the key at m/0'/0/0 (BRBIP32PrivKey, chain 0, index 0): one address for
-//      every site, the identity DigiScope logs in with.
+//      every site, the identity DigiScope logs in with. It takes no root: its m is always DIGIBYTE's
+//      (BRDigiIdSharedKey, BRDigiIdSignShared). BRDigiIdAddress takes a root for its per-site branch and
+//      refuses an unknown one on both branches; on the shared branch both roots give the one address.
 //    - A MESSAGE is signed over SHA256(SHA256("\x19DigiByte Signed Message:\n" || prefix || message)),
 //      where prefix is the message length written as the bridge writes it: one byte below 0xfd; 0xfd
 //      and two little-endian bytes up to 0xffff; 0xfe and four up to 0xffffffff; 0xff and eight above
@@ -37,7 +52,8 @@
 //      (BRDigiIdUtf8FromUtf16), a surrogate without its partner written '?' as Java's and okio's
 //      encoders write it.
 //    - REFUSED (BR_DIGIID_REFUSED, and no key, address or answer): no seed (the wallet is locked); no
-//      message; no URI where one is needed; an account index below zero; the shared identity's address
+//      message; no URI where one is needed; an account index below zero; an unknown root (THE ROOT) on
+//      any call that takes one, even where `work` is too small as well; the shared identity's address
 //      asked for any index but 0. A NULL pointer is "no value": an empty URI or message is a non-NULL
 //      pointer with length 0. The bridge signs an empty message, so a caller with one passes a
 //      non-NULL pointer: Swift does not promise a non-nil baseAddress for an empty buffer (an
@@ -60,7 +76,8 @@
 //
 //  No allocation, no wallet, no network I/O (but see THE NETWORK above), no clock, no I/O. Header-only,
 //  static inline; its includes are libc, BRKey.h (BRKey, addresses, BRKeyCompactSign, BRKeyClean),
-//  BRBIP32Sequence.h (BRBIP32PrivKeyPath, BRBIP32PrivKey) and BRCrypto.h (BRSHA256, BRSHA256_2), so a
+//  BRBIP32Sequence.h (BRBIP32PrivKeyPath, BRBIP32PrivKeyArrayPath, BRBIP32PrivKey), BRCrypto.h (BRSHA256,
+//  BRSHA256_2) and BRDerivationProfiles.h (BR_DERIVATION_HMAC_STANDARD; libc only, nothing to link), so a
 //  program that calls it links BRKey.c, BRBIP32Sequence.c, BRCrypto.c and what they need. Nothing in the
 //  core calls it yet.
 //
@@ -85,13 +102,21 @@
 //    32768 DIGIID_RED_URI_AS_MESSAGE      BRDigiIdUriBytesFromUtf16 writes U+0000 as one 00 byte and a
 //                                         lone surrogate as '?' (the message's rules).
 //    65536 DIGIID_RED_ADDRESS_KEY_KEPT    BRDigiIdAddressWithKey leaves the caller's key unwiped.
+//    131072 DIGIID_RED_ROOT_IGNORED       every known root derives with "DigiByte seed" (the per-site
+//                                         master key before the root was an argument).
+//    262144 DIGIID_RED_ROOT_ALWAYS_STANDARD
+//                                         every known root derives with "Bitcoin seed" (the constant
+//                                         swapped in place, which moves every existing identity).
+//    524288 DIGIID_RED_ANY_ROOT           a root that is neither DIGIBYTE nor STANDARD is not refused: it
+//                                         derives with "DigiByte seed" and answers BR_DIGIID_OK.
 //
 
 #ifndef BRDigiId_h
 #define BRDigiId_h
 
-#include "BRBIP32Sequence.h"   // BRBIP32PrivKeyPath, BRBIP32PrivKey, BIP32_HARD
+#include "BRBIP32Sequence.h"   // BRBIP32PrivKeyPath, BRBIP32PrivKeyArrayPath, BRBIP32PrivKey, BIP32_HARD
 #include "BRCrypto.h"          // BRSHA256, BRSHA256_2
+#include "BRDerivationProfiles.h"   // BR_DERIVATION_HMAC_STANDARD
 #include "BRKey.h"             // BRKey, BRKeyAddress, BRKeySegwitAddress, BRKeyCompactSign, BRKeyClean
 #include <stddef.h>
 #include <stdint.h>
@@ -122,14 +147,26 @@ extern "C" {
 #define DIGIID_RED_URI_SPEC_PAIRS      16384
 #define DIGIID_RED_URI_AS_MESSAGE      32768
 #define DIGIID_RED_ADDRESS_KEY_KEPT    65536
+#define DIGIID_RED_ROOT_IGNORED        131072
+#define DIGIID_RED_ROOT_ALWAYS_STANDARD 262144
+#define DIGIID_RED_ANY_ROOT            524288
 
 typedef enum {
     BR_DIGIID_OK = 0,
-    BR_DIGIID_REFUSED = 1,      // no seed, message or URI; an index below zero; the shared identity at index != 0
+    BR_DIGIID_REFUSED = 1,      // no seed, message or URI; an index below zero; an unknown root; the shared identity at
+                                // index != 0
     BR_DIGIID_CAPACITY = 2,     // `work` or `out` is too small
     BR_DIGIID_NO_ADDRESS = 3,   // the key gives no address
     BR_DIGIID_NOT_SIGNED = 4    // BRKeyCompactSign gave no signature
 } BRDigiIdStatus;
+
+// The master key of a per-site identity (THE PER-SITE IDENTITY, THE ROOT). The zero value is the one that
+// derives nothing.
+typedef enum {
+    BR_DIGIID_ROOT_NONE = 0,        // no root: REFUSED by every call that takes one
+    BR_DIGIID_ROOT_DIGIBYTE = 1,    // "DigiByte seed" (BRBIP32PrivKeyPath's)
+    BR_DIGIID_ROOT_STANDARD = 2     // "Bitcoin seed" (BR_DERIVATION_HMAC_STANDARD)
+} BRDigiIdRoot;
 
 // The longest answer with its NUL: a 74-character address (the bridge's 75-byte buffer), '|', and the
 // 88 base64 characters of a 65-byte signature. Any `out` this long holds every answer.
@@ -193,14 +230,17 @@ static inline BRDigiIdStatus BRDigiIdSlip13Indexes(uint32_t out[4], const char *
 
 // ---- the two identities ---------------------------------------------------------------------------
 
-// The per-site identity key of uri[0, uriLen) at account `index` into *key, from seed[0, seedLen) (the
-// bridge's seed_derive_identity_key; the bridge's seed is BRBIP39DeriveKey's 64 bytes). On anything but
-// BR_DIGIID_OK *key is wiped. Refused: no key, no seed, no uri, index < 0. CAPACITY as
-// BRDigiIdSlip13Indexes.
-static inline BRDigiIdStatus BRDigiIdSiteKey(BRKey *key, const void *seed, size_t seedLen, const char *uri, size_t uriLen,
-                                             int32_t index, uint8_t *work, size_t workCap)
+// The per-site identity key of uri[0, uriLen) at account `index` under `root` into *key, from seed[0,
+// seedLen) (the bridge's seed_derive_identity_key, for BR_DIGIID_ROOT_DIGIBYTE; the bridge's seed is
+// BRBIP39DeriveKey's 64 bytes). On anything but BR_DIGIID_OK *key is wiped. Refused: no key, no seed, no
+// uri, index < 0, a root that is neither BR_DIGIID_ROOT_DIGIBYTE nor BR_DIGIID_ROOT_STANDARD (before
+// CAPACITY is looked at). CAPACITY as BRDigiIdSlip13Indexes.
+static inline BRDigiIdStatus BRDigiIdSiteKey(BRKey *key, const void *seed, size_t seedLen, BRDigiIdRoot root,
+                                             const char *uri, size_t uriLen, int32_t index, uint8_t *work,
+                                             size_t workCap)
 {
     uint32_t idx[4], hard = BIP32_HARD;
+    BRDigiIdRoot master = root;   // the root the key is derived under
     BRDigiIdStatus status;
 
     if (key) BRKeyClean(key);
@@ -208,19 +248,36 @@ static inline BRDigiIdStatus BRDigiIdSiteKey(BRKey *key, const void *seed, size_
 #if ! (DIGIID_UNFIXED & DIGIID_RED_NEGATIVE_INDEX)
     if (index < 0) return BR_DIGIID_REFUSED;
 #endif
+#if ! (DIGIID_UNFIXED & DIGIID_RED_ANY_ROOT)
+    if (root != BR_DIGIID_ROOT_DIGIBYTE && root != BR_DIGIID_ROOT_STANDARD) return BR_DIGIID_REFUSED;
+#endif
 
     status = BRDigiIdSlip13Indexes(idx, uri, uriLen, (uint32_t)index, work, workCap);
     if (status != BR_DIGIID_OK) return status;
 #if (DIGIID_UNFIXED & DIGIID_RED_SOFT_PATH)
     hard = 0;
 #endif
+#if (DIGIID_UNFIXED & DIGIID_RED_ROOT_IGNORED)
+    master = BR_DIGIID_ROOT_DIGIBYTE;
+#endif
+#if (DIGIID_UNFIXED & DIGIID_RED_ROOT_ALWAYS_STANDARD)
+    master = BR_DIGIID_ROOT_STANDARD;
+#endif
+    if (master == BR_DIGIID_ROOT_STANDARD) {
+        const uint32_t path[5] = { 13 | BIP32_HARD, idx[0] | hard, idx[1] | hard, idx[2] | hard, idx[3] | hard };
+
+        BRBIP32PrivKeyArrayPath(key, seed, seedLen, BR_DERIVATION_HMAC_STANDARD, path, 5);
+        return BR_DIGIID_OK;
+    }
+    // BR_DIGIID_ROOT_DIGIBYTE, the only other root the refusal above lets through
     BRBIP32PrivKeyPath(key, seed, seedLen, 5, 13 | BIP32_HARD, idx[0] | hard, idx[1] | hard, idx[2] | hard,
                        idx[3] | hard);
     return BR_DIGIID_OK;
 }
 
 // The shared identity key, m/0'/0/0, into *key from seed[0, seedLen) (the bridge's seed_derive_key(key,
-// 0, 0)). On anything but BR_DIGIID_OK *key is wiped. Refused: no key, no seed.
+// 0, 0)); it takes no root (THE SHARED IDENTITY). On anything but BR_DIGIID_OK *key is wiped. Refused: no
+// key, no seed.
 static inline BRDigiIdStatus BRDigiIdSharedKey(BRKey *key, const void *seed, size_t seedLen)
 {
     if (key) BRKeyClean(key);
@@ -570,9 +627,9 @@ static inline size_t BRDigiIdSignSiteWorkSize(size_t uriLen, size_t msgLen)
     return (a == 0 || b == 0) ? 0 : (a > b ? a : b);
 }
 
-// A login signed with the SHARED identity (the bridge's signMessage): the answer for msg[0, msgLen) into
-// out, P2WPKH for addressFormat 2 and P2PKH otherwise. Refused: no seed (a locked wallet), no msg, no
-// out. CAPACITY as BRDigiIdSignWithKey.
+// A login signed with the SHARED identity (the bridge's signMessage; no root): the answer for msg[0,
+// msgLen) into out, P2WPKH for addressFormat 2 and P2PKH otherwise. Refused: no seed (a locked wallet), no
+// msg, no out. CAPACITY as BRDigiIdSignWithKey.
 static inline BRDigiIdStatus BRDigiIdSignShared(char *out, size_t outCap, const void *seed, size_t seedLen,
                                                 const uint8_t *msg, size_t msgLen, int32_t addressFormat, uint8_t *work,
                                                 size_t workCap)
@@ -588,13 +645,14 @@ static inline BRDigiIdStatus BRDigiIdSignShared(char *out, size_t outCap, const 
     return BRDigiIdSignWithKey(out, outCap, &key, msg, msgLen, addressFormat, work, workCap);   // wipes key
 }
 
-// A login signed with the PER-SITE identity of uri[0, uriLen) at account `index` (the bridge's
-// signIdentityMessage): the answer for msg[0, msgLen) into out, always P2PKH. Refused: no seed, no msg,
-// no uri, no out, index < 0. CAPACITY: work cannot hold BRDigiIdSignSiteWorkSize(uriLen, msgLen) bytes,
-// or out the answer.
+// A login signed with the PER-SITE identity of uri[0, uriLen) at account `index` under `root` (the
+// bridge's signIdentityMessage, for BR_DIGIID_ROOT_DIGIBYTE): the answer for msg[0, msgLen) into out,
+// always P2PKH. Refused: no seed, no msg, no uri, no out, index < 0, a root that is neither
+// BR_DIGIID_ROOT_DIGIBYTE nor BR_DIGIID_ROOT_STANDARD. CAPACITY: work cannot hold
+// BRDigiIdSignSiteWorkSize(uriLen, msgLen) bytes, or out the answer.
 static inline BRDigiIdStatus BRDigiIdSignSite(char *out, size_t outCap, const void *seed, size_t seedLen,
-                                              const uint8_t *msg, size_t msgLen, const char *uri, size_t uriLen,
-                                              int32_t index, uint8_t *work, size_t workCap)
+                                              BRDigiIdRoot root, const uint8_t *msg, size_t msgLen, const char *uri,
+                                              size_t uriLen, int32_t index, uint8_t *work, size_t workCap)
 {
     BRKey key;
     BRDigiIdStatus status;
@@ -604,8 +662,11 @@ static inline BRDigiIdStatus BRDigiIdSignSite(char *out, size_t outCap, const vo
 #if ! (DIGIID_UNFIXED & DIGIID_RED_NEGATIVE_INDEX)
     if (index < 0) return BR_DIGIID_REFUSED;
 #endif
+#if ! (DIGIID_UNFIXED & DIGIID_RED_ANY_ROOT)
+    if (root != BR_DIGIID_ROOT_DIGIBYTE && root != BR_DIGIID_ROOT_STANDARD) return BR_DIGIID_REFUSED;
+#endif
 
-    status = BRDigiIdSiteKey(&key, seed, seedLen, uri, uriLen, index, work, workCap);
+    status = BRDigiIdSiteKey(&key, seed, seedLen, root, uri, uriLen, index, work, workCap);
     if (status != BR_DIGIID_OK) {
         BRKeyClean(&key);
         return status;
@@ -613,15 +674,16 @@ static inline BRDigiIdStatus BRDigiIdSignSite(char *out, size_t outCap, const vo
     return BRDigiIdSignWithKey(out, outCap, &key, msg, msgLen, 0, work, workCap);   // wipes key
 }
 
-// The P2PKH address a login would sign with, without signing (the bridge's identityAddress): the
-// per-site identity of uri[0, uriLen) at account `index` when hasUri, the shared identity otherwise
-// (index must then be 0). NUL-terminated into out[0, outCap). Refused: no seed, no out, index < 0,
-// hasUri with no uri, no hasUri with index != 0. CAPACITY: work cannot hold
-// BRDigiIdIndexesWorkSize(uriLen) bytes (when hasUri), or out the address (BR_DIGIID_ADDRESS_CAPACITY
-// always suffices).
-static inline BRDigiIdStatus BRDigiIdAddress(char *out, size_t outCap, const void *seed, size_t seedLen, int hasUri,
-                                             const char *uri, size_t uriLen, int32_t index, uint8_t *work,
-                                             size_t workCap)
+// The P2PKH address a login would sign with, without signing (the bridge's identityAddress, for
+// BR_DIGIID_ROOT_DIGIBYTE): the per-site identity of uri[0, uriLen) at account `index` under `root` when
+// hasUri, the shared identity otherwise (index must then be 0, and both roots give the one shared
+// address). NUL-terminated into out[0, outCap). Refused: no seed, no out, index < 0, a root that is
+// neither BR_DIGIID_ROOT_DIGIBYTE nor BR_DIGIID_ROOT_STANDARD (with or without hasUri), hasUri with no
+// uri, no hasUri with index != 0. CAPACITY: work cannot hold BRDigiIdIndexesWorkSize(uriLen) bytes (when
+// hasUri), or out the address (BR_DIGIID_ADDRESS_CAPACITY always suffices).
+static inline BRDigiIdStatus BRDigiIdAddress(char *out, size_t outCap, const void *seed, size_t seedLen,
+                                             BRDigiIdRoot root, int hasUri, const char *uri, size_t uriLen,
+                                             int32_t index, uint8_t *work, size_t workCap)
 {
     BRKey key;
     BRDigiIdStatus status;
@@ -632,8 +694,11 @@ static inline BRDigiIdStatus BRDigiIdAddress(char *out, size_t outCap, const voi
 #else
     if (! out || ! seed || index < 0) return BR_DIGIID_REFUSED;
 #endif
+#if ! (DIGIID_UNFIXED & DIGIID_RED_ANY_ROOT)
+    if (root != BR_DIGIID_ROOT_DIGIBYTE && root != BR_DIGIID_ROOT_STANDARD) return BR_DIGIID_REFUSED;
+#endif
 
-    if (hasUri) status = BRDigiIdSiteKey(&key, seed, seedLen, uri, uriLen, index, work, workCap);
+    if (hasUri) status = BRDigiIdSiteKey(&key, seed, seedLen, root, uri, uriLen, index, work, workCap);
 #if (DIGIID_UNFIXED & DIGIID_RED_SHARED_ANY_INDEX)
     else status = BRDigiIdSharedKey(&key, seed, seedLen);
 #else

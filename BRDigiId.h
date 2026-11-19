@@ -67,9 +67,21 @@
 //          whatever digiScopeIdentity is.
 //      Both properties are checked on every call, also where the answer does not use them. 0 is no value
 //      (BR_DIGIID_SCOPE_NONE, BR_DIGIID_ROOT_NONE): it and every unknown value are REFUSED, so a zeroed
-//      or unset property chooses nothing. THE DIGISCOPE LIST and THE CHOICE have this ONE COPY. Android
-//      and iOS store the two properties with the wallet, pass them in, and sign with what the answer
-//      names; neither keeps a list of its own, and neither decides which key signs.
+//      or unset property chooses nothing. THE DIGISCOPE LIST and THE CHOICE have this ONE COPY, and
+//      this is the contract: an app stores the two properties with the wallet, passes them in, and signs
+//      with what the answer names; it keeps no list of its own and does not decide which key signs.
+//      Neither app calls it yet. Until each does, it decides for itself from a list of its own that must
+//      equal this one: Android's IdentityKeyPolicy.kt (DIGISCOPE_HOSTS), which digiid_core_kat's SOURCE
+//      GATE holds to this list, and iOS's DigiIdIdentityPolicy.sharedIdentityHosts, which nothing here
+//      can read.
+//    - THE ANSWER'S URI for a host off the list is the caller's own pointer: nothing is copied, so it is
+//      valid only while the caller's callback bytes are. C keeps them as long as it likes. Swift does
+//      not: an array or String passed where a pointer goes is a pointer for that one call only, so a
+//      Swift caller makes the choice AND signs inside one withUnsafeBufferPointer (or withCString) over
+//      the callback's bytes, or takes only `kind` and `root` from the answer and gives the signing call
+//      its own callback bytes again. Reading choice.uri after that scope is a dead pointer: a login
+//      signed as some other identity, or a crash. On a DigiScope host the URI is this header's literal
+//      and lives as long as the program.
 //    - A MESSAGE is signed over SHA256(SHA256("\x19DigiByte Signed Message:\n" || prefix || message)),
 //      where prefix is the message length written as the bridge writes it: one byte below 0xfd; 0xfd
 //      and two little-endian bytes up to 0xffff; 0xfe and four up to 0xffffffff; 0xff and eight above
@@ -158,6 +170,25 @@
 //                                         BR_DIGIID_DIGISCOPE_LOGIN_URI.
 //    33554432 DIGIID_RED_ANY_SCOPE        a digiScopeIdentity that is neither SHARED nor SITE is not refused:
 //                                         BRDigiIdChooseIdentity chooses as it does for SITE.
+//    67108864 DIGIID_RED_LIST_API_ONLY    only "api.digiscope.me", the login URL's host, is on the list;
+//                                         "digiscope.me" is not.
+//    134217728 DIGIID_RED_LIST_PREFIX     a name that begins with a listed host counts as one (the length
+//                                         is not compared: a trailing dot, a port, "digiscope.me.other.example",
+//                                         the host's NUL counted in).
+//    268435456 DIGIID_RED_SHARED_NAMES_ROOT
+//                                         the SHARED answer names the wallet's siteKeyRoot, not
+//                                         BR_DIGIID_ROOT_NONE.
+//    536870912 DIGIID_RED_CALLBACK_DECIDES
+//                                         a request whose callback is BR_DIGIID_DIGISCOPE_LOGIN_URI gets
+//                                         DigiScope's answer on any host (the callback read where the host
+//                                         decides: another site that names that URL is given DigiScope's
+//                                         identity).
+//    1073741824 DIGIID_RED_REFUSAL_KEEPS_OUT
+//                                         a refusal from BRDigiIdChooseIdentity leaves *out as the caller
+//                                         had it, not all zero.
+//    2147483648 DIGIID_RED_NO_CALLBACK_ANSWERS
+//                                         a host off the list with no callback URL is not refused: the
+//                                         answer is SITE with no URI.
 //
 
 #ifndef BRDigiId_h
@@ -205,6 +236,12 @@ extern "C" {
 #define DIGIID_RED_SITE_SIGNS_SHARED   8388608
 #define DIGIID_RED_SITE_USES_CALLBACK  16777216
 #define DIGIID_RED_ANY_SCOPE           33554432
+#define DIGIID_RED_LIST_API_ONLY       67108864
+#define DIGIID_RED_LIST_PREFIX         134217728
+#define DIGIID_RED_SHARED_NAMES_ROOT   268435456
+#define DIGIID_RED_CALLBACK_DECIDES    536870912
+#define DIGIID_RED_REFUSAL_KEEPS_OUT   1073741824
+#define DIGIID_RED_NO_CALLBACK_ANSWERS 2147483648
 
 typedef enum {
     BR_DIGIID_OK = 0,
@@ -816,8 +853,15 @@ static inline int BRDigiIdIsDigiScopeHost(const char *host, size_t hostLen)
 
     if (! host || hostLen == 0) return 0;
 
+#if (DIGIID_UNFIXED & DIGIID_RED_LIST_API_ONLY)
+    for (i = 1; i < sizeof(list) / sizeof(list[0]); i++) {
+#else
     for (i = 0; i < sizeof(list) / sizeof(list[0]); i++) {
+#endif
         n = strlen(list[i]);
+#if (DIGIID_UNFIXED & DIGIID_RED_LIST_PREFIX)
+        if (hostLen > n && memcmp(host, list[i], n) == 0) return 1;
+#endif
 #if (DIGIID_UNFIXED & DIGIID_RED_LIST_SUFFIX)
         if (hostLen > n && host[hostLen - n - 1] == '.' && memcmp(host + (hostLen - n), list[i], n) == 0) return 1;
 #endif
@@ -851,6 +895,9 @@ static inline int BRDigiIdIsDigiScopeHost(const char *host, size_t hostLen)
 //                                      siteKeyRoot }: never the request's own callback
 //   any other host                   { BR_DIGIID_IDENTITY_SITE, callbackUri, callbackLen, siteKeyRoot },
 //                                      whatever scope is: the caller's own pointer, valid while its bytes are
+//                                      and no longer (THE ANSWER'S URI: a Swift caller chooses and signs
+//                                      inside one withUnsafeBufferPointer over the callback, or signs with
+//                                      its own callback bytes and takes only kind and root from here)
 // A DigiScope host needs no callback: a caller that signs for DigiScope without a request, as the Hub's own
 // login does, passes NULL. The caller then signs with BRDigiIdSignShared for SHARED, and for SITE with
 // BRDigiIdSignSite under out->root over out->uri (BRDigiIdAddress with hasUri 1 gives that address). The
@@ -867,8 +914,10 @@ static inline BRDigiIdStatus BRDigiIdChooseIdentity(BRDigiIdChoice *out, const c
                                                     BRDigiIdScopeIdentity scope, BRDigiIdRoot siteKeyRoot)
 {
     if (! out) return BR_DIGIID_REFUSED;
+#if ! (DIGIID_UNFIXED & DIGIID_RED_REFUSAL_KEEPS_OUT)
     memset(out, 0, sizeof(*out));   // no identity: kind NONE, uriLen 0, root NONE, and the padding between them
     out->uri = NULL;
+#endif
     if (! host || hostLen == 0) return BR_DIGIID_REFUSED;
 #if ! (DIGIID_UNFIXED & DIGIID_RED_ANY_SCOPE)
     if (scope != BR_DIGIID_SCOPE_SHARED && scope != BR_DIGIID_SCOPE_SITE) return BR_DIGIID_REFUSED;
@@ -877,13 +926,27 @@ static inline BRDigiIdStatus BRDigiIdChooseIdentity(BRDigiIdChoice *out, const c
     if (siteKeyRoot != BR_DIGIID_ROOT_DIGIBYTE && siteKeyRoot != BR_DIGIID_ROOT_STANDARD) return BR_DIGIID_REFUSED;
 #endif
 
+    // Every answer below writes all four fields, so none of them rests on the zeroing above.
+#if (DIGIID_UNFIXED & DIGIID_RED_CALLBACK_DECIDES)
+    if (BRDigiIdIsDigiScopeHost(host, hostLen) ||
+        (callbackUri && callbackLen == sizeof(BR_DIGIID_DIGISCOPE_LOGIN_URI) - 1 &&
+         memcmp(callbackUri, BR_DIGIID_DIGISCOPE_LOGIN_URI, callbackLen) == 0)) {
+#else
     if (BRDigiIdIsDigiScopeHost(host, hostLen)) {
+#endif
 #if (DIGIID_UNFIXED & DIGIID_RED_SITE_SIGNS_SHARED)
-        out->kind = BR_DIGIID_IDENTITY_SHARED;
-        return BR_DIGIID_OK;
+        if (1) {
 #else
         if (scope == BR_DIGIID_SCOPE_SHARED) {
-            out->kind = BR_DIGIID_IDENTITY_SHARED;   // uri NULL, uriLen 0, root NONE: the shared identity takes none
+#endif
+            out->kind = BR_DIGIID_IDENTITY_SHARED;   // no URI and no root: the shared identity takes none
+            out->uri = NULL;
+            out->uriLen = 0;
+#if (DIGIID_UNFIXED & DIGIID_RED_SHARED_NAMES_ROOT)
+            out->root = siteKeyRoot;
+#else
+            out->root = BR_DIGIID_ROOT_NONE;
+#endif
             return BR_DIGIID_OK;
         }
 #if ! (DIGIID_UNFIXED & DIGIID_RED_SITE_USES_CALLBACK)
@@ -893,10 +956,13 @@ static inline BRDigiIdStatus BRDigiIdChooseIdentity(BRDigiIdChoice *out, const c
         out->root = siteKeyRoot;
         return BR_DIGIID_OK;
 #endif
-#endif
     }
 
+#if (DIGIID_UNFIXED & DIGIID_RED_NO_CALLBACK_ANSWERS)
+    if (! callbackUri || callbackLen == 0) { callbackUri = NULL; callbackLen = 0; }
+#else
     if (! callbackUri || callbackLen == 0) return BR_DIGIID_REFUSED;
+#endif
     out->kind = BR_DIGIID_IDENTITY_SITE;
     out->uri = callbackUri;
     out->uriLen = callbackLen;

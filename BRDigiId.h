@@ -10,6 +10,11 @@
 //  refused here. The bridge takes no root: its per-site master key is always DIGIBYTE's, so it has no
 //  answer for BR_DIGIID_ROOT_STANDARD to match.
 //
+//  Which of the two identities a login signs with is decided here as well (THE DIGISCOPE LIST and THE
+//  CHOICE below: BRDigiIdIsDigiScopeHost, BRDigiIdChooseIdentity). The rule comes from the two apps, which
+//  each held a list of DigiScope's two hosts and decided for itself (Android's IdentityKeyPolicy.kt, a
+//  Swift list on iOS). An app keeps its own list only until it calls this.
+//
 //  THE RULES:
 //    - THE PER-SITE IDENTITY of a site's URI and an account index i under a root is the key at
 //      m/13'/A'/B'/C'/D', every step hardened, where h = SHA256(LE32(i) || uri) and A, B, C, D are h's
@@ -44,6 +49,27 @@
 //      every site, the identity DigiScope logs in with. It takes no root: its m is always DIGIBYTE's
 //      (BRDigiIdSharedKey, BRDigiIdSignShared). BRDigiIdAddress takes a root for its per-site branch and
 //      refuses an unknown one on both branches; on the shared branch both roots give the one address.
+//    - THE DIGISCOPE LIST is two hosts, "digiscope.me" and "api.digiscope.me", and no other
+//      (BRDigiIdIsDigiScopeHost). A host is on it when its bytes are exactly one of the two. Nothing is
+//      folded, trimmed or matched in part, so a name under either host, a trailing dot, a lookalike,
+//      another letter case and a host with a NUL among its bytes are all off the list. The host compared
+//      is the request's PARSED domain: the callback's host as the app's one parse reads it, which
+//      lower-cases its letters.
+//    - THE CHOICE of the identity a login signs with (BRDigiIdChooseIdentity) is made from the request's
+//      host and callback URL and from two properties of the wallet that signs: its digiScopeIdentity
+//      (BRDigiIdScopeIdentity) and its siteKeyRoot (THE ROOT).
+//        A host on THE DIGISCOPE LIST, digiScopeIdentity SHARED: THE SHARED IDENTITY.
+//        A host on THE DIGISCOPE LIST, digiScopeIdentity SITE: THE PER-SITE IDENTITY of
+//          BR_DIGIID_DIGISCOPE_LOGIN_URI, DigiScope's one login callback, under the wallet's root, and
+//          never of the request's own callback. Every DigiScope request then signs as one account: for
+//          a phrase restored from Coinomi, the account Coinomi's login made.
+//        Every other host: THE PER-SITE IDENTITY of the request's callback URL under the wallet's root,
+//          whatever digiScopeIdentity is.
+//      Both properties are checked on every call, also where the answer does not use them. 0 is no value
+//      (BR_DIGIID_SCOPE_NONE, BR_DIGIID_ROOT_NONE): it and every unknown value are REFUSED, so a zeroed
+//      or unset property chooses nothing. THE DIGISCOPE LIST and THE CHOICE have this ONE COPY. Android
+//      and iOS store the two properties with the wallet, pass them in, and sign with what the answer
+//      names; neither keeps a list of its own, and neither decides which key signs.
 //    - A MESSAGE is signed over SHA256(SHA256("\x19DigiByte Signed Message:\n" || prefix || message)),
 //      where prefix is the message length written as the bridge writes it: one byte below 0xfd; 0xfd
 //      and two little-endian bytes up to 0xffff; 0xfe and four up to 0xffffffff; 0xff and eight above
@@ -58,10 +84,13 @@
 //    - REFUSED (BR_DIGIID_REFUSED, and no key, address or answer): no seed (the wallet is locked); no
 //      message; no URI where one is needed; an account index below zero; an unknown root (THE ROOT) on
 //      any call that takes one, and a hasUri that is neither 0 nor 1 (THE ROOT), even where `work` is
-//      too small as well; the shared identity's address asked for any index but 0. A NULL pointer is "no
-//      value": an empty URI or message is a non-NULL pointer with length 0. The bridge signs an empty
-//      message, so a caller with one passes a non-NULL pointer: Swift does not promise a non-nil
-//      baseAddress for an empty buffer (an UnsafeRawBufferPointer's may be nil), and nil here is REFUSED.
+//      too small as well; the shared identity's address asked for any index but 0. Where a URI or a
+//      message is hashed, a NULL pointer is "no value" and an empty one is a non-NULL pointer with length
+//      0. The bridge signs an empty message, so a caller with one passes a non-NULL pointer: Swift does
+//      not promise a non-nil baseAddress for an empty buffer (an UnsafeRawBufferPointer's may be nil), and
+//      nil here is REFUSED. THE CHOICE refuses more, and its answer is then all zero (no identity): a
+//      host that is NULL or empty; a digiScopeIdentity that is neither SHARED nor SITE; an unknown root;
+//      and, for a host off THE DIGISCOPE LIST, a callback URL that is NULL or empty.
 //    - THE CALLER'S OWN REFUSAL: the bridge also refuses all three calls while there is no wallet
 //      (g_wallet NULL, read under WALLET_READ_GUARD). That check is not here; a caller makes it, and
 //      passes no seed when it fails.
@@ -112,10 +141,23 @@
 //                                         every known root derives with "Bitcoin seed" (the constant
 //                                         swapped in place, which moves every existing identity).
 //    524288 DIGIID_RED_ANY_ROOT           a root that is neither DIGIBYTE nor STANDARD is not refused: it
-//                                         derives with "DigiByte seed" and answers BR_DIGIID_OK.
+//                                         derives with "DigiByte seed" and answers BR_DIGIID_OK, and
+//                                         BRDigiIdChooseIdentity chooses with it (every copy of the refusal).
 //    1048576 DIGIID_RED_ANY_HASURI        BRDigiIdAddress takes any nonzero hasUri as 1, so a root swapped
 //                                         with hasUri is not refused (STANDARD, 1 swapped answers DIGIBYTE's
 //                                         per-site address).
+//    2097152 DIGIID_RED_LIST_SUFFIX       a name ending in ".digiscope.me" counts as a DigiScope host (a
+//                                         suffix match in place of the exact one).
+//    4194304 DIGIID_RED_LIST_CASEFOLD     BRDigiIdIsDigiScopeHost compares without regard to letter case, so
+//                                         a spelling no parse gives ("API.DigiScope.me") is on the list.
+//    8388608 DIGIID_RED_SITE_SIGNS_SHARED a wallet whose digiScopeIdentity is SITE still gets the shared
+//                                         identity on a DigiScope host (the rule before the property), and
+//                                         signs in as another account without a word.
+//    16777216 DIGIID_RED_SITE_USES_CALLBACK
+//                                         SITE on a DigiScope host answers the request's own callback, not
+//                                         BR_DIGIID_DIGISCOPE_LOGIN_URI.
+//    33554432 DIGIID_RED_ANY_SCOPE        a digiScopeIdentity that is neither SHARED nor SITE is not refused:
+//                                         BRDigiIdChooseIdentity chooses as it does for SITE.
 //
 
 #ifndef BRDigiId_h
@@ -158,11 +200,17 @@ extern "C" {
 #define DIGIID_RED_ROOT_ALWAYS_STANDARD 262144
 #define DIGIID_RED_ANY_ROOT            524288
 #define DIGIID_RED_ANY_HASURI          1048576
+#define DIGIID_RED_LIST_SUFFIX         2097152
+#define DIGIID_RED_LIST_CASEFOLD       4194304
+#define DIGIID_RED_SITE_SIGNS_SHARED   8388608
+#define DIGIID_RED_SITE_USES_CALLBACK  16777216
+#define DIGIID_RED_ANY_SCOPE           33554432
 
 typedef enum {
     BR_DIGIID_OK = 0,
     BR_DIGIID_REFUSED = 1,      // no seed, message or URI; an index below zero; an unknown root; a hasUri but 0 or 1;
-                                // the shared identity at index != 0
+                                // the shared identity at index != 0; from BRDigiIdChooseIdentity, no host, an
+                                // unknown digiScopeIdentity, or no callback URL for a host off the list
     BR_DIGIID_CAPACITY = 2,     // `work` or `out` is too small
     BR_DIGIID_NO_ADDRESS = 3,   // the key gives no address
     BR_DIGIID_NOT_SIGNED = 4    // BRKeyCompactSign gave no signature
@@ -175,6 +223,36 @@ typedef enum {
     BR_DIGIID_ROOT_DIGIBYTE = 1,    // "DigiByte seed" (BRBIP32PrivKeyPath's)
     BR_DIGIID_ROOT_STANDARD = 2     // "Bitcoin seed" (BR_DERIVATION_HMAC_STANDARD)
 } BRDigiIdRoot;
+
+// What a wallet signs DigiScope with: its digiScopeIdentity (THE CHOICE), a property each app stores with the
+// wallet and passes to BRDigiIdChooseIdentity. The zero value is the one that chooses nothing.
+typedef enum {
+    BR_DIGIID_SCOPE_NONE = 0,       // no value: REFUSED
+    BR_DIGIID_SCOPE_SHARED = 1,     // the shared identity, m/0'/0/0
+    BR_DIGIID_SCOPE_SITE = 2        // the per-site identity of BR_DIGIID_DIGISCOPE_LOGIN_URI under the wallet's root
+} BRDigiIdScopeIdentity;
+
+// The identity BRDigiIdChooseIdentity chose. The zero value is no identity: what a refusal leaves.
+typedef enum {
+    BR_DIGIID_IDENTITY_NONE = 0,    // nothing was chosen
+    BR_DIGIID_IDENTITY_SHARED = 1,  // the shared identity: BRDigiIdSignShared signs
+    BR_DIGIID_IDENTITY_SITE = 2     // the per-site identity of uri under root: BRDigiIdSignSite signs
+} BRDigiIdIdentityKind;
+
+// BRDigiIdChooseIdentity's answer. uri[0, uriLen) and root mean something for BR_DIGIID_IDENTITY_SITE only:
+// the URI the per-site identity is derived from, and its master-key root. For BR_DIGIID_IDENTITY_SHARED they
+// are NULL, 0 and BR_DIGIID_ROOT_NONE, and after a refusal every byte is zero.
+typedef struct {
+    BRDigiIdIdentityKind kind;
+    const char *uri;                // not owned: the header's literal, or the caller's callbackUri
+    size_t uriLen;
+    BRDigiIdRoot root;
+} BRDigiIdChoice;
+
+// DigiScope's one login and step-up callback URL: the URI a wallet whose digiScopeIdentity is SITE derives
+// its DigiScope identity from, on every DigiScope host and for every request (THE CHOICE). ASCII, hashed as
+// these bytes (THE URI). A plain literal, so that Swift imports it.
+#define BR_DIGIID_DIGISCOPE_LOGIN_URI "https://api.digiscope.me/api/auth/digiid/callback"
 
 // The longest answer with its NUL: a 74-character address (the bridge's 75-byte buffer), '|', and the
 // 88 base64 characters of a 65-byte signature. Any `out` this long holds every answer.
@@ -721,6 +799,109 @@ static inline BRDigiIdStatus BRDigiIdAddress(char *out, size_t outCap, const voi
         return status;
     }
     return BRDigiIdAddressWithKey(out, outCap, &key);   // wipes key
+}
+
+// ---- which identity signs -------------------------------------------------------------------------
+
+// 1 when host[0, hostLen) is on THE DIGISCOPE LIST: its hostLen bytes are exactly "digiscope.me" or exactly
+// "api.digiscope.me". 0 for everything else: no host (NULL), an empty one, a name under either host, a
+// trailing dot, a lookalike, another letter case, and any host with a NUL among its bytes (all hostLen bytes
+// are compared, and no listed host has one). The caller passes the request's PARSED domain, which the parse
+// lower-cased: nothing is folded here. This is the list's one copy. A caller that wants the identity to sign
+// with asks BRDigiIdChooseIdentity, which reads it.
+static inline int BRDigiIdIsDigiScopeHost(const char *host, size_t hostLen)
+{
+    static const char *const list[] = { "digiscope.me", "api.digiscope.me" };
+    size_t i, n;
+
+    if (! host || hostLen == 0) return 0;
+
+    for (i = 0; i < sizeof(list) / sizeof(list[0]); i++) {
+        n = strlen(list[i]);
+#if (DIGIID_UNFIXED & DIGIID_RED_LIST_SUFFIX)
+        if (hostLen > n && host[hostLen - n - 1] == '.' && memcmp(host + (hostLen - n), list[i], n) == 0) return 1;
+#endif
+        if (hostLen != n) continue;
+#if (DIGIID_UNFIXED & DIGIID_RED_LIST_CASEFOLD)
+        {
+            size_t k;
+
+            for (k = 0; k < n; k++) {
+                char c = host[k];
+
+                if (c >= 'A' && c <= 'Z') c = (char)(c - 'A' + 'a');
+                if (c != list[i][k]) break;
+            }
+            if (k == n) return 1;
+        }
+#else
+        if (memcmp(host, list[i], n) == 0) return 1;
+#endif
+    }
+
+    return 0;
+}
+
+// THE CHOICE: the identity a login to `host` signs with, into *out, for a wallet whose digiScopeIdentity is
+// `scope` and whose per-site master-key root is `siteKeyRoot`. host[0, hostLen) is the request's PARSED
+// domain, as BRDigiIdIsDigiScopeHost takes it, and callbackUri[0, callbackLen) the same request's callback
+// URL, the bytes THE URI names; the two are not compared with each other here. The answers:
+//   a DigiScope host, scope SHARED   { BR_DIGIID_IDENTITY_SHARED, NULL, 0, BR_DIGIID_ROOT_NONE }
+//   a DigiScope host, scope SITE     { BR_DIGIID_IDENTITY_SITE, BR_DIGIID_DIGISCOPE_LOGIN_URI, its length,
+//                                      siteKeyRoot }: never the request's own callback
+//   any other host                   { BR_DIGIID_IDENTITY_SITE, callbackUri, callbackLen, siteKeyRoot },
+//                                      whatever scope is: the caller's own pointer, valid while its bytes are
+// A DigiScope host needs no callback: a caller that signs for DigiScope without a request, as the Hub's own
+// login does, passes NULL. The caller then signs with BRDigiIdSignShared for SHARED, and for SITE with
+// BRDigiIdSignSite under out->root over out->uri (BRDigiIdAddress with hasUri 1 gives that address). The
+// SHARED answer names no root, as the shared identity takes none: BRDigiIdAddress refuses
+// BR_DIGIID_ROOT_NONE on both its branches, so for the shared address it is given the wallet's own root,
+// with hasUri 0.
+// Refused, with *out all zero (kind BR_DIGIID_IDENTITY_NONE) when there is one: no out; a host that is NULL
+// or empty; a scope that is neither BR_DIGIID_SCOPE_SHARED nor BR_DIGIID_SCOPE_SITE; a root that is neither
+// BR_DIGIID_ROOT_DIGIBYTE nor BR_DIGIID_ROOT_STANDARD; a host off the list with a callback that is NULL or
+// empty. scope and siteKeyRoot are checked on every call, also where the answer does not use them. Nothing
+// is derived, hashed, copied or allocated here, and no key is held.
+static inline BRDigiIdStatus BRDigiIdChooseIdentity(BRDigiIdChoice *out, const char *host, size_t hostLen,
+                                                    const char *callbackUri, size_t callbackLen,
+                                                    BRDigiIdScopeIdentity scope, BRDigiIdRoot siteKeyRoot)
+{
+    if (! out) return BR_DIGIID_REFUSED;
+    memset(out, 0, sizeof(*out));   // no identity: kind NONE, uriLen 0, root NONE, and the padding between them
+    out->uri = NULL;
+    if (! host || hostLen == 0) return BR_DIGIID_REFUSED;
+#if ! (DIGIID_UNFIXED & DIGIID_RED_ANY_SCOPE)
+    if (scope != BR_DIGIID_SCOPE_SHARED && scope != BR_DIGIID_SCOPE_SITE) return BR_DIGIID_REFUSED;
+#endif
+#if ! (DIGIID_UNFIXED & DIGIID_RED_ANY_ROOT)
+    if (siteKeyRoot != BR_DIGIID_ROOT_DIGIBYTE && siteKeyRoot != BR_DIGIID_ROOT_STANDARD) return BR_DIGIID_REFUSED;
+#endif
+
+    if (BRDigiIdIsDigiScopeHost(host, hostLen)) {
+#if (DIGIID_UNFIXED & DIGIID_RED_SITE_SIGNS_SHARED)
+        out->kind = BR_DIGIID_IDENTITY_SHARED;
+        return BR_DIGIID_OK;
+#else
+        if (scope == BR_DIGIID_SCOPE_SHARED) {
+            out->kind = BR_DIGIID_IDENTITY_SHARED;   // uri NULL, uriLen 0, root NONE: the shared identity takes none
+            return BR_DIGIID_OK;
+        }
+#if ! (DIGIID_UNFIXED & DIGIID_RED_SITE_USES_CALLBACK)
+        out->kind = BR_DIGIID_IDENTITY_SITE;
+        out->uri = BR_DIGIID_DIGISCOPE_LOGIN_URI;
+        out->uriLen = sizeof(BR_DIGIID_DIGISCOPE_LOGIN_URI) - 1;
+        out->root = siteKeyRoot;
+        return BR_DIGIID_OK;
+#endif
+#endif
+    }
+
+    if (! callbackUri || callbackLen == 0) return BR_DIGIID_REFUSED;
+    out->kind = BR_DIGIID_IDENTITY_SITE;
+    out->uri = callbackUri;
+    out->uriLen = callbackLen;
+    out->root = siteKeyRoot;
+    return BR_DIGIID_OK;
 }
 
 #ifdef __cplusplus

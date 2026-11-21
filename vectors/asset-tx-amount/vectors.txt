@@ -30,3 +30,4 @@ amount send_no_carrier 1 0014aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:f,00141111
 amount send_undecided 1 0014aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:f,6a06444103150005:d,6a06444103150005:d all - -> NONE 0 -
 amount send_no_transaction 1 - all t/B/3/0/1/Laxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx -> NONE 0 -
 amount send_unresolved_change 1 0014aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:f,6a084441031500050203:d,00141111111111111111111111111111111111111111:o all t/U/3/0/1/unresolved:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc -> OK 5 -
+amount recv_id_lowest_vout 0 - all t/B/2/0/1/Layyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy/3,t/V/1/0/1/Laxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx/1 -> OK 3 Laxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx

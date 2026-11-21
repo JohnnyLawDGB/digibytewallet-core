@@ -12,9 +12,9 @@
 //                as f). The transaction is version 1 with one input (00..01:0) and the txid's hash; every
 //                output's value is 600 satoshis, a data output's 0.
 //   <ownership>  all: the owned set is the scripts marked o; none: the owned set is empty
-//   <rows>       - : none; otherwise comma-separated, each <t|x>/<credit>/<quantity>/<spent>/<isAsset>/<id|->,
+//   <rows>       - : none; otherwise comma-separated, each <t|x>/<credit>/<quantity>/<spent>/<isAsset>/<id|->[/<vout>],
 //                t the transaction's txid, x another's; credit U B V M (UNCHECKED BACKED VERIFIED MIXED); the
-//                row's vout is its place in the list
+//                row's vout is <vout> when given (0 or above), otherwise its place in the list
 //   the answer   OK|NONE|REFUSED, the units, the asset id or -
 //
 // The transaction's txid is TXA_TXID, the other TXA_OTHER, both display order.
@@ -111,16 +111,22 @@ static int txaRead(const char *line, TxaCase *c)
         char *r, *rsave = NULL;
 
         for (r = strtok_r(fields[5], ",", &rsave); r; r = strtok_r(NULL, ",", &rsave)) {
-            char *p[6], *psave = NULL, *q;
+            char *p[7], *psave = NULL, *q, *end = NULL;
             size_t np = 0;
             BRAssetRow *row;
 
             if (c->rowCount >= TXA_MAX_ROWS) return 0;
-            for (q = strtok_r(r, "/", &psave); q && np < 6; q = strtok_r(NULL, "/", &psave)) p[np++] = q;
-            if (np != 6 || strlen(p[5]) >= sizeof(c->ids[0])) return 0;
+            for (q = strtok_r(r, "/", &psave); q && np < 7; q = strtok_r(NULL, "/", &psave)) p[np++] = q;
+            if (q || (np != 6 && np != 7) || strlen(p[5]) >= sizeof(c->ids[0])) return 0;
             row = &c->rows[c->rowCount];
             row->txid = p[0][0] == 't' ? TXA_TXID : TXA_OTHER;
             row->vout = (int32_t)c->rowCount;
+            if (np == 7) {
+                long v = strtol(p[6], &end, 10);
+
+                if (end == p[6] || *end != 0 || v < 0 || v > INT32_MAX) return 0;
+                row->vout = (int32_t)v;
+            }
             row->credit = p[1][0] == 'B' ? BR_ASSET_CREDIT_BACKED : p[1][0] == 'V' ? BR_ASSET_CREDIT_VERIFIED :
                           p[1][0] == 'M' ? BR_ASSET_CREDIT_MIXED : BR_ASSET_CREDIT_UNCHECKED;
             row->assetQuantity = strtoll(p[2], NULL, 10);

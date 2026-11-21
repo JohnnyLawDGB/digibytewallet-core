@@ -12,8 +12,8 @@
 //    - THE DIRECTION is the platform's: a send when the transaction's row amount is below zero (Android's
 //      WalletViewModel.kt:926, `tx.amount < 0`; the row amount is BRTxRows.h's).
 //    - THE ROWS OF THE TRANSACTION are the rows given that are asset rows and whose txid is `txid`, byte
-//      for byte (Kotlin: `WHERE is_asset = 1 AND txid = :txid`), spent or not, owned or not, in the order
-//      given.
+//      for byte (Kotlin: `WHERE is_asset = 1 AND txid = :txid`), spent or not, owned or not, given in any
+//      order (no answer depends on it).
 //    - A RECEIVE: the stored quantities of the transaction's rows whose credit counts (BACKED or VERIFIED,
 //      BRAssetCreditCounts), summed with the sum stopping at the end of the int64 range (INT64_MAX, or
 //      INT64_MIN for negative quantities) and never wrapping (Kotlin: AssetSums.saturating). Never what
@@ -32,12 +32,15 @@
 //    - THE AMOUNT is that total when it is above zero; otherwise there is none (Kotlin: null, and the row
 //      shows its DGB).
 //    - THE ASSET (Kotlin: getResolvedAssetIdForTx, `asset_id NOT LIKE 'unresolved:%' AND asset_credit IN
-//      ('BACKED', 'VERIFIED') LIMIT 1`): the asset id of the first of the transaction's rows that names one
-//      that is not a placeholder (one starting "unresolved:", ASCII case ignored, as SQLite's LIKE ignores
-//      it) and whose credit counts; NULL when none does. The same for a receive and a send (a send's are
-//      the rows of its own change). SQLite's LIMIT 1 without ORDER BY takes the table's order, which for
-//      Android's table is the order the rows were written: the platform passes its rows in the order it
-//      stored them.
+//      ('BACKED', 'VERIFIED') LIMIT 1`): the asset id of the transaction's row with the lowest vout among
+//      those that name one that is not a placeholder (one starting "unresolved:", ASCII case ignored, as
+//      SQLite's LIKE ignores it) and whose credit counts; NULL when none does. The same for a receive and a
+//      send (a send's are the rows of its own change). The query has no ORDER BY, but its table's only index
+//      is the primary key (txid, vout) (UtxoEntity; schema 12 has no other index on utxos), and SQLite reads
+//      `txid = :txid` through that index, so the rows come in vout order and LIMIT 1 takes the lowest vout
+//      (measured: EXPLAIN QUERY PLAN says SEARCH utxos USING INDEX sqlite_autoindex_utxos_1 (txid=?)). Not the
+//      order the rows were written, and not the order the caller passes them: the answer is the same for any
+//      order. (txid, vout) is unique in Android's table; of two rows with the same vout, the first given.
 //
 //  Display only: the answer is an amount on a screen, never a balance, a spend or the held set. The
 //  platform words it (the asset's symbol or name from its metadata, the quantity at the core's
@@ -65,6 +68,7 @@
 //    512   ASSET_TX_AMOUNT_RED_PLACEHOLDER_CASE    a placeholder is told by its case ("UNRESOLVED:" names the asset).
 //    1024  ASSET_TX_AMOUNT_RED_RECEIVE_CLAIMED     a receive counts what the instructions assign the wallet's outputs.
 //    2048  ASSET_TX_AMOUNT_RED_ANY_TXID            a row of another transaction counts and names.
+//    4096  ASSET_TX_AMOUNT_RED_FIRST_GIVEN         the first row given names the asset, not the lowest vout.
 //
 //  Permission is hereby granted, free of charge, to any person obtaining a copy
 //  of this software and associated documentation files (the "Software"), to deal
@@ -118,6 +122,7 @@ extern "C" {
 #define ASSET_TX_AMOUNT_RED_PLACEHOLDER_CASE    512
 #define ASSET_TX_AMOUNT_RED_RECEIVE_CLAIMED     1024
 #define ASSET_TX_AMOUNT_RED_ANY_TXID            2048
+#define ASSET_TX_AMOUNT_RED_FIRST_GIVEN         4096
 
 // What BRAssetTxActivityAmount answers. REFUSED is 0.
 typedef enum {
@@ -181,10 +186,12 @@ static inline int _BRAssetTxAmountIsPlaceholder(const char *assetId)
 #endif
 }
 
-// THE ASSET: the first of the transaction's rows naming an id that is not a placeholder and whose credit
-// counts; NULL when none does. Kotlin: UtxoDao.getResolvedAssetIdForTx.
+// THE ASSET: of the transaction's rows naming an id that is not a placeholder and whose credit counts, the
+// one with the lowest vout (the first given of equal vouts); NULL when none does. Kotlin:
+// UtxoDao.getResolvedAssetIdForTx, read through the (txid, vout) primary-key index.
 static inline const char *_BRAssetTxAmountAssetOf(const char *txid, const BRAssetRow *rows, size_t rowCount)
 {
+    const BRAssetRow *best = NULL;
     size_t i;
 
     for (i = 0; i < rowCount; i++) {
@@ -195,9 +202,13 @@ static inline const char *_BRAssetTxAmountAssetOf(const char *txid, const BRAsse
 #if !(ASSET_TX_AMOUNT_UNFIXED & ASSET_TX_AMOUNT_RED_UNCOUNTED_NAMED)
         if (! BRAssetCreditCounts(r->credit)) continue;
 #endif
+#if (ASSET_TX_AMOUNT_UNFIXED & ASSET_TX_AMOUNT_RED_FIRST_GIVEN)
         return r->assetId;
+#else
+        if (! best || r->vout < best->vout) best = r;
+#endif
     }
-    return NULL;
+    return best ? best->assetId : NULL;
 }
 
 // Is the script one of `owned`? An empty owned set owns nothing.

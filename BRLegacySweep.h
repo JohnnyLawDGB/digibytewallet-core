@@ -8,7 +8,8 @@
 //  (bridge/sweep_fee_guard.h) also uses (SWEEP-ABS-CEIL). The core refuses everything the bridge refuses and signs
 //  the same bytes wherever it signs; it refuses one thing more, an amount or total above MAX_MONEY (the bridge bounds
 //  its sum at UINT64_MAX). A fee product that wraps is refused by both: the core names it FEE_OVERFLOW, the bridge
-//  refuses the rate as out of range. The bridge's
+//  refuses the rate as out of range. A sweep that lists one outpoint twice is refused by both (CORE-SWEEP-DISTINCT:
+//  the bridge by its tx_inputs_distinct, the core as DUPLICATE_INPUT). The bridge's
 //  JNI handling (arrays, strings, the hex decoding of txids and scripts, logging), the signed-spend gate and the
 //  serialization stay on the platform side.
 //
@@ -25,6 +26,12 @@
 //       otherwise the key at prefixPath/chain/index is derived (BRBIP32PrivKeyArrayPath, HMAC key hmacKey) and
 //       the input added (txHash, vout, amount, script; no signature or witness; TXIN_SEQUENCE). totalIn is the
 //       sum of the amounts, at most MAX_MONEY.
+//   5b. EVERY INPUT A DIFFERENT OUTPOINT (CORE-SWEEP-DISTINCT), asked of the inputs as assembled, once all of them
+//       passed 5: two inputs with the same txHash and the same vout, whatever their amounts, scripts or key paths
+//                                                                                        -> DUPLICATE_INPUT
+//       (fee->input is the later input of the first such pair: the lowest j for which some i < j names the same
+//       outpoint). Inputs that share a txHash and differ in vout are different outpoints. Nothing is signed: this
+//       is before the destination is read and before the fee rule, as in the bridge.
 //    6. BRAddressScriptPubKey(destAddress) into BR_LEGACY_SWEEP_DEST_SCRIPT_MAX (48) bytes is 0 -> BAD_DESTINATION
 //    7. THE FEE: BRLegacySweepFeeCheck (BRLegacySweepFee.h), in its order. estSize = 10 + inputCount * 160 + 34;
 //       estSize * feePerKb above UINT64_MAX (or estSize above SIZE_MAX)                  -> FEE_OVERFLOW
@@ -57,8 +64,9 @@
 //  fee (optional) reports what was computed for the platform's log: estSize, fee, totalIn and the output amount
 //  as far as the call got (FEE_OVERFLOW leaves fee 0; FEE_RATE_TOO_LOW, FEE_RATE_TOO_HIGH and FEE_ABOVE_CEILING
 //  report the fee the rate would have paid;
-//  BAD_AMOUNT leaves totalIn the sum before the refused input), and the failing input for BAD_INPUT and
-//  BAD_AMOUNT (SIZE_MAX otherwise).
+//  BAD_AMOUNT leaves totalIn the sum before the refused input; DUPLICATE_INPUT leaves totalIn the sum of every
+//  listed amount, the repeat included), and the failing input for BAD_INPUT, BAD_AMOUNT and DUPLICATE_INPUT
+//  (SIZE_MAX otherwise).
 //
 //  THE GATE. A platform MUST pass *txOut through BRSignedSpendGate (or its reservation) before serializing or
 //  publishing it; a SIGNED result is not permission to broadcast. The bridge does so against its loaded wallet, or
@@ -77,6 +85,9 @@
 //  bytes, which must outlive the call; so a proof is never paired with another outpoint. It refuses (0, in untouched)
 //  a proof that is not PROVEN, a vout outside 0..UINT32_MAX, a parent index or script range outside parents[], and a
 //  parent filed under a txid other than the coin's.
+//  The caller's list is not trusted to name each coin once: a platform removes repeated rows before it builds the
+//  list (BRRecoveryUtxo.h), and step 5b refuses a list that still names one twice. The comparison is quadratic in
+//  inputCount, 36 bytes a pair, beside one BIP32 derivation per input.
 //
 //  NETWORK. BRAddressScriptPubKey follows BRNetworkIsTestnet() at the call.
 //
@@ -86,6 +97,7 @@
 //    BR_LEGACY_SWEEP_RED_NO_WIPE=1       the derived keys are freed without being wiped
 //    BR_LEGACY_SWEEP_RED_MAX_MONEY=1     no MAX_MONEY bound on an amount or the total (the sum wraps)
 //    BR_LEGACY_SWEEP_RED_ZERO_AMOUNT=1   an amount of 0 is accepted
+//    BR_LEGACY_SWEEP_RED_DUPLICATE_INPUT=1  two inputs naming one outpoint are not refused (5b)
 //  Header-only, static inline; no I/O, no locking, no clock.
 //
 
@@ -117,6 +129,9 @@ extern "C" {
 #endif
 #ifndef BR_LEGACY_SWEEP_RED_ZERO_AMOUNT
 #define BR_LEGACY_SWEEP_RED_ZERO_AMOUNT 0
+#endif
+#ifndef BR_LEGACY_SWEEP_RED_DUPLICATE_INPUT
+#define BR_LEGACY_SWEEP_RED_DUPLICATE_INPUT 0
 #endif
 
 #define BR_LEGACY_SWEEP_SEED_MAX        64u    // a BIP39 seed; the bridge's SEED_BUFFER_MAX
@@ -158,7 +173,8 @@ typedef enum {
     BR_LEGACY_SWEEP_FEE_RATE_TOO_HIGH = 11, // feePerKb is above BR_LEGACY_SWEEP_MAX_FEE_PER_KB
     BR_LEGACY_SWEEP_FEE_OVERFLOW = 12,    // estSize * feePerKb does not fit in 64 bits
     BR_LEGACY_SWEEP_FEE_RATE_TOO_LOW = 13, // feePerKb is below BR_LEGACY_SWEEP_MIN_FEE_PER_KB
-    BR_LEGACY_SWEEP_FEE_ABOVE_CEILING = 14 // the fee is above BR_LEGACY_SWEEP_FEE_CEILING
+    BR_LEGACY_SWEEP_FEE_ABOVE_CEILING = 14, // the fee is above BR_LEGACY_SWEEP_FEE_CEILING
+    BR_LEGACY_SWEEP_DUPLICATE_INPUT = 15  // two inputs name one outpoint (the same txHash and vout)
 } BRLegacySweepResult;
 
 typedef struct {
@@ -166,7 +182,7 @@ typedef struct {
     uint64_t fee;
     uint64_t totalIn;
     uint64_t outAmount;
-    size_t input;              // BAD_INPUT, BAD_AMOUNT: the input refused; otherwise SIZE_MAX
+    size_t input;              // BAD_INPUT, BAD_AMOUNT, DUPLICATE_INPUT: the input refused; otherwise SIZE_MAX
 } BRLegacySweepFee;
 
 // Fills in's outpoint from utxo and its amount and script from utxo's PROVEN proof of parents[]
@@ -188,6 +204,20 @@ static inline int BRLegacySweepInputFromProof(BRLegacySweepInput *in, const BRRa
     in->script = parents[proof->parent].bytes + proof->scriptOffset;
     in->scriptLen = proof->scriptLen;
     return 1;
+}
+
+// The later input of the first pair of inputs[0, count) that names one outpoint (the same txHash and vout): the
+// lowest j for which some i < j names inputs[j]'s outpoint. SIZE_MAX when every input names a different one.
+static inline size_t _BRLegacySweepRepeatedInput(const BRLegacySweepInput inputs[], size_t count)
+{
+    size_t i, j;
+
+    for (j = 1; j < count; j++) {
+        for (i = 0; i < j; i++) {
+            if (inputs[i].vout == inputs[j].vout && UInt256Eq(inputs[i].txHash, inputs[j].txHash)) return j;
+        }
+    }
+    return SIZE_MAX;
 }
 
 static inline void _BRLegacySweepWipeKeys(BRKey *keys, size_t count)
@@ -264,6 +294,16 @@ static inline BRLegacySweepResult BRLegacySweepBuildAndSign(BRTransaction **txOu
     mem_clean(fullPath, (prefixLen + 2) * sizeof(uint32_t));
     free(fullPath);
     fullPath = NULL;
+
+#if ! BR_LEGACY_SWEEP_RED_DUPLICATE_INPUT
+    // CORE-SWEEP-DISTINCT: every input names a different outpoint, or nothing is signed.
+    i = _BRLegacySweepRepeatedInput(inputs, inputCount);
+    if (i != SIZE_MAX) {
+        f.input = i;
+        r = BR_LEGACY_SWEEP_DUPLICATE_INPUT;
+        goto out;
+    }
+#endif
 
     destScriptLen = BRAddressScriptPubKey(destScript, sizeof(destScript), destAddress);
     if (destScriptLen == 0) { r = BR_LEGACY_SWEEP_BAD_DESTINATION; goto out; }

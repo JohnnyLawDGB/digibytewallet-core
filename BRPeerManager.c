@@ -551,7 +551,8 @@ struct BRPeerManagerStruct {
     _Atomic uint32_t cachedEstimatedHeight;
     _Atomic uint32_t cachedSyncStartHeight;
     _Atomic uint32_t cachedCFTip;
-    _Atomic int      cachedPeerCount;
+    _Atomic int      cachedPeerCount;            // connecting or handshaken (BRPeerManagerPeerCount)
+    _Atomic int      cachedHandshakedPeerCount;  // handshaken only (BRPeerManagerHandshakedPeerCount)
     uint32_t         lastSpanClampLog;   // rate-limits the retention-span-clamp WARN
 
     // TOTAL heights this manager has actually written off, accumulated across every
@@ -888,11 +889,25 @@ static void _BRPeerManagerRefreshCachedStatus(BRPeerManager *manager)
                      ? BRCompactFilterChainNextHeight(manager->compactFilterChain) : 0;
     atomic_store_explicit(&manager->cachedCFTip, cfTip, memory_order_relaxed);
 
-    int pc = 0;
+    // Two counts, because they answer two questions (PEER-COUNT-HANDSHAKED). `pc` is every peer
+    // that is not disconnected, so it includes one that is still dialling or mid-handshake: "is
+    // anything in flight?", which is what a recovery decision needs (a manager with a dial in
+    // flight is not dead, and must not be torn down as if it were). `hc` is the peers whose
+    // version/verack handshake has completed: "how many peers can this wallet talk to?", which is
+    // the number a screen shows. Showing `pc` told the user "N peers" while N sockets were dialling.
+    // (connectedPeers, despite its name, holds a peer from the moment it is dialled.)
+    int pc = 0, hc = 0;
     for (size_t i = array_count(manager->connectedPeers); i > 0; i--) {
-        if (BRPeerConnectStatus(manager->connectedPeers[i - 1]) != BRPeerStatusDisconnected) pc++;
+        BRPeerStatus st = BRPeerConnectStatus(manager->connectedPeers[i - 1]);
+        if (st != BRPeerStatusDisconnected) pc++;
+#ifdef PEER_COUNT_HANDSHAKED_UNFIXED   // host-KAT comparison arm: a connecting peer counts as handshaken
+        if (st != BRPeerStatusDisconnected) hc++;
+#else
+        if (st == BRPeerStatusConnected) hc++;
+#endif
     }
     atomic_store_explicit(&manager->cachedPeerCount, pc, memory_order_relaxed);
+    atomic_store_explicit(&manager->cachedHandshakedPeerCount, hc, memory_order_relaxed);
 }
 
 void BRPeerManagerSetStartBlock(BRPeerManager* manager, BRMerkleBlock* start) {
@@ -9715,11 +9730,19 @@ double  BRPeerManagerSyncProgress(BRPeerManager *manager, uint32_t startHeight)
     return progress;
 }
 
-// returns the number of currently connected peers
+// returns the number of peers that are connecting or connected (see BRPeerManager.h)
 size_t BRPeerManagerPeerCount(BRPeerManager *manager)
 {
     assert(manager != NULL);
     int c = atomic_load_explicit(&manager->cachedPeerCount, memory_order_relaxed);
+    return (c > 0) ? (size_t)c : 0;
+}
+
+// returns the number of peers that have completed the version/verack handshake (see BRPeerManager.h)
+size_t BRPeerManagerHandshakedPeerCount(BRPeerManager *manager)
+{
+    assert(manager != NULL);
+    int c = atomic_load_explicit(&manager->cachedHandshakedPeerCount, memory_order_relaxed);
     return (c > 0) ? (size_t)c : 0;
 }
 

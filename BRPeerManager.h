@@ -725,8 +725,17 @@ uint32_t BRPeerManagerLastBlockInfo(BRPeerManager *manager, UInt256 *hash);
 // startHeight is the block height of the most recent fully completed sync
 double BRPeerManagerSyncProgress(BRPeerManager *manager, uint32_t startHeight);
 
-// returns the number of currently connected peers
+// The number of peers that are not disconnected: handshaken peers AND peers that are still dialling
+// or mid-handshake. It answers "is anything in flight?", so it is the count for a recovery decision
+// (zero means no socket is open or opening). It is NOT a count to show: use
+// BRPeerManagerHandshakedPeerCount for that. Lock-free (a cached mirror).
 size_t BRPeerManagerPeerCount(BRPeerManager *manager);
+
+// PEER-COUNT-HANDSHAKED. The number of peers whose version/verack handshake has completed
+// (BRPeerStatusConnected). A peer that is still connecting is never counted. This is the count a
+// screen shows as "N peers": always <= BRPeerManagerPeerCount. Lock-free (a cached mirror, refreshed
+// under the manager lock when a peer completes its handshake or disconnects).
+size_t BRPeerManagerHandshakedPeerCount(BRPeerManager *manager);
 
 // description of the peer most recently used to sync blockchain data
 const char *BRPeerManagerDownloadPeerName(BRPeerManager *manager);

@@ -27,6 +27,19 @@
 #include <string.h>
 #include <inttypes.h>
 
+// strtok_r's behaviour without strtok_r, which strict C99 on glibc does not declare
+// (Android's Linux KAT shard builds -std=c99 without _POSIX_C_SOURCE).
+static char *txaTok(char *s, const char *delims, char **save) {
+    char *end;
+    if (!s) s = *save;
+    if (!s) return NULL;
+    s += strspn(s, delims);
+    if (*s == '\0') { *save = NULL; return NULL; }
+    end = s + strcspn(s, delims);
+    if (*end != '\0') { *end = '\0'; *save = end + 1; } else *save = NULL;
+    return s;
+}
+
 #define TXA_TXID  "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
 #define TXA_OTHER "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
 #define TXA_MAX_OUTPUTS 16
@@ -76,7 +89,7 @@ static int txaRead(const char *line, TxaCase *c)
     if (strlen(line) >= sizeof(buf)) return 0;
     strcpy(buf, line);
     buf[strcspn(buf, "\r\n")] = 0;
-    for (f = strtok_r(buf, " ", &save); f && nf < 10; f = strtok_r(NULL, " ", &save)) fields[nf++] = f;
+    for (f = txaTok(buf, " ", &save); f && nf < 10; f = txaTok(NULL, " ", &save)) fields[nf++] = f;
     if ((nf != 6 && nf != 10) || strcmp(fields[0], "amount") != 0 || strlen(fields[1]) >= sizeof(c->name)) return 0;
     strcpy(c->name, fields[1]);
     c->send = strcmp(fields[2], "1") == 0;
@@ -90,7 +103,7 @@ static int txaRead(const char *line, TxaCase *c)
         memset(&prev, 0, sizeof(prev));
         prev.u8[0] = 1;
         BRTransactionAddInput(c->tx, prev, 0, 0, NULL, 0, NULL, 0, NULL, 0, TXIN_SEQUENCE);
-        for (o = strtok_r(fields[3], ",", &osave); o; o = strtok_r(NULL, ",", &osave)) {
+        for (o = txaTok(fields[3], ",", &osave); o; o = txaTok(NULL, ",", &osave)) {
             char *colon = strrchr(o, ':');
             size_t len = 0;
 
@@ -110,13 +123,13 @@ static int txaRead(const char *line, TxaCase *c)
     if (strcmp(fields[5], "-") != 0) {
         char *r, *rsave = NULL;
 
-        for (r = strtok_r(fields[5], ",", &rsave); r; r = strtok_r(NULL, ",", &rsave)) {
+        for (r = txaTok(fields[5], ",", &rsave); r; r = txaTok(NULL, ",", &rsave)) {
             char *p[7], *psave = NULL, *q, *end = NULL;
             size_t np = 0;
             BRAssetRow *row;
 
             if (c->rowCount >= TXA_MAX_ROWS) return 0;
-            for (q = strtok_r(r, "/", &psave); q && np < 7; q = strtok_r(NULL, "/", &psave)) p[np++] = q;
+            for (q = txaTok(r, "/", &psave); q && np < 7; q = txaTok(NULL, "/", &psave)) p[np++] = q;
             if (q || (np != 6 && np != 7) || strlen(p[5]) >= sizeof(c->ids[0])) return 0;
             row = &c->rows[c->rowCount];
             row->txid = p[0][0] == 't' ? TXA_TXID : TXA_OTHER;

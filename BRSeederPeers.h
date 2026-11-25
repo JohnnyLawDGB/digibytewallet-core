@@ -25,7 +25,12 @@
 //      must still count toward the filter-first pool;
 //    - only an IPv4 dotted-quad literal is added (the seeder serves IPv4), as IPv4-mapped;
 //    - the cached list is fetched again when it is empty or older than
-//      BR_SEEDER_REFRESH_MS (one hour).
+//      BR_SEEDER_REFRESH_MS (one hour);
+//    - one seeder answer contributes at most BR_SEEDER_MAX_PEERS peers (the first ones listed),
+//      and a cached pool that merges answers holds at most BR_SEEDER_POOL_MAX_PEERS, dropping
+//      its oldest entries to make room. The answer's size was the only bound before 2026-11
+//      (256 KiB on Android: room for some 14,000 minimal entries), each stored, merged into a
+//      pool that only grew, and added one by one. The seeder serves a few dozen.
 //  The Kotlin parse (trim(), removePrefix("0x"), removePrefix("0X"), toLongOrNull(16)) read more
 //  than this, and those forms are now 0: a sign ("-1" was -1, every service bit; "+44d" was
 //  0x44d), leading zeros past 16 digits, a second prefix ("0x0X44d" was 0x44d), non-ASCII digits
@@ -35,10 +40,10 @@
 //  An own-node in exclusive mode adds no seeder peer at all; that state is the platform's (it
 //  pins the node), so the platform skips this call then.
 //
-//  Host KAT: digibytewallet-android native/src/test/host/seeder_peers_kat/. Three comparison
+//  Host KAT: digibytewallet-android native/src/test/host/seeder_peers_kat/. Four comparison
 //  seams, each failing only its own cases: SEEDER_PEERS_RED (the service parse and tag),
-//  SEEDER_SERVICES_RED (the Kotlin parse's ASCII leniencies) and SEEDER_REFRESH_RED (the
-//  refresh decision).
+//  SEEDER_SERVICES_RED (the Kotlin parse's ASCII leniencies), SEEDER_REFRESH_RED (the
+//  refresh decision) and SEEDER_CAP_RED (no bound on an answer or on a pool).
 //  Header-only, static inline.
 //
 
@@ -57,6 +62,13 @@ extern "C" {
 
 // How long a fetched seeder list is used before it is fetched again: one hour.
 #define BR_SEEDER_REFRESH_MS 3600000LL
+
+// The most peers one seeder answer contributes. The seeder serves a few dozen filter peers; a
+// thousand leaves room for growth and keeps the work of one answer small.
+#define BR_SEEDER_MAX_PEERS 1024
+
+// The most peers a cached pool holds when it merges answers over time (Android's general pool).
+#define BR_SEEDER_POOL_MAX_PEERS 4096
 
 static inline int _BRSeederIsSpace(char c)
 {
@@ -125,6 +137,38 @@ static inline int BRSeederShouldRefresh(int64_t lastFetchMs, int64_t nowMs, size
     return age >= BR_SEEDER_REFRESH_MS;
 #else
     return cachedCount == 0 || age > BR_SEEDER_REFRESH_MS;
+#endif
+}
+
+// How many of an answer's `listed` peers are taken: the first BR_SEEDER_MAX_PEERS at most. The
+// platform reads, stores and adds only that many, whatever the answer holds.
+static inline size_t BRSeederPeersAccepted(size_t listed)
+{
+#ifdef SEEDER_CAP_RED
+    return listed;                      // RED ARM SEAM (seeder_peers_kat): every listed peer is taken
+#else
+    return listed < (size_t)BR_SEEDER_MAX_PEERS ? listed : (size_t)BR_SEEDER_MAX_PEERS;
+#endif
+}
+
+// How many of its OLDEST entries a pool of `pooled` peers drops so that `adding` new ones fit
+// within BR_SEEDER_POOL_MAX_PEERS. Never more than `pooled`: when `adding` alone is over the
+// limit the whole pool goes, and the caller adds only what BRSeederPeersAccepted allows.
+static inline size_t BRSeederPoolDrop(size_t pooled, size_t adding)
+{
+#ifdef SEEDER_CAP_RED
+    (void)pooled; (void)adding;
+    return 0;                           // RED ARM SEAM (seeder_peers_kat): the pool only grows
+#else
+    size_t room;
+
+    if (pooled > (size_t)BR_SEEDER_POOL_MAX_PEERS) {                    // an older, unbounded pool
+        if (adding >= (size_t)BR_SEEDER_POOL_MAX_PEERS) return pooled;
+        return pooled - ((size_t)BR_SEEDER_POOL_MAX_PEERS - adding);
+    }
+    room = (size_t)BR_SEEDER_POOL_MAX_PEERS - pooled;
+    if (adding <= room) return 0;
+    return (adding - room < pooled) ? adding - room : pooled;
 #endif
 }
 
